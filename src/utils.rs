@@ -34,6 +34,7 @@ pub fn data_home() -> Result<PathBuf> {
 
 static KEY_REGEX: OnceLock<Regex> = OnceLock::new();
 static URL_CRED_REGEX: OnceLock<Regex> = OnceLock::new();
+static URL_USER_CRED_REGEX: OnceLock<Regex> = OnceLock::new();
 
 /// Returns the longest prefix of `input` that is valid UTF-8 and no longer
 /// than `max_bytes` bytes.
@@ -52,17 +53,21 @@ pub fn utf8_prefix(input: &str, max_bytes: usize) -> &str {
 ///
 /// Specifically targets:
 /// - API keys in query parameters (e.g., `key=AIza...`)
-/// - Credentials in URLs (e.g., `https://user:pass@host`)
+/// - Credentials in URLs (e.g., `https://user:pass@host` or `https://token@host`)
 pub fn redact_secret(s: &str) -> String {
     let key_re =
         KEY_REGEX.get_or_init(|| Regex::new(r"(?i)(key|token|secret)=([a-zA-Z0-9_\-]+)").unwrap());
 
-    let url_cred_re = URL_CRED_REGEX.get_or_init(|| Regex::new(r"://([^/:]+):([^/@]+)@").unwrap());
+    let url_cred_re =
+        URL_CRED_REGEX.get_or_init(|| Regex::new(r"://([^/:\s@]*):([^/\s@]*)@").unwrap());
+    let url_user_cred_re =
+        URL_USER_CRED_REGEX.get_or_init(|| Regex::new(r"(?i)(https?://)([^/:\s@]+)@").unwrap());
 
     let redacted_params = key_re.replace_all(s, "$1=[REDACTED]");
     let redacted_url = url_cred_re.replace_all(&redacted_params, "://[REDACTED]:[REDACTED]@");
+    let redacted_user_url = url_user_cred_re.replace_all(&redacted_url, "${1}[REDACTED]@");
 
-    redacted_url.to_string()
+    redacted_user_url.to_string()
 }
 
 /// Cleans a JSON string by escaping unescaped control characters inside string literals.
@@ -145,6 +150,21 @@ mod tests {
             redacted,
             "https://[REDACTED]:[REDACTED]@github.com/torvalds/linux.git"
         );
+
+        let token_url = "https://ghp_secretToken123@github.com/sashiko-dev/sashiko.git";
+        assert_eq!(
+            redact_secret(token_url),
+            "https://[REDACTED]@github.com/sashiko-dev/sashiko.git"
+        );
+
+        let empty_pass_url = "https://token_only:@github.com/sashiko-dev/sashiko.git";
+        assert_eq!(
+            redact_secret(empty_pass_url),
+            "https://[REDACTED]:[REDACTED]@github.com/sashiko-dev/sashiko.git"
+        );
+
+        let ssh_url = "ssh://git@github.com/torvalds/linux.git";
+        assert_eq!(redact_secret(ssh_url), ssh_url);
     }
 
     #[test]

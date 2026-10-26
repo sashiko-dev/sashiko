@@ -853,10 +853,14 @@ async fn run_daemon(
         raw_tx.clone(),
         settings.forge.api_token.clone(),
     );
+    let fetch_agent = Arc::new(fetch_agent.with_db(db.clone(), settings.review.max_retries));
 
-    // Spawn FetchAgent
-    let fetch_handle = tokio::spawn(async move {
-        fetch_agent.run().await;
+    // Spawn FetchAgent under supervision so unexpected panics recover and drain fetch_queue
+    let fetch_handle = spawn_supervised_worker("FetchAgent", move || {
+        let agent = Arc::clone(&fetch_agent);
+        async move {
+            agent.run().await;
+        }
     });
 
     // Parser Dispatcher

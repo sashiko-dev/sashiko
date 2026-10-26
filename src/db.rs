@@ -1403,6 +1403,23 @@ pub struct ForgeOutboxRow {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct FetchQueueRow {
+    pub id: i64,
+    pub repo_url: String,
+    pub commit_range: String,
+    pub article_id: String,
+    pub mr_url: Option<String>,
+    pub mr_title: Option<String>,
+    pub mr_number: Option<i64>,
+    pub status: String,
+    pub locked_at: Option<i64>,
+    pub retry_count: i64,
+    pub next_retry_at: Option<i64>,
+    pub error_log: Option<String>,
+    pub created_at: i64,
+}
+
 #[cfg(feature = "server")]
 impl Database {
     pub fn has_bug_actor(&self) -> bool {
@@ -2282,6 +2299,30 @@ impl Database {
             }
         }
 
+        if current_version < 16 {
+            info!("Applying database migration version 16 (durable fetch queue)...");
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 16 {
+                info!(
+                    "Database already at version {} under the migration lock; skipping version 16.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                tx.execute_batch(include_str!("migrations/016_fetch_queue.sql"))
+                    .await?;
+                tx.execute("PRAGMA user_version = 16", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
         let has_patchwork_outbox = {
             let mut rows = self
                 .conn
@@ -2300,7 +2341,7 @@ impl Database {
             .await?;
         }
 
-        info!("Database schema is up to date at version 15.");
+        info!("Database schema is up to date at version 16.");
 
         Ok(())
     }
@@ -7193,7 +7234,10 @@ impl Database {
                         "UPDATE patchsets
                          SET status = 'Incomplete', failed_reason = NULL
                          WHERE id = ?
-                           AND (status = 'Fetching' OR (status = 'Failed' AND COALESCE(received_parts, 0) = 0))",
+                           AND (status = 'Fetching'
+                                OR (status = 'Failed'
+                                    AND (COALESCE(received_parts, 0) = 0
+                                         OR COALESCE(received_parts, 0) < COALESCE(total_parts, 1))))",
                         libsql::params![id],
                     )
                     .await?;
@@ -7906,21 +7950,27 @@ impl Database {
                 .await?;
             }
 
+            // Reopen Fetching or partially-ingested Failed patchsets before
+            // recalculating received_parts so a merge that reaches total_parts
+            // transitions cleanly to Pending below.
+            self.execute(
+                "UPDATE patchsets
+                     SET status = 'Incomplete', failed_reason = NULL
+                     WHERE id = ?
+                       AND (status = 'Fetching'
+                            OR (status = 'Failed'
+                                AND (COALESCE(received_parts, 0) = 0
+                                     OR COALESCE(received_parts, 0) < COALESCE(total_parts, 1))))",
+                libsql::params![target_id],
+            )
+            .await?;
+
             // Recalculate received parts for target (in case we merged)
             self.execute(
                 "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
                 libsql::params![target_id, target_id],
             )
             .await?;
-
-            self.execute(
-                    "UPDATE patchsets
-                     SET status = 'Incomplete', failed_reason = NULL
-                     WHERE id = ?
-                       AND (status = 'Fetching' OR (status = 'Failed' AND COALESCE(received_parts, 0) = 0))",
-                    libsql::params![target_id],
-                )
-                .await?;
 
             self.execute(
                 "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
@@ -8104,6 +8154,30 @@ impl Database {
             )
             .await?;
         }
+
+        tx.execute(
+            "UPDATE patches SET status = 'Cancelled'
+              WHERE id = ?
+                AND (status IS NULL OR status = 'Pending')
+                AND EXISTS (
+                    SELECT 1 FROM patchsets ps
+                     WHERE ps.id = ? AND ps.status = 'Cancelled'
+                )",
+            libsql::params![patch_id, patchset_id],
+        )
+        .await?;
+
+        tx.execute(
+            "UPDATE patches SET status = 'Pending', apply_error = NULL
+              WHERE id = ?
+                AND status = 'Cancelled'
+                AND NOT EXISTS (
+                    SELECT 1 FROM patchsets ps
+                     WHERE ps.id = ? AND ps.status = 'Cancelled'
+                )",
+            libsql::params![patch_id, patchset_id],
+        )
+        .await?;
 
         tx.execute(
             "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
@@ -8340,7 +8414,10 @@ impl Database {
     ) -> Result<()> {
         let tx = self.begin_immediate_transaction().await?;
         let tx_db = self.with_connection((*tx).clone());
-        if let Some(s) = slug {
+        let is_cancelled = tx_db.get_patchset_status(id).await?.as_deref()
+            == Some(ReviewStatus::Cancelled.as_str());
+        let effective_slug = if is_cancelled { None } else { slug };
+        if let Some(s) = effective_slug {
             tx_db.rotate_mr_slug(s, Some(id)).await?;
         }
         tx_db
@@ -8351,7 +8428,7 @@ impl Database {
                     mr_number = COALESCE(mr_number, ?),
                     slug = COALESCE(?, slug)
                  WHERE id = ?",
-                libsql::params![mr_url, mr_title, mr_number, slug, id],
+                libsql::params![mr_url, mr_title, mr_number, effective_slug, id],
             )
             .await?;
         tx_db
@@ -10815,6 +10892,35 @@ impl Database {
         )
         .await?;
 
+        self.execute(
+            "UPDATE fetch_queue
+                 SET status = 'Cancelled', error_log = ?, locked_at = NULL
+                 WHERE status IN ('Pending', 'Fetching')
+                   AND EXISTS (
+                       SELECT 1 FROM patchsets ps
+                       WHERE ps.id = ?
+                         AND ps.cover_letter_message_id IN (
+                             fetch_queue.article_id,
+                             '<' || fetch_queue.article_id || '>',
+                             fetch_queue.article_id || '@sashiko.local',
+                             '<' || fetch_queue.article_id || '@sashiko.local>'
+                         )
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM patchsets ps2
+                       WHERE ps2.id != ?
+                         AND COALESCE(ps2.status, '') != 'Cancelled'
+                         AND ps2.cover_letter_message_id IN (
+                             fetch_queue.article_id,
+                             '<' || fetch_queue.article_id || '>',
+                             fetch_queue.article_id || '@sashiko.local',
+                             '<' || fetch_queue.article_id || '@sashiko.local>'
+                         )
+                   )",
+            libsql::params![reason.to_string(), id, id],
+        )
+        .await?;
+
         Ok(())
     }
 
@@ -12452,30 +12558,11 @@ impl Database {
 
         let should_increment = current_status.as_deref() == Some("Reviewed");
 
-        // 2. Reset patchset, active claim generation, and non-terminal/failed patch statuses to Pending
+        // 2. Reset patchset status to Pending
         tx_db
             .execute(
                 "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
                 libsql::params![id],
-            )
-            .await?;
-        tx_db
-            .execute(
-                "DELETE FROM meta WHERE key = 'patchset_active_gen:' || CAST(? AS TEXT)",
-                libsql::params![id],
-            )
-            .await?;
-        tx_db
-            .execute(
-                "UPDATE patches
-                    SET status = 'Pending', apply_error = NULL
-                  WHERE patchset_id = ?
-                    AND (status IN ('Failed', 'Cancelled', 'In Review', 'error')
-                         OR (status = 'applied' AND NOT EXISTS (
-                             SELECT 1 FROM reviews r
-                              WHERE r.patchset_id = ? AND r.patch_id = patches.id AND r.status = 'Reviewed'
-                         )))",
-                libsql::params![id, id],
             )
             .await?;
 
@@ -12489,155 +12576,171 @@ impl Database {
                 .await?;
         }
 
-        // 4. Delete associated tool usages, findings, bug links, and unsent
+        // 4. Reset active claim generation, non-terminal/failed patch statuses,
+        // and associated failed/cancelled/interrupted review and outbox rows.
+        tx_db.reset_patchset_review_state(id).await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn reset_patchset_review_state(&self, id: i64) -> Result<()> {
+        self.execute(
+            "DELETE FROM meta WHERE key = 'patchset_active_gen:' || CAST(? AS TEXT)",
+            libsql::params![id],
+        )
+        .await?;
+        self.execute(
+            "UPDATE patches
+                SET status = 'Pending', apply_error = NULL
+              WHERE patchset_id = ?
+                AND (status IN ('Failed', 'Cancelled', 'In Review', 'error')
+                     OR (status = 'applied' AND NOT EXISTS (
+                         SELECT 1 FROM reviews r
+                          WHERE r.patchset_id = ? AND r.patch_id = patches.id AND r.status = 'Reviewed'
+                     )))",
+            libsql::params![id, id],
+        )
+        .await?;
+
+        // Delete associated tool usages, findings, bug links, and unsent
         // outbox entries for infra-failed attempts (interaction_id IS NULL,
         // which are the only Failed rows matched by has_failed_review()) and
         // interrupted/cancelled ('In Review', 'Cancelled') attempts before
-        // deleting those review rows in step 5. Standalone ai_interactions rows
-        // have no foreign key to reviews and remain in the ledger for cumulative
-        // token accounting.
+        // deleting those review rows. Standalone ai_interactions rows have no
+        // foreign key to reviews and remain in the ledger for cumulative token
+        // accounting.
         let review_filter = "((status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL) OR status IN ('In Review', 'Cancelled'))";
 
-        tx_db
-            .execute(
-                &format!(
-                    "DELETE FROM tool_usages WHERE review_id IN (
-                        SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
-                    )"
-                ),
-                libsql::params![id],
-            )
-            .await?;
+        self.execute(
+            &format!(
+                "DELETE FROM tool_usages WHERE review_id IN (
+                    SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
+                )"
+            ),
+            libsql::params![id],
+        )
+        .await?;
 
-        tx_db
-            .execute(
-                &format!(
-                    "DELETE FROM findings WHERE review_id IN (
-                        SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
-                    )"
-                ),
-                libsql::params![id],
-            )
-            .await?;
+        self.execute(
+            &format!(
+                "DELETE FROM findings WHERE review_id IN (
+                    SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
+                )"
+            ),
+            libsql::params![id],
+        )
+        .await?;
 
-        tx_db
-            .execute(
-                &format!(
-                    "DELETE FROM bug_reviews WHERE review_id IN (
-                        SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
-                    )"
-                ),
-                libsql::params![id],
-            )
-            .await?;
+        self.execute(
+            &format!(
+                "DELETE FROM bug_reviews WHERE review_id IN (
+                    SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
+                )"
+            ),
+            libsql::params![id],
+        )
+        .await?;
 
-        tx_db
-            .execute(
-                &format!(
-                    "DELETE FROM email_outbox
-                      WHERE status IN ('Pending', 'Embargoed', 'Skipped', 'Muted', 'Disabled', 'Dry-Run', 'Cancelled')
-                        AND patch_id IN (
-                            SELECT id FROM patches WHERE patchset_id = ?
+        self.execute(
+            &format!(
+                "DELETE FROM email_outbox
+                  WHERE status IN ('Pending', 'Embargoed', 'Skipped', 'Muted', 'Disabled', 'Dry-Run', 'Cancelled')
+                    AND patch_id IN (
+                        SELECT id FROM patches WHERE patchset_id = ?
+                    )
+                    AND (
+                        patch_id IN (
+                            SELECT patch_id FROM reviews
+                             WHERE patchset_id = ? AND patch_id IS NOT NULL AND {review_filter}
                         )
-                        AND (
-                            patch_id IN (
-                                SELECT patch_id FROM reviews
-                                 WHERE patchset_id = ? AND patch_id IS NOT NULL AND {review_filter}
-                            )
-                            OR status = 'Cancelled'
-                        )
-                        AND NOT EXISTS (
-                            SELECT 1 FROM reviews r_ok
-                             WHERE r_ok.patchset_id = ? AND r_ok.patch_id = email_outbox.patch_id AND r_ok.status = 'Reviewed'
-                        )"
-                ),
-                libsql::params![id, id, id],
-            )
-            .await?;
+                        OR status = 'Cancelled'
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM reviews r_ok
+                         WHERE r_ok.patchset_id = ? AND r_ok.patch_id = email_outbox.patch_id AND r_ok.status = 'Reviewed'
+                    )"
+            ),
+            libsql::params![id, id, id],
+        )
+        .await?;
 
-        tx_db
-            .execute(
-                &format!(
-                    "DELETE FROM email_outbox
-                      WHERE status IN ('Pending', 'Embargoed', 'Skipped', 'Muted', 'Disabled', 'Dry-Run', 'Cancelled')
-                        AND patch_id IS NULL
-                        AND patchset_id = ?
-                        AND (
-                            EXISTS (
-                                SELECT 1 FROM reviews
-                                 WHERE patchset_id = ? AND patch_id IS NULL AND {review_filter}
-                            )
-                            OR status = 'Cancelled'
+        self.execute(
+            &format!(
+                "DELETE FROM email_outbox
+                  WHERE status IN ('Pending', 'Embargoed', 'Skipped', 'Muted', 'Disabled', 'Dry-Run', 'Cancelled')
+                    AND patch_id IS NULL
+                    AND patchset_id = ?
+                    AND (
+                        EXISTS (
+                            SELECT 1 FROM reviews
+                             WHERE patchset_id = ? AND patch_id IS NULL AND {review_filter}
                         )
-                        AND NOT EXISTS (
-                            SELECT 1 FROM reviews r_ok
-                             WHERE r_ok.patchset_id = ? AND r_ok.patch_id IS NULL AND r_ok.status = 'Reviewed'
-                        )"
-                ),
-                libsql::params![id, id, id],
-            )
-            .await?;
+                        OR status = 'Cancelled'
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM reviews r_ok
+                         WHERE r_ok.patchset_id = ? AND r_ok.patch_id IS NULL AND r_ok.status = 'Reviewed'
+                    )"
+            ),
+            libsql::params![id, id, id],
+        )
+        .await?;
 
-        tx_db
-            .execute(
-                &format!(
-                    "DELETE FROM patchwork_outbox
-                      WHERE status IN ('Pending', 'Cancelled')
-                        AND patch_msg_id IN (
-                            SELECT p.message_id FROM patches p
-                            WHERE p.patchset_id = ?
-                              AND (
-                                  p.id IN (
-                                      SELECT patch_id FROM reviews
-                                       WHERE patchset_id = ? AND patch_id IS NOT NULL AND {review_filter}
-                                  )
-                                  OR patchwork_outbox.status = 'Cancelled'
+        self.execute(
+            &format!(
+                "DELETE FROM patchwork_outbox
+                  WHERE status IN ('Pending', 'Cancelled')
+                    AND patch_msg_id IN (
+                        SELECT p.message_id FROM patches p
+                        WHERE p.patchset_id = ?
+                          AND (
+                              p.id IN (
+                                  SELECT patch_id FROM reviews
+                                   WHERE patchset_id = ? AND patch_id IS NOT NULL AND {review_filter}
                               )
-                              AND NOT EXISTS (
-                                  SELECT 1 FROM reviews r_ok
-                                   WHERE r_ok.patch_id = p.id AND r_ok.status = 'Reviewed'
-                              )
-                        )"
-                ),
-                libsql::params![id, id],
-            )
-            .await?;
+                              OR patchwork_outbox.status = 'Cancelled'
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM reviews r_ok
+                               WHERE r_ok.patch_id = p.id AND r_ok.status = 'Reviewed'
+                          )
+                    )"
+            ),
+            libsql::params![id, id],
+        )
+        .await?;
 
-        tx_db
-            .execute(
-                "DELETE FROM forge_outbox
-                  WHERE patchset_id = ?
-                    AND status IN ('Pending', 'Embargoed', 'Failed', 'Cancelled', 'Disabled', 'Dry-Run')",
-                libsql::params![id],
-            )
-            .await?;
+        self.execute(
+            "DELETE FROM forge_outbox
+              WHERE patchset_id = ?
+                AND status IN ('Pending', 'Embargoed', 'Failed', 'Cancelled', 'Disabled', 'Dry-Run')",
+            libsql::params![id],
+        )
+        .await?;
 
-        // 5. Record the high-water review ID before deleting failed,
-        // cancelled, or interrupted ('In Review') review rows so SQLite never
-        // recycles the deleted rowid on the next INSERT INTO reviews.
-        tx_db
-            .execute(
-                "INSERT INTO meta (key, value)
-                 VALUES (
-                     'reviews_max_id',
-                     CAST((SELECT COALESCE(MAX(id), 0) FROM reviews) AS TEXT)
-                 )
-                 ON CONFLICT(key) DO UPDATE SET
-                     value = CAST(
-                         MAX(CAST(meta.value AS INTEGER), CAST(excluded.value AS INTEGER))
-                         AS TEXT
-                     )",
-                (),
-            )
-            .await?;
-        tx_db
-            .execute(
-                &format!("DELETE FROM reviews WHERE patchset_id = ? AND {review_filter}"),
-                libsql::params![id],
-            )
-            .await?;
-
-        tx.commit().await?;
+        // Record the high-water review ID before deleting failed, cancelled,
+        // or interrupted ('In Review') review rows so SQLite never recycles the
+        // deleted rowid on the next INSERT INTO reviews.
+        self.execute(
+            "INSERT INTO meta (key, value)
+             VALUES (
+                 'reviews_max_id',
+                 CAST((SELECT COALESCE(MAX(id), 0) FROM reviews) AS TEXT)
+             )
+             ON CONFLICT(key) DO UPDATE SET
+                 value = CAST(
+                     MAX(CAST(meta.value AS INTEGER), CAST(excluded.value AS INTEGER))
+                     AS TEXT
+                 )",
+            (),
+        )
+        .await?;
+        self.execute(
+            &format!("DELETE FROM reviews WHERE patchset_id = ? AND {review_filter}"),
+            libsql::params![id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -13013,6 +13116,18 @@ impl Database {
                         "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, version = COALESCE(?, version) WHERE id = ?",
                         libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, effective_ver, id]
                     ).await?;
+                    tx_db.reset_patchset_review_state(id).await?;
+                    tx_db
+                        .execute(
+                            "DELETE FROM fetch_queue
+                             WHERE status IN ('Done', 'Failed', 'Cancelled')
+                               AND article_id IN (
+                                   TRIM(?, '<>'),
+                                   REPLACE(TRIM(?, '<>'), '@sashiko.local', '')
+                               )",
+                            libsql::params![clid.clone(), clid.clone()],
+                        )
+                        .await?;
                 }
                 tx.commit().await?;
                 self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
@@ -13088,8 +13203,23 @@ impl Database {
     pub async fn update_patchset_error(&self, root_msg_id: &str, error: &str) -> Result<()> {
         let candidates = Self::get_msgid_candidates(root_msg_id);
         for clid in candidates {
-            let res = self.execute(
-                    "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
+            let res = self
+                .execute(
+                    "UPDATE patchsets SET status = 'Failed', failed_reason = ?
+                     WHERE cover_letter_message_id = ?
+                       AND status IN ('Fetching', 'Incomplete', 'Failed')
+                       AND NOT EXISTS (
+                           SELECT 1 FROM fetch_queue fq
+                           WHERE fq.status IN ('Pending', 'Fetching')
+                             AND fq.article_id IN (
+                                 TRIM(COALESCE(patchsets.cover_letter_message_id, ''), '<>'),
+                                 REPLACE(
+                                     TRIM(COALESCE(patchsets.cover_letter_message_id, ''), '<>'),
+                                     '@sashiko.local',
+                                     ''
+                                 )
+                             )
+                       )",
                     libsql::params![error, clid],
                 )
                 .await?;
@@ -13103,10 +13233,13 @@ impl Database {
     pub async fn fail_fetching_patchset(&self, root_msg_id: &str, error: &str) -> Result<()> {
         let candidates = Self::get_msgid_candidates(root_msg_id);
         for clid in candidates {
-            let res = self.execute(
+            let res = self
+                .execute(
                     "UPDATE patchsets SET status = 'Failed', failed_reason = ?
                      WHERE cover_letter_message_id = ?
-                       AND (status = 'Fetching' OR (status = 'Incomplete' AND COALESCE(received_parts, 0) = 0))",
+                       AND (status = 'Fetching'
+                            OR (status = 'Incomplete' AND COALESCE(received_parts, 0) = 0)
+                            OR (status = 'Failed' AND COALESCE(received_parts, 0) = 0))",
                     libsql::params![error, clid],
                 )
                 .await?;
@@ -13118,11 +13251,48 @@ impl Database {
     }
 
     pub async fn fail_interrupted_fetching_patchsets(&self) -> Result<u64> {
+        let tx = self.begin_immediate_transaction().await?;
+
+        // Reset any remote git fetches interrupted mid-flight (or marked Done
+        // just before shutdown while their patchset remained Fetching or
+        // Incomplete in the in-memory channel) so FetchAgent resumes them.
+        // Drive the Done lookup from active Fetching/Incomplete patchsets via
+        // the UNIQUE(article_id) index so startup never scans historical Done rows.
+        tx.execute(
+            "UPDATE fetch_queue
+             SET status = 'Pending', locked_at = NULL
+             WHERE status = 'Fetching'",
+            (),
+        )
+        .await?;
+        tx.execute(
+            "UPDATE fetch_queue
+             SET status = 'Pending', locked_at = NULL
+             WHERE status = 'Done'
+               AND article_id IN (
+                   SELECT TRIM(COALESCE(ps.cover_letter_message_id, ''), '<>')
+                   FROM patchsets ps
+                   WHERE ps.status IN ('Fetching', 'Incomplete')
+                     AND ps.cover_letter_message_id IS NOT NULL
+                   UNION ALL
+                   SELECT REPLACE(
+                       TRIM(COALESCE(ps.cover_letter_message_id, ''), '<>'),
+                       '@sashiko.local',
+                       ''
+                   )
+                   FROM patchsets ps
+                   WHERE ps.status IN ('Fetching', 'Incomplete')
+                     AND ps.cover_letter_message_id IS NOT NULL
+               )",
+            (),
+        )
+        .await?;
+
         // Restore normal mailing-list cover letters (0 received parts, positive
         // total_parts, non-placeholder subject, non-local message ID, and no MR
         // URL) that an earlier startup sweep wrongly transitioned from
         // 'Incomplete' to 'Failed'.
-        self.execute(
+        tx.execute(
             "UPDATE patchsets SET status = 'Incomplete', failed_reason = NULL
              WHERE status = 'Failed'
                AND failed_reason = 'Interrupted before fetch completed'
@@ -13135,13 +13305,27 @@ impl Database {
         )
         .await?;
 
-        let count = self
+        let count = tx
             .execute(
-                "UPDATE patchsets SET status = 'Failed', failed_reason = 'Interrupted before fetch completed'
-                 WHERE status = 'Fetching'",
+                "UPDATE patchsets
+                 SET status = 'Failed', failed_reason = 'Interrupted before fetch completed'
+                 WHERE status = 'Fetching'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM fetch_queue fq
+                       WHERE fq.status IN ('Pending', 'Fetching')
+                         AND fq.article_id IN (
+                             TRIM(COALESCE(patchsets.cover_letter_message_id, ''), '<>'),
+                             REPLACE(
+                                 TRIM(COALESCE(patchsets.cover_letter_message_id, ''), '<>'),
+                                 '@sashiko.local',
+                                 ''
+                             )
+                         )
+                   )",
                 (),
             )
             .await?;
+        tx.commit().await?;
         Ok(count)
     }
 
@@ -13284,6 +13468,28 @@ impl Database {
         Ok(counts)
     }
 }
+
+#[cfg(feature = "server")]
+const FETCH_QUEUE_TARGET_CANCELLED_SQL: &str = "EXISTS (
+    SELECT 1 FROM patchsets ps
+    WHERE ps.status = 'Cancelled'
+      AND ps.cover_letter_message_id IN (
+          fetch_queue.article_id,
+          '<' || fetch_queue.article_id || '>',
+          fetch_queue.article_id || '@sashiko.local',
+          '<' || fetch_queue.article_id || '@sashiko.local>'
+      )
+)
+AND NOT EXISTS (
+    SELECT 1 FROM patchsets ps2
+    WHERE COALESCE(ps2.status, '') != 'Cancelled'
+      AND ps2.cover_letter_message_id IN (
+          fetch_queue.article_id,
+          '<' || fetch_queue.article_id || '>',
+          fetch_queue.article_id || '@sashiko.local',
+          '<' || fetch_queue.article_id || '@sashiko.local>'
+      )
+)";
 
 #[cfg(feature = "server")]
 impl Database {
@@ -14118,6 +14324,314 @@ impl Database {
         let count = self.execute(
                 "UPDATE forge_outbox SET status = 'Pending' WHERE patchset_id = ? AND status = 'Embargoed'",
                 libsql::params![patchset_id],
+            )
+            .await?;
+        Ok(count)
+    }
+
+    pub async fn enqueue_fetch_request(
+        &self,
+        repo_url: Option<&str>,
+        commit_range: &str,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+    ) -> Result<()> {
+        if crate::fetcher::url_has_embedded_credentials(repo_url) {
+            anyhow::bail!(
+                "Refusing to persist repository URL with embedded credentials in fetch_queue"
+            );
+        }
+        let repo_key = repo_url.unwrap_or("");
+        let article_id = crate::fetcher::fetch_article_id(commit_range, mr_number);
+        let now = chrono::Utc::now().timestamp();
+        self.execute(
+            "INSERT INTO fetch_queue (repo_url, commit_range, article_id, mr_url, mr_title, mr_number, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'Pending', ?)
+             ON CONFLICT(repo_url, article_id) DO UPDATE SET
+                 commit_range = excluded.commit_range,
+                 mr_url = CASE
+                     WHEN fetch_queue.status IN ('Pending', 'Fetching')
+                         THEN COALESCE(excluded.mr_url, fetch_queue.mr_url)
+                     ELSE excluded.mr_url
+                 END,
+                 mr_title = CASE
+                     WHEN fetch_queue.status IN ('Pending', 'Fetching')
+                         THEN COALESCE(excluded.mr_title, fetch_queue.mr_title)
+                     ELSE excluded.mr_title
+                 END,
+                 mr_number = CASE
+                     WHEN fetch_queue.status IN ('Pending', 'Fetching')
+                         THEN COALESCE(excluded.mr_number, fetch_queue.mr_number)
+                     ELSE excluded.mr_number
+                 END,
+                 status = CASE
+                     WHEN fetch_queue.status = 'Fetching' THEN 'Fetching'
+                     ELSE 'Pending'
+                 END,
+                 retry_count = CASE
+                     WHEN fetch_queue.status IN ('Pending', 'Fetching') THEN fetch_queue.retry_count
+                     ELSE 0
+                 END,
+                 next_retry_at = CASE
+                     WHEN fetch_queue.status = 'Fetching' THEN fetch_queue.next_retry_at
+                     ELSE NULL
+                 END,
+                 error_log = CASE
+                     WHEN fetch_queue.status = 'Fetching' THEN fetch_queue.error_log
+                     ELSE NULL
+                 END",
+            libsql::params![
+                repo_key,
+                commit_range,
+                article_id,
+                mr_url,
+                mr_title,
+                mr_number,
+                now,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn lock_pending_fetch_queue(&self) -> Result<Option<FetchQueueRow>> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.begin_immediate_transaction().await?;
+        tx.execute(
+            &format!(
+                "UPDATE fetch_queue
+                 SET status = 'Cancelled',
+                     error_log = 'Cancelled: target patchset was cancelled',
+                     locked_at = NULL
+                 WHERE status IN ('Pending', 'Fetching')
+                   AND {FETCH_QUEUE_TARGET_CANCELLED_SQL}"
+            ),
+            (),
+        )
+        .await?;
+
+        let claimed = {
+            let mut rows = tx
+                .query(
+                    "UPDATE fetch_queue
+                     SET status = 'Fetching', locked_at = ?
+                     WHERE id = (
+                         SELECT id FROM fetch_queue
+                         WHERE status = 'Pending'
+                           AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                         ORDER BY created_at ASC, id ASC
+                         LIMIT 1
+                     )
+                     RETURNING id, repo_url, commit_range, article_id, mr_url, mr_title, mr_number, status, locked_at, retry_count, next_retry_at, error_log, created_at",
+                    libsql::params![now, now],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                Some(FetchQueueRow {
+                    id: row.get(0)?,
+                    repo_url: row.get(1)?,
+                    commit_range: row.get(2)?,
+                    article_id: row.get(3)?,
+                    mr_url: row.get(4)?,
+                    mr_title: row.get(5)?,
+                    mr_number: row.get(6)?,
+                    status: row.get(7)?,
+                    locked_at: row.get(8)?,
+                    retry_count: row.get(9)?,
+                    next_retry_at: row.get(10)?,
+                    error_log: row.get(11)?,
+                    created_at: row.get(12)?,
+                })
+            } else {
+                None
+            }
+        };
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    async fn cancel_fetch_queue_if_target_cancelled(
+        &self,
+        id: i64,
+        locked_at: Option<i64>,
+    ) -> Result<()> {
+        self.execute(
+            &format!(
+                "UPDATE fetch_queue
+                 SET status = 'Cancelled',
+                     error_log = 'Cancelled: target patchset was cancelled',
+                     locked_at = NULL
+                 WHERE id = ?
+                   AND status = 'Fetching'
+                   AND COALESCE(locked_at, 0) = COALESCE(?, 0)
+                   AND {FETCH_QUEUE_TARGET_CANCELLED_SQL}"
+            ),
+            libsql::params![id, locked_at],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn has_fetch_queue_lease(&self, id: i64, locked_at: Option<i64>) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT 1 FROM fetch_queue
+                     WHERE id = ?
+                       AND status = 'Fetching'
+                       AND COALESCE(locked_at, 0) = COALESCE(?, 0)
+                       AND NOT ({FETCH_QUEUE_TARGET_CANCELLED_SQL})
+                     LIMIT 1"
+                ),
+                libsql::params![id, locked_at],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(true);
+        }
+        drop(rows);
+        self.cancel_fetch_queue_if_target_cancelled(id, locked_at)
+            .await?;
+        Ok(false)
+    }
+
+    pub async fn mark_fetch_queue_done(&self, id: i64, locked_at: Option<i64>) -> Result<bool> {
+        let count = self
+            .execute(
+                &format!(
+                    "UPDATE fetch_queue
+                     SET status = 'Done', locked_at = NULL, next_retry_at = NULL, error_log = NULL
+                     WHERE id = ?
+                       AND status = 'Fetching'
+                       AND COALESCE(locked_at, 0) = COALESCE(?, 0)
+                       AND NOT ({FETCH_QUEUE_TARGET_CANCELLED_SQL})"
+                ),
+                libsql::params![id, locked_at],
+            )
+            .await?;
+        if count == 0 {
+            self.cancel_fetch_queue_if_target_cancelled(id, locked_at)
+                .await?;
+        }
+        Ok(count > 0)
+    }
+
+    pub async fn mark_fetch_queue_failed(
+        &self,
+        id: i64,
+        locked_at: Option<i64>,
+        error_log: &str,
+    ) -> Result<bool> {
+        let redacted = crate::utils::redact_secret(error_log);
+        let tx = self.begin_immediate_transaction().await?;
+        tx.execute(
+            &format!(
+                "UPDATE fetch_queue
+                 SET status = 'Cancelled',
+                     error_log = 'Cancelled: target patchset was cancelled',
+                     locked_at = NULL
+                 WHERE id = ?
+                   AND status = 'Fetching'
+                   AND COALESCE(locked_at, 0) = COALESCE(?, 0)
+                   AND {FETCH_QUEUE_TARGET_CANCELLED_SQL}"
+            ),
+            libsql::params![id, locked_at],
+        )
+        .await?;
+        let article_id: Option<String> = {
+            let mut rows = tx
+                .query(
+                    &format!(
+                        "UPDATE fetch_queue
+                         SET status = 'Failed', error_log = ?, locked_at = NULL
+                         WHERE id = ?
+                           AND status = 'Fetching'
+                           AND COALESCE(locked_at, 0) = COALESCE(?, 0)
+                           AND NOT ({FETCH_QUEUE_TARGET_CANCELLED_SQL})
+                         RETURNING article_id"
+                    ),
+                    libsql::params![redacted.clone(), id, locked_at],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                Some(row.get(0)?)
+            } else {
+                None
+            }
+        };
+        if let Some(ref aid) = article_id {
+            let root_local = format!("{aid}@sashiko.local");
+            for clid in Self::get_msgid_candidates(&root_local)
+                .into_iter()
+                .chain(Self::get_msgid_candidates(aid))
+            {
+                tx.execute(
+                    "UPDATE patchsets SET status = 'Failed', failed_reason = ?
+                     WHERE cover_letter_message_id = ?
+                       AND status IN ('Fetching', 'Incomplete', 'Failed')
+                       AND NOT EXISTS (
+                           SELECT 1 FROM fetch_queue fq
+                           WHERE fq.status IN ('Pending', 'Fetching')
+                             AND fq.article_id IN (
+                                 TRIM(COALESCE(patchsets.cover_letter_message_id, ''), '<>'),
+                                 REPLACE(
+                                     TRIM(COALESCE(patchsets.cover_letter_message_id, ''), '<>'),
+                                     '@sashiko.local',
+                                     ''
+                                 )
+                             )
+                       )",
+                    libsql::params![redacted.clone(), clid],
+                )
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(article_id.is_some())
+    }
+
+    pub async fn set_fetch_queue_retry_at(
+        &self,
+        id: i64,
+        locked_at: Option<i64>,
+        next_retry_at: i64,
+        error_log: &str,
+    ) -> Result<bool> {
+        let redacted = crate::utils::redact_secret(error_log);
+        let count = self
+            .execute(
+                &format!(
+                    "UPDATE fetch_queue
+                     SET status = 'Pending',
+                         retry_count = retry_count + 1,
+                         next_retry_at = ?,
+                         error_log = ?,
+                         locked_at = NULL
+                     WHERE id = ?
+                       AND status = 'Fetching'
+                       AND COALESCE(locked_at, 0) = COALESCE(?, 0)
+                       AND NOT ({FETCH_QUEUE_TARGET_CANCELLED_SQL})"
+                ),
+                libsql::params![next_retry_at, redacted, id, locked_at],
+            )
+            .await?;
+        if count == 0 {
+            self.cancel_fetch_queue_if_target_cancelled(id, locked_at)
+                .await?;
+        }
+        Ok(count > 0)
+    }
+
+    pub async fn sweep_stale_fetch_queue(&self) -> Result<u64> {
+        let ten_mins_ago = chrono::Utc::now().timestamp() - 600;
+        let count = self
+            .execute(
+                "UPDATE fetch_queue
+                 SET status = 'Pending', locked_at = NULL
+                 WHERE status = 'Fetching' AND (locked_at IS NULL OR locked_at < ?)",
+                libsql::params![ten_mins_ago],
             )
             .await?;
         Ok(count)
@@ -26631,7 +27145,7 @@ mod tests {
         let db = setup_db().await;
         let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
         let version: u32 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
 
         for (table, expected_cols) in [
             (
@@ -30318,5 +30832,547 @@ mod tests {
         assert_eq!(ml_row.get::<String>(4)?, "ml_single@kernel.org");
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_lifecycle_and_startup_recovery() {
+        let db = setup_db().await;
+
+        // Reject embedded credentials at the DB boundary.
+        assert!(
+            db.enqueue_fetch_request(
+                Some("https://oauth2:secret_pat@github.com/org/repo.git"),
+                "aaa..bbb",
+                None,
+                None,
+                None,
+            )
+            .await
+            .is_err()
+        );
+
+        let backed_ps = db
+            .create_fetching_patchset(
+                "mr-738-aaa..bbb@sashiko.local",
+                "Fetching GitHub PR/MR: #738",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/738"),
+                Some("Durable fetch queue"),
+                Some(738),
+                Some("sashiko-738"),
+            )
+            .await
+            .unwrap();
+        let unbacked_ps = db
+            .create_fetching_patchset(
+                "lore-thread@example.com",
+                "Fetching thread...",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            "aaa..bbb",
+            Some("https://github.com/sashiko-dev/sashiko/pull/738"),
+            Some("Durable fetch queue"),
+            Some(738),
+        )
+        .await
+        .unwrap();
+
+        // Simulate daemon restart while fetch was mid-flight ('Fetching'):
+        // fail_interrupted_fetching_patchsets resets fetch_queue to Pending,
+        // preserves backed_ps in Fetching, and fails unbacked_ps.
+        let claimed = db
+            .lock_pending_fetch_queue()
+            .await
+            .unwrap()
+            .expect("should claim pending fetch request");
+        assert_eq!(claimed.article_id, "mr-738-aaa..bbb");
+        assert_eq!(claimed.status, "Fetching");
+
+        let failed_count = db.fail_interrupted_fetching_patchsets().await.unwrap();
+        assert_eq!(failed_count, 1);
+        assert_eq!(
+            db.get_patchset_status(backed_ps).await.unwrap().as_deref(),
+            Some("Fetching")
+        );
+        assert_eq!(
+            db.get_patchset_status(unbacked_ps)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Failed")
+        );
+
+        // Stale lease from before restart is fenced out.
+        assert!(
+            !db.mark_fetch_queue_done(claimed.id, claimed.locked_at)
+                .await
+                .unwrap()
+        );
+
+        let reclaimed = db
+            .lock_pending_fetch_queue()
+            .await
+            .unwrap()
+            .expect("should reclaim after startup reset");
+        assert_eq!(reclaimed.id, claimed.id);
+
+        // Schedule backoff retry and verify secret redaction in error_log.
+        let future_ts = chrono::Utc::now().timestamp() + 60;
+        assert!(
+            db.set_fetch_queue_retry_at(
+                reclaimed.id,
+                reclaimed.locked_at,
+                future_ts,
+                "https://user:topsecret@github.com/org/repo.git returned 502",
+            )
+            .await
+            .unwrap()
+        );
+        assert!(db.lock_pending_fetch_queue().await.unwrap().is_none());
+
+        // Re-enqueuing clears next_retry_at for an immediate retry.
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            "aaa..bbb",
+            Some("https://github.com/sashiko-dev/sashiko/pull/738"),
+            Some("Durable fetch queue"),
+            Some(738),
+        )
+        .await
+        .unwrap();
+
+        let retried = db
+            .lock_pending_fetch_queue()
+            .await
+            .unwrap()
+            .expect("immediate re-enqueue should clear backoff");
+        assert_eq!(retried.retry_count, 1);
+        assert!(
+            !retried
+                .error_log
+                .as_deref()
+                .unwrap_or_default()
+                .contains("topsecret")
+        );
+        assert!(
+            db.mark_fetch_queue_done(retried.id, retried.locked_at)
+                .await
+                .unwrap()
+        );
+        assert!(db.lock_pending_fetch_queue().await.unwrap().is_none());
+
+        // If a daemon restarts after fetch_queue is marked Done but before the
+        // ingestion pipeline moves the patchset out of Fetching or Incomplete,
+        // startup recovery resets the fetch_queue row back to Pending.
+        db.update_patchset_status(backed_ps, "Incomplete")
+            .await
+            .unwrap();
+        assert_eq!(db.fail_interrupted_fetching_patchsets().await.unwrap(), 0);
+        let recovered = db
+            .lock_pending_fetch_queue()
+            .await
+            .unwrap()
+            .expect("Done fetch_queue row with Incomplete patchset must reset to Pending");
+        assert_eq!(recovered.id, retried.id);
+        db.update_patchset_status(backed_ps, "Pending")
+            .await
+            .unwrap();
+        assert!(
+            db.mark_fetch_queue_done(recovered.id, recovered.locked_at)
+                .await
+                .unwrap()
+        );
+
+        // Cancelling a placeholder patchset cancels an in-flight Fetching lease
+        // and prevents late error or slug updates from mutating the cancelled row.
+        let cancelled_ps = db
+            .create_fetching_patchset(
+                "mr-739-ccc..ddd@sashiko.local",
+                "Fetching GitHub PR/MR: #739",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/739"),
+                Some("Cancelled PR"),
+                Some(739),
+                Some("sashiko-739"),
+            )
+            .await
+            .unwrap();
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            "ccc..ddd",
+            Some("https://github.com/sashiko-dev/sashiko/pull/739"),
+            Some("Cancelled PR"),
+            Some(739),
+        )
+        .await
+        .unwrap();
+        let active_claim = db
+            .lock_pending_fetch_queue()
+            .await
+            .unwrap()
+            .expect("should claim PR #739 fetch");
+        assert!(
+            db.has_fetch_queue_lease(active_claim.id, active_claim.locked_at)
+                .await
+                .unwrap()
+        );
+        db.cancel_patchset(cancelled_ps, true).await.unwrap();
+        assert!(
+            !db.has_fetch_queue_lease(active_claim.id, active_claim.locked_at)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.mark_fetch_queue_done(active_claim.id, active_claim.locked_at)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.mark_fetch_queue_failed(
+                active_claim.id,
+                active_claim.locked_at,
+                "late fetch failure"
+            )
+            .await
+            .unwrap()
+        );
+        db.update_patchset_error("mr-739-ccc..ddd@sashiko.local", "late error")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_status(cancelled_ps)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Cancelled")
+        );
+
+        // If a sibling candidate patchset row is Cancelled while another
+        // matching candidate patchset row is actively Fetching, lease checks
+        // and completion transitions still succeed.
+        let sibling_cancelled_ps = db
+            .create_fetching_patchset(
+                "<mr-740-eee..fff>",
+                "Sibling cancelled PR #740",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.cancel_patchset(sibling_cancelled_ps, true)
+            .await
+            .unwrap();
+        let active_ps = db
+            .create_fetching_patchset(
+                "mr-740-eee..fff@sashiko.local",
+                "Fetching GitHub PR/MR: #740",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/740"),
+                Some("Active PR"),
+                Some(740),
+                Some("sashiko-740"),
+            )
+            .await
+            .unwrap();
+        assert_ne!(sibling_cancelled_ps, active_ps);
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            "eee..fff",
+            Some("https://github.com/sashiko-dev/sashiko/pull/740"),
+            Some("Active PR"),
+            Some(740),
+        )
+        .await
+        .unwrap();
+        let sibling_claim = db
+            .lock_pending_fetch_queue()
+            .await
+            .unwrap()
+            .expect("should claim PR #740 fetch despite sibling Cancelled row");
+        assert!(
+            db.has_fetch_queue_lease(sibling_claim.id, sibling_claim.locked_at)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.mark_fetch_queue_done(sibling_claim.id, sibling_claim.locked_at)
+                .await
+                .unwrap()
+        );
+        db.update_patchset_status(active_ps, "Reviewed")
+            .await
+            .unwrap();
+        db.update_patchset_error("mr-740-eee..fff@sashiko.local", "late error")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_status(active_ps).await.unwrap().as_deref(),
+            Some("Reviewed")
+        );
+
+        // A partially ingested multi-patch series (0 < received_parts < total_parts)
+        // is NOT marked Failed by fail_fetching_patchset, and if marked Failed by
+        // mark_fetch_queue_failed or update_patchset_error, reopens to Incomplete
+        // and reaches Pending once the remaining patches arrive.
+        let partial_root = "mr-741-111..222@sashiko.local";
+        let partial_ps = db
+            .create_fetching_patchset(
+                partial_root,
+                "Fetching GitHub PR/MR: #741",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/741"),
+                Some("Partial series"),
+                Some(741),
+                Some("sashiko-741"),
+            )
+            .await
+            .unwrap();
+        let thread_741 = db
+            .ensure_thread_for_message(partial_root, 1_000)
+            .await
+            .unwrap();
+        db.ensure_thread_for_message("msg-741-p1@sashiko.local", 1_000)
+            .await
+            .unwrap();
+        db.ensure_thread_for_message("msg-741-p2@sashiko.local", 1_001)
+            .await
+            .unwrap();
+        let ps_after_p1 = db
+            .create_patchset(
+                thread_741,
+                Some(partial_root),
+                "msg-741-p1@sashiko.local",
+                "[PATCH 1/2] Part one",
+                "Alice <alice@example.com>",
+                1_000,
+                2,
+                1,
+                "alice@example.com",
+                "",
+                Some(1),
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_after_p1, partial_ps);
+        db.create_patch(
+            partial_ps,
+            "msg-741-p1@sashiko.local",
+            1,
+            "diff --git a/a.rs b/a.rs",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_patchset_status(partial_ps).await.unwrap().as_deref(),
+            Some("Incomplete")
+        );
+
+        // Single-message error (fail_fetching_patchset) must NOT fail a series with received_parts > 0.
+        db.fail_fetching_patchset(partial_root, "duplicate part error")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_status(partial_ps).await.unwrap().as_deref(),
+            Some("Incomplete")
+        );
+
+        // Fetch-level failure transitions Incomplete -> Failed, and ingesting the remaining
+        // part reopens Failed -> Incomplete -> Pending.
+        db.update_patchset_error(partial_root, "Fetch interrupted")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_status(partial_ps).await.unwrap().as_deref(),
+            Some("Failed")
+        );
+        let ps_after_p2 = db
+            .create_patchset(
+                thread_741,
+                Some(partial_root),
+                "msg-741-p2@sashiko.local",
+                "[PATCH 2/2] Part two",
+                "Bob <bob@example.com>",
+                1_001,
+                2,
+                2,
+                "bob@example.com",
+                "",
+                Some(1),
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_after_p2, partial_ps);
+        let mut author_rows = db
+            .conn
+            .query(
+                "SELECT author FROM patchsets WHERE id = ?",
+                libsql::params![partial_ps],
+            )
+            .await
+            .unwrap();
+        let preserved_author: String = author_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(preserved_author, "Alice <alice@example.com>");
+        db.create_patch(
+            partial_ps,
+            "msg-741-p2@sashiko.local",
+            2,
+            "diff --git a/b.rs b/b.rs",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_patchset_status(partial_ps).await.unwrap().as_deref(),
+            Some("Pending")
+        );
+
+        // Cancelling a patchset marks its child patches Cancelled; re-submitting
+        // via create_fetching_patchset and create_patch resets child patches back
+        // to Pending so review transitions (update_patch_status) succeed.
+        db.cancel_patchset(partial_ps, true).await.unwrap();
+        let re_ps = db
+            .create_fetching_patchset(
+                partial_root,
+                "Fetching GitHub PR/MR: #741",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/741"),
+                Some("Partial series"),
+                Some(741),
+                Some("sashiko-741"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(re_ps, partial_ps);
+        let p1_id = db
+            .create_patch(
+                partial_ps,
+                "msg-741-p1@sashiko.local",
+                1,
+                "diff --git a/a.rs b/a.rs",
+            )
+            .await
+            .unwrap();
+        let p2_id = db
+            .create_patch(
+                partial_ps,
+                "msg-741-p2@sashiko.local",
+                2,
+                "diff --git a/b.rs b/b.rs",
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(partial_ps, "In Review")
+            .await
+            .unwrap();
+        db.update_patch_status(p1_id, "Reviewed").await.unwrap();
+        db.update_patch_status(p2_id, "Reviewed").await.unwrap();
+        // If a fetch fails via mark_fetch_queue_failed and the same patchset is
+        // re-submitted before the earlier attempt's queued IngestionFailed event
+        // reaches update_patchset_error, the active fetch_queue entry protects
+        // the newly re-submitted Fetching patchset from being clobbered.
+        let resub_root = "mr-742-333..444@sashiko.local";
+        let resub_ps = db
+            .create_fetching_patchset(
+                resub_root,
+                "Fetching GitHub PR/MR: #742",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/742"),
+                Some("Resubmitted PR"),
+                Some(742),
+                Some("sashiko-742"),
+            )
+            .await
+            .unwrap();
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            "333..444",
+            Some("https://github.com/sashiko-dev/sashiko/pull/742"),
+            Some("Resubmitted PR"),
+            Some(742),
+        )
+        .await
+        .unwrap();
+        let failed_claim = db.lock_pending_fetch_queue().await.unwrap().unwrap();
+        assert!(
+            db.mark_fetch_queue_failed(failed_claim.id, failed_claim.locked_at, "attempt 1 failed")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_patchset_status(resub_ps).await.unwrap().as_deref(),
+            Some("Failed")
+        );
+        db.create_fetching_patchset(
+            resub_root,
+            "Fetching GitHub PR/MR: #742",
+            None,
+            None,
+            Some("https://github.com/sashiko-dev/sashiko/pull/742"),
+            Some("Resubmitted PR"),
+            Some(742),
+            Some("sashiko-742"),
+        )
+        .await
+        .unwrap();
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            "333..444",
+            Some("https://github.com/sashiko-dev/sashiko/pull/742"),
+            Some("Resubmitted PR"),
+            Some(742),
+        )
+        .await
+        .unwrap();
+        db.update_patchset_error(resub_root, "late IngestionFailed from attempt 1")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_status(resub_ps).await.unwrap().as_deref(),
+            Some("Fetching")
+        );
+
+        let patch_statuses = db
+            .get_patch_statuses_for_patchset(partial_ps)
+            .await
+            .unwrap();
+        assert_eq!(
+            patch_statuses.get(&p1_id).map(String::as_str),
+            Some("Reviewed")
+        );
+        assert_eq!(
+            patch_statuses.get(&p2_id).map(String::as_str),
+            Some("Reviewed")
+        );
     }
 }

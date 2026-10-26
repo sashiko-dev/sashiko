@@ -12,15 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::db::{Database, FetchQueueRow};
 use crate::events::{Event, MessageSource};
 use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
-use tokio::sync::mpsc;
-use tokio::time::{Duration, interval};
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::{Duration, interval, timeout};
 use tracing::{error, info, warn};
+
+const GIT_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Compute the ingestion `article_id` matching a remote fetch placeholder.
+pub fn fetch_article_id(commit_or_range: &str, mr_number: Option<i64>) -> String {
+    match mr_number {
+        Some(number) => format!("mr-{}-{}", number, commit_or_range),
+        None => commit_or_range.to_string(),
+    }
+}
+
+/// Return true if a repository URL embeds HTTP credentials or secret query tokens
+/// that must never be persisted to disk in `fetch_queue`.
+pub fn url_has_embedded_credentials(url: Option<&str>) -> bool {
+    let Some(u) = url else {
+        return false;
+    };
+    if redact_secret(u) != u {
+        return true;
+    }
+    url::Url::parse(u).is_ok_and(|parsed| {
+        matches!(parsed.scheme(), "http" | "https")
+            && (!parsed.username().is_empty() || parsed.password().is_some())
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FetchRequest {
@@ -33,11 +60,12 @@ pub struct FetchRequest {
 
 pub struct FetchAgent {
     repo_path: PathBuf,
-    rx: mpsc::Receiver<FetchRequest>,
+    rx: Mutex<mpsc::Receiver<FetchRequest>>,
     main_tx: mpsc::Sender<Event>,
     #[allow(clippy::type_complexity)]
-    mr_metadata: HashMap<String, (Option<String>, Option<String>, Option<i64>)>,
+    mr_metadata: std::sync::Mutex<HashMap<String, (Option<String>, Option<String>, Option<i64>)>>,
     gitlab_token: Option<String>,
+    db: Option<(Arc<Database>, u32)>,
 }
 
 impl FetchAgent {
@@ -50,43 +78,402 @@ impl FetchAgent {
         (
             Self {
                 repo_path,
-                rx,
+                rx: Mutex::new(rx),
                 main_tx,
-                mr_metadata: HashMap::new(),
+                mr_metadata: std::sync::Mutex::new(HashMap::new()),
                 gitlab_token,
+                db: None,
             },
             tx,
         )
     }
 
-    pub async fn run(mut self) {
-        info!("FetchAgent started");
-        let mut queue: HashMap<Option<String>, HashSet<String>> = HashMap::new();
-        let mut ticker = interval(Duration::from_secs(10));
+    pub fn with_db(mut self, db: Arc<Database>, max_retries: u32) -> Self {
+        self.db = Some((db, max_retries));
+        self
+    }
 
+    fn record_in_memory_request(
+        &self,
+        queue: &mut HashMap<Option<String>, HashSet<String>>,
+        req: FetchRequest,
+    ) {
+        let mut mr_metadata = self.mr_metadata.lock().unwrap_or_else(|e| e.into_inner());
+        if req.mr_url.is_some() || req.mr_title.is_some() || req.mr_number.is_some() {
+            mr_metadata.insert(
+                req.commit_hash.clone(),
+                (req.mr_url.clone(), req.mr_title.clone(), req.mr_number),
+            );
+        } else {
+            mr_metadata.remove(&req.commit_hash);
+        }
+        drop(mr_metadata);
+        queue
+            .entry(req.repo_url)
+            .or_default()
+            .insert(req.commit_hash);
+    }
+
+    async fn flush_in_memory_channel(
+        &self,
+        rx: &mut mpsc::Receiver<FetchRequest>,
+        queue: &mut HashMap<Option<String>, HashSet<String>>,
+    ) {
+        while let Ok(next_req) = rx.try_recv() {
+            if url_has_embedded_credentials(next_req.repo_url.as_deref()) {
+                self.record_in_memory_request(queue, next_req);
+            }
+        }
+        if !queue.is_empty() {
+            self.process_queue(queue).await;
+            self.mr_metadata
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
+    }
+
+    pub async fn run(&self) {
+        info!("FetchAgent started");
+        let mut rx = self.rx.lock().await;
+        let mut queue: HashMap<Option<String>, HashSet<String>> = HashMap::new();
+
+        if let Some((ref db, max_retries)) = self.db {
+            self.drain_db_queue_with_channel(db, max_retries, Some((&mut rx, &mut queue)))
+                .await;
+            let mut ticker = interval(Duration::from_secs(5));
+
+            loop {
+                tokio::select! {
+                    maybe_req = rx.recv() => {
+                        let Some(first_req) = maybe_req else {
+                            break;
+                        };
+                        if url_has_embedded_credentials(first_req.repo_url.as_deref()) {
+                            self.record_in_memory_request(&mut queue, first_req);
+                        }
+                        self.flush_in_memory_channel(&mut rx, &mut queue).await;
+                        self.drain_db_queue_with_channel(
+                            db,
+                            max_retries,
+                            Some((&mut rx, &mut queue)),
+                        )
+                        .await;
+                    }
+                    _ = ticker.tick() => {
+                        self.flush_in_memory_channel(&mut rx, &mut queue).await;
+                        self.drain_db_queue_with_channel(
+                            db,
+                            max_retries,
+                            Some((&mut rx, &mut queue)),
+                        )
+                        .await;
+                    }
+                }
+            }
+            return;
+        }
+
+        let mut ticker = interval(Duration::from_secs(10));
         loop {
             tokio::select! {
-                Some(req) = self.rx.recv() => {
-                    if req.mr_url.is_some() || req.mr_title.is_some() || req.mr_number.is_some() {
-                        self.mr_metadata.insert(
-                            req.commit_hash.clone(),
-                            (req.mr_url.clone(), req.mr_title.clone(), req.mr_number)
-                        );
-                    } else {
-                        self.mr_metadata.remove(&req.commit_hash);
-                    }
-                    queue.entry(req.repo_url)
-                        .or_default()
-                        .insert(req.commit_hash);
+                Some(req) = rx.recv() => {
+                    self.record_in_memory_request(&mut queue, req);
                 }
                 _ = ticker.tick() => {
                     if !queue.is_empty() {
                         self.process_queue(&mut queue).await;
-                        self.mr_metadata.clear();
+                        self.mr_metadata
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clear();
                     }
                 }
             }
         }
+    }
+
+    pub async fn drain_db_queue(&self, db: &Database, max_retries: u32) {
+        self.drain_db_queue_with_channel(db, max_retries, None)
+            .await;
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn drain_db_queue_with_channel(
+        &self,
+        db: &Database,
+        max_retries: u32,
+        mut in_memory: Option<(
+            &mut mpsc::Receiver<FetchRequest>,
+            &mut HashMap<Option<String>, HashSet<String>>,
+        )>,
+    ) {
+        if let Err(e) = db.sweep_stale_fetch_queue().await {
+            error!("Failed to sweep stale fetch_queue entries: {}", e);
+        }
+
+        loop {
+            if let Some((ref mut rx, ref mut queue)) = in_memory {
+                self.flush_in_memory_channel(rx, queue).await;
+            }
+            match db.lock_pending_fetch_queue().await {
+                Ok(Some(row)) => {
+                    self.process_fetch_queue_row(db, row, max_retries).await;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    error!("Failed to lock pending fetch_queue entry: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn backoff_seconds(retry_count: i64) -> i64 {
+        match retry_count {
+            0 => 5,
+            1 => 30,
+            _ => 180,
+        }
+    }
+
+    async fn handle_db_fetch_error(
+        &self,
+        db: &Database,
+        row: &FetchQueueRow,
+        max_retries: u32,
+        err_msg: &str,
+    ) {
+        let cap = max_retries.max(1) as i64;
+        if row.retry_count + 1 >= cap {
+            self.fail_db_fetch_permanently(db, row, err_msg).await;
+        } else {
+            let delay = Self::backoff_seconds(row.retry_count);
+            let retry_at = chrono::Utc::now().timestamp() + delay;
+            warn!(
+                "Transient fetch failure for {} (attempt {}/{}), retrying in {}s: {}",
+                row.article_id,
+                row.retry_count + 1,
+                cap,
+                delay,
+                err_msg
+            );
+            if let Err(e) = db
+                .set_fetch_queue_retry_at(row.id, row.locked_at, retry_at, err_msg)
+                .await
+            {
+                error!("Failed to schedule retry for fetch_queue {}: {}", row.id, e);
+            }
+        }
+    }
+
+    async fn fail_db_fetch_permanently(&self, db: &Database, row: &FetchQueueRow, err_msg: &str) {
+        let redacted = redact_secret(err_msg);
+        match db
+            .mark_fetch_queue_failed(row.id, row.locked_at, &redacted)
+            .await
+        {
+            Ok(true) => {
+                let _ = self
+                    .main_tx
+                    .send(Event::IngestionFailed {
+                        article_id: row.article_id.clone(),
+                        error: redacted,
+                        source: MessageSource::GitFetch,
+                    })
+                    .await;
+            }
+            Ok(false) => {
+                warn!(
+                    "Fetch queue entry {} lease was already superseded; suppressing IngestionFailed",
+                    row.id
+                );
+            }
+            Err(e) => {
+                error!("Failed to mark fetch_queue {} as Failed: {}", row.id, e);
+            }
+        }
+    }
+
+    fn collect_endpoints(commit_or_range: &str) -> Vec<String> {
+        let mut endpoints = Vec::new();
+        if commit_or_range.contains("..") {
+            let parts: Vec<&str> = commit_or_range.split("..").collect();
+            if parts.len() == 2 {
+                let base = parts[0];
+                let head = parts[1].trim_start_matches('.');
+                if !base.is_empty() {
+                    endpoints.push(base.to_string());
+                }
+                if !head.is_empty() {
+                    endpoints.push(head.to_string());
+                }
+            }
+        } else {
+            endpoints.push(commit_or_range.to_string());
+        }
+        endpoints
+    }
+
+    async fn is_local_repo_url(&self, url: &str) -> bool {
+        let url_path = PathBuf::from(url);
+        let repo_path = self.repo_path.clone();
+        tokio::task::spawn_blocking(move || {
+            match (
+                std::fs::canonicalize(&url_path),
+                std::fs::canonicalize(&repo_path),
+            ) {
+                (Ok(canon_url), Ok(canon_repo)) => canon_url == canon_repo,
+                _ => false,
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    async fn process_fetch_queue_row(&self, db: &Database, row: FetchQueueRow, max_retries: u32) {
+        let commits_to_check = Self::collect_endpoints(&row.commit_range);
+        let mut missing_commits = Vec::new();
+        for commit in &commits_to_check {
+            if !self.is_present(commit).await {
+                missing_commits.push(commit.clone());
+            }
+        }
+
+        if !missing_commits.is_empty() {
+            if row.repo_url.is_empty() || self.is_local_repo_url(&row.repo_url).await {
+                let err_msg = format!(
+                    "Local repository missing commits for {}: {:?}",
+                    row.article_id, missing_commits
+                );
+                warn!("{}", err_msg);
+                self.fail_db_fetch_permanently(db, &row, &err_msg).await;
+                return;
+            }
+
+            let url_display = redact_secret(&row.repo_url);
+            let remote_name = self.get_remote_name(&row.repo_url);
+
+            if let Err(e) = self.ensure_remote(&remote_name, &row.repo_url).await {
+                let err_msg = format!(
+                    "Failed to set up remote {}: {}",
+                    url_display,
+                    redact_secret(&e.to_string())
+                );
+                error!("{}", err_msg);
+                self.handle_db_fetch_error(db, &row, max_retries, &err_msg)
+                    .await;
+                return;
+            }
+
+            if let Err(e) = self.fetch_commits(&remote_name, &missing_commits).await {
+                warn!(
+                    "Optimistic fetch failed for {}: {}. Falling back to full fetch.",
+                    url_display,
+                    redact_secret(&e.to_string())
+                );
+                if let Err(e) = self.fetch_all(&remote_name).await {
+                    let err_msg = format!(
+                        "Failed to fetch from {}: {}",
+                        url_display,
+                        redact_secret(&e.to_string())
+                    );
+                    error!("{}", err_msg);
+                    self.handle_db_fetch_error(db, &row, max_retries, &err_msg)
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        match db.has_fetch_queue_lease(row.id, row.locked_at).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    "Fetch queue entry {} lost its lease during git fetch; skipping submission",
+                    row.id
+                );
+                return;
+            }
+            Err(e) => {
+                let err_msg = format!(
+                    "Failed to verify fetch_queue lease for {}: {}",
+                    row.article_id,
+                    redact_secret(&e.to_string())
+                );
+                error!("{}", err_msg);
+                self.handle_db_fetch_error(db, &row, max_retries, &err_msg)
+                    .await;
+                return;
+            }
+        }
+
+        let events = if row.commit_range.contains("..") {
+            match self
+                .extract_range_events(
+                    &row.commit_range,
+                    &row.article_id,
+                    row.mr_url.clone(),
+                    row.mr_title.clone(),
+                    row.mr_number,
+                )
+                .await
+            {
+                Ok(events) => events,
+                Err(err_msg) => {
+                    self.fail_db_fetch_permanently(db, &row, &err_msg).await;
+                    return;
+                }
+            }
+        } else {
+            match self
+                .extract_single_commit_event(
+                    &row.commit_range,
+                    &row.article_id,
+                    row.mr_url.clone(),
+                    row.mr_title.clone(),
+                    row.mr_number,
+                )
+                .await
+            {
+                Ok(event) => vec![event],
+                Err(err_msg) => {
+                    self.fail_db_fetch_permanently(db, &row, &err_msg).await;
+                    return;
+                }
+            }
+        };
+
+        match db.mark_fetch_queue_done(row.id, row.locked_at).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    "Fetch queue entry {} lost its lease before submission; dropping extracted events",
+                    row.id
+                );
+                return;
+            }
+            Err(e) => {
+                let err_msg = format!(
+                    "Failed to mark fetch_queue {} as Done: {}",
+                    row.id,
+                    redact_secret(&e.to_string())
+                );
+                error!("{}", err_msg);
+                self.handle_db_fetch_error(db, &row, max_retries, &err_msg)
+                    .await;
+                return;
+            }
+        }
+
+        for event in events {
+            if let Err(e) = self.main_tx.send(event).await {
+                error!("Failed to send PatchSubmitted event: {}", e);
+                return;
+            }
+        }
+
+        info!("Successfully submitted fetched request {}", row.article_id);
     }
 
     pub async fn fetch_and_submit_batch(&mut self, repo_url: Option<String>, commits: Vec<String>) {
@@ -96,14 +483,13 @@ impl FetchAgent {
     }
 
     fn article_id_for(&self, commit_or_range: &str) -> String {
-        match self
+        let mr_number = self
             .mr_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .get(commit_or_range)
-            .and_then(|(_, _, mr_number)| *mr_number)
-        {
-            Some(number) => format!("mr-{}-{}", number, commit_or_range),
-            None => commit_or_range.to_string(),
-        }
+            .and_then(|(_, _, mr_number)| *mr_number);
+        fetch_article_id(commit_or_range, mr_number)
     }
 
     async fn send_ingestion_failed(&self, article_id: String, error: String) {
@@ -182,17 +568,7 @@ impl FetchAgent {
                 let remote_name = self.get_remote_name(&url);
 
                 // Check if repo is local (same as self.repo_path)
-                let is_local = {
-                    let url_path = PathBuf::from(&url);
-                    if let (Ok(canon_url), Ok(canon_repo)) = (
-                        std::fs::canonicalize(&url_path),
-                        std::fs::canonicalize(&self.repo_path),
-                    ) {
-                        canon_url == canon_repo
-                    } else {
-                        false
-                    }
-                };
+                let is_local = self.is_local_repo_url(&url).await;
 
                 if is_local {
                     warn!(
@@ -257,26 +633,21 @@ impl FetchAgent {
         }
     }
 
-    async fn process_range_item(&self, range: &str) {
-        let (mr_url, mr_title, mr_number) = self
-            .mr_metadata
-            .get(range)
-            .cloned()
-            .unwrap_or((None, None, None));
-        let article_id = self.article_id_for(range);
-
+    async fn extract_range_events(
+        &self,
+        range: &str,
+        article_id: &str,
+        mr_url: Option<String>,
+        mr_title: Option<String>,
+        mr_number: Option<i64>,
+    ) -> std::result::Result<Vec<Event>, String> {
         let shas = match crate::git_ops::resolve_git_range(&self.repo_path, range).await {
             Ok(shas) => shas,
             Err(e) => {
-                self.send_ingestion_failed(
-                    article_id,
-                    format!(
-                        "Failed to resolve git range: {}",
-                        redact_secret(&e.to_string())
-                    ),
-                )
-                .await;
-                return;
+                return Err(format!(
+                    "Failed to resolve git range: {}",
+                    redact_secret(&e.to_string())
+                ));
             }
         };
 
@@ -290,15 +661,10 @@ impl FetchAgent {
                         "Failed to extract patch {} from range {}: {}",
                         sha, range, redacted
                     );
-                    self.send_ingestion_failed(
-                        article_id,
-                        format!(
-                            "Failed to extract patch {} from range {}: {}",
-                            sha, range, redacted
-                        ),
-                    )
-                    .await;
-                    return;
+                    return Err(format!(
+                        "Failed to extract patch {} from range {}: {}",
+                        sha, range, redacted
+                    ));
                 }
             }
         }
@@ -340,12 +706,11 @@ impl FetchAgent {
         }
 
         if real_patches.is_empty() {
-            self.send_ingestion_failed(article_id, format!("No commits found in range {}", range))
-                .await;
-            return;
+            return Err(format!("No commits found in range {}", range));
         }
 
         let real_count = real_patches.len() as u32;
+        let mut events = Vec::with_capacity(real_patches.len() + 1);
 
         if let Some((tracker_info, tracker_meta)) = tracker_cover {
             if let Some(ref cid) = tracker_info.change_id
@@ -376,9 +741,9 @@ impl FetchAgent {
                     .or_else(|| mr_title.clone())
                     .or_else(|| real_patches.first().map(|(_, p)| p.subject.clone()))
                     .unwrap_or(tracker_meta.subject);
-                let cover_event = Event::PatchSubmitted {
+                events.push(Event::PatchSubmitted {
                     group: "git-fetch".to_string(),
-                    article_id: article_id.clone(),
+                    article_id: article_id.to_string(),
                     message_id: format!("{}@sashiko.local", article_id),
                     subject: cover_subject,
                     author: tracker_meta.author,
@@ -391,17 +756,14 @@ impl FetchAgent {
                     mr_url: mr_url.clone(),
                     mr_title: mr_title.clone(),
                     mr_number,
-                };
-                if let Err(e) = self.main_tx.send(cover_event).await {
-                    error!("Failed to send cover PatchSubmitted event: {}", e);
-                }
+                });
             }
         }
 
         for (i, (sha, meta)) in real_patches.into_iter().enumerate() {
-            let event = Event::PatchSubmitted {
+            events.push(Event::PatchSubmitted {
                 group: "git-fetch".to_string(),
-                article_id: article_id.clone(),
+                article_id: article_id.to_string(),
                 message_id: sha,
                 subject: meta.subject,
                 author: meta.author,
@@ -414,38 +776,34 @@ impl FetchAgent {
                 mr_url: mr_url.clone(),
                 mr_title: mr_title.clone(),
                 mr_number,
-            };
-            if let Err(e) = self.main_tx.send(event).await {
-                error!("Failed to send PatchSubmitted event: {}", e);
-            }
+            });
         }
-        info!("Successfully submitted remote range {}", range);
+
+        Ok(events)
     }
 
-    async fn process_single_commit_item(&self, commit: &str) {
-        let (mr_url, mr_title, mr_number) = self
-            .mr_metadata
-            .get(commit)
-            .cloned()
-            .unwrap_or((None, None, None));
-        let article_id = self.article_id_for(commit);
-
+    async fn extract_single_commit_event(
+        &self,
+        commit: &str,
+        article_id: &str,
+        mr_url: Option<String>,
+        mr_title: Option<String>,
+        mr_number: Option<i64>,
+    ) -> std::result::Result<Event, String> {
         let full_sha = match self.resolve_sha(commit).await {
             Ok(sha) => sha,
             Err(e) => {
-                self.send_ingestion_failed(
-                    article_id,
-                    format!("Failed to resolve SHA: {}", redact_secret(&e.to_string())),
-                )
-                .await;
-                return;
+                return Err(format!(
+                    "Failed to resolve SHA: {}",
+                    redact_secret(&e.to_string())
+                ));
             }
         };
 
         match self
             .extract_patch(
                 &full_sha,
-                &article_id,
+                article_id,
                 1,
                 1,
                 mr_url.as_ref(),
@@ -461,20 +819,67 @@ impl FetchAgent {
                 {
                     *message_id = full_sha;
                 }
+                Ok(event)
+            }
+            Err(e) => {
+                let err_msg = redact_secret(&e.to_string());
+                error!("Failed to extract patch {}: {}", commit, err_msg);
+                Err(format!("Failed to extract patch: {}", err_msg))
+            }
+        }
+    }
+
+    async fn process_range_item(&self, range: &str) {
+        let (mr_url, mr_title, mr_number) = self
+            .mr_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(range)
+            .cloned()
+            .unwrap_or((None, None, None));
+        let article_id = fetch_article_id(range, mr_number);
+
+        match self
+            .extract_range_events(range, &article_id, mr_url, mr_title, mr_number)
+            .await
+        {
+            Ok(events) => {
+                for event in events {
+                    if let Err(e) = self.main_tx.send(event).await {
+                        error!("Failed to send PatchSubmitted event: {}", e);
+                    }
+                }
+                info!("Successfully submitted remote range {}", range);
+            }
+            Err(err_msg) => {
+                self.send_ingestion_failed(article_id, err_msg).await;
+            }
+        }
+    }
+
+    async fn process_single_commit_item(&self, commit: &str) {
+        let (mr_url, mr_title, mr_number) = self
+            .mr_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(commit)
+            .cloned()
+            .unwrap_or((None, None, None));
+        let article_id = fetch_article_id(commit, mr_number);
+
+        match self
+            .extract_single_commit_event(commit, &article_id, mr_url, mr_title, mr_number)
+            .await
+        {
+            Ok(event) => {
                 if let Err(e) = self.main_tx.send(event).await {
                     error!("Failed to send PatchSubmitted event: {}", e);
                 } else {
                     info!("Successfully submitted remote patch {}", commit);
                 }
             }
-            Err(e) => {
-                let err_msg = redact_secret(&e.to_string());
-                error!("Failed to extract patch {}: {}", commit, err_msg);
-                self.send_ingestion_failed(
-                    article_id,
-                    format!("Failed to extract patch: {}", err_msg),
-                )
-                .await;
+            Err(err_msg) => {
+                self.send_ingestion_failed(article_id, err_msg).await;
             }
         }
     }
@@ -577,12 +982,16 @@ impl FetchAgent {
         let mut dropped_graph = false;
 
         loop {
-            let output = crate::git_cmd::in_dir_async(&self.repo_path)
-                .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
-                .arg("fetch")
-                .args(args)
-                .output()
-                .await?;
+            let output = timeout(
+                GIT_FETCH_TIMEOUT,
+                crate::git_cmd::in_dir_async(&self.repo_path)
+                    .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
+                    .arg("fetch")
+                    .args(args)
+                    .output(),
+            )
+            .await
+            .map_err(|_| anyhow!("git fetch timed out after {}s", GIT_FETCH_TIMEOUT.as_secs()))??;
 
             if output.status.success() || dropped_graph {
                 if dropped_graph {
@@ -1129,8 +1538,8 @@ mod tests {
 
         let range = format!("{}..{}", base_sha, head_sha);
         let (tx, mut rx) = mpsc::channel(10);
-        let (mut agent, _) = FetchAgent::new(repo_path, tx, None);
-        agent.mr_metadata.insert(
+        let (agent, _) = FetchAgent::new(repo_path, tx, None);
+        agent.mr_metadata.lock().unwrap().insert(
             range.clone(),
             (
                 Some("https://github.com/org/repo/pull/42".to_string()),
@@ -1228,8 +1637,8 @@ mod tests {
         let remote_range = format!("{}..deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", base_sha);
 
         let (tx, mut rx) = mpsc::channel(10);
-        let (mut agent, _) = FetchAgent::new(repo_path, tx, None);
-        agent.mr_metadata.insert(
+        let (agent, _) = FetchAgent::new(repo_path, tx, None);
+        agent.mr_metadata.lock().unwrap().insert(
             local_range.clone(),
             (
                 Some("https://github.com/org/repo/pull/99".to_string()),
@@ -1237,7 +1646,7 @@ mod tests {
                 Some(99),
             ),
         );
-        agent.mr_metadata.insert(
+        agent.mr_metadata.lock().unwrap().insert(
             remote_range.clone(),
             (
                 Some("https://gitlab.com/group/repo/-/merge_requests/77".to_string()),
@@ -1289,6 +1698,158 @@ mod tests {
             other => panic!("Expected IngestionFailed, got {:?}", other),
         }
         assert!(rx.try_recv().is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_drain_db_queue_submits_range_and_retries_transient_failures() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        crate::git_cmd::in_dir_async(&repo_path)
+            .arg("init")
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+
+        let file_path = repo_path.join("file.txt");
+        {
+            let mut file = File::create(&file_path)?;
+            writeln!(file, "base")?;
+        }
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["commit", "-m", "Base commit"])
+            .output()
+            .await?;
+        let base_out = crate::git_cmd::in_dir_async(&repo_path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await?;
+        let base_sha = String::from_utf8(base_out.stdout)?.trim().to_string();
+
+        {
+            let mut file = File::create(&file_path)?;
+            writeln!(file, "head")?;
+        }
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["commit", "-m", "PR commit"])
+            .output()
+            .await?;
+        let head_out = crate::git_cmd::in_dir_async(&repo_path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await?;
+        let head_sha = String::from_utf8(head_out.stdout)?.trim().to_string();
+
+        let db = Arc::new(
+            Database::new(&crate::settings::DatabaseSettings {
+                url: ":memory:".to_string(),
+                token: String::new(),
+            })
+            .await?,
+        );
+        db.migrate().await?;
+
+        let range = format!("{base_sha}..{head_sha}");
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            &range,
+            Some("https://github.com/sashiko-dev/sashiko/pull/738"),
+            Some("Durable fetch queue"),
+            Some(738),
+        )
+        .await?;
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (agent, _) = FetchAgent::new(repo_path, tx, None);
+        let agent = agent.with_db(db.clone(), 2);
+
+        agent.drain_db_queue(&db, 2).await;
+
+        let submitted = rx.try_recv().expect("expected PatchSubmitted event");
+        match submitted {
+            Event::PatchSubmitted {
+                article_id,
+                message_id,
+                mr_number,
+                index,
+                total,
+                ..
+            } => {
+                assert_eq!(article_id, format!("mr-738-{range}"));
+                assert_eq!(message_id, head_sha);
+                assert_eq!(mr_number, Some(738));
+                assert_eq!(index, 1);
+                assert_eq!(total, 1);
+            }
+            other => panic!("expected PatchSubmitted, got {other:?}"),
+        }
+        assert!(db.lock_pending_fetch_queue().await?.is_none());
+
+        // Now enqueue an unreachable remote range with max_retries = 2:
+        // attempt 1 schedules a retry without emitting IngestionFailed;
+        // attempt 2 exhausts retries and emits IngestionFailed with the exact
+        // mr-739-<range> article_id (not individual commit SHAs).
+        let missing_range =
+            "1111111111111111111111111111111111111111..2222222222222222222222222222222222222222";
+        db.enqueue_fetch_request(
+            Some("https://127.0.0.1:0/sashiko-dev/sashiko.git"),
+            missing_range,
+            Some("https://github.com/sashiko-dev/sashiko/pull/739"),
+            Some("Unreachable PR"),
+            Some(739),
+        )
+        .await?;
+
+        agent.drain_db_queue(&db, 2).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "first transient failure must schedule backoff rather than failing immediately"
+        );
+
+        // Clear backoff via immediate re-enqueue and run attempt 2 (exhaustion).
+        db.enqueue_fetch_request(
+            Some("https://127.0.0.1:0/sashiko-dev/sashiko.git"),
+            missing_range,
+            Some("https://github.com/sashiko-dev/sashiko/pull/739"),
+            Some("Unreachable PR"),
+            Some(739),
+        )
+        .await?;
+        agent.drain_db_queue(&db, 2).await;
+
+        let failed = rx
+            .try_recv()
+            .expect("exhausted retry budget must emit IngestionFailed");
+        match failed {
+            Event::IngestionFailed {
+                article_id, source, ..
+            } => {
+                assert_eq!(article_id, format!("mr-739-{missing_range}"));
+                assert_eq!(source, MessageSource::GitFetch);
+            }
+            other => panic!("expected IngestionFailed, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "must emit exactly one IngestionFailed per failed range, not one per missing SHA"
+        );
 
         Ok(())
     }

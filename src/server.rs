@@ -528,7 +528,10 @@ async fn submit_patch(
                 return Err(StatusCode::BAD_REQUEST.into_response());
             }
             let id = sha.clone();
-            let repo_display = repo.as_deref().unwrap_or("local");
+            let repo_display = repo
+                .as_deref()
+                .map(crate::utils::redact_secret)
+                .unwrap_or_else(|| "local".to_string());
             info!(
                 "Received remote fetch request: {} from {}",
                 sha, repo_display
@@ -553,11 +556,12 @@ async fn submit_patch(
                 _ => {}
             }
 
+            let placeholder_id = format!("{}@sashiko.local", id);
             // Create a placeholder record in the DB so the user can track status
-            if let Err(e) = state
+            let ps_id = match state
                 .db
                 .create_fetching_patchset(
-                    &format!("{}@sashiko.local", id),
+                    &placeholder_id,
                     &format!("Fetching {} from {}...", sha, repo_display),
                     skip_subjects.as_ref(),
                     only_subjects.as_ref(),
@@ -568,21 +572,65 @@ async fn submit_patch(
                 )
                 .await
             {
-                error!("Failed to create placeholder patchset: {}", e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
-            }
-
-            let req = FetchRequest {
-                repo_url: repo,
-                commit_hash: sha,
-                mr_url: None,
-                mr_title: None,
-                mr_number: None,
+                Ok(ps_id) => ps_id,
+                Err(e) => {
+                    error!("Failed to create placeholder patchset: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                }
             };
 
-            if let Err(e) = state.fetch_sender.send(req).await {
-                error!("Failed to send fetch request to queue: {}", e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            let should_enqueue = match state.db.get_patchset_status(ps_id).await {
+                Ok(Some(status)) => status == "Fetching",
+                Ok(None) => false,
+                Err(e) => {
+                    error!("Failed to inspect placeholder patchset status: {}", e);
+                    fail_fetching_patchset_logged(
+                        &state.db,
+                        &placeholder_id,
+                        "Failed to verify placeholder patchset status",
+                    )
+                    .await;
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                }
+            };
+
+            if should_enqueue {
+                let req = FetchRequest {
+                    repo_url: repo.clone(),
+                    commit_hash: sha.clone(),
+                    mr_url: None,
+                    mr_title: None,
+                    mr_number: None,
+                };
+
+                if crate::fetcher::url_has_embedded_credentials(repo.as_deref()) {
+                    if let Err(e) = state.fetch_sender.try_send(req) {
+                        error!("Failed to send fetch request to queue: {}", e);
+                        fail_fetching_patchset_logged(
+                            &state.db,
+                            &placeholder_id,
+                            "Failed to queue in-memory fetch request",
+                        )
+                        .await;
+                        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+                    }
+                } else {
+                    if let Err(e) = state
+                        .db
+                        .enqueue_fetch_request(repo.as_deref(), &sha, None, None, None)
+                        .await
+                    {
+                        error!("Failed to persist fetch request in fetch_queue: {}", e);
+                        fail_fetching_patchset_logged(
+                            &state.db,
+                            &placeholder_id,
+                            "Failed to enqueue fetch request",
+                        )
+                        .await;
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    }
+                    let _ = state.fetch_sender.try_send(req);
+                }
             }
 
             Ok(Json(SubmitResponse {
@@ -640,6 +688,15 @@ async fn submit_patch(
                 id, // The client might expect this ID
             }))
         }
+    }
+}
+
+async fn fail_fetching_patchset_logged(db: &Database, root_msg_id: &str, err_msg: &str) {
+    if let Err(e) = db.fail_fetching_patchset(root_msg_id, err_msg).await {
+        error!(
+            "Failed to mark fetching patchset {} as Failed: {}",
+            root_msg_id, e
+        );
     }
 }
 
@@ -2334,6 +2391,15 @@ async fn forge_webhook(
         })));
     }
 
+    if crate::fetcher::url_has_embedded_credentials(metadata.repo_url.as_deref()) {
+        warn!(
+            "Rejected {} PR #{} webhook with credentialed repository URL",
+            forge.name(),
+            metadata.pr_number
+        );
+        return Err(StatusCode::BAD_REQUEST.into_response());
+    }
+
     let default_subject = format!("{} #{}", forge.name(), metadata.pr_number);
     let subject = metadata.pr_title.as_deref().unwrap_or(&default_subject);
 
@@ -2362,7 +2428,7 @@ async fn forge_webhook(
             })?;
     }
 
-    state
+    let ps_id = state
         .db
         .create_fetching_patchset(
             &placeholder_id,
@@ -2380,18 +2446,52 @@ async fn forge_webhook(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
 
-    let req = FetchRequest {
-        repo_url: metadata.repo_url,
-        commit_hash: commit_range,
-        mr_url: metadata.pr_url,
-        mr_title: metadata.pr_title,
-        mr_number: Some(metadata.pr_number),
+    let should_enqueue = match state.db.get_patchset_status(ps_id).await {
+        Ok(Some(status)) => status == "Fetching",
+        Ok(None) => false,
+        Err(e) => {
+            error!("Failed to inspect placeholder patchset status: {}", e);
+            fail_fetching_patchset_logged(
+                &state.db,
+                &placeholder_id,
+                "Failed to verify placeholder patchset status",
+            )
+            .await;
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
     };
 
-    state.fetch_sender.send(req).await.map_err(|e| {
-        error!("Failed to send fetch request to queue: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })?;
+    if should_enqueue {
+        if let Err(e) = state
+            .db
+            .enqueue_fetch_request(
+                metadata.repo_url.as_deref(),
+                &commit_range,
+                metadata.pr_url.as_deref(),
+                metadata.pr_title.as_deref(),
+                Some(metadata.pr_number),
+            )
+            .await
+        {
+            error!("Failed to persist fetch request in fetch_queue: {}", e);
+            fail_fetching_patchset_logged(
+                &state.db,
+                &placeholder_id,
+                "Failed to enqueue fetch request",
+            )
+            .await;
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+
+        let req = FetchRequest {
+            repo_url: metadata.repo_url,
+            commit_hash: commit_range,
+            mr_url: metadata.pr_url,
+            mr_title: metadata.pr_title,
+            mr_number: Some(metadata.pr_number),
+        };
+        let _ = state.fetch_sender.try_send(req);
+    }
 
     Ok(Json(serde_json::json!({
         "status": "accepted",
@@ -6001,6 +6101,138 @@ F:	*
         assert_eq!(after_details["status"], "Reviewed");
         assert_eq!(after_details["can_release_embargo"], false);
         assert_eq!(after_details["reviews"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_forge_webhook_persists_fetch_queue_and_deduplicates_completed() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.forge.enabled = true;
+        settings.forge.webhook_secret = None;
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        // Drop the fetch receiver deliberately to prove durability in fetch_queue
+        // does not depend on an in-memory channel send succeeding.
+        let (fetch_tx, fetch_rx) = mpsc::channel(1);
+        drop(fetch_rx);
+
+        let state = Arc::new(AppState {
+            settings: Arc::new(settings),
+            db: db.clone(),
+            sender: event_tx,
+            fetch_sender: fetch_tx,
+            read_only: false,
+            forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
+            allow_all_submit: true,
+            smtp_enabled: false,
+            dry_run: true,
+            local_token: None,
+            email_worker_heartbeat: None,
+            sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
+            stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+            stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
+            stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
+            messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
+            patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
+            patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+            messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+            bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+        });
+
+        let payload = serde_json::json!({
+            "action": "opened",
+            "number": 42,
+            "pull_request": {
+                "number": 42,
+                "title": "Persist fetch_queue requests",
+                "html_url": "https://github.com/sashiko-dev/sashiko/pull/42",
+                "draft": false,
+                "user": { "login": "octocat", "type": "User" },
+                "base": { "sha": "1111111111111111111111111111111111111111" },
+                "head": { "sha": "2222222222222222222222222222222222222222" }
+            },
+            "repository": {
+                "clone_url": "https://github.com/sashiko-dev/sashiko.git"
+            }
+        });
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+
+        let make_req = || {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("x-github-event", "pull_request".parse().unwrap());
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/webhook/github")
+                .header("x-github-event", "pull_request")
+                .body(axum::body::Body::from(body_bytes.clone()))
+                .unwrap();
+            (headers, request)
+        };
+
+        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let (headers, request) = make_req();
+        let Json(resp) = forge_webhook(
+            ConnectInfo(addr),
+            State(state.clone()),
+            Path("github".to_string()),
+            headers,
+            request,
+        )
+        .await
+        .unwrap_or_else(|r| panic!("webhook failed with status {}", r.status()));
+        assert_eq!(resp["status"], "accepted");
+
+        let locked = db
+            .lock_pending_fetch_queue()
+            .await
+            .unwrap()
+            .expect("fetch_queue row should be persisted");
+        assert_eq!(
+            locked.repo_url,
+            "https://github.com/sashiko-dev/sashiko.git"
+        );
+        assert_eq!(
+            locked.commit_range,
+            "1111111111111111111111111111111111111111..2222222222222222222222222222222222222222"
+        );
+        assert_eq!(
+            locked.article_id,
+            "mr-42-1111111111111111111111111111111111111111..2222222222222222222222222222222222222222"
+        );
+        assert_eq!(locked.mr_number, Some(42));
+        assert!(
+            db.mark_fetch_queue_done(locked.id, locked.locked_at)
+                .await
+                .unwrap()
+        );
+
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Reviewed' WHERE mr_number = 42",
+                (),
+            )
+            .await
+            .unwrap();
+
+        // Duplicate webhook redelivery after ingestion/review must not reset or re-enqueue.
+        let (headers2, request2) = make_req();
+        let Json(resp2) = forge_webhook(
+            ConnectInfo(addr),
+            State(state),
+            Path("github".to_string()),
+            headers2,
+            request2,
+        )
+        .await
+        .unwrap_or_else(|r| panic!("redelivery failed with status {}", r.status()));
+        assert_eq!(resp2["status"], "accepted");
+        assert!(db.lock_pending_fetch_queue().await.unwrap().is_none());
     }
 }
 
