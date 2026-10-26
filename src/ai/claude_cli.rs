@@ -25,6 +25,10 @@
 //! instructions; managed MCP configurations can prevent strict-mode startup.
 //! These restrictions disable agent functionality, not operating-system
 //! access: the CLI is still trusted to read credentials and contact the model.
+//!
+//! A request with tools also gets `--json-schema`. Claude Code serves it with
+//! a single StructuredOutput tool that takes the reply object and nothing
+//! else, so it gives the model no access to files, commands or the network.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -56,6 +60,8 @@ pub enum ClaudeCliError {
     Cli(String),
     #[error("Failed to parse claude CLI JSON output: {0}")]
     Parse(String),
+    #[error("claude CLI returned an empty reply to a request with tools")]
+    EmptyReply,
 }
 
 impl ClassifyAiError for ClaudeCliError {
@@ -89,6 +95,9 @@ impl ClassifyAiError for ClaudeCliError {
             },
             ClaudeCliError::Cli(_) => AiErrorClass::Fatal,
             ClaudeCliError::Parse(_) => AiErrorClass::Fatal,
+            ClaudeCliError::EmptyReply => AiErrorClass::Transient {
+                retry_after: Duration::from_secs(30),
+            },
         }
     }
 }
@@ -122,13 +131,22 @@ fn format_cli_exit_error(
     ClaudeCliError::Cli(format!("exited with {status}: {stderr}"))
 }
 
-fn extract_cli_result(outer: &Value) -> Result<String, ClaudeCliError> {
+/// With `--json-schema`, Claude Code returns the reply object in
+/// `structured_output` and the same object serialized in `result`
+fn extract_cli_result(outer: &Value, has_schema: bool) -> Result<String, ClaudeCliError> {
     if outer["is_error"].as_bool().unwrap_or(false) {
         return Err(ClaudeCliError::Cli(redact_secret(
             outer["result"].as_str().unwrap_or("unknown error"),
         )));
     }
-    Ok(outer["result"].as_str().unwrap_or("").trim().to_string())
+    if has_schema && outer["structured_output"].is_object() {
+        return Ok(outer["structured_output"].to_string());
+    }
+    let result = outer["result"].as_str().unwrap_or("").trim().to_string();
+    if has_schema && result.is_empty() {
+        return Err(ClaudeCliError::EmptyReply);
+    }
+    Ok(result)
 }
 
 pub struct ClaudeCliProvider {
@@ -136,10 +154,17 @@ pub struct ClaudeCliProvider {
     pub effort: Option<String>,
 }
 
+/// Constrains a reply to the tool-calling format `build_prompt` asks for. With
+/// `--tools ""` the API has no tool for the model's native tool-call syntax to
+/// end on, so the model can write it as text and keep inventing calls and
+/// results until the CLI times out.
+const TOOL_REPLY_SCHEMA: &str = r#"{"type":"object","minProperties":1,"properties":{"tool_calls":{"type":"array","minItems":1,"items":{"type":"object","properties":{"id":{"type":"string"},"function_name":{"type":"string"},"arguments":{"type":"object"}},"required":["id","function_name","arguments"]}},"content":{"type":"string"}}}"#;
+
 /// Returns the argv passed to `claude` (the prompt goes on stdin). Extracted
 /// so tests can assert that no tool survives.
-pub fn build_claude_args(model: &str, effort: Option<&str>) -> Vec<String> {
-    // Isolation arguments/settings verified with Claude Code 2.1.170.
+pub fn build_claude_args(model: &str, effort: Option<&str>, has_tools: bool) -> Vec<String> {
+    // Isolation arguments/settings verified with Claude Code 2.1.170, and
+    // --json-schema with 2.1.308
     let mut args = vec![
         "--print".to_string(),
         "--output-format".to_string(),
@@ -172,6 +197,11 @@ pub fn build_claude_args(model: &str, effort: Option<&str>) -> Vec<String> {
         args.push(effort.to_string());
     }
 
+    if has_tools {
+        args.push("--json-schema".to_string());
+        args.push(TOOL_REPLY_SCHEMA.to_string());
+    }
+
     args
 }
 
@@ -186,9 +216,14 @@ impl ClaudeCliProvider {
 
         debug!("claude-cli prompt length: {} chars", prompt.len());
 
+        let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
         let working_directory = tempfile::tempdir().map_err(ClaudeCliError::WorkingDirectory)?;
         let child = Command::new(binary)
-            .args(build_claude_args(&self.model, self.effort.as_deref()))
+            .args(build_claude_args(
+                &self.model,
+                self.effort.as_deref(),
+                has_tools,
+            ))
             .current_dir(working_directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -209,7 +244,7 @@ impl ClaudeCliProvider {
             return Err(format_cli_exit_error(output.status, &raw, &stderr).into());
         }
         let outer = parse_cli_output(&raw)?;
-        let result_text = extract_cli_result(&outer)?;
+        let result_text = extract_cli_result(&outer, has_tools)?;
 
         // Parse usage from the outer JSON
         let usage = parse_usage(&outer);
@@ -244,7 +279,7 @@ impl AiProvider for ClaudeCliProvider {
             &self.model,
             &[
                 ("effort", self.effort.as_deref()),
-                ("completion_profile", Some("restricted-v1")),
+                ("completion_profile", Some("restricted-v2")),
             ],
         )
     }
@@ -676,13 +711,69 @@ mod tests {
 
     #[test]
     fn test_claude_args_disable_every_tool() {
-        let args = build_claude_args("sonnet", Some("high"));
+        let args = build_claude_args("sonnet", Some("high"), true);
         let tools = args.iter().position(|a| a == "--tools").unwrap();
         assert_eq!(args[tools + 1], "");
         let denied = args.iter().position(|a| a == "--disallowedTools").unwrap();
         assert_eq!(args[denied + 1], "mcp__*");
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(args.contains(&"--print".to_string()));
+    }
+
+    #[test]
+    fn test_claude_args_schema_only_with_tools() {
+        let with = build_claude_args("sonnet", None, true);
+        let schema = with.iter().position(|a| a == "--json-schema").unwrap();
+        let parsed: Value = serde_json::from_str(&with[schema + 1]).unwrap();
+        assert!(parsed["properties"]["tool_calls"].is_object());
+        assert!(parsed["properties"]["content"].is_object());
+        let without = build_claude_args("sonnet", None, false);
+        assert!(!without.contains(&"--json-schema".to_string()));
+    }
+
+    #[test]
+    fn test_tool_reply_schema_rejects_empty_replies() {
+        let schema: Value = serde_json::from_str(TOOL_REPLY_SCHEMA).unwrap();
+        assert_eq!(schema["minProperties"], 1);
+        assert_eq!(schema["properties"]["tool_calls"]["minItems"], 1);
+    }
+
+    #[test]
+    fn test_extract_cli_result_prefers_structured_output() {
+        // Envelope shape from Claude Code 2.1.308 with --json-schema
+        let outer = json!({
+            "is_error": false,
+            "subtype": "success",
+            "result": r#"{"content":"from result"}"#,
+            "structured_output": {"tool_calls": [{"id": "1", "function_name": "git_grep", "arguments": {"pattern": "foo"}}]},
+        });
+        let text = extract_cli_result(&outer, true).unwrap();
+        let response = parse_inner_response(&text, None).unwrap();
+        let calls = response.tool_calls.unwrap();
+        assert_eq!(calls[0].function_name, "git_grep");
+
+        assert_eq!(
+            extract_cli_result(&outer, false).unwrap(),
+            r#"{"content":"from result"}"#
+        );
+    }
+
+    #[test]
+    fn test_extract_cli_result_rejects_an_empty_schema_reply() {
+        let outer = json!({"is_error": false, "result": "  "});
+        let error = extract_cli_result(&outer, true).unwrap_err();
+        assert!(matches!(error, ClaudeCliError::EmptyReply));
+        assert!(matches!(
+            error.ai_error_class(),
+            AiErrorClass::Transient { .. }
+        ));
+        assert_eq!(extract_cli_result(&outer, false).unwrap(), "");
+
+        let fallback = json!({"is_error": false, "result": r#"{"content":"ok"}"#});
+        assert_eq!(
+            extract_cli_result(&fallback, true).unwrap(),
+            r#"{"content":"ok"}"#
+        );
     }
 
     #[test]
@@ -779,7 +870,9 @@ mod tests {
             "is_error": true,
             "result": "upstream failed at https://user:pass@host with key=sk-secret and token=tok-123"
         });
-        let err_result = extract_cli_result(&outer_err).unwrap_err().to_string();
+        let err_result = extract_cli_result(&outer_err, false)
+            .unwrap_err()
+            .to_string();
         assert!(err_result.contains("https://[REDACTED]:[REDACTED]@host"));
         assert!(err_result.contains("key=[REDACTED]"));
         assert!(err_result.contains("token=[REDACTED]"));

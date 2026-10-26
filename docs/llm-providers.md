@@ -97,6 +97,10 @@ Context window sizes:
   instruction files and automatic memory) are disabled explicitly. Each call
   runs in a fresh temporary working directory with no session reuse.
   This invocation was validated with Claude Code 2.1.170.
+- Requests that offer Sashiko tools also pass `--json-schema`, so the model
+  replies with a `tool_calls` or `content` object through Claude Code's
+  StructuredOutput tool instead of free text. This needs a Claude Code version
+  with `--json-schema`; it was validated with 2.1.308.
 - Earlier claude-cli response-cache entries are not reused with this restricted
   completion profile; responses are regenerated on the next request.
 - User/project settings are not loaded. CLI subscription credentials and
