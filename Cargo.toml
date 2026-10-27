@@ -76,7 +76,7 @@ flate2 = { version = "1.1.9", optional = true }
 futures = "0.3.31"
 lettre = { version = "0.11.7", default-features = false, features = ["aws-lc-rs", "builder", "hostname", "pool", "sendmail-transport", "smtp-transport", "tokio1", "tokio1-rustls", "webpki-roots"], optional = true }
 libc = "0.2.186"
-libsql = { version = "0.10.0", optional = true }
+libsql = { version = "0.10.0", default-features = false, features = ["core"], optional = true }
 mail-parser = "0.11.3"
 regex = "1.12.2"
 reqwest = { version = "0.13.1", features = ["json", "query"] }

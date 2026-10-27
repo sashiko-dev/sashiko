@@ -81,8 +81,8 @@ Optional. Controls forge (GitHub/GitLab) webhook integration, GitHub App comment
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `url` | string | `""` | Path to the SQLite database file, or a `libsql://` / `https://` URL of a remote libSQL database. Required by the daemon, which refuses to start without it; the shipped `Settings.toml` uses `"sashiko.db"`. The daemon writes its local operator token (`.sashiko-local-token`) beside a local database file. |
-| `token` | string | `""` | Authentication token for a remote libSQL database. Ignored for a local file. |
+| `url` | string | `""` | Path to the local SQLite database file (or `":memory:"` for in-memory testing). Required by the daemon, which refuses to start without it; the shipped `Settings.toml` uses `"sashiko.db"`. The daemon writes its local operator token (`.sashiko-local-token`) beside a local database file. |
+| `token` | string | `""` | Deprecated setting retained for configuration compatibility; ignored because remote database URLs are not supported. |
 
 ### `[mailing_lists]`
 

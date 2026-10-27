@@ -2154,15 +2154,14 @@ impl Database {
             crate::utils::redact_secret(&settings.url)
         );
 
-        let is_remote =
-            settings.url.starts_with("libsql://") || settings.url.starts_with("https://");
-        let db = if is_remote {
-            Builder::new_remote(settings.url.clone(), settings.token.clone())
-                .build()
-                .await?
-        } else {
-            Builder::new_local(&settings.url).build().await?
-        };
+        let lower_url = settings.url.trim().to_ascii_lowercase();
+        if lower_url.starts_with("libsql://")
+            || lower_url.starts_with("https://")
+            || lower_url.starts_with("http://")
+        {
+            bail!("remote database URLs are not supported; configure a local SQLite file path");
+        }
+        let db = Builder::new_local(&settings.url).build().await?;
 
         let conn = db.connect()?;
 
@@ -2185,7 +2184,7 @@ impl Database {
         // file-backed SQLite databases so active read cursors on `conn` can
         // never block `COMMIT` with `SQL statements in progress` or collide
         // with transaction state on the same `sqlite3*` handle.
-        let tx_conn = if !is_remote && !settings.url.contains(":memory:") {
+        let tx_conn = if !settings.url.contains(":memory:") {
             let tx_conn = db.connect()?;
             tx_conn
                 .query("PRAGMA busy_timeout = 5000;", ())
@@ -31686,5 +31685,27 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
             .await
             .unwrap();
         assert_eq!(wm_non_empty, 13_600);
+    }
+
+    #[tokio::test]
+    async fn test_database_new_rejects_remote_urls() {
+        for url in [
+            "libsql://sashiko.example.turso.io",
+            "https://sashiko.example.turso.io",
+            "http://localhost:8080",
+        ] {
+            let err = Database::new(&DatabaseSettings {
+                url: url.to_string(),
+                token: String::new(),
+            })
+            .await
+            .err()
+            .expect("remote URL must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("remote database URLs are not supported"),
+                "unexpected error for {url}: {err}"
+            );
+        }
     }
 }
