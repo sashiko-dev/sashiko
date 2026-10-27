@@ -1,3 +1,6 @@
+# Fragment, not a complete configuration: merge these tables into a
+# working Settings.toml (start from the one at the repository root).
+#
 # GitLab webhook integration — production deployment with signing token.
 # Use with a reverse proxy (nginx/Caddy) that terminates TLS.
 # See docs/WEBHOOK_SECURITY.md for full setup guide.
@@ -9,7 +12,10 @@ provider = "gitlab"
 # Generate in GitLab: Settings > Webhooks > Add new > Generate signing token.
 # Verifies both sender identity and payload integrity.
 webhook_secret = "whsec_YOUR_BASE64_SIGNING_TOKEN_HERE"
-# api_token = "glpat-..."  # Optional: for future API-based features
+# Authenticates HTTPS fetches of merge request branches from gitlab.com.
+# Posting reviews back is supported for GitHub only, so leave post_mode
+# at its default ("off") for GitLab.
+# api_token = "glpat-..."
 
 [server]
 host = "127.0.0.1"   # Bind to localhost; reverse proxy handles public traffic

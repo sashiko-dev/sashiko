@@ -1,3 +1,6 @@
+# Fragment, not a complete configuration: merge these tables into a
+# working Settings.toml (start from the one at the repository root).
+#
 # Self-hosted GitLab on the same LAN as Sashiko.
 # No reverse proxy needed if both are on a trusted private network.
 # See docs/WEBHOOK_SECURITY.md for full setup guide.

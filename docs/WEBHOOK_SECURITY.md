@@ -28,7 +28,7 @@ address, because a proxied request arrives from localhost exactly as a local
 one does.
 
 - No `--enable-unsafe-all-submit` flag needed
-- Example config: `docs/examples/Settings.forge-gitlab-production.toml`
+- Example fragment (merge into Settings.toml): `docs/examples/Settings.forge-gitlab-production.toml`
 - See [Reverse proxy examples](#reverse-proxy-examples) for nginx/Caddy setup
 
 ### Tunnel-based (ngrok, Cloudflare Tunnel, SSH)
@@ -54,7 +54,7 @@ Sashiko binds to all interfaces (`host = "::"`). Configure `webhook_secret`
 check.
 
 - No `--enable-unsafe-all-submit` flag needed
-- Example config: `docs/examples/Settings.forge-selfhosted.toml`
+- Example fragment (merge into Settings.toml): `docs/examples/Settings.forge-selfhosted.toml`
 
 ### Script-based polling (cronjob + curl)
 
@@ -66,7 +66,7 @@ No forge webhook — a script polls the API and posts results to Sashiko via
 curl. The plain secret token method works well here (simple `-H` flag in
 curl). Requests are localhost, so the secret provides defense-in-depth.
 
-- Example config: `docs/examples/Settings.forge-gitlab-simple.toml`
+- Example fragment (merge into Settings.toml): `docs/examples/Settings.forge-gitlab-simple.toml`
 - See [Script-based setup](#script-based--cronjob-setup) for curl examples
 
 ## Authentication methods
