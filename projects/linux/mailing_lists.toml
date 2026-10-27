@@ -1,3 +1,9 @@
+# Mailing list policy for --project linux: which lists are tracked via
+# NNTP, and who receives review emails for each. Every key is described in
+# docs/configuration.md. A list with cc but no reply_to mails its review
+# only to those cc addresses, unless the patch also went to a list whose
+# reply_to adds more recipients.
+
 [defaults]
 # Whether lists in this file are tracked and ingested via NNTP by default.
 track = true
@@ -5,12 +11,14 @@ track = true
 # Who from the original patch receives the review email:
 # - "author": the patch author (From: header -> To:)
 # - "list": this block's mailing list address (-> To:/Cc:)
-# - "recipients": all individual (non-mailing-list) To:/Cc: recipients on the patch
+# - "recipients": all individual (non-mailing-list) To:/Cc: recipients on
+#   the patch
 reply_to = []
 
 # When a review finds no issues, who receives the positive review email:
 # - "none": do not send positive review emails (default)
-# - "author": send positive review only to the patch author (To: author, no list/CCs)
+# - "author": send positive review only to the patch author (To: author,
+#   no list/CCs)
 # - "all": send positive review to the full resolved recipient set
 positive_review = "none"
 
@@ -21,9 +29,14 @@ mute_all = false
 cc = []
 
 # Hours to hold reviews with findings before sending (0 = immediate).
+# Setting it on a list, even to 0, matters for cross-posted series: the
+# lowest value set on a matched list wins (preferring lists whose
+# subject_prefixes match the subject), and the default applies only when
+# no matched list sets one.
 embargo_hours = 0
 
-# Author email addresses whose submissions are ignored and never reviewed.
+# Author addresses (substring match) whose submissions are ignored and
+# never reviewed. Entries in a list section apply to every list.
 ignored_emails = ["patchwork@emeril.freedesktop.org"]
 
 # --- Tracked for Web UI only (no outbound emails) ---
@@ -70,9 +83,13 @@ reply_to = ["author", "list"]
 positive_review = "all"
 
 ["b.a.t.m.a.n@lists.open-mesh.org"]
-nntp_group = "org.open-mesh.lists.batman"
 reply_to = ["author"]
-cc = ["marek.lindner@mailbox.org", "sw@simonwunderlich.de", "antonio@mandelbit.com", "sven@narfation.org"]
+cc = [
+    "marek.lindner@mailbox.org",
+    "sw@simonwunderlich.de",
+    "antonio@mandelbit.com",
+    "sven@narfation.org",
+]
 embargo_hours = 0
 subject_prefixes = ["batadv", "batadv-next"]
 
@@ -88,7 +105,6 @@ embargo_hours = 0
 subject_prefixes = ["damon"]
 
 ["devicetree@vger.kernel.org"]
-nntp_group = "org.kernel.vger.linux-devicetree"
 reply_to = ["author", "list"]
 cc = ["robh@kernel.org", "conor+dt@kernel.org"]
 
@@ -119,6 +135,7 @@ subject_prefixes = ["net", "net-next"]
 reply_to = ["author", "list"]
 embargo_hours = 0
 subject_prefixes = ["mptcp", "mptcp-net", "mptcp-next"]
+
 ["mptcp@lists.linux.dev".patchwork]
 enabled = true
 api_url = "https://patchwork.kernel.org/api/1.3"
@@ -181,7 +198,11 @@ cc = ["neil.armstrong@linaro.org"]
 reply_to = ["author", "list"]
 
 ["linux-nfs@vger.kernel.org"]
-cc = ["Chuck Lever <cel@kernel.org>", "Jeff Layton <jlayton@kernel.org>", "Anna Schumaker <anna@kernel.org>"]
+cc = [
+    "Chuck Lever <cel@kernel.org>",
+    "Jeff Layton <jlayton@kernel.org>",
+    "Anna Schumaker <anna@kernel.org>",
+]
 
 ["kexec@lists.infradead.org"]
 reply_to = ["author", "list", "recipients"]
@@ -190,7 +211,10 @@ positive_review = "all"
 ["virtualization@lists.linux.dev"]
 reply_to = ["author", "list"]
 positive_review = "all"
-cc = ["Michael S. Tsirkin <mst@redhat.com>", "Eugenio Perez <eperezma@redhat.com>"]
+cc = [
+    "Michael S. Tsirkin <mst@redhat.com>",
+    "Eugenio Perez <eperezma@redhat.com>",
+]
 
 ["kvm@vger.kernel.org"]
 reply_to = ["author", "list"]
@@ -201,7 +225,10 @@ cc = ["Petr Pavlu <petr.pavlu@suse.com>"]
 
 ["nova-gpu@lists.linux.dev"]
 reply_to = ["author", "list", "recipients"]
-cc = ["Danilo Krummrich <dakr@kernel.org>", "Alexandre Courbot <acourbot@nvidia.com>"]
+cc = [
+    "Danilo Krummrich <dakr@kernel.org>",
+    "Alexandre Courbot <acourbot@nvidia.com>",
+]
 
 ["linux-btrfs@vger.kernel.org"]
 cc = ["dsterba@suse.cz"]
@@ -221,7 +248,10 @@ positive_review = "all"
 
 ["linux-i3c@lists.infradead.org"]
 reply_to = ["author", "list"]
-cc = ["Frank.Li@kernel.org", "Alexandre Belloni <alexandre.belloni@bootlin.com>"]
+cc = [
+    "Frank.Li@kernel.org",
+    "Alexandre Belloni <alexandre.belloni@bootlin.com>",
+]
 
 ["linux-raid@vger.kernel.org"]
 reply_to = ["author", "list"]
@@ -233,7 +263,12 @@ cc = ["linux-kernel@vger.kernel.org"]
 
 ["linux-can@vger.kernel.org"]
 reply_to = ["author", "list"]
-cc = ["Marc Kleine-Budde <mkl@pengutronix.de>", "Oliver Hartkopp <socketcan@hartkopp.net>", "Vincent Mailhol <mailhol@kernel.org>", "Oleksij Rempel <o.rempel@pengutronix.de>"]
+cc = [
+    "Marc Kleine-Budde <mkl@pengutronix.de>",
+    "Oliver Hartkopp <socketcan@hartkopp.net>",
+    "Vincent Mailhol <mailhol@kernel.org>",
+    "Oleksij Rempel <o.rempel@pengutronix.de>",
+]
 
 ["linux-scsi@vger.kernel.org"]
 reply_to = ["author", "list"]
@@ -247,7 +282,12 @@ reply_to = ["author", "list"]
 ["linux-s390@vger.kernel.org"]
 reply_to = ["author", "list"]
 positive_review = "all"
-cc = ["Heiko Carstens <hca@linux.ibm.com>", "Vasily Gorbik <gor@linux.ibm.com>", "Alexander Gordeev <agordeev@linux.ibm.com>", "Christian Borntraeger <borntraeger@linux.ibm.com>"]
+cc = [
+    "Heiko Carstens <hca@linux.ibm.com>",
+    "Vasily Gorbik <gor@linux.ibm.com>",
+    "Alexander Gordeev <agordeev@linux.ibm.com>",
+    "Christian Borntraeger <borntraeger@linux.ibm.com>",
+]
 
 ["kvmarm@lists.linux.dev"]
 reply_to = ["author", "list"]
@@ -284,7 +324,11 @@ positive_review = "all"
 ["ocfs2-devel@lists.linux.dev"]
 reply_to = ["author"]
 positive_review = "all"
-cc = ["Mark Fasheh <mark@fasheh.com>", "Joel Becker <jlbec@evilplan.org>", "Joseph Qi <joseph.qi@linux.alibaba.com>"]
+cc = [
+    "Mark Fasheh <mark@fasheh.com>",
+    "Joel Becker <jlbec@evilplan.org>",
+    "Joseph Qi <joseph.qi@linux.alibaba.com>",
+]
 
 ["linux-serial@vger.kernel.org"]
 reply_to = ["author", "list"]
@@ -299,7 +343,6 @@ reply_to = ["list"]
 positive_review = "all"
 
 ["intel-wired-lan@lists.osuosl.org"]
-nntp_group = "org.osuosl.intel-wired-lan"
 reply_to = ["author", "list"]
 
 ["linux-gpio@vger.kernel.org"]
