@@ -90,7 +90,7 @@ The daemon monitors configured mailing lists (NNTP) or forge webhooks, manages t
 sashiko
 ```
 
-(Or from source: `cargo run --release --bin sashiko`, or via Nix: `nix run github:sashiko-dev/sashiko`)
+(Or from source: `cargo run --release --bin sashiko`)
 
 ### Web Interface
 
@@ -114,7 +114,7 @@ sashiko-cli status
 sashiko-cli show latest
 ```
 
-(From source: `cargo run --bin sashiko-cli -- [OPTIONS] [COMMAND]`, or via Nix: `nix profile add github:sashiko-dev/sashiko`)
+(From source: `cargo run --bin sashiko-cli -- [OPTIONS] [COMMAND]`)
 
 For the complete command list, see the [CLI Reference](sashiko-cli.md).
 
