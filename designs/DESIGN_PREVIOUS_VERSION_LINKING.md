@@ -15,9 +15,9 @@ Linux kernel patch series and Forge pull requests frequently go through multiple
    * Explicit Lore links in the cover letter or below `---` (`v1: https://lore.kernel.org/all/<msgid>/`, `Link: https://lore.kernel.org/r/<msgid>`).
    * Stable Git patch IDs (`patches.git_patch_id` from `012_git_patch_id.sql`) shared by unchanged patches across versions.
 4. **No patch-level lineage across versions:**
-   Reviewers (both humans in the Web UI and the AI review workflow) cannot see which patches in `v2` are unchanged from `v1`, which were modified, and which are newly added.
+   Reviewers in the Web UI cannot see which patches in `v2` are unchanged from `v1`, which were modified, and which are newly added.
 
-This design introduces **local, multi-signal version discovery and linking** at both the **patchset level** (`v1 -> v2 -> v3`) and the **individual patch level** (`v1 Patch i <-> v2 Patch j`), integrated into ingestion, the REST API, the Web UI, and the review workflow.
+This design introduces **local, multi-signal version discovery and linking** at both the **patchset level** (`v1 -> v2 -> v3`) and the **individual patch level** (`v1 Patch i <-> v2 Patch j`), integrated into ingestion, the REST API, and the Web UI.
 
 ---
 
@@ -46,7 +46,7 @@ flowchart TD
 * **Confidence:** Exact (`"forge_mr"`).
 
 ### Signal 2: `b4` `change-id:` Trailer & `b4 prep` Tracker Commits
-* **Extraction:** Parse `change-id: <token>` (case-insensitive header/trailer line in the cover letter body or below `---` in patch `1/N`, e.g., `change-id: 20260920-net-foo-teardown-4f2a9c1b`) or `"change-id"` from an un-sent `b4 prep` tracking block (`--- b4-submit-tracking ---`) via `parse_b4_change_id(body: &str) -> Option<String>` in `src/patch.rs`. When reviewing a git branch range containing an empty `b4 prep` tracker commit (`parse_b4_submit_tracking`), filter the tracker commit out of the `1..N` patch list and extract its `change-id` and any edited cover letter subject/body into the `index = 0` cover context. Store in `patchsets.change_id` (indexed).
+* **Extraction:** Parse `change-id: <token>` (case-insensitive header/trailer line in the cover letter body or below `---` in patch `1/N`, e.g., `change-id: 20260920-net-foo-teardown-4f2a9c1b`) or `"change-id"` from an un-sent `b4 prep` tracking block (`--- b4-submit-tracking ---`) via `parse_b4_change_id(body: &str) -> Option<String>` in `src/patch.rs`. When reviewing a git branch range containing an empty `b4 prep` tracker commit (`parse_b4_submit_tracking`), filter the tracker commit out of the `1..N` patch list and extract its `change-id`. Store in `patchsets.change_id` (indexed).
 * **Match criteria:** Any local patchset $C \neq S$ with `C.change_id == S.change_id`, `authors_match(&C.author, &S.author)`, and `C.version != S.version`.
 * **Confidence:** Exact (`"change_id"`). Survives cover letter subject renames and patch count changes.
 
@@ -86,7 +86,7 @@ Whenever patchset $S_k$ has a linked `previous_patchset_id` $= S_{k-1}$, Sashiko
    * If both $S_{k-1}$ and $S_k$ are single-patch series (`total_parts == 1`) linked via Signal 1, 2, or 3 and their single patches did not match in Tier 1, link `P_1.previous_patch_id = Some(P_prev_1.id)` with status `"modified"`.
 4. **Unmatched Patches:**
    * Any remaining patch in $S_k$ has `previous_patch_id = NULL` and `previous_patch_status = NULL` (treated as newly `"added"` in $S_k$).
-   * Any patch in $S_{k-1}$ not referenced by any patch in $S_k$ is reported as `"removed"` in the inter-version lineage summary.
+   * Any patch in $S_{k-1}$ not referenced by any patch in $S_k$ is treated as `"removed"` in $S_k$.
 
 ---
 
