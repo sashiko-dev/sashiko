@@ -3804,10 +3804,21 @@ async fn process_parsed_article(
             }
             Ok(None) => {}
             Err(e) => {
-                warn!(
+                let err_msg = format!(
                     "Failed to check in-thread follow-up version for {}: {}",
                     metadata.message_id, e
                 );
+                error!("{}", err_msg);
+                fail_fetching_patchset_logged(worker_db, &root_msg_id, &err_msg).await;
+                if root_msg_id != metadata.message_id {
+                    fail_fetching_patchset_logged(worker_db, &metadata.message_id, &err_msg).await;
+                }
+                if let Some(ref reply_to) = metadata.in_reply_to
+                    && reply_to != &root_msg_id
+                {
+                    fail_fetching_patchset_logged(worker_db, reply_to, &err_msg).await;
+                }
+                return ProcessStatus::Error;
             }
         }
     }

@@ -6663,7 +6663,10 @@ impl Database {
             if cover_msg_id.as_deref() == Some(message_id)
                 || self.patchset_holds_message(ps_id, message_id).await?
             {
-                return Ok(existing_version.filter(|&v| v > 1));
+                if let Some(v) = existing_version.filter(|&v| v > 1) {
+                    return Ok(Some(v));
+                }
+                continue;
             }
 
             if total_parts == 1
@@ -6684,8 +6687,8 @@ impl Database {
             .query(
                 "SELECT p.git_patch_id, p.diff FROM patches p \
                  JOIN patchsets ps ON p.patchset_id = ps.id \
-                 WHERE ps.thread_id = ?",
-                libsql::params![thread_id],
+                 WHERE ps.thread_id = ? AND p.message_id != ?",
+                libsql::params![thread_id, message_id],
             )
             .await?;
 
@@ -6706,8 +6709,8 @@ impl Database {
 
         let next_version = crate::patch::parse_subject_version(subject)
             .filter(|&v| v > max_version)
-            .unwrap_or(max_version + 1);
-        Ok(Some(next_version))
+            .or_else(|| max_version.checked_add(1));
+        Ok(next_version)
     }
 
     /// Determine whether an incoming message's version tag is compatible with an
@@ -20276,6 +20279,71 @@ mod tests {
             .await
             .unwrap(),
             Some(2)
+        );
+
+        // Even if a Fetching placeholder row already exists for reply_msg in the
+        // same thread, promotion to v2 still succeeds.
+        db.create_message(
+            reply_msg,
+            thread_id,
+            Some(root_msg),
+            author,
+            reply_subject,
+            1001,
+            v2_diff,
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, status, total_parts, received_parts) \
+                 VALUES (?, ?, 'Fetching thread', 'Loading...', 1001, 'Fetching', 1, 0)",
+                libsql::params![thread_id, reply_msg],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.find_in_thread_followup_version(
+                thread_id,
+                reply_msg,
+                author,
+                reply_subject,
+                Some("patchid-v2"),
+                v2_diff,
+            )
+            .await
+            .unwrap(),
+            Some(2)
+        );
+
+        // Overflowing u32::MAX returns None rather than panicking or wrapping.
+        let max_ver_subject = format!(
+            "[PATCH v{}] lra: Handle subregs in get_dependent_filter.",
+            u32::MAX
+        );
+        db.conn
+            .execute(
+                "UPDATE patchsets SET subject = ? WHERE id = ?",
+                libsql::params![max_ver_subject, ps1],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.find_in_thread_followup_version(
+                thread_id,
+                reply_msg,
+                author,
+                reply_subject,
+                Some("patchid-v2"),
+                v2_diff,
+            )
+            .await
+            .unwrap(),
+            None
         );
     }
 
