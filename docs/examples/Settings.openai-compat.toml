@@ -1,5 +1,10 @@
+# Any endpoint that implements the OpenAI chat completions API. Export
+# OPENAI_API_KEY (or LLM_API_KEY) if the endpoint needs a key.
+# Setup: docs/llm-providers.md, section "OpenAI-Compatible Providers".
+
 [ai]
-# Can be "openai" or "openai-compatible"
+# "openai-compatible" sends max_tokens; "openai" is for OpenAI's own API
+# and sends max_completion_tokens instead (see Settings.openai-api.toml).
 provider = "openai-compatible"
 model = "gemma-xyz"
 
@@ -7,15 +12,19 @@ model = "gemma-xyz"
 base_url = "http://localhost:8080/v1"
 context_window_size = 8192
 max_tokens = 2048
-# Sent as the reasoning_effort request field. Left unset the field is omitted,
-# which is what an endpoint that does not implement it needs -- some reject
-# the whole request over an unknown field. Set it only for a reasoning model on an
-# endpoint documented to accept it, and raise max_tokens above when you do:
-# an endpoint that spends reasoning tokens from that same cap returns an empty
-# reply once thinking exhausts it, which the run reports as truncated output.
+# Sent as the reasoning_effort request field. Left unset the field is
+# omitted, which is what an endpoint that does not implement it needs --
+# some reject the whole request over an unknown field. Set it only for a
+# reasoning model on an endpoint documented to accept it, and raise
+# max_tokens above when you do: an endpoint that spends reasoning tokens
+# from that same cap returns an empty reply once thinking exhausts it,
+# which the run reports as truncated output.
 # effort = "medium"
 
 # Send a thinking model's reasoning back as reasoning_content on later
 # assistant turns. DeepSeek and Kimi reject a tool-call follow-up without
 # it; leave it off for endpoints that reject unknown message fields.
 # send_reasoning_content = true
+
+[review]
+concurrency = 4

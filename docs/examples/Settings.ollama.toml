@@ -1,9 +1,17 @@
+# Local models served by Ollama (no API key).
+# Setup: docs/llm-providers.md, section "Ollama".
+
 [ai]
 provider = "ollama"
 model = "deepseek-v3"
-max_input_tokens = 32768
+# Leave room below context_window_size for the reply (max_tokens,
+# 4096 by default).
+max_input_tokens = 28672
 
 [ai.ollama]
 base_url = "http://localhost:11434"
+# Sent as Ollama's num_ctx.
 context_window_size = 32768
-think = "medium"
+
+[review]
+concurrency = 4

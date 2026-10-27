@@ -1,3 +1,6 @@
+# goose in front of a local OpenAI-compatible server (no API key).
+# Setup: docs/llm-providers.md, section "goose".
+
 [ai]
 provider = "goose"
 # Model identifier the goose backend serves. For a local vLLM server this is

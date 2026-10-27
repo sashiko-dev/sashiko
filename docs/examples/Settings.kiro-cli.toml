@@ -1,3 +1,6 @@
+# Kiro CLI (KIRO_API_KEY or browser login).
+# Setup: docs/llm-providers.md, section "Kiro CLI".
+
 [ai]
 provider = "kiro-cli"
 model = "claude-opus-4.6"
@@ -7,3 +10,6 @@ api_timeout_secs = 300
 binary = "kiro-cli"
 context_window_size = 200000
 # agent = "my-custom-agent"
+
+[review]
+concurrency = 4

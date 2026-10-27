@@ -1,3 +1,7 @@
+# Claude on Google Cloud Vertex AI. Needs a build with --features vertex:
+# without it the [ai.vertex] table below is rejected as an unknown field.
+# Setup: docs/llm-providers.md, section "Google Cloud Vertex AI".
+
 [ai]
 provider = "vertex"
 model = "claude-sonnet-4-6"
@@ -6,7 +10,12 @@ max_input_tokens = 40000
 [ai.vertex]
 prompt_caching = true
 max_tokens = 8192
-# project_id = "my-gcp-project" # Optional: Falls back to ANTHROPIC_VERTEX_PROJECT_ID
-# region = "us-east5"           # Optional: Falls back to CLOUD_ML_REGION
-# thinking = "adaptive"
-# effort = "high"
+# Falls back to ANTHROPIC_VERTEX_PROJECT_ID, then GOOGLE_CLOUD_PROJECT.
+# project_id = "my-gcp-project"
+# Falls back to CLOUD_ML_REGION, then GOOGLE_CLOUD_LOCATION, then us-east5.
+# region = "us-east5"
+# thinking = "adaptive"   # or "disabled" where the model allows it
+# effort = "high"         # "low", "medium", "high", "xhigh", "max"
+
+[review]
+concurrency = 4

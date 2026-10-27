@@ -1,3 +1,15 @@
+# Codex CLI (OpenAI subscription auth, no API key). Requires the codex
+# CLI installed, on $PATH, and authenticated.
+# Setup: docs/llm-providers.md, section "Codex CLI".
+
 [ai]
 provider = "codex-cli"
-model = "gpt-4o"
+model = "gpt-5-codex"
+
+[ai.codex_cli]
+# Reasoning effort: "none", "minimal", "low", "medium", "high", "xhigh",
+# "max". Unset accepts the account default.
+# effort = "xhigh"
+
+[review]
+concurrency = 4
