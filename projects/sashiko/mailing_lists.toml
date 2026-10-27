@@ -1,5 +1,6 @@
 # Per-mailing-list configuration for Sashiko (--project sashiko).
-# Sashiko reviews are ingested via GitHub webhooks rather than NNTP mailing lists.
+# Sashiko reviews are ingested via GitHub webhooks rather than NNTP
+# mailing lists.
 
 [defaults]
 track = false
