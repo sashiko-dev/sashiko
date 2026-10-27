@@ -921,19 +921,27 @@ fn find_opaque_types(
     )
     .unwrap();
     let scoped_re = Regex::new(r"\b([A-Za-z_]\w*)\s*::\s*(\w+)").unwrap();
+    let member_access_re = Regex::new(r"\b([A-Za-z_]\w*)\s*(?:->|\.)\s*(\w+)").unwrap();
 
     for file in file_ranges.keys() {
         let Some(content) = snapshot.blobs.get(Path::new(file)) else {
             continue;
         };
+        let content = content.as_ref();
 
-        let mut var_to_type: Vec<(String, String)> = Vec::new();
+        let mut var_to_types: HashMap<&str, HashSet<&str>> = HashMap::new();
         for decl_re in [&ptr_decl_re, &val_decl_re] {
             for cap in decl_re.captures_iter(content) {
-                let type_name = &cap[1];
-                let var_name = &cap[2];
+                let Some(type_match) = cap.get(1) else {
+                    continue;
+                };
+                let Some(var_match) = cap.get(2) else {
+                    continue;
+                };
+                let type_name = type_match.as_str();
+                let var_name = var_match.as_str();
                 if type_members.contains_key(type_name) && !is_common_c_word(var_name) {
-                    var_to_type.push((var_name.to_string(), type_name.to_string()));
+                    var_to_types.entry(var_name).or_default().insert(type_name);
                 }
             }
         }
@@ -944,12 +952,15 @@ fn find_opaque_types(
             }
         }
 
-        for (var, typ) in &var_to_type {
-            let pattern = format!(r"\b{}\s*(?:->|\.)\s*(\w+)", regex::escape(var));
-            if let Ok(re) = Regex::new(&pattern) {
-                for cap in re.captures_iter(content) {
-                    let member = cap[1].to_string();
-                    type_members.get_mut(typ.as_str()).unwrap().insert(member);
+        if !var_to_types.is_empty() {
+            for cap in member_access_re.captures_iter(content) {
+                if let Some(bound_types) = var_to_types.get(&cap[1]) {
+                    let member = &cap[2];
+                    for &typ in bound_types {
+                        if let Some(members) = type_members.get_mut(typ) {
+                            members.insert(member.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -1208,5 +1219,52 @@ struct MyStruct {
         assert!(is_non_c_dsl_or_table_file("gcc/config/i386/i386.md"));
         assert!(is_non_c_dsl_or_table_file("gcc/fortran/resolve.f90"));
         assert!(!is_non_c_dsl_or_table_file("gcc/tree-vect-stmts.cc"));
+    }
+
+    #[test]
+    fn test_find_opaque_types_single_pass_member_detection() {
+        let types: HashSet<String> = [
+            "OpaqueHandle",
+            "PrivOnlyBox",
+            "UsedStruct",
+            "UsedByValue",
+            "ScopedClass",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        let mut file_ranges = HashMap::new();
+        file_ranges.insert("gcc/foo.cc".to_string(), vec![(0, 20)]);
+
+        let mut blobs = HashMap::new();
+        blobs.insert(
+            PathBuf::from("gcc/foo.cc"),
+            Arc::<str>::from(
+                r#"
+void f(const struct OpaqueHandle *handle, struct PrivOnlyBox *box_ptr) {
+    struct UsedStruct *item = get_item();
+    struct UsedStruct *item = get_other_item();
+    UsedByValue local_val = make_val();
+    pass_along(handle);
+    use_priv(box_ptr->priv_data);
+    item->count += 1;
+    local_val.field = ScopedClass::static_member;
+}
+"#,
+            ),
+        );
+        let snapshot = SourceSnapshot {
+            repository: Path::new("."),
+            sha: "0".repeat(40),
+            blobs,
+        };
+
+        let opaque = find_opaque_types(&types, &file_ranges, &snapshot);
+        assert!(opaque.contains("OpaqueHandle"));
+        assert!(opaque.contains("PrivOnlyBox"));
+        assert!(!opaque.contains("UsedStruct"));
+        assert!(!opaque.contains("UsedByValue"));
+        assert!(!opaque.contains("ScopedClass"));
     }
 }
