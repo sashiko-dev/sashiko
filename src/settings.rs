@@ -1535,6 +1535,14 @@ mod tests {
                 .expect("Production 'Settings.toml' must satisfy the daemon");
             crate::ai::create_provider_from_ai(&settings.ai)
                 .expect("Production 'Settings.toml' must name a usable provider");
+
+            // Its commented-out alternatives must load once uncommented too.
+            let temp = tempfile::tempdir().unwrap();
+            let uncommented = temp.path().join("Settings.toml");
+            let text = std::fs::read_to_string(path).unwrap();
+            std::fs::write(&uncommented, uncomment_examples(&text)).unwrap();
+            Settings::load(Some(&uncommented))
+                .expect("Production 'Settings.toml' uncommented failed to load");
         }
     }
 
