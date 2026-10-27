@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use crate::ai::AiMessage;
 
 use super::events::WorkflowEvent;
-use super::graph::{StageResolver, Workflow, WorkflowStep};
+use super::graph::{Workflow, WorkflowStep};
 use super::policy::ParallelPolicy;
 use super::stage::{ExecutableStage, StageOutcome, WorkflowEnv};
 
@@ -200,13 +200,24 @@ impl WorkflowEngine {
                         }
                     };
                     record_stage_outcome(outcome, planner.name(), planner_outcome);
-                    resolve_and_execute_parallel(resolver, *policy, env, state, event_cb, outcome)
-                        .await?;
-                }
 
-                WorkflowStep::ResolveParallel { resolver, policy } => {
-                    resolve_and_execute_parallel(resolver, *policy, env, state, event_cb, outcome)
+                    let dynamic_stages = resolver(state);
+                    if let Some(cb) = event_cb {
+                        cb(WorkflowEvent::ParallelResolved {
+                            stage_names: dynamic_stages.iter().map(|s| s.name()).collect(),
+                        });
+                    }
+                    if !dynamic_stages.is_empty() {
+                        execute_parallel_batch(
+                            &dynamic_stages,
+                            *policy,
+                            env,
+                            state,
+                            event_cb,
+                            outcome,
+                        )
                         .await?;
+                    }
                 }
 
                 WorkflowStep::Branch {
@@ -259,26 +270,6 @@ impl WorkflowEngine {
         }
         Ok(())
     }
-}
-
-async fn resolve_and_execute_parallel<S: Send + Sync + 'static>(
-    resolver: &StageResolver<S>,
-    policy: ParallelPolicy,
-    env: &WorkflowEnv<'_>,
-    state: &mut S,
-    event_cb: Option<&(dyn Fn(WorkflowEvent) + Send + Sync)>,
-    outcome: &mut WorkflowOutcome,
-) -> Result<()> {
-    let dynamic_stages = resolver(state);
-    if let Some(cb) = event_cb {
-        cb(WorkflowEvent::ParallelResolved {
-            stage_names: dynamic_stages.iter().map(|s| s.name()).collect(),
-        });
-    }
-    if !dynamic_stages.is_empty() {
-        execute_parallel_batch(&dynamic_stages, policy, env, state, event_cb, outcome).await?;
-    }
-    Ok(())
 }
 
 async fn execute_parallel_batch<S: Send + Sync + 'static>(

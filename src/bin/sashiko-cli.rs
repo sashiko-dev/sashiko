@@ -2082,7 +2082,6 @@ async fn handle_local(
             baseline_ref,
             "--repo".to_string(),
             repo_path.to_string_lossy().to_string(),
-            "--current-tree".to_string(),
             // The worker resolves its own prompts, and without being told the
             // project it resolves the default one's.
             "--project".to_string(),

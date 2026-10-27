@@ -13,5 +13,4 @@ explicit_prompt_caching = false
 # Reviews run concurrently up to this many patches. Sized for one developer's
 # machine; the daemon's own Settings.toml uses a much larger fan-out.
 concurrency = 4
-# series_review_enabled = true  # Run 0/N cover letter and PR description reviews
 # effort = "mid"  # Options: "low", "mid" (default for Argon 4), "high", "dynamic"

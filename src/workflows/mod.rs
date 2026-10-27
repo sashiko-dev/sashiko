@@ -71,27 +71,22 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
         ProjectId::Linux => {
             let mut planned: Vec<String> = stage_names
                 .iter()
-                .filter(|n| linux_patch_review::any_analysis_stage_by_name(n).is_some())
+                .filter(|n| linux_patch_review::analysis_stage_by_name(n).is_some())
                 .map(|n| n.to_string())
                 .collect();
             if !planned.is_empty() {
-                let is_cover_only =
-                    planned.len() == 1 && planned[0] == linux_patch_review::SERIES_ANALYSIS.name;
                 planned.extend(
                     linux_patch_review::CONSOLIDATION_STAGES
                         .iter()
                         .map(|s| s.name.to_string()),
                 );
-                if is_cover_only {
-                    planned.push(linux_patch_review::SUMMARY.name.to_string());
-                }
             }
             planned
         }
         ProjectId::Sashiko => {
             let mut planned: Vec<String> = stage_names
                 .iter()
-                .filter(|n| sashiko_patch_review::any_analysis_stage_by_name(n).is_some())
+                .filter(|n| sashiko_patch_review::analysis_stage_by_name(n).is_some())
                 .map(|n| n.to_string())
                 .collect();
             if !planned.is_empty() {
@@ -106,23 +101,15 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
         ProjectId::Gcc => {
             let mut planned: Vec<String> = stage_names
                 .iter()
-                .filter(|n| {
-                    gcc_patch_review::analysis_stage_by_name(n).is_some()
-                        || **n == linux_patch_review::SERIES_ANALYSIS.name
-                })
+                .filter(|n| gcc_patch_review::analysis_stage_by_name(n).is_some())
                 .map(|n| n.to_string())
                 .collect();
             if !planned.is_empty() {
-                let is_cover_only =
-                    planned.len() == 1 && planned[0] == linux_patch_review::SERIES_ANALYSIS.name;
                 planned.extend(
                     gcc_patch_review::CONSOLIDATION_STAGES
                         .iter()
                         .map(|s| s.name.to_string()),
                 );
-                if is_cover_only {
-                    planned.push(linux_patch_review::SUMMARY.name.to_string());
-                }
             }
             planned
         }

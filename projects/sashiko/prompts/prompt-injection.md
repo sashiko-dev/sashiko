@@ -81,17 +81,6 @@ Know these before changing anything near them.
 - **Secret redaction** — `redact_secret` in `src/fetcher.rs` keeps tokens
   embedded in git URLs out of logs.
 
-- **Cover letter and PR description prose** — the one deliberate widening of
-  forge and email context beyond the diff and commit message. A 0/N cover
-  letter body or PR description (and the previous version's) reaches the
-  model only through `build_cover_review_context` in `src/worker/prompts.rs`,
-  which substitutes it as a prompt variable (never rescanned for directives)
-  inside `<cover_letter_body source="author-supplied prose...">` fencing,
-  bounded in lines and bytes, with any literal closing tag defused. Storing
-  the body (`update_message_body` from the forge webhook, `messages.body` for
-  email) is not by itself a widening; a new place that renders it into a
-  prompt without that fence is.
-
 ## What to check in a diff
 
 Report a finding if a change does any of the following without a compensating
@@ -107,11 +96,10 @@ control:
   somewhere the template later interprets.
 - Moves include resolution, or any directive parsing, to **after** variable
   substitution.
-- Adds **PR or email prose** — a title, body, or comment — into a prompt
-  anywhere other than the fenced series review context above. For per-patch
-  reviews only the diff and the commit message enter the model context.
-  Widening that is a deliberate decision that needs its own fencing, not an
-  incidental one.
+- Adds **PR or email prose** — a title, body, or comment — into a prompt. Today
+  only the diff and the commit message enter the model context for forge
+  reviews. Widening that is a deliberate decision that needs its own fencing,
+  not an incidental one.
 - Loosens the **prompt path sanitizers** (`sanitize_guide_path` /
   `sanitize_prompt_relpath`), or adds another place where model output becomes a
   filename, an identifier, or a lookup key without going through those prompt

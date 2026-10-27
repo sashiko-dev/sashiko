@@ -6643,7 +6643,6 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 .into_owned(),
         );
         settings.review.ignore_files = vec!["value.txt".to_string()];
-        settings.review.series_review_enabled = false;
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;
