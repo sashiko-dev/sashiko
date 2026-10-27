@@ -91,7 +91,7 @@ Sashiko evaluates patches through specialized parallel analysis stages followed 
 - **[Sashiko in the Press](PRESS.md)** — quotes from Linux kernel maintainers on LKML and press coverage.
 - **[LLM Provider Configuration](docs/llm-providers.md)** — setup instructions for Gemini, Claude, OpenAI, Bedrock, Vertex AI, and CLI providers.
 - **[Running the Daemon (Server Mode)](docs/daemon.md)** — building from source, monitoring mailing lists (NNTP) and forges, Web UI, `sashiko-cli`, and server ACL security.
-- **[Configuration Reference](docs/configuration.md)** — complete reference for `Settings.toml`, `email_policy.toml`, Patchwork integration, and environment variables.
+- **[Configuration Reference](docs/configuration.md)** — complete reference for `Settings.toml`, `projects/<project>/mailing_lists.toml`, Patchwork integration, and environment variables.
 - **[CLI Reference (`sashiko-cli`)](docs/sashiko-cli.md)** — submitting patches and querying status on a running Sashiko daemon.
 - **[Forge Setup Guide](docs/FORGE_SETUP.md)** *(Experimental)* — webhook integration for [GitHub](docs/GITHUB_SETUP.md), [GitLab](docs/GITLAB_SETUP.md), and [Webhook Security](docs/WEBHOOK_SECURITY.md).
 - **[Benchmarking Guide](docs/benchmarking.md)** — evaluating review accuracy against historical bugs.
