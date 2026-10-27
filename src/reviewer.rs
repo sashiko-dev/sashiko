@@ -451,7 +451,7 @@ impl Reviewer {
     fn latest_completed_reviews_by_part(
         reviews: Vec<crate::db::ReleaseReview>,
     ) -> Vec<crate::db::ReleaseReview> {
-        let mut by_part: std::collections::BTreeMap<(i64, Option<i64>), crate::db::ReleaseReview> =
+        let mut by_part: std::collections::BTreeMap<(i64, i64), crate::db::ReleaseReview> =
             std::collections::BTreeMap::new();
         for review in reviews {
             let key = (review.index, review.patch_id);
@@ -484,9 +484,6 @@ impl Reviewer {
         );
 
         for review in reviews {
-            let Some(patch_id) = review.patch_id else {
-                continue;
-            };
             let ps_msg_id = patchset
                 .message_id
                 .as_deref()
@@ -495,7 +492,7 @@ impl Reviewer {
                 ctx,
                 patchset.id,
                 Some(review.id),
-                patch_id,
+                review.patch_id,
                 &review.patch_message_id,
                 ps_msg_id,
                 review.index,
@@ -547,7 +544,7 @@ impl Reviewer {
         for (patch_id, idx, _diff, subj, _auth, _date, msg_id) in diffs {
             let matching_review = reviews
                 .iter()
-                .find(|r| r.patch_id == Some(*patch_id) || r.index == *idx);
+                .find(|r| r.patch_id == *patch_id || r.index == *idx);
             if *idx == 0 {
                 if let Some(r) = matching_review
                     && !r.summary.trim().is_empty()
@@ -2201,7 +2198,7 @@ impl Reviewer {
 
         let successful_count = ctx
             .db
-            .count_successful_reviews(patchset_id, Some(patch_id), baseline_id)
+            .count_successful_reviews(patchset_id, patch_id, baseline_id)
             .await?;
 
         if successful_count >= ctx.target_review_count {
@@ -2225,7 +2222,7 @@ impl Reviewer {
             if embargo_until.filter(|&u| u > now).is_none()
                 && let Some(review) = ctx
                     .db
-                    .get_latest_completed_review_for_patch(patchset_id, Some(patch_id))
+                    .get_latest_completed_review_for_patch(patchset_id, patch_id)
                     .await?
                 && review.has_inline_review
             {
@@ -2259,7 +2256,7 @@ impl Reviewer {
 
         if ctx
             .db
-            .has_failed_review(patchset_id, Some(patch_id), baseline_id)
+            .has_failed_review(patchset_id, patch_id, baseline_id)
             .await?
         {
             info!(

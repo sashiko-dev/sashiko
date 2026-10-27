@@ -1307,11 +1307,6 @@ mod tests {
                     part_index INTEGER,
                     diff TEXT
                 );
-                CREATE TABLE email_outbox (
-                    id INTEGER PRIMARY KEY,
-                    patch_id INTEGER,
-                    kind TEXT NOT NULL DEFAULT 'review_notification'
-                );
                 PRAGMA user_version = 11;",
             )
             .await?;

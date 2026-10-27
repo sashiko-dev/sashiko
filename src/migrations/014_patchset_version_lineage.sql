@@ -28,17 +28,3 @@ ALTER TABLE patches ADD COLUMN previous_patch_status TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_patches_previous_patch_id
     ON patches(previous_patch_id);
-
--- Cover-letter review email outbox linkage
-ALTER TABLE email_outbox ADD COLUMN patchset_id INTEGER REFERENCES patchsets(id);
-ALTER TABLE email_outbox ADD COLUMN review_id INTEGER REFERENCES reviews(id);
-
-CREATE INDEX IF NOT EXISTS idx_email_outbox_patchset_id
-    ON email_outbox(patchset_id);
-
-CREATE INDEX IF NOT EXISTS idx_email_outbox_review_id
-    ON email_outbox(review_id);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_email_outbox_cover_reply_unique
-    ON email_outbox(patchset_id)
-    WHERE patchset_id IS NOT NULL AND patch_id IS NULL AND kind = 'review_reply';
