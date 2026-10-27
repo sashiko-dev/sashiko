@@ -148,8 +148,12 @@ pub struct MaintainerSection {
     pub regexes: Vec<Regex>,
     /// `L:` mailing lists.
     pub mailing_lists: Vec<String>,
-    /// `M:` / `R:` maintainers and reviewers.
+    /// `M:` / `R:` maintainers and reviewers combined.
     pub maintainers: Vec<String>,
+    /// `M:` subsystem maintainers only.
+    pub m_maintainers: Vec<String>,
+    /// `R:` designated subsystem reviewers only.
+    pub r_reviewers: Vec<String>,
     /// `T:` SCM source trees.
     pub trees: Vec<(String, Option<String>)>,
     /// Whether a file pattern claims the whole tree, which in the current file
@@ -202,6 +206,20 @@ impl MaintainerSection {
         self.maintainers
             .iter()
             .filter_map(|m| maintainer_address(m))
+    }
+
+    /// The addresses listed specifically on `M:` lines.
+    pub fn m_maintainer_addresses(&self) -> impl Iterator<Item = String> + '_ {
+        self.m_maintainers
+            .iter()
+            .filter_map(|m| maintainer_address(m))
+    }
+
+    /// The addresses listed specifically on `R:` lines.
+    pub fn r_reviewer_addresses(&self) -> impl Iterator<Item = String> + '_ {
+        self.r_reviewers
+            .iter()
+            .filter_map(|r| maintainer_address(r))
     }
 
     /// Checks if a file path matches this section.
@@ -375,9 +393,9 @@ impl<'a> FileMatcher<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct MaintainersIndex {
     sections: Vec<MaintainerSection>,
-    /// Every section title an address is listed against, keyed by lowercased
-    /// address. Built once so that resolving a caller's authority costs one
-    /// hash lookup rather than a scan of several thousand sections.
+    /// Every section title an address is listed against (`M:` or `R:`), keyed
+    /// by lowercased address. Built once so that resolving a caller's authority
+    /// costs one hash lookup rather than a scan of several thousand sections.
     subsystems_by_address: HashMap<String, BTreeSet<String>>,
     /// Addresses listed on a section that claims the whole tree.
     global_addresses: HashSet<String>,
@@ -494,6 +512,8 @@ impl MaintainersIndex {
         let mut current_regexes = Vec::new();
         let mut current_lists = Vec::new();
         let mut current_maintainers = Vec::new();
+        let mut current_m_maintainers = Vec::new();
+        let mut current_r_reviewers = Vec::new();
         let mut current_trees = Vec::new();
         let mut current_catch_all = false;
 
@@ -524,9 +544,21 @@ impl MaintainersIndex {
                         regexes: std::mem::take(&mut current_regexes),
                         mailing_lists: std::mem::take(&mut current_lists),
                         maintainers: std::mem::take(&mut current_maintainers),
+                        m_maintainers: std::mem::take(&mut current_m_maintainers),
+                        r_reviewers: std::mem::take(&mut current_r_reviewers),
                         trees: std::mem::take(&mut current_trees),
                         catch_all: std::mem::take(&mut current_catch_all),
                     });
+                } else {
+                    current_files.clear();
+                    current_excludes.clear();
+                    current_regexes.clear();
+                    current_lists.clear();
+                    current_maintainers.clear();
+                    current_m_maintainers.clear();
+                    current_r_reviewers.clear();
+                    current_trees.clear();
+                    current_catch_all = false;
                 }
                 current_name.clear();
                 continue;
@@ -570,8 +602,13 @@ impl MaintainersIndex {
                             current_lists.push(email);
                         }
                     }
-                    "M" | "R" => {
+                    "M" => {
                         current_maintainers.push(val.to_string());
+                        current_m_maintainers.push(val.to_string());
+                    }
+                    "R" => {
+                        current_maintainers.push(val.to_string());
+                        current_r_reviewers.push(val.to_string());
                     }
                     "T" => {
                         if let Some(rest) = val.strip_prefix("git ") {
@@ -607,6 +644,8 @@ impl MaintainersIndex {
                 regexes: current_regexes,
                 mailing_lists: current_lists,
                 maintainers: current_maintainers,
+                m_maintainers: current_m_maintainers,
+                r_reviewers: current_r_reviewers,
                 trees: current_trees,
                 catch_all: current_catch_all,
             });
@@ -1097,5 +1136,30 @@ F:	*/
     fn test_sections_for_diff_without_file_names() {
         assert!(sections_for_diff("").is_empty());
         assert!(sections_for_diff("just a cover letter body\n").is_empty());
+    }
+
+    #[test]
+    fn test_m_maintainers_and_r_reviewers_distinguished() {
+        let content = "\
+Maintainers List
+----------------
+
+SUBSYSTEM ALPHA
+M:\tPrimary Maintainer <maint@example.com>
+R:\tDesignated Reviewer <rev@example.com>
+F:\tdrivers/alpha/
+";
+        let idx = MaintainersIndex::from_reader(content.as_bytes()).unwrap();
+        let section = &idx.sections()[0];
+        assert_eq!(
+            section.m_maintainer_addresses().collect::<Vec<_>>(),
+            vec!["maint@example.com".to_string()]
+        );
+        assert_eq!(
+            section.r_reviewer_addresses().collect::<Vec<_>>(),
+            vec!["rev@example.com".to_string()]
+        );
+        assert!(idx.subsystems_for_address("maint@example.com").is_some());
+        assert!(idx.subsystems_for_address("rev@example.com").is_some());
     }
 }

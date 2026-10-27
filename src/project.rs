@@ -94,6 +94,23 @@ impl ProjectId {
         }
     }
 
+    /// Automated bots whose reports are trusted in prior-version feedback.
+    ///
+    /// Build and fuzzing bots report mechanically observed failures (compiler
+    /// errors, sanitizer splats with reproducers), so their claims are
+    /// almost always right. Only addresses listed here earn that trust;
+    /// every other bot-like identity stays low trust.
+    pub fn trusted_bots(self) -> crate::authority::TrustedBots {
+        match self {
+            ProjectId::Linux => {
+                crate::authority::TrustedBots(&["lkp@intel.com", "*@syzkaller.appspotmail.com"])
+            }
+            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu => {
+                crate::authority::TrustedBots(&[])
+            }
+        }
+    }
+
     /// The path to the file holding this project's tracked mailing lists and
     /// outbound email routing policy.
     pub fn mailing_lists_path(self) -> &'static str {

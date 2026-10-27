@@ -18,6 +18,7 @@ pub mod access;
 pub mod ai;
 pub mod api;
 pub mod auth;
+pub mod authority;
 #[cfg(feature = "server")]
 pub mod backfill;
 pub mod baseline;
