@@ -1397,6 +1397,11 @@ pub struct FetchQueueRow {
     pub created_at: i64,
 }
 
+/// Maximum age of a predecessor linked only by its subject for the new
+/// version to cancel it while it is still in flight.
+#[cfg(feature = "server")]
+const SUBJECT_SUPERSEDE_MAX_AGE_SECS: i64 = 30 * 86400;
+
 /// How far back an exact subject match may find a previous version.
 #[cfg(feature = "server")]
 const SUBJECT_LINK_WINDOW_SECS: i64 = 120 * 86400;
@@ -1426,6 +1431,26 @@ impl VersionLinkSignal {
             Self::ChangeId => "change_id",
             Self::MessageRef => "message_ref",
             Self::SubjectAuthor => "subject_author",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "change_id" => Some(Self::ChangeId),
+            "message_ref" => Some(Self::MessageRef),
+            "subject_author" => Some(Self::SubjectAuthor),
+            _ => None,
+        }
+    }
+
+    /// Whether a link through this signal is strong enough to cancel a
+    /// predecessor posted `age_secs` before the new version. An explicit
+    /// change-id or body link always is; a subject match only within the
+    /// 30 days the superseding logic used before version lineage.
+    fn supersedes(self, age_secs: i64) -> bool {
+        match self {
+            Self::ChangeId | Self::MessageRef => true,
+            Self::SubjectAuthor => age_secs <= SUBJECT_SUPERSEDE_MAX_AGE_SECS,
         }
     }
 
@@ -11989,6 +12014,20 @@ impl Database {
         self.reconcile_patch_lineage(pred.id, ctx.patchset_id)
             .await?;
 
+        // A link supersedes when it is newly established or when its signal
+        // upgrades from one that did not supersede at age_secs (for example,
+        // subject_author beyond 30 days) to one that does (change_id or
+        // message_ref). Repeated runs with a signal that already superseded
+        // leave the predecessor alone so an explicit rerun is respected.
+        // Nothing beyond the direct predecessor is ever cancelled.
+        let age_secs = ctx.date.saturating_sub(pred.date);
+        let previously_superseded = !is_new_link
+            && existing_signal
+                .and_then(VersionLinkSignal::from_str)
+                .is_some_and(|prev_sig| prev_sig.supersedes(age_secs));
+        if previously_superseded || !signal.supersedes(age_secs) {
+            return Ok(0);
+        }
         // cancel_patchset only cancels a patchset (and its pending outbox)
         // while it is still in flight.
         if self.cancel_patchset(pred.id, true).await? {
@@ -29372,6 +29411,111 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
             .map(|v| v["id"].as_i64().unwrap())
             .collect();
         assert_eq!(chain, vec![ps_v1, ps_v2, ps_v3, ps_v4]);
+    }
+
+    /// Superseding cancels only the predecessor of a new link, never its
+    /// own predecessors, never an explicitly rerun predecessor of an
+    /// existing link, and a subject-only link only within 30 days.
+    #[tokio::test]
+    async fn test_version_lineage_supersedes_only_new_direct_predecessor() {
+        let db = setup_db().await;
+        let author = "Heidi <heidi@example.org>";
+        let subject_v1 = "[PATCH] spi: fsl: release the DMA channels on remove";
+        let subject_v2 = "[PATCH v2] spi: fsl: release the DMA channels on remove";
+        let subject_v3 = "[PATCH v3] spi: fsl: release the DMA channels on remove";
+        let d0 = 1_790_000_000;
+
+        let ps_v1 = ingest_test_series(
+            &db,
+            author,
+            d0,
+            None,
+            &[TestPart::new("heidi-v1@example.org", subject_v1)],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_v1, "Pending").await.unwrap();
+
+        // An exact subject 45 days later links but is too old to supersede.
+        let ps_v2 = ingest_test_series(
+            &db,
+            author,
+            d0 + 45 * DAY,
+            None,
+            &[TestPart::new("heidi-v2@example.org", subject_v2)],
+            None,
+        )
+        .await;
+        assert_linked(&db, ps_v2, ps_v1, "subject_author").await;
+        assert_status(&db, ps_v1, "Pending").await;
+        db.update_patchset_status(ps_v2, "Pending").await.unwrap();
+
+        // v3 supersedes v2 within 30 days, but not v1 transitively.
+        let ps_v3 = ingest_test_series(
+            &db,
+            author,
+            d0 + 50 * DAY,
+            None,
+            &[TestPart::new("heidi-v3@example.org", subject_v3)],
+            None,
+        )
+        .await;
+        assert_linked(&db, ps_v3, ps_v2, "subject_author").await;
+        assert_status(&db, ps_v2, "Cancelled").await;
+        assert_status(&db, ps_v1, "Pending").await;
+
+        // An explicit rerun of v2 is respected when v3 is reconciled again
+        // with the same link.
+        db.rerun_patchset(ps_v2).await.unwrap();
+        assert_status(&db, ps_v2, "Pending").await;
+        db.reconcile_version_lineage(ps_v3).await.unwrap();
+        assert_linked(&db, ps_v3, ps_v2, "subject_author").await;
+        assert_status(&db, ps_v2, "Pending").await;
+
+        // An explicit previous-version link supersedes regardless of age.
+        let ps_old = ingest_test_series(
+            &db,
+            author,
+            d0,
+            None,
+            &[TestPart::new(
+                "heidi-old-v1@example.org",
+                "[PATCH] spi: fsl: fix the chip select polarity",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_old, "Pending").await.unwrap();
+        let ps_new = ingest_test_series(
+            &db,
+            author,
+            d0 + 90 * DAY,
+            None,
+            &[TestPart::new(
+                "heidi-new-v2@example.org",
+                "[PATCH v2] spi: fsl: honour the chip select polarity from DT",
+            )
+            .body("Rework.\n---\nv1: https://lore.kernel.org/all/heidi-old-v1@example.org/\n")],
+            None,
+        )
+        .await;
+        assert_linked(&db, ps_new, ps_old, "message_ref").await;
+        assert_status(&db, ps_old, "Cancelled").await;
+
+        // Upgrading a >30d link from subject_author to change_id supersedes
+        // the predecessor once, and respects a later rerun.
+        db.set_patchset_change_id_if_unset(ps_v1, "heidi-dma-series")
+            .await
+            .unwrap();
+        db.set_patchset_change_id_if_unset(ps_v2, "heidi-dma-series")
+            .await
+            .unwrap();
+        assert_linked(&db, ps_v2, ps_v1, "change_id").await;
+        assert_status(&db, ps_v1, "Cancelled").await;
+        db.rerun_patchset(ps_v1).await.unwrap();
+        assert_status(&db, ps_v1, "Pending").await;
+        db.reconcile_version_lineage(ps_v2).await.unwrap();
+        assert_status(&db, ps_v1, "Pending").await;
     }
 
     #[test]
