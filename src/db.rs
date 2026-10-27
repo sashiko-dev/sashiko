@@ -7237,9 +7237,6 @@ impl Database {
                     && existing_total == 1
                     && subject_index == 1
                     && !patches_reply_to_new_cover
-                    && !Self::get_msgid_candidates(&clid)
-                        .iter()
-                        .any(|c| c == message_id.trim())
                     && !Self::has_explicit_zero_index(subject);
                 let is_reply_msg =
                     (part_index == 0 && Self::is_reply_subject(subject)) || is_singleton_non_cover;
@@ -7920,11 +7917,6 @@ impl Database {
                 && matches[0].total_parts == 1
                 && current_subject_index == 1
                 && !matches[0].patches_reply_to_new_cover
-                && !matches[0].cover_id.as_deref().is_some_and(|cid| {
-                    Self::get_msgid_candidates(cid)
-                        .iter()
-                        .any(|c| c == message_id.trim())
-                })
                 && !Self::has_explicit_zero_index(subject);
             let is_reply_msg =
                 (part_index == 0 && Self::is_reply_subject(subject)) || is_singleton_non_cover;
@@ -30106,161 +30098,6 @@ mod tests {
             )
             .await?;
         assert!(meta_rows.next().await?.is_none());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_singleton_cover_after_patch_updates_metadata_in_step1() -> Result<()> {
-        let db = setup_db().await;
-        let root_msg_id = "pr-99-aaa..bbb@sashiko.local";
-        let commit_msg_id = "bbb@sashiko.local";
-        let thread_id = db.ensure_thread_for_message(root_msg_id, 1000).await?;
-
-        // 1. Webhook creates placeholder patchset for a 1-commit PR.
-        let ps_id = db
-            .create_fetching_patchset(
-                root_msg_id,
-                "(placeholder)",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await?;
-
-        // 2. Commit 1/1 arrives first, replacing placeholder subject with commit subject
-        // and setting subject_index = 1.
-        let ps_id_from_commit = db
-            .create_patchset(
-                thread_id,
-                Some(root_msg_id),
-                commit_msg_id,
-                "[PATCH] internal commit subject",
-                "Commit Author <commit@example.com>",
-                1001,
-                1,
-                1,
-                "",
-                "",
-                None,
-                1,
-                None,
-                false,
-                None,
-                None,
-            )
-            .await?
-            .unwrap();
-        assert_eq!(ps_id_from_commit, ps_id);
-
-        // 3. PR cover message (part_index = 0, without explicit 0/1 prefix) arrives next
-        // with message_id == cover_letter_message_id == root_msg_id. Step 1 must recognize
-        // it as the designated cover message rather than a non-cover reply.
-        let ps_id_from_cover = db
-            .create_patchset(
-                thread_id,
-                Some(root_msg_id),
-                root_msg_id,
-                "[PR #99 v2] Actual PR title",
-                "PR Author <pr@example.com>",
-                1002,
-                1,
-                1,
-                "maint@example.com",
-                "list@example.com",
-                Some(2),
-                0,
-                None,
-                false,
-                None,
-                None,
-            )
-            .await?
-            .unwrap();
-        assert_eq!(ps_id_from_cover, ps_id);
-
-        let mut rows = db
-            .conn
-            .query(
-                "SELECT subject, subject_index, author, to_recipients, cc_recipients, version
-                   FROM patchsets WHERE id = ?",
-                libsql::params![ps_id],
-            )
-            .await?;
-        let row = rows.next().await?.unwrap();
-        assert_eq!(row.get::<String>(0)?, "[PR #99 v2] Actual PR title");
-        assert_eq!(row.get::<i64>(1)?, 0);
-        assert_eq!(row.get::<String>(2)?, "PR Author <pr@example.com>");
-        assert_eq!(row.get::<String>(3)?, "maint@example.com");
-        assert_eq!(row.get::<String>(4)?, "list@example.com");
-        assert_eq!(row.get::<i64>(5)?, 2);
-
-        // 4. Conversely, a non-cover mailing-list reply without "Re:" (different message_id)
-        // on a singleton series must still be treated as a reply and NOT overwrite metadata.
-        let ml_thread = db
-            .ensure_thread_for_message("ml_single@kernel.org", 2000)
-            .await?;
-        let ml_ps_id = db
-            .create_patchset(
-                ml_thread,
-                Some("ml_single@kernel.org"),
-                "ml_single@kernel.org",
-                "[PATCH] singleton fix",
-                "Original <orig@kernel.org>",
-                2000,
-                1,
-                1,
-                "to@kernel.org",
-                "",
-                Some(1),
-                1,
-                None,
-                false,
-                None,
-                None,
-            )
-            .await?
-            .unwrap();
-        let ml_reply_ps_id = db
-            .create_patchset(
-                ml_thread,
-                Some("ml_reply@kernel.org"),
-                "ml_reply@kernel.org",
-                "[PATCH] singleton fix",
-                "Reviewer <rev@kernel.org>",
-                2005,
-                1,
-                1,
-                "other@kernel.org",
-                "",
-                Some(1),
-                0,
-                None,
-                false,
-                None,
-                None,
-            )
-            .await?
-            .unwrap();
-        assert_eq!(ml_reply_ps_id, ml_ps_id);
-
-        let mut ml_rows = db
-            .conn
-            .query(
-                "SELECT subject, subject_index, author, to_recipients, cover_letter_message_id
-                   FROM patchsets WHERE id = ?",
-                libsql::params![ml_ps_id],
-            )
-            .await?;
-        let ml_row = ml_rows.next().await?.unwrap();
-        assert_eq!(ml_row.get::<String>(0)?, "[PATCH] singleton fix");
-        assert_eq!(ml_row.get::<i64>(1)?, 1);
-        assert_eq!(ml_row.get::<String>(2)?, "Original <orig@kernel.org>");
-        assert_eq!(ml_row.get::<String>(3)?, "to@kernel.org");
-        assert_eq!(ml_row.get::<String>(4)?, "ml_single@kernel.org");
 
         Ok(())
     }

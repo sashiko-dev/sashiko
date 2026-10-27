@@ -674,10 +674,7 @@ impl FetchAgent {
                 .is_none()
         });
 
-        let mut tracker_cover: Option<(
-            crate::patch::B4TrackerCommit,
-            crate::git_ops::PatchMetadata,
-        )> = None;
+        let mut tracker_change_id: Option<String> = None;
         let mut leading_tracker_base: Option<String> = None;
         let mut real_patches = Vec::with_capacity(extracted.len());
 
@@ -689,8 +686,8 @@ impl FetchAgent {
                     if real_patches.is_empty() && leading_tracker_base.is_none() {
                         leading_tracker_base = meta.base_commit.clone();
                     }
-                    if tracker_cover.is_none() {
-                        tracker_cover = Some((t, meta));
+                    if tracker_change_id.is_none() {
+                        tracker_change_id = t.change_id;
                     }
                 } else {
                     real_patches.push((sha, meta));
@@ -710,54 +707,21 @@ impl FetchAgent {
         }
 
         let real_count = real_patches.len() as u32;
-        let mut events = Vec::with_capacity(real_patches.len() + 1);
+        let mut events = Vec::with_capacity(real_patches.len());
 
-        if let Some((tracker_info, tracker_meta)) = tracker_cover {
-            if let Some(ref cid) = tracker_info.change_id
-                && let Some((_, first_meta)) = real_patches.first_mut()
-                && !first_meta
-                    .message
-                    .to_ascii_lowercase()
-                    .contains("change-id:")
-            {
-                if !first_meta.message.is_empty() && !first_meta.message.ends_with('\n') {
-                    first_meta.message.push('\n');
-                }
-                first_meta
-                    .message
-                    .push_str(&format!("\nchange-id: {}", cid));
+        if let Some(ref cid) = tracker_change_id
+            && let Some((_, first_meta)) = real_patches.first_mut()
+            && !first_meta
+                .message
+                .to_ascii_lowercase()
+                .contains("change-id:")
+        {
+            if !first_meta.message.is_empty() && !first_meta.message.ends_with('\n') {
+                first_meta.message.push('\n');
             }
-
-            if tracker_info.edited_subject.is_some() || tracker_info.edited_body.is_some() {
-                let mut cover_body = tracker_info.edited_body.unwrap_or_default();
-                if !cover_body.is_empty()
-                    && let Some(ref cid) = tracker_info.change_id
-                    && !cover_body.to_ascii_lowercase().contains("change-id:")
-                {
-                    cover_body.push_str(&format!("\n\nchange-id: {}", cid));
-                }
-                let cover_subject = tracker_info
-                    .edited_subject
-                    .or_else(|| mr_title.clone())
-                    .or_else(|| real_patches.first().map(|(_, p)| p.subject.clone()))
-                    .unwrap_or(tracker_meta.subject);
-                events.push(Event::PatchSubmitted {
-                    group: "git-fetch".to_string(),
-                    article_id: article_id.to_string(),
-                    message_id: format!("{}@sashiko.local", article_id),
-                    subject: cover_subject,
-                    author: tracker_meta.author,
-                    message: cover_body,
-                    diff: String::new(),
-                    base_commit: leading_tracker_base.or(tracker_meta.base_commit),
-                    timestamp: tracker_meta.timestamp,
-                    index: 0,
-                    total: real_count,
-                    mr_url: mr_url.clone(),
-                    mr_title: mr_title.clone(),
-                    mr_number,
-                });
-            }
+            first_meta
+                .message
+                .push_str(&format!("\nchange-id: {}", cid));
         }
 
         for (i, (sha, meta)) in real_patches.into_iter().enumerate() {
@@ -1409,28 +1373,6 @@ mod tests {
         queue.entry(None).or_default().insert(range.clone());
         agent.process_queue(&mut queue).await;
 
-        let ev0 = rx.try_recv().expect("Expected index 0 cover event");
-        match ev0 {
-            Event::PatchSubmitted {
-                index,
-                total,
-                subject,
-                message,
-                diff,
-                base_commit,
-                ..
-            } => {
-                assert_eq!(index, 0);
-                assert_eq!(total, 1);
-                assert_eq!(subject, "Series cover title");
-                assert!(message.contains("Cover body paragraph."));
-                assert!(message.contains("change-id: 20260401-b4-range-112233445566"));
-                assert!(diff.is_empty());
-                assert_eq!(base_commit.as_deref(), Some(base_sha.as_str()));
-            }
-            other => panic!("Expected PatchSubmitted, got {:?}", other),
-        }
-
         let ev1 = rx.try_recv().expect("Expected index 1 patch event");
         match ev1 {
             Event::PatchSubmitted {
@@ -1438,6 +1380,7 @@ mod tests {
                 total,
                 subject,
                 message_id,
+                message,
                 base_commit,
                 ..
             } => {
@@ -1445,6 +1388,7 @@ mod tests {
                 assert_eq!(total, 1);
                 assert_eq!(subject, "subsys: real patch");
                 assert_eq!(message_id, head_sha);
+                assert!(message.contains("change-id: 20260401-b4-range-112233445566"));
                 assert_eq!(base_commit.as_deref(), Some(base_sha.as_str()));
             }
             other => panic!("Expected PatchSubmitted, got {:?}", other),

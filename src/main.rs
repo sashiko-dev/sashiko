@@ -899,8 +899,8 @@ async fn run_daemon(
         info!("Parser Dispatcher started");
         while let Some(event) = raw_rx.recv().await {
             // Forward pre-parsed events inline without spawning a separate task
-            // so multi-patch git-fetch series (0/N cover followed by 1..=N) are
-            // delivered to parsed_rx in strict FIFO order.
+            // so the patches of a multi-patch git-fetch series are delivered to
+            // parsed_rx in strict FIFO order.
             match event {
                 Event::IngestionFailed {
                     article_id,
@@ -947,10 +947,8 @@ async fn run_daemon(
                 } => {
                     let root_msg_id = format!("{}@sashiko.local", article_id);
 
-                    // For single commits where message_id is the root itself or 0/N
-                    // cover events, in_reply_to is None; range patches (message_id != root_msg_id)
-                    // reply to root_msg_id even when total == 1.
-                    let in_reply_to = if (total == 1 && message_id == root_msg_id) || index == 0 {
+                    // For single patches, we don't want a synthetic parent (the patch is the root)
+                    let in_reply_to = if total == 1 {
                         None
                     } else {
                         Some(root_msg_id.clone())
@@ -973,16 +971,12 @@ async fn run_daemon(
                         body: message.clone(),
                     };
 
-                    let patch = if index == 0 {
-                        None
-                    } else {
-                        Some(sashiko::patch::Patch {
-                            message_id,
-                            body: message,
-                            diff,
-                            part_index: index,
-                        })
-                    };
+                    let patch = Some(sashiko::patch::Patch {
+                        message_id,
+                        body: message,
+                        diff,
+                        part_index: index,
+                    });
 
                     let source = if group.starts_with("git-import") {
                         MessageSource::GitImport
@@ -3631,21 +3625,9 @@ async fn process_parsed_article(
     };
 
     let is_git_hash = article_id.len() == 40 && article_id.chars().all(|c| c.is_ascii_hexdigit());
-    let preserved_cover_body = if group == "git-fetch" && metadata.index == 0 {
-        worker_db
-            .get_message_body(&metadata.message_id)
-            .await
-            .ok()
-            .flatten()
-            .filter(|b| !b.trim().is_empty())
-    } else {
-        None
-    };
     // Only optimize storage (skip body) if it's a bulk git import where we have the archives
     let (body_to_store, git_hash_opt) = if is_git_hash && group.starts_with("git-import") {
         ("", Some(article_id.as_str()))
-    } else if let Some(ref existing) = preserved_cover_body {
-        (existing.as_str(), None)
     } else {
         (metadata.body.as_str(), None)
     };

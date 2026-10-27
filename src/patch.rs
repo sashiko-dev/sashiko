@@ -854,23 +854,12 @@ fn is_valid_b4_change_id_token(token: &str) -> bool {
 pub struct B4TrackerCommit {
     pub change_id: Option<String>,
     pub edited_subject: Option<String>,
-    pub edited_body: Option<String>,
-}
-
-fn is_git_trailer_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    let Some((key, value)) = trimmed.split_once(':') else {
-        return false;
-    };
-    !key.is_empty()
-        && !value.trim().is_empty()
-        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// Detect and parse a `b4 prep` empty tracking commit (`--- b4-submit-tracking ---`).
 /// Returns `None` if the commit has a non-empty diff or lacks the tracking marker.
-/// Unedited `EDITME` / `*** SUBJECT HERE ***` / `*** BLURB HERE ***` placeholders
-/// and trailer-only default bodies produce `edited_subject: None` / `edited_body: None`.
+/// Unedited `EDITME` / `*** SUBJECT HERE ***` subject placeholders
+/// produce `edited_subject: None`.
 pub fn parse_b4_submit_tracking(
     subject: &str,
     message: &str,
@@ -901,47 +890,9 @@ pub fn parse_b4_submit_tracking(
         Some(subject.trim().to_string())
     };
 
-    let mut body_lines = Vec::new();
-    let mut has_non_trailer_prose = false;
-    for line in message.lines().take(MAX_TRAILER_SCAN_LINES) {
-        let trimmed = line.trim();
-        if trimmed == "--- b4-submit-tracking ---" {
-            break;
-        }
-        if line.trim_start().starts_with('#') {
-            continue;
-        }
-        let unescaped = if let Some(rest) = line.strip_prefix(">#") {
-            format!("#{}", rest)
-        } else {
-            line.to_string()
-        };
-        let u_trimmed = unescaped.trim();
-        let u_upper = u_trimmed.to_ascii_uppercase();
-        if u_upper.starts_with("EDITME") || u_trimmed == "*** BLURB HERE ***" {
-            continue;
-        }
-        if !u_trimmed.is_empty() && !is_git_trailer_line(u_trimmed) {
-            has_non_trailer_prose = true;
-        }
-        body_lines.push(unescaped);
-    }
-
-    let edited_body = if has_non_trailer_prose {
-        let joined = body_lines.join("\n").trim().to_string();
-        if joined.is_empty() {
-            None
-        } else {
-            Some(joined)
-        }
-    } else {
-        None
-    };
-
     Some(B4TrackerCommit {
         change_id,
         edited_subject,
-        edited_body,
     })
 }
 
@@ -1794,7 +1745,6 @@ diff --git a/file.c b/file.c";
             Some("20261012-b4-prep-11223344")
         );
         assert_eq!(unedited.edited_subject, None);
-        assert_eq!(unedited.edited_body, None);
 
         let edited_msg = "# Comment line ignored\n># Architecture Overview\n\nExplain why patch 1 prepares the lock before patch 2 drops the old helper.\n\nSigned-off-by: Dev <dev@example.com>\n\n--- b4-submit-tracking ---\n{\"series\": {\"change-id\": \"20261012-b4-prep-11223344\", \"revision\": 2}}\n";
         let edited = parse_b4_submit_tracking("net: foo: refactor lock lifecycle", edited_msg, "")
@@ -1806,12 +1756,6 @@ diff --git a/file.c b/file.c";
         assert_eq!(
             edited.edited_subject.as_deref(),
             Some("net: foo: refactor lock lifecycle")
-        );
-        assert_eq!(
-            edited.edited_body.as_deref(),
-            Some(
-                "# Architecture Overview\n\nExplain why patch 1 prepares the lock before patch 2 drops the old helper.\n\nSigned-off-by: Dev <dev@example.com>"
-            )
         );
 
         assert!(
