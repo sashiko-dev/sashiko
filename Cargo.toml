@@ -49,7 +49,6 @@ server = [
     "dep:hmac",
     "dep:base64",
     "dep:url",
-    "dep:bytes",
     "dep:lettre",
     "dep:rustls-native-certs",
     "dep:tokio-rustls",
@@ -66,7 +65,6 @@ aws-config = { version = "1", features = ["behavior-version-latest"], optional =
 aws-sdk-bedrockruntime = { version = "1", optional = true }
 aws-smithy-types = { version = "1", optional = true }
 axum = { version = "0.8.9", optional = true }
-bytes = { version = "1.9", optional = true }
 chrono = "0.4.43"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 config = { version = "0.15.23", default-features = false, features = ["toml"] }
@@ -75,12 +73,11 @@ fastrand = "2.4.1"
 flate2 = { version = "1.1.9", optional = true }
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 lettre = { version = "0.11.7", default-features = false, features = ["aws-lc-rs", "builder", "hostname", "pool", "sendmail-transport", "smtp-transport", "tokio1", "tokio1-rustls", "webpki-roots"], optional = true }
-libc = "0.2.186"
 libsql = { version = "0.10.0", default-features = false, features = ["core"], optional = true }
 mail-parser = "0.11.3"
 regex = "1.12.2"
 reqwest = { version = "0.13.1", default-features = false, features = ["default-tls", "http2", "system-proxy", "json", "query"] }
-rustix = { version = "1.1.4", features = ["termios"] }
+rustix = { version = "1.1.4", features = ["process", "termios"] }
 rustls-native-certs = { version = "0.8.4", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -107,8 +104,6 @@ jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"], optional = true }
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-# Self-signalling, to test what the display does when the terminal is resized.
-rustix = { version = "1.1.4", features = ["process"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [profile.dev]

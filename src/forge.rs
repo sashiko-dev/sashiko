@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use anyhow::Result;
+use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use base64::Engine;
-use bytes::Bytes;
 use hmac::{Hmac, Mac, digest::KeyInit};
 use sha2::Sha256;
 use std::collections::HashMap;

@@ -219,10 +219,14 @@ pub fn spawn_cli(cmd: &mut Command) -> std::io::Result<Child> {
 /// Signal the whole group, having spawned its leader with `process_group(0)`
 /// so that the group holds the CLI and its descendants and nothing else.
 fn kill_group(pgid: i32) {
-    // SAFETY: kill(2) touches no memory of this process.  A negative pid
-    // addresses the group led by `pgid`, which `spawn_cli` created for the
-    // child alone, so the signal cannot reach the daemon or its siblings.
-    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    // Guard `pgid > 1` so `kill_process_group` (`kill(-pgid, SIGKILL)`) can
+    // never target the caller's group (`0`), all user processes (`1`), or a
+    // negated PID.
+    if pgid > 1
+        && let Some(pid) = rustix::process::Pid::from_raw(pgid)
+    {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
 }
 
 /// The groups of every CLI still running, for a shutdown that never unwinds.
