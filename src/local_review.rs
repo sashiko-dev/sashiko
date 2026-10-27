@@ -22,7 +22,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, anyhow};
-use futures::stream::StreamExt;
+use futures_util::stream::StreamExt;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -1069,7 +1069,7 @@ async fn run_worker_in_worktree(
         settings.ai.max_tpm,
     ));
     // Execute patch reviews concurrently with a limit
-    let futures_stream = futures::stream::iter(patches_to_review.iter().map(|p| {
+    let futures_stream = futures_util::stream::iter(patches_to_review.iter().map(|p| {
         let rich_patches = rich_patches.clone();
         let patch_shas = &patch_shas;
         let options = &options;

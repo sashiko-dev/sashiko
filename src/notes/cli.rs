@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use futures::StreamExt;
+use futures_util::StreamExt;
 
 use crate::git_cmd;
 use crate::maintainers::MaintainersIndex;
@@ -392,7 +392,7 @@ pub async fn run(
             };
 
             let mut failures = Vec::new();
-            let mut builds = futures::stream::iter(report.units.iter())
+            let mut builds = futures_util::stream::iter(report.units.iter())
                 .map(|unit| {
                     let (env, agenda, cfg) = (&env, &agenda, &cfg);
                     async move { (unit, build_unit(repo, env, agenda, unit, cfg).await) }

@@ -305,7 +305,7 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                     }
                 }
             });
-            match futures::future::try_join_all(futures).await {
+            match futures_util::future::try_join_all(futures).await {
                 Ok(mutations) => {
                     for ((stage, slot), mutation) in
                         stages.iter().zip(completed_outcomes).zip(mutations)
@@ -331,7 +331,7 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
             let futures = stages
                 .iter()
                 .map(|stage| stage.execute_isolated(env, state, event_cb));
-            let results = futures::future::join_all(futures).await;
+            let results = futures_util::future::join_all(futures).await;
 
             let mut successes = 0usize;
             let mut first_error = None;

@@ -97,9 +97,9 @@ impl EmailWorker {
                         // A panic, e.g. lettre failing to display a header,
                         // must fail the row: left Sending, it is swept back
                         // to Pending and panics the worker again forever.
-                        let send = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                            self.send_email(&email),
-                        ));
+                        let send = futures_util::FutureExt::catch_unwind(
+                            std::panic::AssertUnwindSafe(self.send_email(&email)),
+                        );
                         send_result = match tokio::time::timeout(SMTP_SEND_TIMEOUT, send).await {
                             Ok(Ok(res)) => res,
                             Ok(Err(panic)) => Err(anyhow::anyhow!(

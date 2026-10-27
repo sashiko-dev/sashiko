@@ -3229,7 +3229,7 @@ dependencies = [
  "config",
  "fastrand",
  "flate2",
- "futures",
+ "futures-util",
  "google-cloud-auth",
  "hmac 0.13.0",
  "jsonwebtoken",

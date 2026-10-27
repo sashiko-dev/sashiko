@@ -22,7 +22,7 @@ use crate::reviewer::{Reviewer, WorkerSubprocessOverrides};
 use crate::settings::Settings;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use futures::stream::StreamExt;
+use futures_util::stream::StreamExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1592,7 +1592,7 @@ async fn evaluate_benchmark_entries(
     let total_entries = entries.len();
     let processed_count = Arc::new(AtomicUsize::new(0));
 
-    futures::stream::iter(entries.iter().cloned().enumerate())
+    futures_util::stream::iter(entries.iter().cloned().enumerate())
         .map(|(idx, entry)| {
             let client = ai_provider.clone();
             let commit_data = commit_map.get(entry.commit.trim()).cloned();

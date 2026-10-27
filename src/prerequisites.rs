@@ -18,8 +18,8 @@ use crate::patch::{Patch, PatchsetMetadata, authors_match, parse_email};
 use crate::utils::redact_secret;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use futures::StreamExt;
-use futures::future::BoxFuture;
+use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -294,7 +294,7 @@ async fn calculate_optional_git_patch_id(diff: Option<&str>) -> Result<Option<St
 /// At most eight subprocesses run at once across the process.
 pub async fn calculate_git_patch_id_batch(diffs: Vec<Option<&str>>) -> Vec<Result<Option<String>>> {
     let calculations = diffs.into_iter().map(calculate_optional_git_patch_id);
-    futures::stream::iter(calculations)
+    futures_util::stream::iter(calculations)
         .buffered(MAX_CONCURRENT_GIT_PATCH_IDS)
         .collect()
         .await

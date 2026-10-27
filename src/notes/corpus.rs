@@ -343,7 +343,7 @@ pub async fn analyze(
     let per_round = CORPUS_BATCH_SIZE * CORPUS_STAGE_NAMES.len();
     let rounds = todo.len().div_ceil(per_round);
     for (round, chunk) in todo.chunks(per_round).enumerate() {
-        let contexts = futures::future::join_all(
+        let contexts = futures_util::future::join_all(
             chunk
                 .iter()
                 .map(|fix| case_context(repo, fix, cfg.introducer.as_ref())),

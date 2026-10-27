@@ -809,7 +809,7 @@ mod tests {
                     std::future::pending::<()>().await;
                 },
             ));
-            let result = futures::FutureExt::catch_unwind(result).await;
+            let result = futures_util::FutureExt::catch_unwind(result).await;
             if panic {
                 assert!(result.is_err());
             } else {

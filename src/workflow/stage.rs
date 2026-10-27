@@ -456,7 +456,7 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
                 (idx, (call.id, res))
             }
         });
-        for (idx, res) in futures::future::join_all(futures).await {
+        for (idx, res) in futures_util::future::join_all(futures).await {
             results[idx] = Some(res);
         }
 
