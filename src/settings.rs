@@ -376,7 +376,9 @@ pub struct GeminiSettings {
     pub auth_token_command: Option<String>,
     /// Optional default thinking level sent as `thinkingConfig.thinkingLevel`
     /// (`"LOW"`, `"MEDIUM"`, `"HIGH"`) when a stage does not specify a
-    /// per-request reasoning effort.
+    /// per-request reasoning effort. Every stage specifies one on Argon
+    /// models, where only `"LOW"` matters: it selects `EffortMode::Low` when
+    /// `[review] effort` is unset.
     #[serde(default)]
     pub thinking_level: Option<String>,
 }
@@ -459,8 +461,10 @@ pub struct VertexSettings {
     /// models (or `[ai.gemini] max_tokens` if configured).
     #[serde(default)]
     pub max_tokens: Option<u32>,
-    /// Thinking mode for Claude (`"adaptive"`, `"enabled"`) or fallback
-    /// thinking level for Gemini (`"LOW"`, `"MEDIUM"`, `"HIGH"`).
+    /// Thinking mode for Claude (`"adaptive"`, or `"disabled"` where the
+    /// model allows it; only the type is sent, so a budgeted `"enabled"` is
+    /// rejected) or fallback thinking level for Gemini (`"LOW"`,
+    /// `"MEDIUM"`, `"HIGH"`).
     #[serde(default)]
     pub thinking: Option<String>,
     /// Effort level for Claude (`"low"`, `"medium"`, `"high"`, `"xhigh"`,
@@ -1004,10 +1008,10 @@ pub struct ReviewSettings {
     /// single review. Set to 0 to disable.
     #[serde(default = "default_max_total_output_tokens")]
     pub max_total_output_tokens: usize,
-    /// Reasoning effort mode (`"low"`, `"mid"`, `"high"`, or `"dynamic"`) for
-    /// models that support configurable effort levels (currently Argon 4).
-    /// Defaults to `"mid"` when the model supports effort levels and is
-    /// ignored otherwise.
+    /// Reasoning effort mode (`"low"`, `"mid"` or its alias `"medium"`,
+    /// `"high"`, or `"dynamic"`) for models that support configurable effort
+    /// levels (currently Argon 4). Defaults to `"mid"` when the model
+    /// supports effort levels and is ignored otherwise.
     #[serde(default)]
     pub effort: Option<EffortMode>,
     #[serde(skip)]
@@ -1092,7 +1096,8 @@ pub struct LinuxBugSettings {
     pub lease_ttl_seconds: i64,
     #[serde(default = "default_bug_max_attempts")]
     pub max_attempts: i64,
-    /// Interval in seconds between periodic upstream fix checks against Linus's tree.
+    /// Interval in seconds between periodic upstream fix checks against the
+    /// mainline tree.
     /// Set to 0 to disable periodic upstream fix checks.
     #[serde(default = "default_fix_check_interval_seconds")]
     pub fix_check_interval_seconds: u64,
