@@ -3894,7 +3894,7 @@
                 return reviews.map((r, i) => renderReviewCard(r, i === reviews.length - 1 ? emailHtml : '')).join('');
             };
 
-            const computeReviewSummaryStatus = (reviews, patch = null) => {
+            const computeReviewSummaryStatus = (reviews, patch) => {
                 if (patch && (patch.status === 'error' || patch.status === 'failed')) {
                     return `<span class="text-error-bold">Apply Failed</span>`;
                 }
@@ -3966,50 +3966,7 @@
 
             const generalReviews = reviewsByPatch.get(null) || [];
             if (generalReviews.length > 0) {
-                const hasCoverMsg = data.message_id
-                    && !/^[0-9a-f]{40}$/.test(data.message_id)
-                    && !data.message_id.includes('@sashiko.local')
-                    && !(Array.isArray(data.patches) && data.patches.some(p => p.message_id === data.message_id));
-                let coverHeader = hasCoverMsg
-                    ? `Cover Letter / Series Review: <a href="#/message/${encodeURIComponent(data.message_id)}">${escapeHtml(data.subject || '(no subject)')}</a>`
-                    : `Cover Letter / Series Review: ${escapeHtml(data.subject || '(no subject)')}`;
-                const encodedPatchsetId = encodeURIComponent(state.patchsetId).replace(/'/g, '%27');
-                const coverLink = window.location.origin + window.location.pathname + `#/patchset/${encodedPatchsetId}?part=0`;
-                coverHeader += `<a href="${escapeHtml(coverLink)}" class="permalink-icon" onclick="copyToClipboard(this.href); return false;" title="Copy permalink to cover letter review">
-                    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg>
-                </a>`;
-
-                let coverEmailHtml = '';
-                if (hasCoverMsg || data.cover_email_status) {
-                    let toAddrs = data.cover_email_to || '';
-                    let ccAddrs = data.cover_email_cc || '';
-                    let eStatus = data.cover_email_status;
-                    if (!data.smtp_enabled) {
-                        eStatus = 'Disabled (SMTP not configured)';
-                    } else if (data.dry_run) {
-                        eStatus = eStatus ? `Dry-run (${eStatus})` : 'Dry-run (Not sent)';
-                    } else {
-                        eStatus = eStatus || 'None';
-                    }
-                    try { if (toAddrs.startsWith('[')) toAddrs = JSON.parse(toAddrs).join(', '); } catch(e) {}
-                    try { if (ccAddrs.startsWith('[')) ccAddrs = JSON.parse(ccAddrs).join(', '); } catch(e) {}
-                    coverEmailHtml = `
-                        <div style="font-size: 0.9em; color: var(--text-muted); line-height: 1.4; word-break: break-all;">
-                            <strong>To:</strong> ${escapeHtml(toAddrs || 'None')} &nbsp;&nbsp; 
-                            <strong>Cc:</strong> ${escapeHtml(ccAddrs || 'None')} &nbsp;&nbsp; 
-                            <strong>Status:</strong> ${escapeHtml(eStatus)}
-                        </div>
-                    `;
-                }
-
-                reviewsHtml += `
-                    <div id="patch-cover" data-part="0" style="margin-top:12px;">
-                        <h3 style="display:flex; justify-content:space-between;">
-                            <span>${coverHeader}</span>
-                        </h3>
-                        ${renderReviewList(generalReviews, coverEmailHtml)}
-                    </div>
-                `;
+                reviewsHtml += `<h3>General Reviews</h3>${renderReviewList(generalReviews)}`;
             }
 
             const sortedPatchIds = Array.from(reviewsByPatch.keys())
@@ -4020,15 +3977,10 @@
                     return (pa?.part_index || 0) - (pb?.part_index || 0);
                 });
 
-            const showSummaryTable = sortedPatchIds.length > 1 || generalReviews.length > 0;
+            const showSummaryTable = sortedPatchIds.length > 1;
             let summaryHtml = '';
             if (showSummaryTable) {
                 summaryHtml = '<table style="margin-bottom: 20px;"><thead><tr><th>Patch</th><th>Potential Regressions</th></tr></thead><tbody>';
-                if (generalReviews.length > 0) {
-                    const coverStatus = computeReviewSummaryStatus(generalReviews);
-                    const coverSubject = escapeHtml(data.subject || '(no subject)');
-                    summaryHtml += `<tr onclick="document.getElementById('patch-cover').scrollIntoView({behavior: 'smooth'})" style="cursor:pointer"><td><strong>Series / Cover Letter</strong>: ${coverSubject}</td><td>${coverStatus}</td></tr>`;
-                }
             }
 
             sortedPatchIds.forEach((pid, index) => {
