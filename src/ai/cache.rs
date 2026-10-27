@@ -11,6 +11,7 @@ use super::{AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities,
 pub struct CachingAiProvider {
     inner: Arc<dyn AiProvider>,
     conn: libsql::Connection,
+    ttl_seconds: i64,
     session_start: i64,
     hits_this: AtomicU64,
     hits_prev: AtomicU64,
@@ -47,11 +48,12 @@ impl CachingAiProvider {
         )
         .await?;
 
-        let cutoff = SystemTime::now()
+        let ttl_seconds = i64::try_from(ttl_days.saturating_mul(86_400)).unwrap_or(i64::MAX);
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64
-            - ttl_days as i64 * 86400;
+            .as_secs() as i64;
+        let cutoff = now.saturating_sub(ttl_seconds);
         let result = conn
             .execute(
                 "DELETE FROM response_cache WHERE created_at < ?",
@@ -77,6 +79,7 @@ impl CachingAiProvider {
         Ok(Self {
             inner,
             conn,
+            ttl_seconds,
             session_start,
             hits_this: AtomicU64::new(0),
             hits_prev: AtomicU64::new(0),
@@ -110,12 +113,19 @@ impl AiProvider for CachingAiProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         let hash = self.compute_cache_key(&request);
         let hash_prefix = &hash[..12];
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let cutoff = now.saturating_sub(self.ttl_seconds);
 
+        // A daemon can keep this provider alive beyond the TTL. Startup
+        // cleanup alone cannot prevent replaying responses that expire later.
         let mut rows = self
             .conn
             .query(
-                "SELECT response_json, tokens_saved, created_at FROM response_cache WHERE request_hash = ?",
-                libsql::params![hash.clone()],
+                "SELECT response_json, tokens_saved, created_at FROM response_cache WHERE request_hash = ? AND created_at >= ?",
+                libsql::params![hash.clone(), cutoff],
             )
             .await?;
 
@@ -239,6 +249,119 @@ mod tests {
     use crate::ai::ProviderCapabilities;
     use crate::ai::session::{LlmSession, SessionRunner, ValidationError};
     use serde_json::Value;
+
+    struct CountingAnswers {
+        calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl AiProvider for CountingAnswers {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(AiResponse {
+                content: Some(format!("answer {call}")),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: Some(crate::ai::AiUsage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                    cached_tokens: None,
+                }),
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "counting-mock".to_string(),
+                context_window_size: 100_000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_expired_response_refreshes_without_reopening_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("response_cache.db");
+        let calls = Arc::new(AtomicU64::new(0));
+        let inner: Arc<dyn AiProvider> = Arc::new(CountingAnswers {
+            calls: calls.clone(),
+        });
+        let cache = CachingAiProvider::new(inner.clone(), path.to_str().unwrap(), 7)
+            .await
+            .unwrap();
+        let request = AiRequest::default();
+
+        let fresh = cache.generate_content(request.clone()).await.unwrap();
+        let hit = cache.generate_content(request.clone()).await.unwrap();
+        assert_eq!(fresh.content.as_deref(), Some("answer 1"));
+        assert_eq!(hit.content, fresh.content);
+        assert_eq!(hit.usage.unwrap().cached_tokens, Some(3));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Age the persisted row beyond the seven-day TTL while keeping the
+        // same provider alive, as a long-running daemon does. No sleeps or
+        // production expiry helpers determine the expected result.
+        cache
+            .conn
+            .execute(
+                "UPDATE response_cache SET created_at = ?",
+                libsql::params![cache.session_start - 8 * 86_400],
+            )
+            .await
+            .unwrap();
+        let refreshed = cache.generate_content(request.clone()).await.unwrap();
+        assert_eq!(refreshed.content.as_deref(), Some("answer 2"));
+        assert_eq!(refreshed.usage.unwrap().cached_tokens, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let stats = cache.cache_stats().unwrap();
+        assert_eq!(stats.hits_this_session + stats.hits_prev_session, 1);
+        assert_eq!(
+            stats.tokens_saved_this_session + stats.tokens_saved_prev_session,
+            5
+        );
+
+        // Refresh replaces the expired row in the existing on-disk format;
+        // reopening must serve that fresh response without another model call.
+        drop(cache);
+        let reopened = CachingAiProvider::new(inner, path.to_str().unwrap(), 7)
+            .await
+            .unwrap();
+        let persisted = reopened.generate_content(request).await.unwrap();
+        assert_eq!(persisted.content.as_deref(), Some("answer 2"));
+        assert_eq!(persisted.usage.unwrap().cached_tokens, Some(3));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_response_cache_large_ttl_preserves_fresh_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("response_cache.db");
+        let calls = Arc::new(AtomicU64::new(0));
+        let inner: Arc<dyn AiProvider> = Arc::new(CountingAnswers {
+            calls: calls.clone(),
+        });
+        let cache = CachingAiProvider::new(inner.clone(), path.to_str().unwrap(), u64::MAX)
+            .await
+            .unwrap();
+        cache.generate_content(AiRequest::default()).await.unwrap();
+        drop(cache);
+
+        // A large accepted TTL must not wrap into a negative duration and
+        // make startup cleanup delete a response created moments ago.
+        let reopened = CachingAiProvider::new(inner, path.to_str().unwrap(), u64::MAX)
+            .await
+            .unwrap();
+        let hit = reopened
+            .generate_content(AiRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(hit.content.as_deref(), Some("answer 1"));
+        assert_eq!(hit.usage.unwrap().cached_tokens, Some(3));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     /// Answers every request with text the session below rejects, and counts
     /// how often it was actually asked.
