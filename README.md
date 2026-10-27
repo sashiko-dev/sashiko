@@ -8,7 +8,7 @@
 
 Sashiko is a self-contained, agentic Linux kernel code review system. It uses kernel-specific prompts and a multi-stage verification protocol to review proposed changes locally from your git checkout or automatically from mailing lists (`lore.kernel.org`) and git forges.
 
-- **Kernel Maintainers:** See the [Guide for Kernel Maintainers](MAINTAINERS_GUIDE.md) for configuring mailing list tracking, maintainer notes, and email policies.
+- **Kernel Maintainers:** See the [Guide for Kernel Maintainers](projects/linux/MAINTAINERS_GUIDE.md) for configuring mailing list tracking, maintainer notes, and email policies.
 - **Mailing List:** Join [`sashiko@lists.linux.dev`](https://lore.kernel.org/sashiko) for announcements, feedback, and discussions (automated review replies use `sashiko-reviews@lists.linux.dev`).
 - **Community & Press:** Read what kernel maintainers and the media say in [Sashiko in the Press](PRESS.md).
 
@@ -92,7 +92,7 @@ Sashiko evaluates patches through specialized parallel analysis stages followed 
 
 ## Documentation
 
-- **[Guide for Kernel Maintainers](MAINTAINERS_GUIDE.md)** — mailing list tracking, maintainer notes, baseline detection, and email delivery options.
+- **[Guide for Kernel Maintainers](projects/linux/MAINTAINERS_GUIDE.md)** — mailing list tracking, maintainer notes, baseline detection, and email delivery options.
 - **[Sashiko in the Press](PRESS.md)** — quotes from Linux kernel maintainers on LKML and press coverage.
 - **[LLM Provider Configuration](docs/llm-providers.md)** — setup instructions for Gemini, Claude, OpenAI, Bedrock, Vertex AI, and CLI providers.
 - **[Running the Daemon (Server Mode)](docs/daemon.md)** — building from source, monitoring mailing lists (NNTP) and forges, Web UI, `sashiko-cli`, and server ACL security.

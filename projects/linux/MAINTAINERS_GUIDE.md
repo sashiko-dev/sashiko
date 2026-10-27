@@ -14,7 +14,7 @@ If you have questions, feedback, or need assistance, please reach out through th
 
 To request tracking for a new lore or NNTP mailing list, you can either:
 
-1.  **Submit a Pull Request:** Add a `["<list-email>"]` section to [`projects/linux/mailing_lists.toml`](projects/linux/mailing_lists.toml). Sashiko automatically derives the Lore NNTP group name by reversing the domain components and appending the list's local part (e.g., `bpf@vger.kernel.org` becomes `org.kernel.vger.bpf`). If the NNTP group name on `nntp.lore.kernel.org` does not follow this convention, set `nntp_group = "..."` explicitly in the section.
+1.  **Submit a Pull Request:** Add a `["<list-email>"]` section to [`projects/linux/mailing_lists.toml`](mailing_lists.toml). Sashiko automatically derives the Lore NNTP group name by reversing the domain components and appending the list's local part (e.g., `bpf@vger.kernel.org` becomes `org.kernel.vger.bpf`). If the NNTP group name on `nntp.lore.kernel.org` does not follow this convention, set `nntp_group = "..."` explicitly in the section.
 2.  **Send an Email:** Contact the Sashiko development mailing list (`sashiko@lists.linux.dev`) and `Cc: Roman Gushchin <roman.gushchin@linux.dev>` with your request.
 
 ## Adding and Updating Maintainer Notes
@@ -28,7 +28,7 @@ During every review, Sashiko deterministically loads all maintainer notes whose 
 
 ### File Format & Front Matter
 
-Each maintainer note lives at [`projects/linux/prompts/maintainers/<subsystem>.md`](projects/linux/prompts/maintainers/) and begins with a `+++`-delimited TOML front matter block followed by a markdown body of bullet points:
+Each maintainer note lives at [`projects/linux/prompts/maintainers/<subsystem>.md`](prompts/maintainers/) and begins with a `+++`-delimited TOML front matter block followed by a markdown body of bullet points:
 
 ```markdown
 +++
@@ -48,7 +48,7 @@ The front matter supports three keys (no unknown keys are permitted):
 *   **`paths`** *(optional if `symbols` is non-empty)*: `MAINTAINERS`-style file patterns matched against every file touched by the patch:
     *   Directory prefix ending in `/` (e.g., `"drivers/net/"`, `"fs/nfsd/"`) matches any file under that directory tree.
     *   Exact file path or glob (e.g., `"*.rs"`, `"include/linux/bpf*.h"`, `"drivers/pci/quirks.c"`).
-    *   `"*"` matches every patch (reserved for [`general.md`](projects/linux/prompts/maintainers/general.md); subsystem notes must scope `paths` to their own files).
+    *   `"*"` matches every patch (reserved for [`general.md`](prompts/maintainers/general.md); subsystem notes must scope `paths` to their own files).
 *   **`symbols`** *(optional if `paths` is non-empty)*: C/Rust identifiers or `<prefix>*` wildcards (e.g., `"ethtool_ops"`, `"netdev_*"`, `"bpf_*"`) matched against identifiers on added/removed diff lines and `@@` hunk headers. Avoid short or ubiquitous C tokens (such as `"dev*"`, `"err"`, or `"lock*"`) that would match unrelated patches across the kernel.
 
 At least one of `paths` or `symbols` must be non-empty, and the markdown body after the closing `+++` must not be empty.
@@ -56,7 +56,7 @@ At least one of `paths` or `symbols` must be non-empty, and the markdown body af
 ### Guidelines for Writing Effective Notes
 
 *   **Focus on policies and preferences, not code facts:** State review rules that cannot be derived from reading the source code (preferred helpers, subsystem conventions, tree/UAPI policies, or recurring nitpicks to suppress). Facts about how the code works belong in source comments or automatic code notes.
-*   **Scope "do not report" rules narrowly:** Because Sashiko treats `<maintainer_notes>` as binding policy, an overly broad ignore rule can hide real bugs. Always state the exact boundary of what to ignore versus what to still report—for example, in [`rust.md`](projects/linux/prompts/maintainers/rust.md):
+*   **Scope "do not report" rules narrowly:** Because Sashiko treats `<maintainer_notes>` as binding policy, an overly broad ignore rule can hide real bugs. Always state the exact boundary of what to ignore versus what to still report—for example, in [`rust.md`](prompts/maintainers/rust.md):
     > - Do not flag ordinary build failures or Clippy style lints in the default config; CI already checks those.
     > - Do report conditional-compilation problems (including broken rustdoc intra-doc links to `CONFIG_*`-gated types) as bugs.
 *   **One rule per bullet:** Keep bullets direct, concrete, and self-contained.
@@ -87,11 +87,11 @@ A subsystem's `T:` entries in `MAINTAINERS` point to the tree(s) Sashiko uses as
 
 If the subject does not carry `-next` and the subsystem lists both a stable and a `-next` tree, the stable tree is preferred. When the `-next` tree is the *only* `T:` entry for the subsystem, it is used regardless of the subject.
 
-You can add additional baseline trees (and restrict to specific branches) with `[[git.custom_remotes]]` in your Sashiko config; see [`docs/configuration.md`](docs/configuration.md) for the schema.
+You can add additional baseline trees (and restrict to specific branches) with `[[git.custom_remotes]]` in your Sashiko config; see [`docs/configuration.md`](../../docs/configuration.md) for the schema.
 
 ## Configuring Mailing List & Email Delivery Options
 
-All per-mailing-list ingestion, embargo, email delivery, and Patchwork settings for Linux live in [`projects/linux/mailing_lists.toml`](projects/linux/mailing_lists.toml). Each section key is the mailing list's email address (e.g. `["bpf@vger.kernel.org"]`), and omitted fields inherit from `[defaults]`:
+All per-mailing-list ingestion, embargo, email delivery, and Patchwork settings for Linux live in [`projects/linux/mailing_lists.toml`](mailing_lists.toml). Each section key is the mailing list's email address (e.g. `["bpf@vger.kernel.org"]`), and omitted fields inherit from `[defaults]`:
 
 *   **`track`:** Whether Sashiko ingests patches from this list via NNTP (default: `true`). Set `track = false` to configure delivery rules for an external list without polling NNTP for it.
 *   **`nntp_group`:** Optional explicit Lore NNTP group override when the group name cannot be derived from the email address (e.g., `devicetree@vger.kernel.org` -> `org.kernel.vger.linux-devicetree`).
@@ -125,4 +125,4 @@ subject_prefixes = ["bpf", "bpf-next"]
 reply_to = ["author", "list", "recipients"]
 ```
 
-**Configuration:** To request a change to your mailing list configuration in [`projects/linux/mailing_lists.toml`](projects/linux/mailing_lists.toml), please open a GitHub Pull Request or Issue, or email the development mailing list (`sashiko@lists.linux.dev`).
+**Configuration:** To request a change to your mailing list configuration in [`projects/linux/mailing_lists.toml`](mailing_lists.toml), please open a GitHub Pull Request or Issue, or email the development mailing list (`sashiko@lists.linux.dev`).

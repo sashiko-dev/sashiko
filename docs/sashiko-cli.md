@@ -282,7 +282,7 @@ maintainers, and/or mailing lists.
 - **Provides:** everything in mode 2, plus automated email delivery.
 - **Emails:** sent per the policy in `projects/<project>/mailing_lists.toml`.
 
-See the [Guide for Kernel Maintainers](../MAINTAINERS_GUIDE.md) for
+See the [Guide for Kernel Maintainers](../projects/linux/MAINTAINERS_GUIDE.md) for
 mailing list policy configuration.
 
 ## Configuration
