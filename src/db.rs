@@ -11357,16 +11357,14 @@ impl Database {
             let mut m_rows = self
                 .conn
                 .query(
-                    "SELECT in_reply_to, references_hdr, body, subject FROM messages WHERE message_id = ? LIMIT 1",
+                    "SELECT body, subject FROM messages WHERE message_id = ? LIMIT 1",
                     libsql::params![clid.as_str()],
                 )
                 .await?;
             if let Some(mrow) = m_rows.next().await? {
                 Some((
-                    mrow.get::<Option<String>>(0)?,
-                    mrow.get::<Option<String>>(1)?,
-                    mrow.get::<libsql::Value>(2)?,
-                    mrow.get::<Option<String>>(3)?.unwrap_or_default(),
+                    mrow.get::<libsql::Value>(0)?,
+                    mrow.get::<Option<String>>(1)?.unwrap_or_default(),
                 ))
             } else {
                 None
@@ -11379,7 +11377,7 @@ impl Database {
             let mut p1_rows = self
                 .conn
                 .query(
-                    "SELECT m.in_reply_to, m.references_hdr, m.body, p.diff
+                    "SELECT m.body, p.diff
                      FROM patches p
                      LEFT JOIN messages m ON m.message_id = p.message_id
                      WHERE p.patchset_id = ? AND p.part_index = 1
@@ -11389,10 +11387,8 @@ impl Database {
                 .await?;
             if let Some(p1row) = p1_rows.next().await? {
                 Some((
-                    p1row.get::<Option<String>>(0)?,
-                    p1row.get::<Option<String>>(1)?,
-                    p1row.get::<libsql::Value>(2)?,
-                    p1row.get::<libsql::Value>(3)?,
+                    p1row.get::<libsql::Value>(0)?,
+                    p1row.get::<libsql::Value>(1)?,
                 ))
             } else {
                 None
@@ -11414,7 +11410,7 @@ impl Database {
             let mut detected_change_id = None;
             let mut has_cover_body = false;
 
-            if let Some((irt, refs, body_val, c_subj)) = cover_raw {
+            if let Some((body_val, c_subj)) = cover_raw {
                 let body = crate::compression::decompress_string_value(&body_val)?;
                 if !body.trim().is_empty() && c_subj != "(placeholder)" {
                     has_cover_body = true;
@@ -11430,18 +11426,14 @@ impl Database {
                     }
                 }
                 prereq_patch_ids.extend(p_pids);
-                for rmid in crate::patch::extract_version_reference_msgids(
-                    &body,
-                    irt.as_deref(),
-                    refs.as_deref(),
-                ) {
+                for rmid in crate::patch::extract_version_reference_msgids(&body) {
                     if !own_msgids.contains(&rmid) && !ref_msgids.contains(&rmid) {
                         ref_msgids.push(rmid);
                     }
                 }
             }
 
-            if let Some((irt, refs, body_val, diff_val)) = p1_raw {
+            if let Some((body_val, diff_val)) = p1_raw {
                 let body = crate::compression::decompress_string_value(&body_val)?;
                 let diff = crate::compression::decompress_string_value(&diff_val)?;
                 for text in [&body, &diff] {
@@ -11461,11 +11453,7 @@ impl Database {
                     prereq_patch_ids.extend(p_pids);
                 }
                 let combined_text = if body.is_empty() { &diff } else { &body };
-                for rmid in crate::patch::extract_version_reference_msgids(
-                    combined_text,
-                    irt.as_deref(),
-                    refs.as_deref(),
-                ) {
+                for rmid in crate::patch::extract_version_reference_msgids(combined_text) {
                     if !own_msgids.contains(&rmid) && !ref_msgids.contains(&rmid) {
                         ref_msgids.push(rmid);
                     }
@@ -11704,7 +11692,7 @@ impl Database {
             }
         }
 
-        // Signal 3: Message-ID references (In-Reply-To, References, Lore URLs in changelog)
+        // Signal 3: explicit previous-version links in the cover letter or patch 1 body
         for ref_mid in &ref_msgids {
             if prereq_msgids.contains(ref_mid) {
                 continue;
@@ -27987,7 +27975,7 @@ mod tests {
             author,
             "[PATCH v3 0/1] Yet another title for shrinker",
             3000,
-            "Changes since v2:\n- Fixed lock ordering\nLink: https://lore.kernel.org/r/b4-v2-cover@kernel.org\n",
+            "Changes since v2:\n- Fixed lock ordering\n- Link to v2: https://lore.kernel.org/r/b4-v2-cover@kernel.org\n",
             "",
             "",
             None,

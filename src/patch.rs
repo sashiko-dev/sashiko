@@ -997,19 +997,48 @@ fn lore_url_regex() -> &'static Regex {
     static RE_LORE_URL: OnceLock<Regex> = OnceLock::new();
     RE_LORE_URL.get_or_init(|| {
         Regex::new(
-            r"(?i)https?://(?:lore\.kernel\.org|lkml\.kernel\.org|patchwork\.kernel\.org)/(?:project/[a-z0-9._-]+/(?:patch|cover)/|(?:patch|cover)/|r/|all/|lkml/|[a-z0-9._-]+/)?([^\s?#<>()\[\]]+(?:@|%40)[^/\s?#<>()\[\]]+)",
+            r"(?i)https?://(?:lore\.kernel\.org|lkml\.kernel\.org|patchwork\.kernel\.org|patch\.msgid\.link)/(?:project/[a-z0-9._-]+/(?:patch|cover)/|(?:patch|cover)/|r/|all/|lkml/|[a-z0-9._-]+/)?([^\s?#<>()\[\]]+(?:@|%40)[^/\s?#<>()\[\]]+)",
         )
         .expect("static Lore URL regex must compile")
     })
 }
 
-fn version_msgid_regex() -> &'static Regex {
-    static RE_VER_MSGID: OnceLock<Regex> = OnceLock::new();
-    RE_VER_MSGID.get_or_init(|| {
+/// Matches a line that starts with an explicit previous-version marker
+/// immediately followed by a link to that version: "v1: <url>",
+/// "[v1] <url>", "v1 link: <url>", "v7 (with test steps): <url>",
+/// "v1 (<url>)", b4's "- Link to v1: <url>", "Link[v1]: <url>",
+/// "Previous version: <url>", "Version 1: <url>" and
+/// "Changes since v1 (<url>):".
+///
+/// The version token must be followed by whitespace or a separator, so
+/// kernel versions such as "v6.8: <url>" never match, and the link must
+/// follow the marker directly, so "v2 of the base series: <url>" or a
+/// "Link:" trailer below a changelog heading do not count either.
+fn version_link_line_regex() -> &'static Regex {
+    static RE_VERSION_LINK_LINE: OnceLock<Regex> = OnceLock::new();
+    RE_VERSION_LINK_LINE.get_or_init(|| {
         Regex::new(
-            r"(?i)^\s*(?:-\s*)?(?:v\d+|version\s+\d+|previous(?:\s+version)?|link(?:\s+to\s+v\d+)?)\s*:\s*<?([^>\s]+@[^>\s]+)>?",
+            r"(?ix)
+            ^(?:[-*+]\s*)?
+            (?:
+                (?:\[\s*v\d+\s*\]|v\d+)(?:\s+links?)?(?:\s*\([^()]*\))?
+              | links?\s*(?:to\s+)?(?:\[\s*v\d+\s*\]|v\d+)
+              | (?:previous|prior|earlier|last)\s+(?:version|revision|posting|iteration)
+                (?:\s*\([^()]*\))?
+              | version\s+\d+
+              | changes\s+(?:since|from)\s+(?:\[\s*v\d+\s*\]|v\d+)
+            )
+            (?:
+                (?:\s*[:=]|\s*-+>?|\s+at\b|\s)\s*[(<\[]?\s*
+              | \s*[(\[]\s*
+            )
+            (?P<link>
+                https?://(?:lore\.kernel\.org|lkml\.kernel\.org|patchwork\.kernel\.org|patch\.msgid\.link)/\S+
+              | <[^<>\s]+@[^<>\s]+>
+              | [^\s<>()\[\]]+@[^\s<>()\[\]]+
+            )",
         )
-        .expect("static version reference Message-ID regex must compile")
+        .expect("static version link line regex must compile")
     })
 }
 
@@ -1027,109 +1056,26 @@ fn extract_msgid_or_lore_url(value: &str) -> Option<String> {
     normalize_candidate_msgid(value)
 }
 
-fn is_non_version_trailer_line(trimmed: &str) -> bool {
-    // Changelog bullets ("- Closes: <url>") carry the same trailers.
-    let unbulleted = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-        .unwrap_or(trimmed)
-        .trim_start();
-    let Some((key, _)) = unbulleted.split_once(':') else {
-        return false;
-    };
-    let key = key.trim();
-    key.eq_ignore_ascii_case("based-on")
-        || key.eq_ignore_ascii_case("base-commit")
-        || key.eq_ignore_ascii_case("prerequisite-message-id")
-        || key.eq_ignore_ascii_case("prerequisite-patch-id")
-        || key.eq_ignore_ascii_case("prerequisite-change-id")
-        || key.eq_ignore_ascii_case("closes")
-        || key.eq_ignore_ascii_case("fixes")
-        || key.eq_ignore_ascii_case("reported-by")
-        || key.eq_ignore_ascii_case("buglink")
-}
-
-/// A bare "Link:" trailer. In the commit message it names the bug report or
-/// discussion a patch responds to; under a changelog heading it names the
-/// posting of the previous version, so the caller decides by section.
-fn is_link_trailer_line(trimmed: &str) -> bool {
-    let unbulleted = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-        .unwrap_or(trimmed)
-        .trim_start();
-    unbulleted
-        .split_once(':')
-        .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("link"))
-}
-
-fn line_is_changelog_heading(trimmed: &str) -> bool {
-    static RE_CHANGELOG_HEADING: OnceLock<Regex> = OnceLock::new();
-    let re = RE_CHANGELOG_HEADING.get_or_init(|| {
-        Regex::new(
-            r"(?i)^(?:#+\s*)?(?:changes\s+(?:in|since|from)\s+v\d+\b|changelog\b|revision\s+history\b|version\s+history\b|v\d+\s*->\s*v\d+\b|(?:v\d+|version\s+\d+|previous(?:\s+version)?)\s*:?\s*$)",
-        )
-        .expect("static changelog heading regex must compile")
-    });
-    re.is_match(trimmed)
-}
-
-fn line_has_version_context(trimmed: &str) -> bool {
-    static RE_VER_CTX: OnceLock<Regex> = OnceLock::new();
-    let re = RE_VER_CTX.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:^\s*(?:changes\s+(?:in|since|from)\s+v\d+\b|changelog\b|previous(?:\s+version)?\s*:|version\s+\d+\s*:)|\b(?:link\s+to\s+v\d+|previous\s+version|earlier\s+version|since\s+v\d+|in\s+v\d+)\b|->\s*v\d+\b)",
-        )
-        .expect("static version context regex must compile")
-    });
-    re.is_match(trimmed) || version_msgid_regex().is_match(trimmed)
-}
-
-/// Extract candidate Message-IDs that may identify earlier versions of the same
-/// patch or series from email headers (`In-Reply-To`, `References`) and from
-/// Lore/LKML links or version notes in the cover letter / changelog body.
-/// Explicitly ignores dependency and bug-report trailers (`Based-on:`,
-/// `prerequisite-message-id:`, `Closes:`, `Fixes:`, `Reported-by:`).
-pub fn extract_version_reference_msgids(
-    body: &str,
-    in_reply_to: Option<&str>,
-    references: Option<&str>,
-) -> Vec<String> {
-    let re_lore = lore_url_regex();
-    let re_ver_msgid = version_msgid_regex();
+/// Extract the Message-IDs of earlier versions of the same patch or series
+/// that the author links explicitly in a cover letter or patch body.
+///
+/// Only lines that start with a previous-version marker and carry the link
+/// on the same line count (see `version_link_line_regex`). Threading
+/// headers, unmarked Lore links (including any link below a changelog
+/// heading that has no marker of its own), kernel-version prose such as
+/// "since v6.8", quoted lines, and prerequisite trailers (`Based-on:`,
+/// `prerequisite-message-id:`) never name a previous version.
+pub fn extract_version_reference_msgids(body: &str) -> Vec<String> {
+    let re_line = version_link_line_regex();
     let (prereq_msgids_vec, _) = extract_prerequisite_message_and_patch_ids(body);
     let prereq_msgids: std::collections::HashSet<String> = prereq_msgids_vec.into_iter().collect();
 
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut push_unique = |candidate: &str| {
-        if out.len() >= MAX_EXTRACTED_REF_IDS {
-            return;
-        }
-        if let Some(msgid) = normalize_candidate_msgid(candidate)
-            && !prereq_msgids.contains(&msgid)
-            && seen.insert(msgid.clone())
-        {
-            out.push(msgid);
-        }
-    };
-
-    if let Some(irt) = in_reply_to {
-        for token in irt.split_whitespace().take(MAX_EXTRACTED_REF_IDS) {
-            push_unique(token);
-        }
-    }
-    if let Some(refs) = references {
-        // RFC 2822 appends newer message references at the end of References;
-        // iterate in reverse with .take() so we prioritize the most recent
-        // parents without allocating an unbounded vector on untrusted headers.
-        for token in refs.split_whitespace().rev().take(MAX_EXTRACTED_REF_IDS) {
-            push_unique(token);
-        }
-    }
-
-    let mut in_changelog_section = false;
     for line in body.lines().take(MAX_TRAILER_SCAN_LINES) {
+        if out.len() >= MAX_EXTRACTED_REF_IDS {
+            break;
+        }
         if line.starts_with("diff --git ")
             || line.starts_with("--- a/")
             || line.starts_with("--- /dev/null")
@@ -1137,36 +1083,21 @@ pub fn extract_version_reference_msgids(
             break;
         }
         let trimmed = line.trim();
-        // The commentary below "---" is where changelogs conventionally go,
-        // but it also carries unrelated discussion links. Only a changelog
-        // heading or a line with explicit version context qualifies a Lore
-        // URL as a previous-version reference, so a stray link to another
-        // thread by the same author cannot be mistaken for lineage.
-        if trimmed == "---" {
+        if trimmed.len() > MAX_TRAILER_LINE_BYTES || trimmed.starts_with('>') {
             continue;
         }
-        if trimmed.len() > MAX_TRAILER_LINE_BYTES
-            || trimmed.starts_with('>')
-            || is_non_version_trailer_line(trimmed)
-            || (!in_changelog_section && is_link_trailer_line(trimmed))
-        {
+        let Some(link) = re_line
+            .captures(trimmed)
+            .and_then(|cap| cap.name("link"))
+            .map(|m| m.as_str())
+        else {
             continue;
-        }
-        if line_is_changelog_heading(trimmed) {
-            in_changelog_section = true;
-        }
-        let has_ver_ctx = line_has_version_context(trimmed);
-        if in_changelog_section || has_ver_ctx {
-            for cap in re_lore.captures_iter(trimmed) {
-                if let Some(m) = cap.get(1) {
-                    push_unique(m.as_str());
-                }
-            }
-        }
-        if let Some(cap) = re_ver_msgid.captures(trimmed)
-            && let Some(m) = cap.get(1)
+        };
+        if let Some(msgid) = extract_msgid_or_lore_url(link)
+            && !prereq_msgids.contains(&msgid)
+            && seen.insert(msgid.clone())
         {
-            push_unique(m.as_str());
+            out.push(msgid);
         }
     }
 
@@ -1770,26 +1701,85 @@ diff --git a/file.c b/file.c";
 
     #[test]
     fn test_extract_version_reference_msgids() {
-        let body = "Fix race in foo_remove when allocating in vmalloc() and setting ptr -> value.\nReported at https://lore.kernel.org/r/20260901-bug-report@kernel.org\nSee discussion at https://lore.kernel.org/r/20260903-unrelated-thread@kernel.org\nCloses: https://lore.kernel.org/r/20260902-closes-bug@kernel.org\nLink: https://lore.kernel.org/r/20260904-link-trailer-discussion@kernel.org\nDepends on https://lore.kernel.org/r/20260925-prereq-url@kernel.org\n\n---\nAlso see my other series at https://lore.kernel.org/r/20261005-other-series-v1-0-cccc@kernel.org\n\nChanges in v3:\n- Address locking feedback\n- Closes: https://lore.kernel.org/r/20260905-bulleted-closes@kernel.org\n- Link to v2: https://lore.kernel.org/r/20261010-foo-v2-0-aaaa@kernel.org\n- Link to v1: https://lore.kernel.org/netdev/20261001-foo-v1-1-bbbb%40kernel.org/\n- Patchwork link: https://patchwork.kernel.org/project/netdev/patch/20261001-pw-v1@kernel.org/\n- Link with slash in local-part: https://lore.kernel.org/r/abc/def+123@kernel.org/\nLink: https://lore.kernel.org/r/20260930-changelog-link-v0@kernel.org\n- Link to v0: <20260929-link-to-v0-msgid@kernel.org>\nv1: <20261001-explicit-v1@kernel.org>\nBased-on: <20260925-prereq-series@kernel.org>\nBased-on: https://lore.kernel.org/r/20260925-prereq-url@kernel.org\nprerequisite-message-id: <20260920-b4-prereq@kernel.org>\ndiff --git a/foo.c b/foo.c\n+https://lore.kernel.org/r/should-ignore-diff@kernel.org\n";
-        let refs = extract_version_reference_msgids(
-            body,
-            Some("<20261010-irt//v2@kernel.org>"),
-            Some("<20261001-ref-v1@kernel.org> <20261010-irt//v2@kernel.org>"),
-        );
+        let body = "Fix race in foo_remove when allocating in vmalloc() and setting ptr -> value.\n\
+Reported at https://lore.kernel.org/r/20260901-bug-report@kernel.org\n\
+See discussion at https://lore.kernel.org/r/20260903-unrelated-thread@kernel.org\n\
+Closes: https://lore.kernel.org/r/20260902-closes-bug@kernel.org\n\
+Link: https://lore.kernel.org/r/20260904-link-trailer-discussion@kernel.org\n\
+\n\
+---\n\
+Changes in v3:\n\
+- Address locking feedback\n\
+- Closes: https://lore.kernel.org/r/20260905-bulleted-closes@kernel.org\n\
+- Link to v2: https://lore.kernel.org/r/20261010-foo-v2-0-aaaa@kernel.org\n\
+- Link to v1: https://lore.kernel.org/netdev/20261001-foo-v1-1-bbbb%40kernel.org/\n\
+Link: https://lore.kernel.org/r/20260930-changelog-link@kernel.org\n\
+[1] https://lore.kernel.org/all/20260930-footnote@kernel.org/\n\
+- Link to v0: <20260929-link-to-v0-msgid@kernel.org>\n\
+v1: <20261001-explicit-v1@kernel.org>\n\
+* v1: https://lore.kernel.org/bpf/20261001-star-v1@kernel.org/\n\
+v2 link: https://lore.kernel.org/all/20261002-v2-link@kernel.org/\n\
+v7 (with test steps): https://lore.kernel.org/all/20261003-v7-note@kernel.org/\n\
+v1 (https://lore.kernel.org/all/20261004-paren-v1@kernel.org/)\n\
+[v3] https://lore.kernel.org/all/20261005-bracket-v3@kernel.org/\n\
+- Link[v1]: https://lore.kernel.org/lkml/20261006-link-bracket@kernel.org/\n\
+- Link to v4: https://patch.msgid.link/20261007-msgid-link@kernel.org\n\
+Previous version: https://lore.kernel.org/r/20261008-previous@kernel.org\n\
+Changes since v5 (https://lore.kernel.org/r/20261009-changes-since@kernel.org):\n\
+- Patchwork link: https://patchwork.kernel.org/project/netdev/patch/20261001-pw-v1@kernel.org/\n\
+v1: https://lore.kernel.org/r/20260925-prereq-url@kernel.org\n\
+Based-on: <20260925-prereq-series@kernel.org>\n\
+Based-on: https://lore.kernel.org/r/20260925-prereq-url@kernel.org\n\
+prerequisite-message-id: <20260920-b4-prereq@kernel.org>\n\
+> v1: https://lore.kernel.org/r/20260918-quoted@kernel.org\n\
+diff --git a/foo.c b/foo.c\n\
++v1: https://lore.kernel.org/r/should-ignore-diff@kernel.org\n";
+        let refs = extract_version_reference_msgids(body);
         assert_eq!(
             refs,
             vec![
-                "20261010-irt//v2@kernel.org",
-                "20261001-ref-v1@kernel.org",
                 "20261010-foo-v2-0-aaaa@kernel.org",
                 "20261001-foo-v1-1-bbbb@kernel.org",
-                "20261001-pw-v1@kernel.org",
-                "abc/def+123@kernel.org",
-                "20260930-changelog-link-v0@kernel.org",
                 "20260929-link-to-v0-msgid@kernel.org",
                 "20261001-explicit-v1@kernel.org",
+                "20261001-star-v1@kernel.org",
+                "20261002-v2-link@kernel.org",
+                "20261003-v7-note@kernel.org",
+                "20261004-paren-v1@kernel.org",
+                "20261005-bracket-v3@kernel.org",
+                "20261006-link-bracket@kernel.org",
+                "20261007-msgid-link@kernel.org",
+                "20261008-previous@kernel.org",
+                "20261009-changes-since@kernel.org",
             ]
         );
+    }
+
+    #[test]
+    fn test_extract_version_reference_msgids_ignores_unmarked_links() {
+        // A dependency link after a changelog heading names another series,
+        // not the previous version of this one.
+        let dependency_after_heading = "Changes since v2:\n\
+- new patches 3 to 7 fix the range checks\n\
+\n\
+[1] https://lore.kernel.org/all/20260915070001.113559-3-hao.ge@linux.dev/\n\
+Link: https://lore.kernel.org/r/20260915070001.113559-1-hao.ge@linux.dev\n\
+This series depends on https://lore.kernel.org/r/20260901-dep@kernel.org\n";
+        assert!(extract_version_reference_msgids(dependency_after_heading).is_empty());
+
+        // Kernel-version prose is not a previous-version marker.
+        let kernel_versions = "This regressed since v6.8 https://lore.kernel.org/r/20260101-regress@kernel.org\n\
+It was fixed in v5.4: https://lore.kernel.org/r/20260102-fixed-in@kernel.org\n\
+in v6.12 (https://lore.kernel.org/r/20260103-in-v6-12@kernel.org)\n\
+v6.8: https://lore.kernel.org/r/20260104-v6-8-colon@kernel.org\n\
+v5.4 (https://lore.kernel.org/r/20260105-v5-4-paren@kernel.org)\n\
+Changes since v6.8: https://lore.kernel.org/r/20260106-changes-since-kver@kernel.org\n";
+        assert!(extract_version_reference_msgids(kernel_versions).is_empty());
+
+        // A version marker followed by prose names something else.
+        let prose = "v2 of the base series: https://lore.kernel.org/r/20260107-base-v2@kernel.org\n\
+v1 was discussed at https://lore.kernel.org/r/20260108-discussed@kernel.org\n";
+        assert!(extract_version_reference_msgids(prose).is_empty());
     }
 
     #[test]
