@@ -7,7 +7,6 @@ RUN rustup component add clippy rustfmt
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     clang \
-    lld \
     pkg-config \
     libssl-dev \
     wget \
