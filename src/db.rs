@@ -12926,52 +12926,6 @@ impl Database {
             .await?;
         Ok(id)
     }
-
-    pub async fn update_message_body(&self, message_id: &str, body: &str) -> Result<()> {
-        let body_owned = body.to_string();
-        let compressed_body = tokio::task::spawn_blocking(move || {
-            crate::compression::compress_string_if_needed(&body_owned)
-        })
-        .await
-        .context("message body compression task failed")?;
-        let now = chrono::Utc::now().timestamp();
-        let tx = self.begin_immediate_transaction().await?;
-        for clid in Self::get_msgid_candidates(message_id) {
-            let res = tx
-                .execute(
-                    "UPDATE messages SET body = ? WHERE message_id = ?",
-                    libsql::params![compressed_body.clone(), clid],
-                )
-                .await?;
-            if res > 0 {
-                tx.commit().await?;
-                return Ok(());
-            }
-        }
-        let thread_id = {
-            let mut rows = tx
-                .query(
-                    "INSERT INTO threads (root_message_id, subject, last_updated) VALUES (?, '(placeholder)', ?) RETURNING id",
-                    libsql::params![message_id, now],
-                )
-                .await?;
-            let val = match rows.next().await? {
-                Some(row) => Some(row.get::<i64>(0)?),
-                None => None,
-            };
-            drop(rows);
-            val.ok_or_else(|| anyhow::anyhow!("Failed to get thread ID"))?
-        };
-        tx.execute(
-            "INSERT INTO messages (message_id, thread_id, in_reply_to, author, subject, date, body, to_recipients, cc_recipients, git_blob_hash, mailing_list, references_hdr)
-             VALUES (?, ?, NULL, 'unknown', '(placeholder)', ?, ?, '', '', NULL, NULL, NULL)",
-            libsql::params![message_id, thread_id, now, compressed_body],
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
     pub async fn update_patchset_error(&self, root_msg_id: &str, error: &str) -> Result<()> {
         let candidates = Self::get_msgid_candidates(root_msg_id);
         for clid in candidates {
@@ -14379,6 +14333,8 @@ impl Database {
             if status == "Fetching" {
                 return Ok(has_active_fetch != 0);
             }
+            // "Failed to store PR description body" is no longer written, but
+            // rows failed with it by earlier releases stay recoverable.
             if status == "Failed"
                 && matches!(
                     failed_reason.as_deref(),
@@ -28952,83 +28908,6 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn test_update_message_body_prefers_existing_alias_before_placeholder() {
-        let db = setup_db().await;
-        db.ensure_thread_for_message("<pr-body-alias@example.com>", 1700000000)
-            .await
-            .unwrap();
-
-        db.update_message_body("pr-body-alias@example.com", "Updated PR description")
-            .await
-            .unwrap();
-
-        assert_eq!(
-            db.get_message_body("<pr-body-alias@example.com>")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("Updated PR description")
-        );
-        let mut rows = db
-            .conn
-            .query(
-                "SELECT COUNT(*) FROM messages WHERE message_id IN ('pr-body-alias@example.com', '<pr-body-alias@example.com>')",
-                (),
-            )
-            .await
-            .unwrap();
-        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[tokio::test]
-    async fn test_update_message_body_creates_placeholder_when_message_is_unknown() {
-        let db = setup_db().await;
-        let msgid = "mr-7-aaaa..bbbb@sashiko.local";
-
-        db.update_message_body(msgid, "Fresh PR description")
-            .await
-            .unwrap();
-
-        assert_eq!(
-            db.get_message_body(msgid).await.unwrap().as_deref(),
-            Some("Fresh PR description")
-        );
-        let mut rows = db
-            .conn
-            .query(
-                "SELECT m.subject, t.subject FROM messages m JOIN threads t ON t.id = m.thread_id WHERE m.message_id = ?",
-                libsql::params![msgid],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().expect("placeholder message row");
-        assert_eq!(row.get::<String>(0).unwrap(), "(placeholder)");
-        assert_eq!(row.get::<String>(1).unwrap(), "(placeholder)");
-        drop(rows);
-
-        // A second write updates the same row instead of adding another.
-        db.update_message_body(msgid, "").await.unwrap();
-        assert!(
-            db.get_message_body(msgid)
-                .await
-                .unwrap()
-                .unwrap_or_default()
-                .is_empty()
-        );
-        let mut rows = db
-            .conn
-            .query(
-                "SELECT COUNT(*) FROM messages WHERE message_id = ?",
-                libsql::params![msgid],
-            )
-            .await
-            .unwrap();
-        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(count, 1);
-    }
-
     fn collect_rust_sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
         let entries = std::fs::read_dir(dir).expect("readable source directory");
         for entry in entries.flatten() {
@@ -31081,9 +30960,16 @@ mod tests {
         // re-pushing head1 is not blocked by the superseded row even if ps_id
         // was already Reviewed, preserves its archived cover letter body and
         // messages_subsystems links, and clears v1's stale Done fetch_queue row.
-        db.update_message_body(&format!("mr-500-{range1}@sashiko.local"), "v1 description")
-            .await
-            .unwrap();
+        assert_eq!(
+            db.conn
+                .execute(
+                    "UPDATE messages SET body = ? WHERE message_id = ?",
+                    libsql::params!["v1 description", format!("mr-500-{range1}@sashiko.local")],
+                )
+                .await
+                .unwrap(),
+            1
+        );
         let sub_id = db.ensure_subsystem("core", "all").await.unwrap();
         db.conn
             .execute(
@@ -31132,9 +31018,16 @@ mod tests {
                 .unwrap(),
             "stale Done fetch_queue row from v1 must be cleared so an unbacked v3 Fetching placeholder is recoverable"
         );
-        db.update_message_body(&format!("mr-500-{range1}@sashiko.local"), "v3 description")
-            .await
-            .unwrap();
+        assert_eq!(
+            db.conn
+                .execute(
+                    "UPDATE messages SET body = ? WHERE message_id = ?",
+                    libsql::params!["v3 description", format!("mr-500-{range1}@sashiko.local")],
+                )
+                .await
+                .unwrap(),
+            1
+        );
         assert!(ps3_id > ps2_id);
         assert_eq!(
             db.get_patchset_status(ps2_id).await.unwrap().as_deref(),

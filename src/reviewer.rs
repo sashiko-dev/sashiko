@@ -776,19 +776,6 @@ impl Reviewer {
             },
             None => None,
         };
-        // A forge pull request stores its PR description on the placeholder
-        // root message for the series-level cover review, not as a mailing-list
-        // 0/N email carrying `base-commit:` or Lore prerequisite trailers.
-        let baseline_body = if patchset.mr_url.is_some() {
-            None
-        } else {
-            body.as_deref()
-        };
-        let prerequisite_msg_id = if patchset.mr_url.is_some() {
-            None
-        } else {
-            patchset.message_id.as_deref()
-        };
         let candidates = if let Some(commit) = forced_baseline {
             info!(
                 "Using forced baseline commit {} from ingestion for patchset {}",
@@ -797,7 +784,7 @@ impl Reviewer {
             vec![BaselineResolution::Commit(commit)]
         } else {
             ctx.baseline_registry
-                .resolve_candidates(&all_files, &subject, baseline_body)
+                .resolve_candidates(&all_files, &subject, body.as_deref())
                 .await
         };
 
@@ -807,8 +794,8 @@ impl Reviewer {
             patchset_id,
             &candidates,
             &diffs,
-            prerequisite_msg_id,
-            baseline_body,
+            patchset.message_id.as_deref(),
+            body.as_deref(),
         )
         .await;
 
@@ -6481,135 +6468,6 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             )
             .await?;
         assert!(meta_rows.next().await?.is_none());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_review_patchset_task_ignores_prerequisite_trailers_in_pr_body() -> Result<()> {
-        let temp_dir = tempdir()?;
-        let repo = temp_dir.path().join("repo");
-        std::fs::create_dir_all(&repo)?;
-        run_git(&repo, &["init", "-q"])?;
-        run_git(&repo, &["config", "user.name", "Test Author"])?;
-        run_git(&repo, &["config", "user.email", "author@example.com"])?;
-
-        let file = repo.join("value.txt");
-        std::fs::write(&file, "one\n")?;
-        run_git(&repo, &["add", "value.txt"])?;
-        run_git(&repo, &["commit", "-q", "-m", "base"])?;
-        let base_sha = run_git(&repo, &["rev-parse", "HEAD"])?;
-
-        std::fs::write(&file, "one\ntwo\n")?;
-        run_git(&repo, &["commit", "-q", "-am", "pr commit"])?;
-        let head_sha = run_git(&repo, &["rev-parse", "HEAD"])?;
-        let target_diff = run_git(&repo, &["show", "--format=", "--patch", "HEAD"])?;
-
-        let mut settings = Settings::new()?;
-        settings.database.url = ":memory:".to_string();
-        settings.git.repository_path = repo.to_string_lossy().into_owned();
-        settings.review.worktree_dir = Some(
-            temp_dir
-                .path()
-                .join("worktrees")
-                .to_string_lossy()
-                .into_owned(),
-        );
-        settings.review.ignore_files = vec!["value.txt".to_string()];
-
-        let db = Arc::new(Database::new(&settings.database).await?);
-        db.migrate().await?;
-
-        let root_msg_id = format!("mr-42-{}..{}@sashiko.local", base_sha, head_sha);
-        let thread_id = db.create_thread(&root_msg_id, "PR #42", 1000).await?;
-        // Store a PR description body containing Lore prerequisite and base-commit
-        // lines that do not exist in the database or repository.
-        db.create_message(
-            &root_msg_id,
-            thread_id,
-            None,
-            "Test Author <author@example.com>",
-            "PR #42: update value",
-            1000,
-            "PR description quoting trailers:\n\
-             prerequisite-patch-id: 1111111111111111111111111111111111111111\n\
-             prerequisite-message-id: missing-prereq@example.com\n\
-             base-commit: 2222222222222222222222222222222222222222\n",
-            "",
-            "",
-            None,
-            None,
-        )
-        .await?;
-        db.create_message(
-            &head_sha,
-            thread_id,
-            Some(&root_msg_id),
-            "Test Author <author@example.com>",
-            "pr commit",
-            1001,
-            "pr commit body",
-            "",
-            "",
-            None,
-            None,
-        )
-        .await?;
-
-        let baseline_id = db.create_baseline(None, None, Some(&base_sha)).await?;
-        let ps_id = db
-            .create_patchset(
-                thread_id,
-                Some(&root_msg_id),
-                &head_sha,
-                "[PR #42 v1] update value",
-                "Test Author <author@example.com>",
-                1001,
-                1,
-                1,
-                "",
-                "",
-                Some(1),
-                1,
-                Some(baseline_id),
-                false,
-                None,
-                None,
-            )
-            .await?
-            .unwrap();
-        db.update_patchset_mr_metadata(
-            ps_id,
-            Some("https://github.com/org/repo/pull/42"),
-            Some("update value"),
-            Some(42),
-            Some("repo-42"),
-        )
-        .await?;
-        db.create_patch(ps_id, &head_sha, 1, &target_diff).await?;
-
-        let mut pending = db.get_pending_patchsets(10).await?;
-        assert_eq!(pending.len(), 1);
-        let patchset = pending.pop().unwrap();
-
-        let ctx = ReviewContext {
-            semaphore: Arc::new(Semaphore::new(1)),
-            llm_semaphore: Arc::new(Semaphore::new(1)),
-            db: db.clone(),
-            settings,
-            baseline_registry: Arc::new(BaselineRegistry::new(&repo, None)?),
-            quota_manager: Arc::new(QuotaManager::new()),
-            target_review_count: 1,
-            provider: Arc::new(MockProvider),
-            worker_overrides: WorkerSubprocessOverrides::default(),
-        };
-
-        Reviewer::review_patchset_task(ctx, patchset).await;
-
-        assert_eq!(
-            db.get_patchset_status(ps_id).await?.as_deref(),
-            Some(ReviewStatus::Reviewed.as_str())
-        );
 
         Ok(())
     }

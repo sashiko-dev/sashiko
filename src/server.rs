@@ -2488,22 +2488,6 @@ pub async fn ingest_forge_pull_request(
         return Ok(false);
     }
 
-    // Written after create_fetching_patchset archives any superseded revision
-    // sharing placeholder_id, and whenever the forge sent a body (empty
-    // included) so a cleared description does not leave stale text behind.
-    if let Some(ref pr_body) = metadata.pr_body
-        && let Err(e) = db
-            .update_message_body(&placeholder_id, pr_body.trim())
-            .await
-    {
-        fail_fetching_patchset_logged(db, &placeholder_id, "Failed to store PR description body")
-            .await;
-        return Err(format!(
-            "Failed to store PR description body for {}: {}",
-            placeholder_id, e
-        ));
-    }
-
     if let Err(e) = db
         .enqueue_fetch_request(
             metadata.repo_url.as_deref(),
