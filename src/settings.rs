@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use config::{Config, ConfigError, Environment, File};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub use crate::ai::{EffortMode, model_supports_effort};
@@ -556,6 +556,45 @@ pub struct OpenAiCompatSettings {
     /// serves, or "responses" for OpenAI's /v1/responses.
     #[serde(default)]
     pub api: Option<String>,
+    /// Processing tier, sent as `service_tier` on both OpenAI endpoints.
+    /// Omitted when unset, which leaves the request on the account's
+    /// default tier. Only OpenAI's own API accepts the field, so setting
+    /// it with `provider = "openai-compatible"` is a configuration error.
+    #[serde(default)]
+    pub service_tier: Option<ServiceTier>,
+}
+
+/// OpenAI processing tier. The set is fixed by the API rather than by the
+/// model, so a misspelling fails at config load instead of as a 400 on the
+/// first request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceTier {
+    /// The project's configured default, which is `Default` unless the
+    /// project was set up for scale tier.
+    Auto,
+    /// Standard pricing and latency.
+    Default,
+    /// Half the standard per-token price in exchange for higher latency
+    /// and more 429s, which the usual retry absorbs.
+    Flex,
+    /// Lower latency at a higher per-token price.
+    Priority,
+    /// Reserved capacity bought in advance.
+    Scale,
+}
+
+impl ServiceTier {
+    /// The wire spelling, which is also what the response echoes back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Default => "default",
+            Self::Flex => "flex",
+            Self::Priority => "priority",
+            Self::Scale => "scale",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

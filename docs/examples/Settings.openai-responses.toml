@@ -19,6 +19,8 @@ api = "responses"              # "chat" (the default) speaks /v1/chat/completion
 max_tokens = 65536             # output cap, sent as max_output_tokens
 effort = "medium"              # the valid set is model-dependent; gpt-5.4-pro
                                # takes only "medium" and "high"
+# service_tier = "flex"        # half price, slower; "priority" is the reverse.
+                               # With "flex", set [ai] api_timeout_secs = 900.
 # base_url = "https://api.openai.com/v1/responses"  # set only to override
 # context_window_size = 128000   # generic fallback; raise to the model's real window
 

@@ -669,3 +669,17 @@ Everything else in `[ai.openai_compat]` applies to both, except
 `extra_headers`, and `extra_body`, which shape a chat completion only.
 Setting any of them with `api = "responses"` is refused at startup
 rather than ignored.
+
+`service_tier` picks the processing tier and is sent on both endpoints,
+omitted when unset. `"flex"` halves the per-token price in exchange
+for slower responses and a higher rate of 429s, which the usual retry
+absorbs. Most of a review's cost is uncached input, so on an expensive
+model this is the one setting that moves the bill. Two things go with
+it. Raise `api_timeout_secs` to at least 900: a flex response can
+outlast the default 300 seconds, and a request the client gives up on
+is resent in full and billed again; Sashiko warns at startup when it is
+lower. A request the account could not run on flex comes back on the
+`default` tier at full price. The first such response logs a warning,
+and the debug-level "OpenAI response received" line reports the tier
+of every response in its `tier=` field. Only OpenAI's own API accepts
+the field, so `provider = "openai-compatible"` refuses it at startup.

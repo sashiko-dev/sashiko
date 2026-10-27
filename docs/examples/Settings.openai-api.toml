@@ -28,6 +28,9 @@ model = "gpt-5.6-sol"
 max_tokens = 65536
 # Sent as reasoning_effort; the valid set is model-dependent.
 effort = "none"
+# Half price and slower; "priority" is the reverse. With "flex", raise
+# api_timeout_secs in the [ai] table to 900.
+# service_tier = "flex"
 # Derived from the model; set only to override.
 # base_url = "https://api.openai.com/v1/chat/completions"
 # Generic fallback for gpt-5.x; raise to the model's real window.
