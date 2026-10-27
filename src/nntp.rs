@@ -51,12 +51,12 @@ pub struct GroupInfo {
 
 /// The crypto provider backing every NNTPS handshake.
 ///
-/// Both `ring` and `aws-lc-rs` are linked into this binary by way of
-/// reqwest and lettre. With two providers present rustls cannot pick a
-/// process default on its own, and `ClientConfig::builder()` panics.
-/// Neither crate installs a default; each falls back to its own
-/// provider when none is set. Naming the provider here makes the
-/// choice local rather than a process-wide one for this module alone.
+/// Optional features (such as `bedrock`) can link `ring` alongside
+/// `aws-lc-rs`. With two providers present rustls cannot pick a process
+/// default on its own, and `ClientConfig::builder()` panics. Neither
+/// crate installs a default; each falls back to its own provider when
+/// none is set. Naming the provider here makes the choice local rather
+/// than a process-wide one for this module alone.
 fn crypto_provider() -> Arc<CryptoProvider> {
     Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider())
 }
