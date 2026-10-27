@@ -51,6 +51,9 @@
             --status-embargoed: #6f42c1;
             --tag-bg: #e0f7fa;
             --tag-text: #006064;
+            --lineage-bg: #f1f5f9;
+            --lineage-text: #334155;
+            --lineage-border: #cbd5e1;
             --diff-add-bg: #e6ffec;
             --diff-rm-bg: #ffebe9;
             --diff-header: #005cc5;
@@ -114,6 +117,9 @@
                 --status-embargoed: #d2a8ff;
                 --tag-bg: #032f62;
                 --tag-text: #79c0ff;
+                --lineage-bg: rgba(148, 163, 184, 0.12);
+                --lineage-text: #cbd5e1;
+                --lineage-border: #475569;
                 --diff-add-bg: rgba(46, 160, 67, 0.15);
                 --diff-rm-bg: rgba(248, 81, 73, 0.15);
                 --diff-header: #79c0ff;
@@ -273,6 +279,9 @@
             --status-embargoed: #6f42c1;
             --tag-bg: #e0f7fa;
             --tag-text: #006064;
+            --lineage-bg: #f1f5f9;
+            --lineage-text: #334155;
+            --lineage-border: #cbd5e1;
             --diff-add-bg: #e6ffec;
             --diff-rm-bg: #ffebe9;
             --diff-header: #005cc5;
@@ -332,6 +341,9 @@
             --status-embargoed: #d2a8ff;
             --tag-bg: #032f62;
             --tag-text: #79c0ff;
+            --lineage-bg: rgba(148, 163, 184, 0.12);
+            --lineage-text: #cbd5e1;
+            --lineage-border: #475569;
             --diff-add-bg: rgba(46, 160, 67, 0.15);
             --diff-rm-bg: rgba(248, 81, 73, 0.15);
             --diff-header: #79c0ff;
@@ -959,6 +971,43 @@
         .kv .label {
             font-weight: 600;
             color: var(--text-muted);
+        }
+
+        /* Series versions: the same slate pills as the per-patch lineage */
+        .version-list .lineage-badge {
+            margin-left: 0;
+            margin-right: 6px;
+        }
+
+        .version-list .lineage-badge.current {
+            border-color: var(--lineage-text);
+            font-weight: 600;
+        }
+
+        .version-list .version-gap {
+            color: var(--text-dim);
+            margin-right: 6px;
+        }
+
+        /* Per-patch lineage: slate pill, deliberately unlike the square .tag */
+        .lineage-badge {
+            display: inline-block;
+            margin-left: 8px;
+            padding: 0 7px;
+            border-radius: 10px;
+            border: 1px solid var(--lineage-border);
+            background: var(--lineage-bg);
+            color: var(--lineage-text);
+            font-size: 0.75em;
+            font-weight: normal;
+            line-height: 1.6;
+            text-decoration: none;
+            vertical-align: middle;
+            white-space: nowrap;
+        }
+
+        a.lineage-badge:hover {
+            border-color: var(--lineage-text);
         }
 
         /* Section containers */
@@ -3056,6 +3105,43 @@
             }
         }
 
+        // Labels a series version the same way everywhere on the page: "vN",
+        // or "RFC" / "RFC vN" when the subject carries an RFC tag.
+        function versionLabel(version, subject) {
+            const ver = Number(version) || 1;
+            const rfc = /^\s*\[[^\]]*\bRFC\b/i.test(subject || '');
+            return rfc ? (ver > 1 ? `RFC v${ver}` : 'RFC') : `v${ver}`;
+        }
+
+        // Renders the patchset version row as slate pills: the first version,
+        // the last three, and the current one with its predecessor (which the
+        // per-patch lineage badges refer to), with gaps collapsed to an
+        // ellipsis, e.g. "RFC ... v5 v6 v8"; the current version is bold.
+        function renderVersionList(data) {
+            const chain = data.versions;
+            const label = v => versionLabel(v.version, v.subject);
+            const href = v => `#/patchset/${encodeURIComponent(v.slug || v.id || v.message_id)}`;
+            const title = v => `${v.subject || '(no subject)'} (${v.status || 'Unknown'}, ${formatDate(v.date)})`;
+
+            const curIdx = chain.findIndex(v => Number(v.id) === Number(data.id));
+            const last = chain.length - 1;
+            const shown = [...new Set([0, curIdx - 1, curIdx, last - 2, last - 1, last])]
+                .filter(i => i >= 0 && i <= last)
+                .sort((x, y) => x - y);
+
+            const out = [];
+            shown.forEach((i, n) => {
+                if (n > 0 && i - shown[n - 1] > 1) {
+                    out.push('<span class="version-gap">&hellip;</span>');
+                }
+                const v = chain[i];
+                out.push(i === curIdx
+                    ? `<span class="lineage-badge current" title="${escapeHtml(title(v))}">${escapeHtml(label(v))}</span>`
+                    : `<a href="${href(v)}" class="lineage-badge" title="${escapeHtml(title(v))}">${escapeHtml(label(v))}</a>`);
+            });
+            return `<div class="version-list">${out.join('')}</div>`;
+        }
+
         function copyToClipboard(input, btn) {
             let text;
             if (input instanceof HTMLElement) {
@@ -3986,33 +4072,40 @@
             sortedPatchIds.forEach((pid, index) => {
                 const patch = patchMap.get(pid);
                 const reviews = reviewsByPatch.get(pid);
-                let header = patch
-                    ? `Patch ${patch.part_index}: <a href="#/message/${encodeURIComponent(patch.message_id)}">${escapeHtml(patch.subject || '(no subject)')}</a>`
-                    : `Patch ID ${pid}`;
-                const encodedPatchsetId = encodeURIComponent(state.patchsetId).replace(/'/g, '%27');
-                const patchLink = window.location.origin + window.location.pathname + `#/patchset/${encodedPatchsetId}?${patch ? 'part=' + encodeURIComponent(patch.part_index) : 'patch=' + encodeURIComponent(pid)}`;
-                header += `<a href="${escapeHtml(patchLink)}" class="permalink-icon" onclick="copyToClipboard(this.href); return false;" title="Copy permalink to this patch">
-                    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg>
-                </a>`;
-                let patchLineageBadge = '';
+                let lineageBadge = '';
                 if (patch && patch.previous_patch) {
                     const prev = patch.previous_patch;
                     const prevTarget = prev.patchset_slug || prev.patchset_id || prev.patchset_message_id;
                     const prevHref = prev.part_index
                         ? `#/patchset/${encodeURIComponent(prevTarget)}?part=${encodeURIComponent(prev.part_index)}`
                         : `#/patchset/${encodeURIComponent(prevTarget)}`;
-                    const prevVer = Number(prev.version) || 1;
+                    const prevNode = (data.versions || []).find(v => Number(v.id) === Number(prev.patchset_id));
+                    const prevVer = prevNode
+                        ? versionLabel(prevNode.version, prevNode.subject)
+                        : versionLabel(prev.version, '');
                     const prevPart = Number(prev.part_index) || 1;
-                    const prevStatus = prev.status === 'unchanged' ? 'unchanged' : 'modified';
-                    patchLineageBadge = ` <a href="${prevHref}" class="tag" onclick="event.stopPropagation();" style="margin-left:6px; text-decoration:none; font-weight:normal;" title="View v${prevVer} Patch ${prevPart} (${escapeHtml(prevStatus)})">&larr; v${prevVer} #${prevPart} (${escapeHtml(prevStatus)})</a>`;
-                    header += patchLineageBadge;
+                    // Name the previous patch number only when the patch moved.
+                    const prevRef = prevPart === Number(patch.part_index)
+                        ? prevVer
+                        : `${prevVer} #${prevPart}`;
+                    const text = prev.status === 'unchanged'
+                        ? `unchanged since ${prevRef}`
+                        : `modified since ${prevRef}`;
+                    lineageBadge = `<a href="${prevHref}" class="lineage-badge" onclick="event.stopPropagation();" title="${escapeHtml(`View ${prevVer} patch ${prevPart}`)}">${escapeHtml(text)}</a>`;
                 } else if (patch && patch.part_index > 0 && data.previous_patchset_id) {
                     // Cover letters (part 0) are not reconciled into per-patch
                     // lineage, so an unlinked part 0 is not a newly added patch.
-                    const currVer = Number(data.version) || 1;
-                    patchLineageBadge = ` <span class="tag" style="margin-left:6px; font-weight:normal;" title="New patch added in v${currVer}">new in v${currVer}</span>`;
-                    header += patchLineageBadge;
+                    const currVer = versionLabel(data.version, data.subject);
+                    lineageBadge = `<span class="lineage-badge">new in ${escapeHtml(currVer)}</span>`;
                 }
+                let header = patch
+                    ? `Patch ${patch.part_index}: <a href="#/message/${encodeURIComponent(patch.message_id)}">${escapeHtml(patch.subject || '(no subject)')}</a>${lineageBadge}`
+                    : `Patch ID ${pid}`;
+                const encodedPatchsetId = encodeURIComponent(state.patchsetId).replace(/'/g, '%27');
+                const patchLink = window.location.origin + window.location.pathname + `#/patchset/${encodedPatchsetId}?${patch ? 'part=' + encodeURIComponent(patch.part_index) : 'patch=' + encodeURIComponent(pid)}`;
+                header += `<a href="${escapeHtml(patchLink)}" class="permalink-icon" onclick="copyToClipboard(this.href); return false;" title="Copy permalink to this patch">
+                    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg>
+                </a>`;
 
                 const borderStyle = '';
 
@@ -4071,7 +4164,7 @@
                     const summaryStatus = computeReviewSummaryStatus(reviews, patch);
                     const patchLabel = patch ? `Patch ${patch.part_index}` : `Patch ${pid}`;
                     const patchSubject = patch ? escapeHtml(patch.subject || '(no subject)') : '';
-                    summaryHtml += `<tr onclick="document.getElementById('patch-${pid}').scrollIntoView({behavior: 'smooth'})" style="cursor:pointer"><td><strong>${patchLabel}</strong>: ${patchSubject}${patchLineageBadge}</td><td>${summaryStatus}</td></tr>`;
+                    summaryHtml += `<tr onclick="document.getElementById('patch-${pid}').scrollIntoView({behavior: 'smooth'})" style="cursor:pointer"><td><strong>${patchLabel}</strong>: ${patchSubject}${lineageBadge}</td><td>${summaryStatus}</td></tr>`;
                 }
             });
 
@@ -4260,24 +4353,9 @@
 
             let versionsRowHtml = '';
             if (Array.isArray(data.versions) && data.versions.length > 1) {
-                const versionPills = data.versions.map(v => {
-                    const vNum = Number(v.version) || 1;
-                    const vStatus = v.status || 'Unknown';
-                    const isCurrent = Number(v.id) === Number(data.id);
-                    if (isCurrent) {
-                        const sigTitle = data.version_link_signal
-                            ? `Current version (v${vNum}, linked via ${data.version_link_signal})`
-                            : `Current version (v${vNum})`;
-                        return `<span class="tag" style="font-weight:bold; border-color:var(--link);" title="${escapeHtml(sigTitle)}">v${vNum} (current)</span>`;
-                    }
-                    const vTarget = v.slug || v.id || v.message_id;
-                    const vHref = `#/patchset/${encodeURIComponent(vTarget)}`;
-                    const vTitle = `v${vNum}: ${v.subject || ''} (${vStatus})`;
-                    return `<a href="${vHref}" class="tag" style="text-decoration:none; cursor:pointer;" title="${escapeHtml(vTitle)}">v${vNum} (${escapeHtml(vStatus)})</a>`;
-                }).join(' <span style="color:var(--text-dim); margin-right:4px;">&rarr;</span> ');
-                versionsRowHtml = `<div class="kv"><div class="label">Versions:</div><div>${versionPills}</div></div>`;
+                versionsRowHtml = `<div class="kv"><div class="label">Versions:</div><div>${renderVersionList(data)}</div></div>`;
             } else if ((Number(data.version) || 1) > 1) {
-                versionsRowHtml = `<div class="kv"><div class="label">Version:</div><div>v${Number(data.version)}</div></div>`;
+                versionsRowHtml = `<div class="kv"><div class="label">Version:</div><div>${escapeHtml(versionLabel(data.version, data.subject))}</div></div>`;
             }
 
             document.getElementById('app').innerHTML = `
