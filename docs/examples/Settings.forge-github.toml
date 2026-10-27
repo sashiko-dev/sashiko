@@ -1,3 +1,6 @@
+# Fragment, not a complete configuration: merge these tables into a
+# working Settings.toml (start from the one at the repository root).
+#
 # GitHub webhook integration with HMAC-SHA256 verification.
 # See docs/WEBHOOK_SECURITY.md for full setup guide.
 
@@ -9,6 +12,12 @@ provider = "github"
 # Enter the same value in GitHub: repo Settings > Webhooks > Secret.
 # Verifies both sender identity and payload integrity.
 webhook_secret = "YOUR_HEX_SECRET_HERE"
+# Reviews are only posted back to the pull request when post_mode is
+# "live" ("dry_run" records them without posting; "off" is the default).
+# Posting authenticates with a GitHub App (app_id, installation_id and
+# app_private_key_path) or, failing that, with api_token.
+# post_mode = "live"
+# api_token = "ghp_..."
 
 [server]
 host = "127.0.0.1"

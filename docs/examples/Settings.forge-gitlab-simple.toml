@@ -1,3 +1,6 @@
+# Fragment, not a complete configuration: merge these tables into a
+# working Settings.toml (start from the one at the repository root).
+#
 # GitLab webhook integration — simple setup for scripts and cronjobs.
 # Use when polling GitLab API and posting results to Sashiko via curl.
 # See docs/WEBHOOK_SECURITY.md for full setup guide.
