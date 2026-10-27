@@ -1,3 +1,6 @@
+# Claude Code CLI (subscription auth, no API key).
+# Setup: docs/llm-providers.md, section "Claude Code CLI".
+
 [ai]
 provider = "claude-cli"
 model = "claude-opus-4-7"
@@ -5,4 +8,8 @@ max_input_tokens = 950000
 max_interactions = 150
 
 [ai.claude_cli]
-# effort = "high"
+# effort = "high"   # "low", "medium", "high", "xhigh", "max"
+
+[review]
+# Each review spawns many CLI processes; lower this on rate limits.
+concurrency = 4

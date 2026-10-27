@@ -1,3 +1,6 @@
+# GitHub Copilot CLI (subscription auth, no API key).
+# Setup: docs/llm-providers.md, section "GitHub Copilot CLI".
+
 [ai]
 provider = "copilot-cli"
 model = "claude-sonnet-4.5"
@@ -5,4 +8,5 @@ max_input_tokens = 40000
 max_interactions = 150
 
 [review]
+# Each review spawns many CLI processes; lower this on rate limits.
 concurrency = 4

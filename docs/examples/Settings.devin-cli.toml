@@ -1,6 +1,10 @@
+# Devin CLI (subscription auth, no API key).
+# Setup: docs/llm-providers.md, section "Devin CLI".
+
 [ai]
 provider = "devin-cli"
-# Leave model as an empty string to use the devin CLI default, or set e.g. "opus", "swe", "gpt".
+# Any value devin --model accepts, e.g. "opus", "swe", "gpt". An empty
+# string uses the devin CLI default.
 model = "opus"
 max_input_tokens = 200000
 max_interactions = 150
@@ -14,3 +18,7 @@ max_interactions = 150
 # applying a deny-all permissions block without touching the user's
 # ~/.config/devin/config.json.
 # config = "/path/to/devin-config.json"
+
+[review]
+# Each review spawns many CLI processes; lower this on rate limits.
+concurrency = 4

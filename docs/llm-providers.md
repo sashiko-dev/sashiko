@@ -7,7 +7,13 @@ preferences.
 
 For all providers, configuration lives in `Settings.toml` at the project
 root. Per-provider example files are available in
-[docs/examples/](examples/).
+[docs/examples/](examples/). Each one is a complete configuration for
+`sashiko review`, so copying it over `Settings.toml` works as shown
+below. A daemon needs more than that (`[database]`, `[git]`,
+`[review] worktree_dir`, ...): start from the repository's
+`Settings.toml` and replace its `[ai]` tables with the example's.
+Every key is described in the
+[Configuration Reference](configuration.md).
 
 ## Gemini (default)
 
@@ -246,6 +252,10 @@ Anything else is rejected at startup.
 `max_tokens`, `thinking`, and `effort` under `[ai.vertex]` apply to both
 Claude and Gemini models (falling back to `[ai.gemini]` for Gemini models when
 unset).
+For Claude, `thinking` takes `"adaptive"` (or `"disabled"` where the model
+allows it) and `effort` takes `"low"`, `"medium"`, `"high"`, `"xhigh"` or
+`"max"`. For Gemini, both take a thinking level (`"LOW"`, `"MEDIUM"`,
+`"HIGH"`), and `effort` wins when both are set.
 
 ## Kiro CLI
 
@@ -350,10 +360,6 @@ subscription -- no per-token charge, no API key.
 cp docs/examples/Settings.codex-cli.toml Settings.toml
 ```
 
-For OpenAI's coding-optimized model, use
-`docs/examples/Settings.gpt-5-codex.toml` instead (same backend,
-`model = "gpt-5-codex"`).
-
 **What you get:**
 
 - Runs `codex exec --json --sandbox read-only` as a stateless backend
@@ -375,20 +381,25 @@ whatever the origin. A run whose effort that layer substitutes fails
 rather than record a review at an effort other than the one configured.
 Leave the setting unset to accept the account default.
 
-#### Devin CLI Setup
+## Devin CLI
 
 Sashiko can use a local [Devin for Terminal](https://cli.devin.ai/) install as
 a completion backend. This path uses your Devin subscription, so there is no
 per-token API charge and no API key to configure.
 
-**Prerequisites**:
+**Prerequisites:**
+
 - `devin` CLI installed and on `$PATH`
 - Authenticated session (run `devin auth login` once)
 
-**Update Settings.toml**:
-Copy `examples/Settings.devin-cli.toml` to your `Settings.toml` and adjust as needed.
+**Apply the example config:**
 
-**Notes**:
+```bash
+cp docs/examples/Settings.devin-cli.toml Settings.toml
+```
+
+**Notes:**
+
 - `model` accepts any identifier `devin --model` accepts (e.g. `opus`,
   `swe`, `gpt`, `codex`). Leave it empty in `[ai]` to use the Devin default.
 - Sashiko invokes `devin --print --prompt-file <tmp>`
@@ -411,7 +422,6 @@ cp docs/examples/Settings.ollama.toml Settings.toml
 **What you get:**
 
 - Private, local execution of LLMs
-- Support for reasoning models via the `think` setting
 - No API key or subscription required
 - `context_window_size` maps to Ollama's `num_ctx`
 

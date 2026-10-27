@@ -1,3 +1,6 @@
+# Claude through the Anthropic API. Export ANTHROPIC_API_KEY.
+# Setup: docs/llm-providers.md, section "Claude (API)".
+
 [ai]
 provider = "claude"
 model = "claude-sonnet-4-6"
@@ -6,5 +9,8 @@ max_input_tokens = 40000
 [ai.claude]
 prompt_caching = true
 max_tokens = 32768
-# thinking = "adaptive"
-# effort = "high"
+# thinking = "adaptive"   # or "disabled" where the model allows it
+# effort = "high"         # "low", "medium", "high", "xhigh", "max"
+
+[review]
+concurrency = 4

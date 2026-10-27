@@ -1,16 +1,16 @@
+# Minimal configuration for local review with sashiko review; sashiko init
+# writes this file. Other providers: docs/examples/Settings.*.toml and
+# docs/llm-providers.md. Every key: docs/configuration.md.
+
 [ai]
 provider = "gemini"
 model = "gemini-4-argon"
-max_input_tokens = 950000
-temperature = 1.0
-
-[ai.gemini]
-explicit_prompt_caching = false
-# max_tokens = 131072
-# thinking_level = "HIGH"
+max_input_tokens = 900000
 
 [review]
 # Reviews run concurrently up to this many patches. Sized for one developer's
 # machine; the daemon's own Settings.toml uses a much larger fan-out.
 concurrency = 4
-# effort = "mid"  # Options: "low", "mid" (default for Argon 4), "high", "dynamic"
+# Reasoning effort on Argon models: "low", "mid" (default), "high", or
+# "dynamic". Other models ignore it.
+# effort = "mid"

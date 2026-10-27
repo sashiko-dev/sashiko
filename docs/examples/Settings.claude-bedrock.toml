@@ -1,6 +1,10 @@
+# Claude on AWS Bedrock. Needs a build with --features bedrock: without
+# it the [ai.bedrock] table below is rejected as an unknown field.
+# Setup: docs/llm-providers.md, section "AWS Bedrock".
+
 [ai]
 provider = "bedrock"
-model = "us.anthropic.claude-sonnet-4-6-20250514-v1:0"
+model = "us.anthropic.claude-sonnet-4-6"
 max_input_tokens = 40000
 
 [ai.bedrock]
@@ -8,4 +12,7 @@ region = "us-east-1"
 prompt_caching = true
 max_tokens = 8192
 # thinking = "adaptive"
-# effort = "high"
+# effort = "high"   # "low", "medium", "high", "xhigh" (Opus 4.7), "max"
+
+[review]
+concurrency = 4
