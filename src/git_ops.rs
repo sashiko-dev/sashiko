@@ -331,9 +331,14 @@ impl GitWorktree {
     pub async fn apply_patch(&self, patch_content: &str) -> Result<()> {
         info!("Applying patch in {:?}", self.path);
 
+        let before_head = get_commit_hash(&self.path, "HEAD").await?;
         let output = self.run_git_am(patch_content, false).await?;
         if output.status.success() {
-            return Ok(());
+            if get_commit_hash(&self.path, "HEAD").await? != before_head {
+                return Ok(());
+            }
+            self.abort_git_am().await;
+            return Err(GitAmError::new(&output.stdout, &output.stderr).into());
         }
 
         self.abort_git_am().await;
@@ -342,7 +347,11 @@ impl GitWorktree {
         if first_err.kind == PatchApplyFailure::ContextMismatch
             && let Ok(retry_output) = self.run_git_am(patch_content, true).await
         {
-            if retry_output.status.success() {
+            if retry_output.status.success()
+                && get_commit_hash(&self.path, "HEAD")
+                    .await
+                    .is_ok_and(|after_head| after_head != before_head)
+            {
                 return Ok(());
             }
             self.abort_git_am().await;
@@ -2173,10 +2182,19 @@ mod tests {
 
         let worktree = GitWorktree::new(repo.path(), &head, None).await?;
         worktree.apply_patch(&mbox).await?;
+        let applied_head = get_commit_hash(&worktree.path, "HEAD").await?;
+        assert_ne!(applied_head, head);
         assert_eq!(
             std::fs::read_to_string(worktree.path.join("value.txt"))?,
             "prepended\nline1\nline2\nline3\nline4\nline5\nline6_changed_context\nline7\nline8_modified\n"
         );
+
+        let noop_err = worktree.apply_patch(&mbox).await.unwrap_err();
+        assert_eq!(
+            PatchApplyFailure::from_error(&noop_err),
+            PatchApplyFailure::ContextMismatch
+        );
+        assert_eq!(get_commit_hash(&worktree.path, "HEAD").await?, applied_head);
         worktree.remove().await?;
         Ok(())
     }
