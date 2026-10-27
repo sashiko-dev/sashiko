@@ -5,7 +5,20 @@ Sashiko is configured through two files:
 - **Settings.toml** -- application settings (AI, server, git, review)
 - **projects/\<project\>/mailing_lists.toml** -- per-mailing-list tracking, embargo, email delivery, and Patchwork policy
 
-Both can be bootstrapped from the examples in [docs/examples/](examples/).
+This page is the complete reference. The files in the repository are
+starting points, each with one job:
+
+- `Settings.toml` at the repository root is the daemon configuration
+  shipped in the container image.
+- [docs/examples/Settings.example.toml](examples/Settings.example.toml) is
+  the minimal local-review configuration that `sashiko init` writes.
+- The other `docs/examples/Settings.<provider>.toml` files are complete
+  local-review configurations for each LLM provider.
+- `docs/examples/Settings.forge-*.toml` are fragments to merge into a full
+  `Settings.toml`.
+- [docs/examples/mailing_lists.example.toml](examples/mailing_lists.example.toml)
+  illustrates the mailing list policy file.
+
 All settings can also be overridden via environment variables using the
 `SASHIKO` prefix with `__` (double underscore) as the separator (e.g.
 `SASHIKO__AI__PROVIDER=gemini`).
@@ -52,12 +65,12 @@ Optional. Controls forge (GitHub/GitLab) webhook integration, GitHub App comment
 | `disable_nntp` | bool | `true` | Disable NNTP ingestion when forge is enabled. |
 | `provider` | string | -- | Forge provider: `"github"` or `"gitlab"`. |
 | `webhook_secret` | string | -- | Webhook signing token or shared secret for authenticating incoming requests. When configured, requests are authenticated via signature verification, which is the only way a forge can authenticate. See the [Webhook Security Guide](WEBHOOK_SECURITY.md). |
-| `api_token` | string | -- | Forge personal access token or API token used when GitHub App credentials are not configured. |
-| `post_mode` | string | `"off"` | Controls PR review comment delivery: `"off"` (disabled), `"dry_run"` (persisted in `forge_outbox` without sending), or `"live"` (posted to GitHub). |
-| `app_id` | integer | -- | GitHub App ID used to mint short-lived installation tokens for posting PR review comments and polling open pull requests. |
-| `installation_id` | integer | -- | GitHub App installation ID for exchanging App JWTs for installation tokens. |
-| `app_private_key` | string | -- | Inline PEM-encoded RSA private key for the GitHub App (prefer `app_private_key_path` or `SASHIKO__FORGE__APP_PRIVATE_KEY`). |
-| `app_private_key_path` | string | -- | Path to the PEM-encoded RSA private key file for the GitHub App. |
+| `api_token` | string | -- | Forge API token. Posts reviews to GitHub and authenticates pull request polling when no GitHub App is configured, and authenticates HTTPS fetches of branches from gitlab.com. Prefer `SASHIKO__FORGE__API_TOKEN` over writing it to disk. |
+| `post_mode` | string | `"off"` | Whether reviews are posted back to the pull request: `"off"` (not posted), `"dry_run"` (recorded in the outbox as Dry-Run, never sent), or `"live"` (posted, after any embargo). Posting is implemented for GitHub only. |
+| `app_id` | integer | -- | GitHub App ID. Together with `installation_id` and a private key, posting and pull request polling authenticate as the App instead of with `api_token`. |
+| `installation_id` | integer | -- | GitHub App installation ID. |
+| `app_private_key` | string | -- | GitHub App private key (PEM). Takes precedence over `app_private_key_path`. |
+| `app_private_key_path` | string | -- | Path to the GitHub App private key (PEM). |
 | `repos` | string or list | `[]` | GitHub `"owner/repo"` repositories to reconcile periodically via the Pulls REST API (accepts a TOML array or a comma-separated string via `SASHIKO__FORGE__REPOS`). When empty and `forge.enabled = true`, auto-detects the GitHub repository from the `origin` remote of `git.repository_path`. |
 | `poll_interval_secs` | integer | `120` | Interval in seconds between periodic GitHub Pulls REST API reconciliation passes (`0` disables polling while keeping webhook ingestion active). |
 
@@ -68,8 +81,8 @@ Optional. Controls forge (GitHub/GitLab) webhook integration, GitHub App comment
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `url` | string | `"sashiko.db"` | Path to the SQLite database file. |
-| `token` | string | `""` | Database token (unused for SQLite). |
+| `url` | string | `""` | Path to the SQLite database file, or a `libsql://` / `https://` URL of a remote libSQL database. Required by the daemon, which refuses to start without it; the shipped `Settings.toml` uses `"sashiko.db"`. The daemon writes its local operator token (`.sashiko-local-token`) beside a local database file. |
+| `token` | string | `""` | Authentication token for a remote libSQL database. Ignored for a local file. |
 
 ### `[mailing_lists]`
 
@@ -81,7 +94,7 @@ Optional. Controls forge (GitHub/GitLab) webhook integration, GitHub App comment
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `server` | string | `"nntp.lore.kernel.org"` | NNTP server hostname. |
+| `server` | string | `""` | NNTP server hostname. Empty disables NNTP ingestion; the shipped `Settings.toml` uses `"nntp.lore.kernel.org"`. |
 | `port` | integer | `119` | NNTP server port. |
 | `tls` | bool | `false` | Wrap the session in TLS (implicit NNTPS). |
 
@@ -129,7 +142,7 @@ Core AI settings that apply to all providers.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `goose`, `openai`, `openai-compatible`. |
+| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `devin-cli`, `kiro-cli`, `goose` (alias `goose-cli`), `openai`, `openai-compatible`, `ollama`, `vllm`, `bedrock`, `vertex`. `bedrock` and `vertex` need a build with `--features bedrock` / `--features vertex`; without it their `[ai.bedrock]` / `[ai.vertex]` table is rejected as an unknown field. |
 | `model` | string | -- | Model identifier (provider-specific). |
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
@@ -147,7 +160,7 @@ Settings specific to the Claude API provider (`provider = "claude"`).
 |-----|------|---------|-------------|
 | `prompt_caching` | bool | `true` | Enable Anthropic prompt caching (5-minute TTL). |
 | `max_tokens` | integer | `32768` | Max output tokens per response, thinking included. |
-| `base_url` | string | -- | Override the API base URL (optional, for proxies like Portkey). |
+| `base_url` | string | -- | Full Messages endpoint URL, e.g. `https://proxy.example.com/v1/messages`, for proxies like Portkey. Defaults to `$ANTHROPIC_BASE_URL/v1/messages`, or the Anthropic API. |
 | `thinking` | string | -- | Thinking mode, sent as `thinking.type`: `"adaptive"` (Opus 4.6, Sonnet 4.6, and later), or `"disabled"` where the model allows it. |
 | `effort` | string | -- | Effort level, sent as `output_config.effort`: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Which levels a model accepts, and its default, vary by model. |
 
@@ -175,7 +188,10 @@ Settings for the Gemini provider (`provider = "gemini"`).
 |-----|------|---------|-------------|
 | `explicit_prompt_caching` | bool | `false` | Use explicit caching hints in requests. |
 | `max_tokens` | integer | model-derived | Max output tokens per response, thinking included (`generationConfig.maxOutputTokens`). Defaults to `131072` on models with Long Decodes v2 (`CONTINUATION` support, such as Argon) and is omitted otherwise (or when set to `0`) so the backend uses the model default. |
-| `thinking_level` | string | -- | Default thinking level sent as `thinkingConfig.thinkingLevel` (`"LOW"`, `"MEDIUM"`, `"HIGH"`) when a stage does not specify a per-request reasoning effort. |
+| `thinking_level` | string | -- | Default thinking level sent as `thinkingConfig.thinkingLevel` (`"LOW"`, `"MEDIUM"`, `"HIGH"`) when a stage does not specify a per-request reasoning effort. On Argon models every stage specifies one (see `[review] effort`), so only `"LOW"` has an effect there: it selects `effort = "low"` when `[review] effort` is unset. |
+| `base_url` | string | `https://generativelanguage.googleapis.com` | API base URL. `GOOGLE_GEMINI_BASE_URL` or `GEMINI_BASE_URL` take precedence when set. |
+| `proxy_command` | string | -- | Shell command that starts a local HTTP proxy on demand; `{port_file}` is replaced with a file the command writes its port to. `GEMINI_PROXY_COMMAND` takes precedence. |
+| `auth_token_command` | string | -- | Shell command whose output is sent as a Bearer token. `GEMINI_AUTH_TOKEN` (a literal token) and `GEMINI_AUTH_TOKEN_COMMAND` take precedence. |
 
 #### `[ai.openai_compat]`
 
@@ -188,6 +204,69 @@ Settings for the OpenAI providers (`provider = "openai"` or `provider = "openai-
 | `max_tokens` | integer | `4096` | Max output tokens per response. With `provider = "openai"` it is sent as `max_completion_tokens`, which bounds reasoning tokens as well as the reply. |
 | `effort` | string | -- | Reasoning effort, sent as the `reasoning_effort` request field and omitted entirely when unset. The valid set belongs to the model rather than to the API: `"none"` is legal, and is what a gpt-5.6 chat completion carrying function tools requires, while gpt-5.4-pro takes only `"medium"` and `"high"`. A level the model rejects comes back as a 400, which is fatal. Applies to both `provider = "openai"` and `provider = "openai-compatible"`; a compatible endpoint that does not implement the field may reject the request, so leave it unset there. |
 | `send_reasoning_content` | bool | `false` | Send the chain of thought a reasoning model returned (as `reasoning_content` or `reasoning`) back as `reasoning_content` on later assistant turns. Thinking models such as DeepSeek and Kimi reject a tool-call follow-up without it; an endpoint that does not know the field may reject the request. |
+
+#### `[ai.ollama]`
+
+Settings for the Ollama provider (`provider = "ollama"`).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `base_url` | string | `"http://localhost:11434"` | Server URL; `/api/chat` is appended unless present. |
+| `context_window_size` | integer | `128000` | Sent as `num_ctx`. Keep `max_input_tokens` below it, leaving room for `max_tokens`. |
+| `max_tokens` | integer | `4096` | Max output tokens, sent as `num_predict`. |
+| `think` | string | -- | Requested thinking level for reasoning models. Sashiko currently sends it inside `options`, where Ollama does not read it, so it has no effect. |
+
+#### `[ai.vllm]`
+
+Settings for the vLLM provider (`provider = "vllm"`). An API key, if the
+server needs one, comes from `VLLM_API_KEY` or `LLM_API_KEY`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `base_url` | string | `"http://localhost:8000"` | Server URL. |
+| `context_window_size` | integer | `32768` | Should match the server's `--max-model-len`. |
+| `max_tokens` | integer | -- | Completion token limit. Unset lets vLLM generate up to the remaining context. |
+| `enable_thinking` | bool | -- | Enable or disable thinking for reasoning models (e.g. Qwen3) via `chat_template_kwargs`. Unset keeps the model default. |
+| `guided_json` | bool | `false` | Enforce JSON responses with guided decoding. Only for backends that support it. |
+| `enable_tools` | bool | `false` | Forward tool definitions. Requires a server started with `--enable-auto-tool-choice` and `--tool-call-parser`, which otherwise rejects the request. |
+
+#### `[ai.devin_cli]`
+
+Settings for the Devin CLI provider (`provider = "devin-cli"`). An empty
+`[ai] model` uses the Devin default.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `agent_config` | string | -- | Declarative agent config (JSON or YAML) passed as `--agent-config`, e.g. one that disables all tools. |
+| `config` | string | -- | Devin config file passed as `--config`, e.g. with deny-all permission rules. |
+
+#### `[ai.bedrock]`
+
+Settings for AWS Bedrock (`provider = "bedrock"`). Only exists in a build
+with `--features bedrock`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `region` | string | AWS SDK default chain | AWS region, e.g. `"us-east-1"`. |
+| `prompt_caching` | bool | `true` | Anthropic prompt caching. Set `false` for non-Anthropic models. |
+| `max_tokens` | integer | `8192` | Max output tokens per Converse call. |
+| `thinking` | string | -- | `"adaptive"` for Anthropic models; unset disables thinking. |
+| `effort` | string | -- | `"low"`, `"medium"`, `"high"`, `"xhigh"` (Opus 4.7 only), `"max"`. Sent as `output_config.effort`, or as `reasoning.effort` for model IDs containing `openai.`. |
+
+#### `[ai.vertex]`
+
+Settings for Google Cloud Vertex AI (`provider = "vertex"`). Only exists in
+a build with `--features vertex`. A `claude-` model uses Anthropic's API, a
+`gemini-` model Google's.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `project_id` | string | env | GCP project. Falls back to `ANTHROPIC_VERTEX_PROJECT_ID`, then `GOOGLE_CLOUD_PROJECT`; one of them is required. |
+| `region` | string | `"us-east5"` | GCP region, e.g. `"global"`. Falls back to `CLOUD_ML_REGION`, then `GOOGLE_CLOUD_LOCATION`. |
+| `prompt_caching` | bool | `true` | Claude only. |
+| `max_tokens` | integer | model-derived | Max output tokens. Claude: `8192`. Gemini: `[ai.gemini] max_tokens`, else the Gemini default above. |
+| `thinking` | string | -- | Claude: `"adaptive"`, or `"disabled"` where the model allows it. Gemini: fallback thinking level (`"LOW"`, `"MEDIUM"`, `"HIGH"`), defaulting to `[ai.gemini] thinking_level`. |
+| `effort` | string | -- | Claude: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Gemini: thinking level, taking precedence over `thinking`. |
 
 #### `[ai.kiro_cli]`
 
@@ -220,6 +299,14 @@ Settings for the goose provider (`provider = "goose"`).
 | `public_base_url` | string | -- | The URL the service is reachable at from outside, with no trailing slash. Required whenever `[smtp]` is configured: sign-in links and bug links are mailed, and the bind address names no host a recipient can open. The server refuses to start without it. |
 | `jwt_secret` | string | -- | Signs sign-in links and session tokens. Without it, sign-in returns `501` and no identity can be established. Keep it stable: replacing it invalidates every session and every unopened link. Prefer `SASHIKO__SERVER__JWT_SECRET` over writing it to disk. |
 | `log_sign_in_links` | bool | `false` | Writes sign-in links to the log. For a developer machine with no real users; a link in a log is a credential anyone reading the log can spend. |
+| `testing_mode` | bool | `false` | **Never enable on a reachable server.** Grants every caller operator capabilities and full bug access without signing in. For automated tests only. |
+
+Local tooling (`sashiko-cli`, the benchmark) authenticates with a token
+rather than an address. On every start the server writes a random one to
+`.sashiko-local-token` beside the database, readable only by its own user,
+and the tools present it automatically. Nothing is inferred from where a
+request comes from, since a reverse proxy in front of a loopback bind makes
+an internet request look local.
 
 ### `[server.acl]`
 
@@ -297,23 +384,25 @@ pass.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `concurrency` | integer | -- | Number of concurrent reviews. |
+| `concurrency` | integer | -- | Number of concurrent reviews. Required: a file without it fails to load. |
 | `worktree_dir` | string | -- | Directory for git worktrees used during daemon reviews. The daemon empties it on startup, so it must hold nothing else. |
 | `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). |
 | `max_retries` | integer | `3` | Retry count on transient failures. |
 | `max_lines_changed` | integer | `10000` | Skip patches with more changed lines than this. |
 | `max_files_touched` | integer | `200` | Skip patches touching more files than this. |
 | `ignore_files` | list | `[]` | File patterns to skip during review (e.g. `MAINTAINERS`). |
-| `email_policy_path` | string | `"projects/linux/mailing_lists.toml"` | Path to the per-project mailing list and email delivery policy file (`projects/<project>/mailing_lists.toml`). |
+| `email_policy_path` | string | `projects/<project>/mailing_lists.toml` | Path to the mailing list and email delivery policy file. The default, and the legacy values `"email_policy.toml"` and `"/app/email_policy.toml"`, resolve to the file of the project selected by `--project`; any other path is used as given. |
 | `max_total_tokens` | integer | `10000000` | Maximum cumulative uncached tokens (input + output, including thinking tokens) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `use_code_notes` | bool | `true` | Load code notes (`notes/<set>/` in the project's prompt directory, built with `sashiko notes build`) into reviews. |
 | `code_notes_scope` | string | `"unit"` | `"unit"` inlines the whole note of every unit the patch touches; `"touched"` keeps only the rules that name an identifier the patch's diff touches. |
 | `max_total_output_tokens` | integer | `1000000` | Maximum cumulative output tokens (including thinking tokens) per review. Set to 0 to disable. |
-| `effort` | string | `"mid"` (Argon 4) | Reasoning effort mode for models that support configurable effort levels (currently Argon 4; ignored for other models). Options: `"low"` (uniform `Low` effort across all stages), `"mid"` (uniform `Medium` effort across all stages, default), `"high"` (`High` effort across screening, planning, analysis, and verification stages; `Medium` for report formatting), or `"dynamic"` (`Low` for screening/planning/summary, planned `Medium` or `High` per analysis stage, `High` for verification stages, `Medium` for report formatting). Can also be set via `--effort`. |
+| `effort` | string | `"mid"` (Argon 4) | Reasoning effort mode for models that support configurable effort levels (currently Argon 4; ignored for other models). Options: `"low"` (uniform `Low` effort across all stages), `"mid"` (alias `"medium"`; uniform `Medium` effort across all stages, default), `"high"` (`High` effort across screening, planning, analysis, and verification stages; `Medium` for report formatting), or `"dynamic"` (`Low` for screening/planning/summary, planned `Medium` or `High` per analysis stage, `High` for verification stages, `Medium` for report formatting). Can also be set via `--effort`. |
 
 ### `[linux_bug]`
 
 Controls pre-existing Linux kernel bug tracking and background analysis.
+The section is also accepted as `[bugs]`, and `fix_check_enabled` as
+`verify_fixes`.
 By default (`enabled = false`), pre-existing issues discovered during patch
 reviews are ignored and the background bug worker is not started.
 
@@ -369,21 +458,22 @@ Controls which mailing lists Sashiko tracks via NNTP, embargo delays, how Sashik
 | `defaults.positive_review` | string | `"none"` | Who receives a review email when 0 issues are found: `"none"`, `"author"`, or `"all"`. |
 | `defaults.mute_all` | bool | `false` | Suppress all email sending for this scope. |
 | `defaults.cc` | list | `[]` | Static CC addresses always included on review emails. |
-| `defaults.ignored_emails` | list | `[]` | Author addresses to mute entirely. |
+| `defaults.ignored_emails` | list | `[]` | Author addresses whose patches are skipped at ingestion, so they are never reviewed or mailed. Matched as case-insensitive substrings of the author address. |
+| `defaults.patchwork` | table | disabled | Patchwork settings (same keys as `patchwork.*` below) for patches that match no list section. |
 
 Each mailing list is configured as a `["<list-email>"]` table (e.g. `["bpf@vger.kernel.org"]`). Omitted fields inherit from `[defaults]`. Each mailing list section accepts:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `track` | bool | `defaults.track` | Whether Sashiko ingests patches from this mailing list via NNTP. |
-| `nntp_group` | string | derived from email | Explicit Lore NNTP group override when the group name cannot be derived by reversing the email domain and appending the list's local part. |
-| `embargo_hours` | integer | `defaults.embargo_hours` | Hours to wait before publishing a review with findings. |
-| `subject_prefixes` | list | `[]` | Subject prefix tags (e.g. `["net", "net-next"]`) used to disambiguate `embargo_hours` on cross-posted series. |
+| `nntp_group` | string | derived from email | Explicit Lore NNTP group override when the group name cannot be derived by reversing the email domain and appending the list's local part. The groups of `devicetree@vger.kernel.org`, `b.a.t.m.a.n@lists.open-mesh.org` and `intel-wired-lan@lists.osuosl.org` are built in. |
+| `embargo_hours` | integer | `defaults.embargo_hours` | Hours to wait before publishing a review with findings. For a series sent to several lists, the lowest value set explicitly on a matched list wins, preferring lists whose `subject_prefixes` match the subject; `defaults.embargo_hours` applies only when no matched list sets one. Setting `0` on a list is therefore not redundant. |
+| `subject_prefixes` | list | `[]` | Subject prefix tags (e.g. `["net", "net-next"]`) used to disambiguate `embargo_hours` on cross-posted series. Only considered on a list that sets `embargo_hours` itself. |
 | `reply_to` | list | `defaults.reply_to` | Recipient targets for this list (`"author"`, `"list"`, `"recipients"`). |
 | `positive_review` | string | `defaults.positive_review` | Positive review delivery mode (`"none"`, `"author"`, `"all"`). |
 | `mute_all` | bool | `defaults.mute_all` | Suppress all email sending for patches matching this list. |
 | `cc` | list | `[]` | Additional static CC addresses for this list (merged with `defaults.cc`). |
-| `ignored_emails` | list | `[]` | Additional author addresses to mute for this list. |
+| `ignored_emails` | list | `[]` | Additional ignored author addresses, with the same meaning as `defaults.ignored_emails`. They apply to patches on every list, not only this one. |
 | `patchwork.enabled` | bool | `false` | Enable Patchwork integration for this mailing list. |
 | `patchwork.api_url` | string | -- | Patchwork REST API URL (e.g. `https://patchwork.kernel.org/api/1.3`). Trailing slashes are stripped automatically. Invalid schemes are rejected with a warning. |
 | `patchwork.token` | string | -- | Patchwork API token. Can also be set via `SASHIKO_PATCHWORK_TOKEN` env var (fills in where token is omitted in TOML). |
@@ -487,14 +577,21 @@ Downstream tools can parse this format with simple line splitting.
 |----------|-------------|
 | `LLM_API_KEY` | API key for the configured LLM provider (universal fallback). |
 | `GEMINI_API_KEY` | API key for Gemini (takes precedence over `LLM_API_KEY`). |
-| `ANTHROPIC_API_KEY` | API key for Claude (takes precedence over `LLM_API_KEY`). |
+| `ANTHROPIC_API_KEY` | API key for Claude (takes precedence over `ANTHROPIC_AUTH_TOKEN` and `LLM_API_KEY`). |
+| `ANTHROPIC_CUSTOM_HEADERS` | Extra HTTP headers for the Claude API, one `Name: value` per line. |
 | `OPENAI_API_KEY` | API key for OpenAI-compatible providers (takes precedence over `LLM_API_KEY`). |
+| `VLLM_API_KEY` | API key for a vLLM server started with `--api-key` (takes precedence over `LLM_API_KEY`). |
 | `ANTHROPIC_BASE_URL` | Override the Claude API base URL (for proxies). |
-| `ANTHROPIC_VERTEX_PROJECT_ID` | GCP project ID for Vertex AI provider. |
-| `CLOUD_ML_REGION` | GCP region for Vertex AI provider. |
+| `GOOGLE_GEMINI_BASE_URL`, `GEMINI_BASE_URL` | Gemini API base URL; outranks `[ai.gemini] base_url`. |
+| `GEMINI_PROXY_COMMAND`, `GEMINI_AUTH_TOKEN_COMMAND`, `GEMINI_AUTH_TOKEN` | Outrank `[ai.gemini] proxy_command` / `auth_token_command`; `GEMINI_AUTH_TOKEN` is a literal Bearer token. |
+| `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT` | GCP project ID for the Vertex AI provider, in that order. |
+| `CLOUD_ML_REGION`, `GOOGLE_CLOUD_LOCATION` | GCP region for the Vertex AI provider, in that order. |
+| `SASHIKO_CONFIG` | Settings file to read when `--settings` is not given. |
+| `SASHIKO_PROJECT` | Project to review (`linux`, `sashiko` or `gcc`), like `--project`. |
 | `SASHIKO_SERVER` | Override daemon URL for CLI commands. |
 | `SASHIKO__*` | Override any Settings.toml value (e.g. `SASHIKO__AI__PROVIDER`). |
 | `SASHIKO__FORGE__WEBHOOK_SECRET` | Override webhook secret from Settings.toml. Avoids storing the secret on disk. |
+| `SASHIKO__SERVER__JWT_SECRET` | Sign-in signing secret, kept out of the file for the same reason. |
 | `SASHIKO_PATCHWORK_TOKEN` | Patchwork API token. Fills in `patchwork.token` for enabled subsystems that have `api_url` set but no explicit token in TOML. |
 | `NO_COLOR` | Disable ANSI color output. |
 | `SASHIKO_LOG_PLAIN` | Use plain log format (no level/target/timestamp). |
