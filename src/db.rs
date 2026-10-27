@@ -9061,339 +9061,6 @@ impl Database {
         Ok(())
     }
 
-    pub async fn get_previous_version_review_context(
-        &self,
-        patchset_id: i64,
-    ) -> Result<Option<serde_json::Value>> {
-        const MAX_FINDINGS_LOOKBACK_HOPS: usize = 5;
-
-        let mut ps_rows = self
-            .conn
-            .query(
-                "SELECT previous_patchset_id, version_link_signal FROM patchsets WHERE id = ?",
-                libsql::params![patchset_id],
-            )
-            .await?;
-        let Some(ps_row) = ps_rows.next().await? else {
-            return Ok(None);
-        };
-        let Some(prev_id) = ps_row.get::<Option<i64>>(0)? else {
-            return Ok(None);
-        };
-        let version_link_signal: Option<String> = ps_row.get(1)?;
-        drop(ps_rows);
-
-        let mut prev_rows = self
-            .conn
-            .query(
-                "SELECT id, subject, subject_index, version, cover_letter_message_id, mr_number,
-                        embargo_until, previous_patchset_id, thread_id,
-                        (SELECT b.last_known_commit FROM baselines b WHERE b.id = patchsets.baseline_id)
-                 FROM patchsets WHERE id = ?",
-                libsql::params![prev_id],
-            )
-            .await?;
-        let Some(prev_row) = prev_rows.next().await? else {
-            return Ok(None);
-        };
-        let prev_subject: Option<String> = prev_row.get(1)?;
-        let prev_subject_index: u32 = prev_row.get::<Option<u32>>(2)?.unwrap_or(9999);
-        let prev_stored_ver: Option<u32> = prev_row.get(3)?;
-        let prev_clid: Option<String> = prev_row.get(4)?;
-        let prev_mr_number: Option<i64> = prev_row.get(5)?;
-        let prev_embargo_until: Option<i64> = prev_row.get(6)?;
-        let prev_parent_id: Option<i64> = prev_row.get(7)?;
-        let prev_thread_id: Option<i64> = prev_row.get(8)?;
-        let prev_baseline_commit: Option<String> = prev_row.get(9)?;
-        drop(prev_rows);
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs() as i64;
-
-        let resolve_effective_ver = |stored: Option<u32>,
-                                     mr_num: Option<i64>,
-                                     subj: Option<&str>|
-         -> u32 {
-            stored
-                .or_else(|| {
-                    mr_num.and_then(|num| crate::forge::extract_mr_version_from_subject(subj, num))
-                })
-                .or_else(|| subj.and_then(crate::patch::parse_subject_version))
-                .unwrap_or(1)
-        };
-
-        let prev_ver =
-            resolve_effective_ver(prev_stored_ver, prev_mr_number, prev_subject.as_deref());
-
-        let cover_body = if let Some(ref clid) = prev_clid
-            && (prev_subject_index == 0 || prev_mr_number.is_some())
-        {
-            self.get_message_body(clid).await?.map(|b| {
-                if b.len() > 8000 {
-                    format!("{}...(truncated)", crate::utils::utf8_prefix(&b, 8000))
-                } else {
-                    b
-                }
-            })
-        } else {
-            None
-        };
-
-        let mut patch_lineage = Vec::new();
-        let mut matched_prev_patch_ids = std::collections::HashSet::new();
-        let mut curr_p_rows = self
-            .conn
-            .query(
-                "SELECT p.part_index, m.subject, p.previous_patch_id, p.previous_patch_status,
-                        prev_p.part_index, prev_m.subject
-                 FROM patches p
-                 LEFT JOIN messages m ON m.message_id = p.message_id
-                 LEFT JOIN patches prev_p ON prev_p.id = p.previous_patch_id
-                 LEFT JOIN messages prev_m ON prev_m.message_id = prev_p.message_id
-                 WHERE p.patchset_id = ? AND p.part_index >= 1
-                 ORDER BY p.part_index ASC
-                 LIMIT 256",
-                libsql::params![patchset_id],
-            )
-            .await?;
-        while let Some(prow) = curr_p_rows.next().await? {
-            let part_index: i64 = prow.get::<Option<i64>>(0)?.unwrap_or(0);
-            let subject: Option<String> = prow.get(1)?;
-            let prev_patch_id: Option<i64> = prow.get(2)?;
-            let prev_status: Option<String> = prow.get(3)?;
-            let prev_part_index: Option<i64> = prow.get(4)?;
-            let prev_patch_subject: Option<String> = prow.get(5)?;
-            if let Some(ppid) = prev_patch_id {
-                matched_prev_patch_ids.insert(ppid);
-                patch_lineage.push(serde_json::json!({
-                    "part_index": part_index,
-                    "subject": subject,
-                    "prev_part_index": prev_part_index,
-                    "prev_subject": prev_patch_subject,
-                    "status": prev_status.unwrap_or_else(|| "modified".to_string()),
-                }));
-            } else {
-                patch_lineage.push(serde_json::json!({
-                    "part_index": part_index,
-                    "subject": subject,
-                    "prev_part_index": serde_json::Value::Null,
-                    "prev_subject": serde_json::Value::Null,
-                    "status": "added",
-                }));
-            }
-        }
-        drop(curr_p_rows);
-
-        let mut prev_p_rows = self
-            .conn
-            .query(
-                "SELECT p.id, p.part_index, m.subject
-                 FROM patches p
-                 LEFT JOIN messages m ON m.message_id = p.message_id
-                 WHERE p.patchset_id = ? AND p.part_index >= 1
-                 ORDER BY p.part_index ASC
-                 LIMIT 256",
-                libsql::params![prev_id],
-            )
-            .await?;
-        while let Some(prow) = prev_p_rows.next().await? {
-            let ppid: i64 = prow.get(0)?;
-            let prev_part_index: i64 = prow.get::<Option<i64>>(1)?.unwrap_or(0);
-            let prev_patch_subject: Option<String> = prow.get(2)?;
-            if !matched_prev_patch_ids.contains(&ppid) {
-                patch_lineage.push(serde_json::json!({
-                    "part_index": serde_json::Value::Null,
-                    "subject": serde_json::Value::Null,
-                    "prev_part_index": prev_part_index,
-                    "prev_subject": prev_patch_subject,
-                    "status": "removed",
-                }));
-            }
-        }
-        drop(prev_p_rows);
-
-        // Walk backwards along `previous_patchset_id` up to MAX_FINDINGS_LOOKBACK_HOPS
-        // so that if the immediate predecessor was superseded/cancelled before its
-        // review completed (or had no findings), the cover review still receives
-        // findings from the most recent ancestor that actually produced them.
-        let mut previous_findings = Vec::new();
-        let mut findings_ver = prev_ver;
-        let mut visited_ancestors = std::collections::HashSet::new();
-        visited_ancestors.insert(patchset_id);
-
-        let mut candidate_opt = Some((prev_id, prev_ver, prev_embargo_until, prev_parent_id));
-        for _ in 0..MAX_FINDINGS_LOOKBACK_HOPS {
-            let Some((cand_id, cand_ver, cand_embargo_until, cand_parent_id)) = candidate_opt
-            else {
-                break;
-            };
-            if !visited_ancestors.insert(cand_id) {
-                break;
-            }
-            let cand_is_embargoed = cand_embargo_until.is_some_and(|until| until > now);
-            if !cand_is_embargoed {
-                let mut f_rows = self
-                    .conn
-                    .query(
-                        "SELECT COALESCE(p.part_index, 0), f.severity, f.problem,
-                                f.severity_explanation, f.locations
-                         FROM findings f
-                         JOIN reviews r ON r.id = f.review_id
-                         LEFT JOIN patches p ON p.id = r.patch_id
-                         WHERE r.patchset_id = ?
-                           AND r.status = 'Reviewed'
-                           AND COALESCE(f.preexisting, 0) = 0
-                         ORDER BY f.severity DESC, COALESCE(p.part_index, 0) ASC, f.id ASC
-                         LIMIT 50",
-                        libsql::params![cand_id],
-                    )
-                    .await?;
-                while let Some(frow) = f_rows.next().await? {
-                    let part_index: i64 = frow.get(0)?;
-                    let sev_int: i64 = frow.get(1)?;
-                    let severity = match sev_int {
-                        4 => "Critical",
-                        3 => "High",
-                        2 => "Medium",
-                        _ => "Low",
-                    };
-                    let problem: String = frow.get::<Option<String>>(2)?.unwrap_or_default();
-                    let severity_explanation: Option<String> = frow.get(3)?;
-                    let locations_str: Option<String> = frow.get(4)?;
-                    let locations = match locations_str {
-                        Some(s) => match serde_json::from_str::<serde_json::Value>(&s) {
-                            Ok(val) => Some(val),
-                            Err(e) => {
-                                warn!(
-                                    "Failed to parse finding locations JSON for patchset {}: {}",
-                                    cand_id, e
-                                );
-                                None
-                            }
-                        },
-                        None => None,
-                    };
-                    previous_findings.push(serde_json::json!({
-                        "version": cand_ver,
-                        "part_index": part_index,
-                        "severity": severity,
-                        "problem": problem,
-                        "severity_explanation": severity_explanation,
-                        "locations": locations,
-                    }));
-                }
-                drop(f_rows);
-                if !previous_findings.is_empty() {
-                    findings_ver = cand_ver;
-                    break;
-                }
-            }
-
-            let Some(next_id) = cand_parent_id else {
-                break;
-            };
-            if visited_ancestors.contains(&next_id) {
-                break;
-            };
-            let mut anc_rows = self
-                .conn
-                .query(
-                    "SELECT id, subject, version, mr_number, embargo_until, previous_patchset_id
-                     FROM patchsets WHERE id = ?",
-                    libsql::params![next_id],
-                )
-                .await?;
-            if let Some(arow) = anc_rows.next().await? {
-                let aid: i64 = arow.get(0)?;
-                let asubj: Option<String> = arow.get(1)?;
-                let astored_ver: Option<u32> = arow.get(2)?;
-                let amr_num: Option<i64> = arow.get(3)?;
-                let aembargo: Option<i64> = arow.get(4)?;
-                let aparent: Option<i64> = arow.get(5)?;
-                let aver = resolve_effective_ver(astored_ver, amr_num, asubj.as_deref());
-                candidate_opt = Some((aid, aver, aembargo, aparent));
-            } else {
-                candidate_opt = None;
-            }
-        }
-
-        let mut thread_replies = Vec::new();
-        let prev_is_embargoed = prev_embargo_until.is_some_and(|until| until > now);
-        if let Some(tid) = prev_thread_id
-            && !prev_is_embargoed
-        {
-            let mut reply_rows = self
-                .conn
-                .query(
-                    "SELECT m.author, m.subject, m.body
-                       FROM messages m
-                      WHERE m.thread_id = ?
-                        AND m.subject != '(placeholder)'
-                        AND m.message_id != COALESCE(?, '')
-                        AND NOT EXISTS (
-                            SELECT 1 FROM patches p
-                             WHERE p.message_id = m.message_id
-                        )
-                        AND NOT EXISTS (
-                            SELECT 1 FROM patchsets ps
-                             WHERE ps.cover_letter_message_id = m.message_id
-                        )
-                      ORDER BY m.date ASC, m.id ASC
-                      LIMIT 12",
-                    libsql::params![tid, prev_clid.as_deref()],
-                )
-                .await?;
-            let mut raw_replies = Vec::new();
-            while let Some(rrow) = reply_rows.next().await? {
-                let r_author: String = rrow.get::<Option<String>>(0)?.unwrap_or_default();
-                let r_subject: String = rrow.get::<Option<String>>(1)?.unwrap_or_default();
-                let r_body_val = rrow.get_value(2)?;
-                raw_replies.push((r_author, r_subject, r_body_val));
-            }
-            drop(reply_rows);
-
-            if !raw_replies.is_empty() {
-                thread_replies = tokio::task::spawn_blocking(move || -> Result<Vec<_>> {
-                    let mut out = Vec::with_capacity(raw_replies.len());
-                    for (author, subject, body_val) in raw_replies {
-                        let body = crate::compression::decompress_string_value(&body_val)?;
-                        let trimmed = body.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        let capped = if trimmed.len() > 1024 {
-                            format!("{}...(truncated)", crate::utils::utf8_prefix(trimmed, 1024))
-                        } else {
-                            trimmed.to_string()
-                        };
-                        out.push(serde_json::json!({
-                            "author": author,
-                            "subject": subject,
-                            "body": capped,
-                        }));
-                    }
-                    Ok(out)
-                })
-                .await
-                .context("reply decompression task failed")??;
-            }
-        }
-
-        Ok(Some(serde_json::json!({
-            "patchset_id": prev_id,
-            "version": prev_ver,
-            "findings_version": findings_ver,
-            "subject": prev_subject,
-            "version_link_signal": version_link_signal,
-            "baseline_commit": prev_baseline_commit,
-            "cover_body": cover_body,
-            "patch_lineage": patch_lineage,
-            "previous_findings": previous_findings,
-            "thread_replies": thread_replies,
-        })))
-    }
-
     pub async fn get_patchset_details(
         &self,
         id: i64,
@@ -29028,8 +28695,7 @@ mod tests {
             .unwrap();
         db.update_patchset_status(ps_b1, "Reviewed").await.unwrap();
 
-        // Attach a Low finding on patch 1 and a High finding on patch 2 of v1
-        // to verify severity-first ordering in get_previous_version_review_context.
+        // Attach a Low finding on patch 1 and a High finding on patch 2 of v1.
         let rev_b1_p1 = db
             .create_review(ps_b1, Some(p1_b1), "gemini", "gemini-2.5-pro", None, None)
             .await
@@ -29175,50 +28841,14 @@ mod tests {
         assert_eq!(db2["previous_patchset_id"], ps_b1);
         assert_eq!(db2["version_link_signal"], "git_patch_id");
 
-        let prev_ctx = db
-            .get_previous_version_review_context(ps_b2)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(prev_ctx["patchset_id"], ps_b1);
-        assert_eq!(prev_ctx["version"], 1);
-        let lineage = prev_ctx["patch_lineage"].as_array().unwrap();
-        // Patch 1: unchanged; Patch 2 of v2: added; Patch 2 of v1: removed
-        assert!(
-            lineage
-                .iter()
-                .any(|l| l["part_index"] == 1 && l["status"] == "unchanged")
-        );
-        assert!(
-            lineage
-                .iter()
-                .any(|l| l["part_index"] == 2 && l["status"] == "added")
-        );
-        assert!(
-            lineage
-                .iter()
-                .any(|l| l["prev_part_index"] == 2 && l["status"] == "removed")
-        );
-
-        let findings = prev_ctx["previous_findings"].as_array().unwrap();
-        assert_eq!(findings.len(), 2);
-        // Severity-first ordering places High (patch 2) ahead of Low (patch 1).
-        assert_eq!(findings[0]["part_index"], 2);
-        assert_eq!(findings[0]["severity"], "High");
-        assert_eq!(
-            findings[0]["problem"],
-            "Unchecked kzalloc return in drv_probe"
-        );
-        assert_eq!(findings[1]["part_index"], 1);
-        assert_eq!(findings[1]["severity"], "Low");
-        assert_eq!(
-            findings[1]["problem"],
-            "Minor error path cleanup order in drv_prep"
-        );
+        let patches_b2 = db2["patches"].as_array().unwrap();
+        assert_eq!(patches_b2.len(), 2);
+        // Patch 1 is unchanged from v1; patch 2 of v2 is newly added.
+        assert_eq!(patches_b2[0]["previous_patch"]["status"], "unchanged");
+        assert!(patches_b2[1]["previous_patch"].is_null());
 
         // Ingest v3 before v2 finishes review (v2 gets superseded/cancelled with 0 reviewed findings).
-        // Verify get_previous_version_review_context(v3) keeps v2 as the immediate predecessor for
-        // lineage/cover_body while walking back to v1 for previous_findings (`findings_version == 1`).
+        // Verify v3 keeps v2 as its immediate predecessor.
         let tb3 = db
             .create_thread("sig5-v3@kernel.org", "[PATCH v3 0/2] New cover title", 4000)
             .await
@@ -29285,18 +28915,12 @@ mod tests {
         .await
         .unwrap();
 
-        let prev_ctx_v3 = db
-            .get_previous_version_review_context(ps_b3)
+        let db3 = db
+            .get_patchset_details(ps_b3, None, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(prev_ctx_v3["patchset_id"], ps_b2);
-        assert_eq!(prev_ctx_v3["version"], 2);
-        assert_eq!(prev_ctx_v3["findings_version"], 1);
-        let findings_v3 = prev_ctx_v3["previous_findings"].as_array().unwrap();
-        assert_eq!(findings_v3.len(), 2);
-        assert_eq!(findings_v3[0]["version"], 1);
-        assert_eq!(findings_v3[0]["severity"], "High");
+        assert_eq!(db3["previous_patchset_id"], ps_b2);
     }
 
     #[test]

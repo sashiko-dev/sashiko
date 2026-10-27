@@ -801,22 +801,6 @@ impl Reviewer {
                 .await
         };
 
-        let mut previous_version = match ctx
-            .db
-            .get_previous_version_review_context(patchset_id)
-            .await
-        {
-            Ok(prev) => prev,
-            Err(e) => {
-                error!(
-                    "Failed to fetch previous version review context for patchset {}: {}",
-                    patchset_id, e
-                );
-                Self::mark_patchset_failed_unless_cancelled(&ctx.db, patchset_id).await;
-                return;
-            }
-        };
-
         // 1. Find a working baseline (apply series)
         let (found_baseline, patch_commits, logs) = Self::prepare_baseline_worktree(
             &ctx,
@@ -882,27 +866,6 @@ impl Reviewer {
                 );
             }
 
-            let series_tip_sha = diffs
-                .iter()
-                .map(|(_, idx, _, _, _, _, _)| *idx)
-                .max()
-                .and_then(|max_idx| patch_commits.get(&max_idx).cloned());
-
-            if let (Some(prev), Some(tip_sha)) =
-                (previous_version.as_mut(), series_tip_sha.as_deref())
-                && let Some(range_diff) = Self::compute_series_range_diff(
-                    &worktree,
-                    &ctx.db,
-                    prev,
-                    &review_baseline,
-                    tip_sha,
-                )
-                .await
-                && let Some(obj) = prev.as_object_mut()
-            {
-                obj.insert("range_diff".to_string(), json!(range_diff));
-            }
-
             // patches_json for input payload (contains all patches)
             let patches_json: Vec<_> = diffs
                 .iter()
@@ -945,7 +908,6 @@ impl Reviewer {
                 "id": patchset_id,
                 "message_id": patchset_msg_id,
                 "subject": patchset.subject.clone().unwrap_or("Unknown".to_string()),
-                "previous_version": previous_version,
                 "patches": patches_json
             });
 
@@ -1976,92 +1938,6 @@ impl Reviewer {
         }
         Err(last_err
             .unwrap_or_else(|| anyhow!("patchset {} completion as {} failed", patchset_id, status)))
-    }
-
-    async fn compute_series_range_diff(
-        worktree: &crate::git_ops::GitWorktree,
-        db: &Database,
-        prev_ctx: &Value,
-        curr_base_sha: &str,
-        curr_tip_sha: &str,
-    ) -> Option<String> {
-        let prev_id = prev_ctx.get("patchset_id").and_then(|v| v.as_i64())?;
-        if curr_base_sha.is_empty() || curr_tip_sha.is_empty() {
-            return None;
-        }
-        let prev_diffs = db.get_patch_diffs(prev_id).await.ok()?;
-        if prev_diffs.is_empty() {
-            return None;
-        }
-        let mut prev_base_sha = prev_ctx
-            .get("baseline_commit")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(ToString::to_string);
-        if let Some(ref b_sha) = prev_base_sha
-            && get_commit_hash(&worktree.path, b_sha).await.is_err()
-        {
-            prev_base_sha = None;
-        }
-        let prev_base = prev_base_sha.unwrap_or_else(|| curr_base_sha.to_string());
-
-        let last_msg_id = &prev_diffs.last()?.6;
-        let all_shas = prev_diffs.iter().all(|(_, _, _, _, _, _, mid)| {
-            mid.len() == 40 && mid.chars().all(|c| c.is_ascii_hexdigit())
-        });
-        let prev_tip =
-            if all_shas && let Ok(sha) = get_commit_hash(&worktree.path, last_msg_id).await {
-                sha
-            } else {
-                let saved_head = get_commit_hash(&worktree.path, "HEAD").await.ok()?;
-                if worktree.reset_hard(&prev_base).await.is_err() {
-                    let _ = worktree.reset_hard(&saved_head).await;
-                    return None;
-                }
-                let mut applied_all = true;
-                for (_patch_id, _index, diff, subject, author, date_ts, _msg_id) in &prev_diffs {
-                    let Ok(mbox) = git_am_message(author, *date_ts, subject, diff) else {
-                        applied_all = false;
-                        break;
-                    };
-                    if worktree.apply_patch(&mbox).await.is_err() {
-                        applied_all = false;
-                        break;
-                    }
-                }
-                let tip_opt = if applied_all {
-                    get_commit_hash(&worktree.path, "HEAD").await.ok()
-                } else {
-                    None
-                };
-                let _ = worktree.reset_hard(&saved_head).await;
-                tip_opt?
-            };
-
-        let output = crate::git_cmd::in_dir_async(&worktree.path)
-            .args([
-                "range-diff",
-                "--no-color",
-                &format!("{prev_base}..{prev_tip}"),
-                &format!("{curr_base_sha}..{curr_tip_sha}"),
-            ])
-            .output()
-            .await
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if text.is_empty() {
-            None
-        } else if text.len() > 16 * 1024 {
-            Some(format!(
-                "{}\n...[truncated]...",
-                crate::utils::utf8_prefix(&text, 16 * 1024)
-            ))
-        } else {
-            Some(text)
-        }
     }
 
     /// Writes a review's final status, retrying a few times in place.
