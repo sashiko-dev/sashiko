@@ -30,8 +30,7 @@ pub fn stage_short_label(project: ProjectId, stage: &str) -> Option<&'static str
     match project {
         ProjectId::Linux => linux_patch_review::stage_short_label(stage),
         ProjectId::Sashiko => sashiko_patch_review::stage_short_label(stage),
-        ProjectId::Gcc => gcc_patch_review::stage_short_label(stage)
-            .or_else(|| linux_patch_review::stage_short_label(stage)),
+        ProjectId::Gcc => gcc_patch_review::stage_short_label(stage),
     }
 }
 

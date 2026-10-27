@@ -674,10 +674,11 @@ pub fn validate_gcc_planning_output_with_effort(
 }
 
 pub fn planning_stage() -> Stage<GccPatchReviewState, PlanningOutput> {
-    planning_stage_with_effort(None)
+    planning_stage_with_effort(0.0, None)
 }
 
 pub fn planning_stage_with_effort(
+    temperature: f32,
     effort: Option<crate::ai::EffortMode>,
 ) -> Stage<GccPatchReviewState, PlanningOutput> {
     let dynamic_effort = effort == Some(crate::ai::EffortMode::Dynamic);
@@ -761,6 +762,7 @@ You MUST respond with ONLY a JSON object, no other text. Use the names exactly a
         .policy(StagePolicy {
             tools: ToolScope::None,
             max_turns: 1,
+            temperature,
             reasoning_effort: effort.map(crate::ai::EffortMode::lightweight_stage_effort),
             ..Default::default()
         })
@@ -1118,7 +1120,7 @@ Return raw text output, not JSON."#
             },
             ..Default::default()
         })
-        .skip_if(|s| s.skip_report)
+        .skip_if(|s| s.skip_report || s.findings.is_empty())
         .reduce(|state, out: String| {
             state.review_inline = out;
         })
@@ -1148,7 +1150,7 @@ pub fn build_gcc_patch_review_workflow_with_effort(
     let stage_max_turns = max_turns.min(20);
     Workflow::builder("gcc_patch_review")
         .dynamic_parallel(
-            planning_stage_with_effort(effort),
+            planning_stage_with_effort(temperature, effort),
             move |state| resolve_analysis_stages_with_options(state, stage_max_turns, temperature),
             ParallelPolicy::BestEffort,
         )
@@ -1255,6 +1257,12 @@ mod tests {
         assert!(is_known_stage("post-verification-1"));
         assert!(is_known_stage("report"));
         assert!(!is_known_stage("hardware"));
+    }
+
+    #[test]
+    fn test_gcc_planning_stage_forwards_temperature() {
+        let stage = planning_stage_with_effort(0.35, None);
+        assert!((stage.policy.temperature - 0.35).abs() < f32::EPSILON);
     }
 
     #[test]

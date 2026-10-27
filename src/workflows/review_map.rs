@@ -253,8 +253,7 @@ fn static_stage_guides(project: ProjectId, stage_name: &str) -> Vec<String> {
     let analysis_def = match project {
         ProjectId::Linux => linux_patch_review::analysis_stage_by_name(stage_name),
         ProjectId::Sashiko => sashiko_patch_review::analysis_stage_by_name(stage_name),
-        ProjectId::Gcc => gcc_patch_review::analysis_stage_by_name(stage_name)
-            .or_else(|| linux_patch_review::analysis_stage_by_name(stage_name)),
+        ProjectId::Gcc => gcc_patch_review::analysis_stage_by_name(stage_name),
     };
     if let Some(def) = analysis_def {
         for g in def.guides {
