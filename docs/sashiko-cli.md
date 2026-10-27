@@ -298,7 +298,7 @@ configurations are in [docs/examples/](examples/).
   examples from [docs/examples/](examples/) as a starting point.
 - **projects/\<project\>/mailing_lists.toml** -- per-mailing-list tracking and email delivery policy. See
   [projects/linux/mailing_lists.toml](../projects/linux/mailing_lists.toml) and
-  [docs/examples/email_policy.toml](examples/email_policy.toml).
+  [docs/examples/mailing_lists.example.toml](examples/mailing_lists.example.toml).
 
 ### Minimal Settings.toml for local review
 

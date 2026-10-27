@@ -359,7 +359,7 @@ mapping = [
 
 ## `projects/<project>/mailing_lists.toml`
 
-Controls which mailing lists Sashiko tracks via NNTP, embargo delays, how Sashiko routes or suppresses review emails, and Patchwork check delivery. See [projects/linux/mailing_lists.toml](../projects/linux/mailing_lists.toml) and [docs/examples/email_policy.toml](examples/email_policy.toml).
+Controls which mailing lists Sashiko tracks via NNTP, embargo delays, how Sashiko routes or suppresses review emails, and Patchwork check delivery. See [projects/linux/mailing_lists.toml](../projects/linux/mailing_lists.toml) and [docs/examples/mailing_lists.example.toml](examples/mailing_lists.example.toml).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
