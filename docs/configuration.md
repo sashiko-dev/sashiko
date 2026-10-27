@@ -369,7 +369,6 @@ Controls which mailing lists Sashiko tracks via NNTP, embargo delays, how Sashik
 | `defaults.reply_to` | list | `[]` | Recipient targets when findings are present: `"author"`, `"list"`, `"recipients"`. |
 | `defaults.positive_review` | string | `"none"` | Who receives a review email when 0 issues are found: `"none"`, `"author"`, or `"all"`. |
 | `defaults.mute_all` | bool | `false` | Suppress all email sending for this scope. |
-| `defaults.cover_review_email` | bool | `false` | Whether to send email replies on `0/N` cover letters when series-level findings are reported (results always appear in the Web UI). |
 | `defaults.cc` | list | `[]` | Static CC addresses always included on review emails. |
 | `defaults.ignored_emails` | list | `[]` | Author addresses to mute entirely. |
 
@@ -384,7 +383,6 @@ Each mailing list is configured as a `["<list-email>"]` table (e.g. `["bpf@vger.
 | `reply_to` | list | `defaults.reply_to` | Recipient targets for this list (`"author"`, `"list"`, `"recipients"`). |
 | `positive_review` | string | `defaults.positive_review` | Positive review delivery mode (`"none"`, `"author"`, `"all"`). |
 | `mute_all` | bool | `defaults.mute_all` | Suppress all email sending for patches matching this list. |
-| `cover_review_email` | bool | `defaults.cover_review_email` | Whether to send email replies on `0/N` cover letters when series-level findings are reported. |
 | `cc` | list | `[]` | Additional static CC addresses for this list (merged with `defaults.cc`). |
 | `ignored_emails` | list | `[]` | Additional author addresses to mute for this list. |
 | `patchwork.enabled` | bool | `false` | Enable Patchwork integration for this mailing list. |

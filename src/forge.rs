@@ -849,6 +849,7 @@ pub fn compose_pr_review_comment(
     total_commits: usize,
     series_summary: Option<&str>,
     patches: &[PatchReviewSummaryItem],
+    patchset_failed: bool,
     target_url: &str,
 ) -> String {
     let header = match version {
@@ -881,7 +882,7 @@ pub fn compose_pr_review_comment(
         })
         .collect();
 
-    if failed_patches.is_empty() && patches_with_findings.is_empty() {
+    if !patchset_failed && failed_patches.is_empty() && patches_with_findings.is_empty() {
         return format!(
             "{header}\n\n✓ **No issues found** across {commit_word}.\n\n[Full review log on {link_host}]({target_url})\n"
         );
@@ -892,37 +893,24 @@ pub fn compose_pr_review_comment(
     out.push_str("\n\n");
 
     if !failed_patches.is_empty() {
-        let failed_commits: Vec<&PatchReviewSummaryItem> = failed_patches
+        let failed_count = failed_patches.len();
+        let listed: Vec<String> = failed_patches
             .iter()
-            .copied()
-            .filter(|p| p.part_index > 0)
+            .take(5)
+            .map(|p| format!("`{}/{}`", p.part_index, p.total_parts))
             .collect();
-        let cover_failed = failed_patches.iter().any(|p| p.part_index == 0);
-        if !failed_commits.is_empty() {
-            let failed_count = failed_commits.len();
-            let listed: Vec<String> = failed_commits
-                .iter()
-                .take(5)
-                .map(|p| format!("`{}/{}`", p.part_index, p.total_parts))
-                .collect();
-            let listed_str = if failed_count > 5 {
-                format!("{}, +{} more", listed.join(", "), failed_count - 5)
-            } else {
-                listed.join(", ")
-            };
-            let suffix = if cover_failed {
-                " and series summary review failed"
-            } else {
-                ""
-            };
-            out.push_str(&format!(
-                "{INCOMPLETE_REVIEW_MARKER} — {failed_count} of {commit_word} failed to complete review ({listed_str}){suffix}.\n\n"
-            ));
+        let listed_str = if failed_count > 5 {
+            format!("{}, +{} more", listed.join(", "), failed_count - 5)
         } else {
-            out.push_str(&format!(
-                "{INCOMPLETE_REVIEW_MARKER} — series summary review failed to complete.\n\n"
-            ));
-        }
+            listed.join(", ")
+        };
+        out.push_str(&format!(
+            "{INCOMPLETE_REVIEW_MARKER} — {failed_count} of {commit_word} failed to complete review ({listed_str}).\n\n"
+        ));
+    } else if patchset_failed {
+        out.push_str(&format!(
+            "{INCOMPLETE_REVIEW_MARKER} — review failed to complete.\n\n"
+        ));
     }
 
     if let Some(summary) = series_summary.map(str::trim).filter(|s| !s.is_empty()) {
@@ -932,24 +920,20 @@ pub fn compose_pr_review_comment(
     }
 
     for patch in patches_with_findings {
-        let title_line = if patch.part_index == 0 {
-            "#### Series / PR Review\n\n".to_string()
-        } else {
-            let short_sha = patch
-                .commit_id
-                .as_deref()
-                .filter(|s| s.len() >= 8)
-                .map(|s| crate::utils::utf8_prefix(s, 8));
-            match short_sha {
-                Some(sha) => format!(
-                    "#### Commit {}/{} — `{}` {}\n\n",
-                    patch.part_index, patch.total_parts, sha, patch.subject
-                ),
-                None => format!(
-                    "#### Commit {}/{} — {}\n\n",
-                    patch.part_index, patch.total_parts, patch.subject
-                ),
-            }
+        let short_sha = patch
+            .commit_id
+            .as_deref()
+            .filter(|s| s.len() >= 8)
+            .map(|s| crate::utils::utf8_prefix(s, 8));
+        let title_line = match short_sha {
+            Some(sha) => format!(
+                "#### Commit {}/{} — `{}` {}\n\n",
+                patch.part_index, patch.total_parts, sha, patch.subject
+            ),
+            None => format!(
+                "#### Commit {}/{} — {}\n\n",
+                patch.part_index, patch.total_parts, patch.subject
+            ),
         };
         out.push_str(&title_line);
 
@@ -1883,6 +1867,7 @@ mod tests {
             2,
             None,
             &patches,
+            false,
             "https://sashiko.sashiko.dev/#/patchset/mr-501-abc..def",
         );
         assert!(body.starts_with("### Sashiko review\n\n"));
@@ -1920,6 +1905,7 @@ mod tests {
             2,
             Some("Series summary text here."),
             &patches,
+            false,
             "https://sashiko.sashiko.dev/#/patchset/mr-501-v3",
         );
         assert!(body.starts_with("### Sashiko review — v3\n\n"));
@@ -1933,41 +1919,6 @@ mod tests {
                 "[Full review and stage logs on sashiko.sashiko.dev](https://sashiko.sashiko.dev/#/patchset/mr-501-v3)"
             )
         );
-    }
-
-    #[test]
-    fn test_compose_pr_review_comment_with_series_review_finding() {
-        let patches = vec![
-            PatchReviewSummaryItem {
-                part_index: 0,
-                total_parts: 2,
-                commit_id: None,
-                subject: "Series / PR Review".to_string(),
-                inline_review: Some(
-                    "Severity: MEDIUM\nPR description claims a metrics endpoint is added, but no endpoint is registered.".to_string(),
-                ),
-                failed: false,
-            },
-            PatchReviewSummaryItem {
-                part_index: 1,
-                total_parts: 2,
-                commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
-                subject: "clean commit".to_string(),
-                inline_review: Some("No issues found.".to_string()),
-                failed: false,
-            },
-        ];
-        let body = compose_pr_review_comment(
-            Some(2),
-            1,
-            Some("Series summary text."),
-            &patches,
-            "https://sashiko.sashiko.dev/#/patchset/mr-502-v2",
-        );
-        assert!(body.starts_with("### Sashiko review — v2\n\n"));
-        assert!(!body.contains("No issues found"));
-        assert!(body.contains("#### Series / PR Review\n\nSeverity: MEDIUM\nPR description claims a metrics endpoint is added"));
-        assert!(!body.contains("clean commit"));
     }
 
     #[test]
@@ -2003,6 +1954,7 @@ mod tests {
             3,
             None,
             &patches,
+            false,
             "https://sashiko.sashiko.dev/#/patchset/sashiko-733",
         );
         assert!(is_incomplete_pr_review_comment(&body));
@@ -2050,6 +2002,7 @@ mod tests {
             3,
             Some("Series overview."),
             &patches,
+            false,
             "https://sashiko.sashiko.dev/#/patchset/sashiko-733",
         );
         assert!(body.starts_with("### Sashiko review — v2\n\n"));
@@ -2079,6 +2032,7 @@ mod tests {
             7,
             None,
             &many_failed,
+            false,
             "https://sashiko.sashiko.dev/#/patchset/sashiko-700",
         );
         assert!(is_incomplete_pr_review_comment(&body));
@@ -2102,9 +2056,33 @@ mod tests {
                 )),
                 failed: false,
             }],
+            false,
             "https://sashiko.sashiko.dev/#/patchset/sashiko-701",
         );
         assert!(!is_incomplete_pr_review_comment(&completed_quoting_marker));
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_failed_patchset_without_failed_commits() {
+        let patches = vec![PatchReviewSummaryItem {
+            part_index: 1,
+            total_parts: 1,
+            commit_id: None,
+            subject: "clean commit".to_string(),
+            inline_review: None,
+            failed: false,
+        }];
+        let body = compose_pr_review_comment(
+            None,
+            1,
+            None,
+            &patches,
+            true,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-702",
+        );
+        assert!(is_incomplete_pr_review_comment(&body));
+        assert!(body.contains("⚠ **Review incomplete** — review failed to complete."));
+        assert!(!body.contains("No issues found"));
     }
 
     #[test]

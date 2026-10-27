@@ -287,41 +287,6 @@ impl EmailRouter {
         patch_author: &str,
         sashiko_address: &str,
     ) -> Action {
-        Self::resolve_recipients_inner(
-            policy,
-            incoming_to,
-            incoming_cc,
-            patch_author,
-            sashiko_address,
-            false,
-        )
-    }
-
-    pub fn resolve_cover_recipients(
-        policy: &EmailPolicyConfig,
-        incoming_to: &[String],
-        incoming_cc: &[String],
-        patch_author: &str,
-        sashiko_address: &str,
-    ) -> Action {
-        Self::resolve_recipients_inner(
-            policy,
-            incoming_to,
-            incoming_cc,
-            patch_author,
-            sashiko_address,
-            true,
-        )
-    }
-
-    fn resolve_recipients_inner(
-        policy: &EmailPolicyConfig,
-        incoming_to: &[String],
-        incoming_cc: &[String],
-        patch_author: &str,
-        sashiko_address: &str,
-        is_cover_review: bool,
-    ) -> Action {
         let sashiko_bare = extract_bare_email(sashiko_address);
         let author_bare = extract_bare_email(patch_author);
         if Self::is_ignored_author(policy, patch_author)
@@ -358,8 +323,7 @@ impl EmailRouter {
         let mut static_cc = Vec::new();
 
         if matched_lists.is_empty() {
-            if policy.defaults.mute_all || (is_cover_review && !policy.defaults.cover_review_email)
-            {
+            if policy.defaults.mute_all {
                 return Action::Mute;
             }
             if policy.defaults.reply_to.contains(&ReplyTarget::Author) {
@@ -376,22 +340,10 @@ impl EmailRouter {
             // Sort matched lists by bare email for deterministic CC ordering.
             matched_lists.sort_by(|a, b| a.0.cmp(&b.0));
 
-            for (_list_bare, list_policy) in &matched_lists {
+            for (list_bare, list_policy) in matched_lists {
                 if list_policy.mute_all.unwrap_or(policy.defaults.mute_all) {
                     mute_all = true;
                 }
-            }
-            if is_cover_review {
-                matched_lists.retain(|(_bare, lp)| {
-                    lp.cover_review_email
-                        .unwrap_or(policy.defaults.cover_review_email)
-                });
-                if matched_lists.is_empty() {
-                    return Action::Mute;
-                }
-            }
-
-            for (list_bare, list_policy) in matched_lists {
                 let reply_to = list_policy
                     .reply_to
                     .as_deref()
@@ -644,33 +596,6 @@ impl EmailRouter {
                 }
             }
         }
-    }
-
-    pub fn is_cover_review_email_enabled(
-        policy: &EmailPolicyConfig,
-        incoming_to: &[String],
-        incoming_cc: &[String],
-    ) -> bool {
-        let all_incoming: Vec<&String> = incoming_to.iter().chain(incoming_cc.iter()).collect();
-        let mut matched_lists = Vec::new();
-        for (list_email, list_policy) in &policy.lists {
-            let list_bare = extract_bare_email(list_email);
-            if all_incoming
-                .iter()
-                .any(|incoming| Self::address_matches_list(incoming, &list_bare))
-            {
-                matched_lists.push(list_policy);
-            }
-        }
-        if matched_lists.is_empty() {
-            return !policy.defaults.mute_all && policy.defaults.cover_review_email;
-        }
-        matched_lists.iter().any(|lp| {
-            !lp.mute_all.unwrap_or(policy.defaults.mute_all)
-                && lp
-                    .cover_review_email
-                    .unwrap_or(policy.defaults.cover_review_email)
-        })
     }
 
     pub fn is_ignored_author(policy: &EmailPolicyConfig, author_email: &str) -> bool {
@@ -1397,104 +1322,6 @@ mod tests {
                 "sashiko@example.com"
             ),
             Action::Mute
-        );
-    }
-
-    #[test]
-    fn test_is_cover_review_email_enabled() {
-        let mut lists = HashMap::new();
-        lists.insert(
-            "bpf@vger.kernel.org".to_string(),
-            MailingListPolicy {
-                mute_all: Some(false),
-                cover_review_email: Some(true),
-                ..Default::default()
-            },
-        );
-        lists.insert(
-            "netdev@vger.kernel.org".to_string(),
-            MailingListPolicy {
-                mute_all: Some(false),
-                ..Default::default()
-            },
-        );
-        let policy = EmailPolicyConfig {
-            defaults: DefaultListPolicy::default(),
-            lists,
-        };
-
-        assert!(!EmailRouter::is_cover_review_email_enabled(
-            &policy,
-            &["netdev@vger.kernel.org".to_string()],
-            &[]
-        ));
-        assert!(EmailRouter::is_cover_review_email_enabled(
-            &policy,
-            &["bpf@vger.kernel.org".to_string()],
-            &[]
-        ));
-        assert!(EmailRouter::is_cover_review_email_enabled(
-            &policy,
-            &["netdev@vger.kernel.org".to_string()],
-            &["bpf@vger.kernel.org".to_string()]
-        ));
-    }
-
-    #[test]
-    fn test_cover_review_cross_post_excludes_disabled_list() {
-        let mut lists = HashMap::new();
-        lists.insert(
-            "bpf@vger.kernel.org".to_string(),
-            MailingListPolicy {
-                mute_all: Some(false),
-                cover_review_email: Some(true),
-                reply_to: Some(vec![ReplyTarget::Author, ReplyTarget::List]),
-                cc: vec!["bpf-maint@kernel.org".to_string()],
-                ..Default::default()
-            },
-        );
-        lists.insert(
-            "netdev@vger.kernel.org".to_string(),
-            MailingListPolicy {
-                mute_all: Some(false),
-                cover_review_email: Some(false),
-                reply_to: Some(vec![
-                    ReplyTarget::Author,
-                    ReplyTarget::List,
-                    ReplyTarget::Recipients,
-                ]),
-                cc: vec!["netdev-maint@kernel.org".to_string()],
-                ..Default::default()
-            },
-        );
-        let policy = EmailPolicyConfig {
-            defaults: DefaultListPolicy::default(),
-            lists,
-        };
-
-        let to = vec![
-            "netdev@vger.kernel.org".to_string(),
-            "bpf@vger.kernel.org".to_string(),
-        ];
-        let cc = vec!["reviewer@example.com".to_string()];
-
-        let action = EmailRouter::resolve_cover_recipients(
-            &policy,
-            &to,
-            &cc,
-            "Author <author@kernel.org>",
-            "sashiko@example.com",
-        );
-        assert_eq!(
-            action,
-            Action::Send {
-                to: vec![
-                    "Author <author@kernel.org>".to_string(),
-                    "bpf@vger.kernel.org".to_string(),
-                ],
-                cc: vec!["bpf-maint@kernel.org".to_string()],
-                positive_review: PositiveReviewPolicy::None,
-            }
         );
     }
 
