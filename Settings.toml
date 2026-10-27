@@ -1,3 +1,8 @@
+# Sashiko daemon configuration, as shipped in the container image.
+# Every key with its default: docs/configuration.md.
+# Other LLM providers: docs/llm-providers.md and docs/examples/.
+# Environment variables override any key, e.g. SASHIKO__SERVER__PORT=8081.
+
 log_level = "info"
 
 [project]
@@ -7,19 +12,14 @@ description = ""
 [forge]
 enabled = false
 # provider = "github"
+# Reviews are posted back to GitHub only with post_mode = "live"
+# ("dry_run" records them without posting). See
+# docs/examples/Settings.forge-github.toml.
+# post_mode = "off"
 # api_token = "your-api-token"
-
-# Webhook authentication (recommended for production).
-# When configured, Sashiko authenticates incoming webhook requests using
-# this token. Non-localhost requests are permitted without
-# --enable-unsafe-all-submit when a secret is set.
-#
-# For GitLab 19.0+ signing token (recommended):
-#   webhook_secret = "whsec_YOUR_BASE64_TOKEN"
-# For GitHub or plain secret token:
-#   webhook_secret = "YOUR_SECRET"
-# Generate a strong secret: openssl rand -hex 32
-# See docs/WEBHOOK_SECURITY.md for full setup guide.
+# Authenticates incoming webhooks, which lets non-localhost senders in
+# without --enable-unsafe-all-submit. Generate one with
+# openssl rand -hex 32; see docs/WEBHOOK_SECURITY.md.
 # webhook_secret = ""
 
 # GitHub repositories ("owner/repo") to reconcile via periodic Pulls REST API
@@ -27,23 +27,20 @@ enabled = false
 # and forge.enabled = true, auto-detects the GitHub repository from the origin
 # remote of git.repository_path.
 # repos = ["sashiko-dev/sashiko"]
-# Interval in seconds between periodic GitHub PR reconciliation passes (0 = disabled).
+# Interval in seconds between periodic GitHub PR reconciliation passes
+# (0 = disabled).
 # poll_interval_secs = 120
 
 [subsystems]
-# Regex map: email address pattern -> subsystem name
-# mapping = [
-#     { pattern = ".*linux-kernel@vger.kernel.org.*", name = "LKML" },
-#     { pattern = ".*netdev@vger.kernel.org.*", name = "netdev" },
-# ]
+# Regex map: email address pattern -> subsystem name.
+# mapping = [{ pattern = ".*netdev@vger.kernel.org.*", name = "netdev" }]
 
 [database]
 url = "sashiko.db"
-token = ""
 
 [mailing_lists]
-# Tracked mailing lists are configured in projects/<project>/mailing_lists.toml
-# by default. Set `track` here (or via SASHIKO__MAILING_LISTS__TRACK) to override.
+# Tracked lists come from projects/<project>/mailing_lists.toml. Setting
+# track here (or SASHIKO__MAILING_LISTS__TRACK) overrides them.
 # track = ["linux-kernel"]
 
 [nntp]
@@ -59,23 +56,16 @@ port = 119
 # Ensure your filters and dry_run settings are correctly configured before use.
 # sender_address = "sashiko@example.com"
 # dry_run = true
-#
-# Both transports share the two keys above. Add the keys for one
-# transport below, not both.
-#
-# smtp connects to a submission service directly. It requires
-# implicit TLS, so name the submissions port rather than the
-# STARTTLS port.
+# The smtp transport requires implicit TLS, so name the submissions port
+# rather than the STARTTLS port.
 # transport = "smtp"
 # server = "smtp.example.com"
 # port = 465
 # username = "user@example.com"
 # password = "your_password"
-#
-# sendmail hands the message to the local MTA and lets it relay.
-# Use it where the submission service offers only cleartext.
-# transport = "sendmail"
-# sendmail_path = "/usr/sbin/sendmail"
+# To hand mail to the local MTA instead, use transport = "sendmail"
+# (and sendmail_path if it is not /usr/sbin/sendmail) without server,
+# port, username or password.
 
 [ai]
 provider = "gemini"
@@ -83,117 +73,6 @@ model = "gemini-4-argon"
 max_input_tokens = 900000
 max_interactions = 100
 temperature = 1.0
-
-# To use Claude API directly:
-# provider = "claude"
-# model = "claude-sonnet-4-6"
-# max_input_tokens = 40000
-# max_interactions = 50
-
-# To use Claude Code CLI (fixed-cost subscription, no API key needed):
-# provider = "claude-cli"
-# model = "claude-sonnet-4-6"
-# max_input_tokens = 40000
-# max_interactions = 150
-
-# To use GitHub Copilot CLI (subscription auth, no API key needed):
-# provider = "copilot-cli"
-# model = "claude-sonnet-4.5"
-# max_input_tokens = 40000
-# max_interactions = 150
-
-# To use Claude via Google Cloud Vertex AI (requires --features vertex):
-# provider = "vertex"
-# model = "claude-sonnet-4-6"
-# max_input_tokens = 40000
-# max_interactions = 50
-
-# To use Gemini via Google Cloud Vertex AI (requires --features vertex):
-# provider = "vertex"
-# model = "gemini-4-argon"
-# max_input_tokens = 200000
-# max_interactions = 100
-
-# To use Claude via AWS Bedrock (requires --features bedrock):
-# provider = "bedrock"
-# model = "us.anthropic.claude-sonnet-4-6-20250514-v1:0"
-# max_input_tokens = 40000
-# max_interactions = 50
-
-# To use Kiro CLI (fixed-cost subscription, no API key needed):
-# provider = "kiro-cli"
-# model = "claude-opus-4.6"
-# max_input_tokens = 40000
-# max_interactions = 50
-
-# To use Devin CLI (fixed-cost subscription, no API key needed):
-# provider = "devin-cli"
-# model = "opus"
-# max_input_tokens = 200000
-# max_interactions = 150
-
-# To use goose in front of a local server (no API key needed), see
-# docs/examples/Settings.goose-cli.toml for the matching [ai.goose_cli.env]:
-# provider = "goose"
-# model = "qwen3-8b-ov"
-# max_input_tokens = 4000
-# max_interactions = 50
-
-# To use OpenRouter, also export OPENAI_API_KEY with the API key in the environment
-# provider = "openai-compatible"
-# model = "openrouter/free"
-# max_input_tokens = 128000
-# max_interactions = 100
-
-# To use OrcaRouter (OpenAI-compatible gateway), also export OPENAI_API_KEY with the API key in the environment
-# provider = "openai-compatible"
-# model = "openai/gpt-4o-mini"
-# max_input_tokens = 128000
-# max_interactions = 100
-
-# [ai.gemini]
-# explicit_prompt_caching = false
-# max_tokens = 131072
-# base_url = "http://localhost:8000"  # Or set GOOGLE_GEMINI_BASE_URL env var
-# proxy_command = "scripts/gemini-proxy-helper.sh --port-file {port_file}"
-# auth_token_command = "gcloud auth print-access-token"
-# thinking_level = "HIGH"             # Default thinking level: "LOW", "MEDIUM", "HIGH"
-
-[ai.claude]
-prompt_caching = true
-# thinking = "adaptive"   # Adaptive thinking (Opus 4.6, Sonnet 4.6, and later)
-# effort = "high"         # Effort: "low", "medium", "high", "xhigh", "max"
-
-# [ai.claude_cli]
-# effort = "high"   # Thinking effort: "low", "medium", "high", "xhigh", "max"
-
-# [ai.openai_compat]        # Enable openrouter url
-# base_url = "https://openrouter.ai/api/v1"
-# base_url = "https://api.orcarouter.ai/v1"  # Enable for OrcaRouter
-
-# [ai.vertex]
-# project_id = "my-gcp-project"  # Or ANTHROPIC_VERTEX_PROJECT_ID / GOOGLE_CLOUD_PROJECT
-# region = "us-east5"            # Or CLOUD_ML_REGION / GOOGLE_CLOUD_LOCATION (default: "us-east5")
-# prompt_caching = true          # Claude only
-# max_tokens = 8192              # Claude (default: 8192) and Gemini (default: 131072 on Argon, omitted otherwise)
-# thinking = "adaptive"          # Claude thinking mode or Gemini fallback thinking level ("LOW", "MEDIUM", "HIGH")
-# effort = "high"                # Claude effort or Gemini default thinking level ("LOW", "MEDIUM", "HIGH")
-
-# [ai.bedrock]
-# region = "us-east-1"
-# prompt_caching = true
-# max_tokens = 8192
-
-# [ai.kiro_cli]
-# binary = "kiro-cli"
-# context_window_size = 200000
-
-# [ai.goose_cli]
-# binary = "goose"
-# goose_provider = "openai"        # Backend goose itself talks to
-# context_window_size = 32768
-# [ai.goose_cli.env]               # Whatever that backend needs
-# OPENAI_HOST = "http://localhost:8000"
 
 [server]
 host = "::"
@@ -203,20 +82,13 @@ port = 8080
 # the bind address above does not name a host a recipient can open. The server
 # refuses to start if SMTP is on and this is unset or names a bind address.
 # public_base_url = ""
+# Signs sign-in links and sessions; sign-in is unavailable without it.
+# Prefer SASHIKO__SERVER__JWT_SECRET to writing it here.
+# jwt_secret = ""
 
-# Local tooling authenticates with a token rather than an address. The server
-# writes a random one to .sashiko-local-token beside the database on every
-# start, readable only by the user it runs as, and sashiko-cli and the
-# benchmark present it automatically.
-#
-# Nothing is inferred from where a request comes from. The deployed topology
-# puts a reverse proxy in front of a loopback bind, so a request from the
-# public internet arrives exactly as a local one does; reading a file owned by
-# the server's user is a claim that caller cannot make.
-
-# Identity-based Capabilities: Defines what authenticated (JWT) entities can do.
-# If these lists are empty or the section is missing, nobody is allowed to perform any mutations (Fail-Closed secure default).
-# Do NOT list arbitrary users here.
+# Capabilities of signed-in (JWT) identities. Empty lists grant nothing
+# (fail-closed). Do NOT list arbitrary users here. Each list also accepts
+# a comma separated string, e.g. SASHIKO__SERVER__ACL__ADMINS.
 [server.acl]
 # Admins have all capabilities, including root-level maintenance operations.
 admins = []
@@ -227,19 +99,19 @@ admins = []
 security = []
 # Principals permitted to file new bugs over HTTP. Empty means only admins can.
 bug_reporters = []
-# Ingest limits users/bots to only submit new patches into the system (/api/submit).
+# May submit new patches into the system (/api/submit).
 ingest = []
-# Cancel permits halting workloads (useful for automation / cron scripts).
+# May halt running workloads (useful for automation / cron scripts).
 cancel = []
-# Review allows triggering intensive AI analyses on existing patches.
+# May trigger intensive AI analyses of existing patches.
 review = []
-# Blocklist explicitly denies all capabilities and access, overriding any grants.
+# Denies all capabilities and access, overriding any grants.
 blocklist = []
 
 [git]
 repository_path = "third_party/linux"
 
-# Track custom remotes and attempt to apply patches on their branches
+# Track custom remotes and attempt to apply patches on their branches.
 # [[git.custom_remotes]]
 # name = "remote-name"
 # url = "git://my-custom.com/remote"
@@ -252,20 +124,20 @@ worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
-# effort = "mid"  # Options: "low", "mid" (default for Argon 4), "high", "dynamic"
+# Reasoning effort on Argon models: "low", "mid" (default), "high", or
+# "dynamic". Other models ignore it.
+# effort = "mid"
 
 [linux_bug]
-# Enable pre-existing bug tracking and the background bug worker (default: false).
-# When disabled, pre-existing issues found during patch review are ignored.
+# Pre-existing bug tracking and the background bug worker. When disabled,
+# pre-existing issues found during patch review are ignored.
 enabled = false
-# Maximum number of concurrent bug analyses run by the bug worker (default: 4).
+# Maximum number of concurrent bug analyses run by the bug worker.
 # concurrency = 4
-# Enable periodic verification of whether open bugs have been fixed upstream (default: false).
+# Periodically check whether open bugs have been fixed upstream.
 fix_check_enabled = false
-# Interval in seconds between periodic upstream fix checks against Linus's tree (0 = disabled).
+# Seconds between upstream fix checks against the mainline tree
+# (0 = disabled).
 # fix_check_interval_seconds = 21600
-# Maximum number of open bugs to evaluate per upstream fix check cycle.
+# Maximum number of open bugs evaluated per upstream fix check cycle.
 # fix_check_batch_size = 50
-
-
-
