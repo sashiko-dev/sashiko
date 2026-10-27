@@ -19,6 +19,7 @@
 //! bodies differ.
 
 use crate::ai::{AiErrorClass, ClassifyAiError, classify_status_code};
+use crate::settings::ServiceTier;
 use crate::utils::redact_secret;
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -141,6 +142,36 @@ pub fn normalize_base_url(url: &str, endpoint_path: &str) -> Result<String> {
     };
 
     Ok(format!("{base}{path}"))
+}
+
+/// The tier a response reports when it differs from the configured one.
+///
+/// OpenAI echoes the tier on every response.  A request sent as "flex"
+/// that the account could not run there comes back "default" and is billed
+/// at the standard rate, and the echo is the only place that shows.  "auto"
+/// leaves the choice to the project, so any echo matches it.
+pub fn service_tier_mismatch(requested: Option<ServiceTier>, echoed: Option<&str>) -> Option<&str> {
+    match (requested, echoed) {
+        (None | Some(ServiceTier::Auto), _) | (_, None) => None,
+        (Some(requested), Some(echoed)) if echoed == requested.as_str() => None,
+        (Some(_), Some(echoed)) => Some(echoed),
+    }
+}
+
+/// Warns, once per process, that a request ran on a tier other than the
+/// configured one.  Every response repeats the tier on the debug-level
+/// "OpenAI response received" line, so the later ones stay visible there.
+pub fn warn_on_service_tier_mismatch(requested: Option<ServiceTier>, echoed: Option<&str>) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let (Some(requested), Some(ran)) = (requested, service_tier_mismatch(requested, echoed)) else {
+        return;
+    };
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "OpenAI ran a request on service tier {ran}, not the configured {}",
+            requested.as_str()
+        );
+    }
 }
 
 /// Whether an error is the OpenAI API, or a compatible endpoint, refusing
@@ -335,6 +366,19 @@ pub(crate) mod tests {
     use crate::ai::DEFAULT_RETRY_AFTER;
 
     const CHAT: &str = "/chat/completions";
+
+    #[test]
+    fn service_tier_mismatch_reports_only_a_different_tier() {
+        use ServiceTier::{Auto, Flex};
+        assert_eq!(service_tier_mismatch(None, Some("default")), None);
+        assert_eq!(service_tier_mismatch(Some(Auto), Some("default")), None);
+        assert_eq!(service_tier_mismatch(Some(Flex), Some("flex")), None);
+        assert_eq!(service_tier_mismatch(Some(Flex), None), None);
+        assert_eq!(
+            service_tier_mismatch(Some(Flex), Some("default")),
+            Some("default")
+        );
+    }
 
     /// The bodies gpt-6-luna and gpt-5.6-sol returned for temperature 0.0
     /// on 2026-09-24, from /v1/chat/completions and from /v1/responses.

@@ -52,8 +52,8 @@ A `provider = "openai-responses"` value would be more visible in a config
 file, but it forces either a duplicate settings block or a provider that
 reads its configuration from a section named after a different provider.
 The flag keeps one settings block for one vendor. Everything else in that
-block -- `base_url`, `context_window_size`, `max_tokens`, `effort` --
-applies to both transports unchanged.
+block -- `base_url`, `context_window_size`, `max_tokens`, `effort`,
+`service_tier` -- applies to both transports unchanged.
 
 ## Request Mapping
 
@@ -64,6 +64,7 @@ applies to both transports unchanged.
 | `tools` | `{type, function: {name, description, parameters}}` | `{type: "function", name, description, parameters}`, flat |
 | `temperature` | `temperature` | `temperature` |
 | effort, from settings | `reasoning_effort` | `reasoning.effort` |
+| `service_tier`, from settings | `service_tier` | `service_tier` |
 | `max_tokens`, from settings | `max_completion_tokens` | `max_output_tokens` |
 | `response_format` | `response_format` | `text.format` |
 
