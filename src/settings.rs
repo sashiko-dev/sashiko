@@ -1499,16 +1499,42 @@ impl Settings {
     }
 }
 
+/// Uncomments every commented-out key and table header, so a commented
+/// alternative is checked as strictly as the active lines: a reader who
+/// uncomments it must get a file that still loads.
+#[cfg(test)]
+pub(crate) fn uncomment_examples(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let is_key_or_table = line.strip_prefix("# ").is_some_and(|rest| {
+            rest.starts_with('[')
+                || rest.split_once(" = ").is_some_and(|(key, _)| {
+                    !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+        });
+        out.push_str(if is_key_or_table { &line[2..] } else { line });
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The shipped Settings.toml is the daemon's configuration in the image,
+    /// so it has to satisfy the daemon's own startup checks as well as parse.
     #[test]
     fn test_production_settings_is_valid() {
         let path = "Settings.toml";
         if Path::new(path).exists() {
-            let _ = Settings::from_file("Settings")
+            let settings = Settings::from_file("Settings")
                 .expect("Production 'Settings.toml' failed to parse");
+            settings
+                .validate_for_daemon()
+                .expect("Production 'Settings.toml' must satisfy the daemon");
+            crate::ai::create_provider_from_ai(&settings.ai)
+                .expect("Production 'Settings.toml' must name a usable provider");
         }
     }
 
@@ -1689,6 +1715,110 @@ mod tests {
     fn test_init_template_parses() {
         Settings::load(Some(Path::new("docs/examples/Settings.example.toml")))
             .expect("init template must parse");
+    }
+
+    /// Overlays `fragment` onto `base`, table by table, the way a reader
+    /// merges an example fragment into a full Settings.toml.
+    fn merge_toml(base: &mut toml::Value, fragment: toml::Value) {
+        match (base, fragment) {
+            (toml::Value::Table(base), toml::Value::Table(fragment)) => {
+                for (key, value) in fragment {
+                    match base.get_mut(&key) {
+                        Some(existing) => merge_toml(existing, value),
+                        None => {
+                            base.insert(key, value);
+                        }
+                    }
+                }
+            }
+            (base, fragment) => *base = fragment,
+        }
+    }
+
+    /// Whether this build can load an example for `provider`. The bedrock
+    /// and vertex tables exist only under their cargo features, so a build
+    /// without the feature rejects the example as an unknown field.
+    fn provider_is_built(provider: &str) -> bool {
+        const GATED: [(&str, bool); 2] = [
+            ("bedrock", cfg!(feature = "bedrock")),
+            ("vertex", cfg!(feature = "vertex")),
+        ];
+        GATED
+            .iter()
+            .find(|(name, _)| *name == provider)
+            .is_none_or(|(_, built)| *built)
+    }
+
+    /// Every docs/examples/Settings*.toml loads through the real loader, so
+    /// a removed key or a value an enum no longer accepts fails here rather
+    /// than in a user's copy. Provider examples are complete configurations
+    /// that docs/llm-providers.md tells users to copy verbatim, and their
+    /// provider must be one the factory knows. The forge examples are
+    /// fragments and load merged over the shipped Settings.toml.
+    #[test]
+    fn test_every_example_settings_file_loads() {
+        let temp = tempfile::tempdir().unwrap();
+        let base: toml::Value =
+            toml::from_str(&std::fs::read_to_string("Settings.toml").unwrap()).unwrap();
+        let mut loaded = 0;
+        for entry in std::fs::read_dir("docs/examples").unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.starts_with("Settings.") || !name.ends_with(".toml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (label, text) in [
+                (name.clone(), text.clone()),
+                (format!("uncommented {name}"), uncomment_examples(&text)),
+            ] {
+                let copy = temp.path().join(label.replace(' ', "-"));
+                if check_example(&base, &name, &label, &text, &copy) {
+                    loaded += 1;
+                }
+            }
+        }
+        assert!(loaded >= 20, "only {loaded} example variants loaded");
+    }
+
+    /// Loads one example variant from `copy`, returning false when this
+    /// build lacks the cargo feature its provider needs.
+    fn check_example(base: &toml::Value, name: &str, label: &str, text: &str, copy: &Path) -> bool {
+        let example: toml::Value =
+            toml::from_str(text).unwrap_or_else(|e| panic!("{label} is not TOML: {e}"));
+
+        if name.starts_with("Settings.forge-") {
+            assert!(
+                example.get("ai").is_none() && example.get("review").is_none(),
+                "{label} is a fragment and must not carry [ai] or [review]"
+            );
+            let mut merged = base.clone();
+            merge_toml(&mut merged, example);
+            std::fs::write(copy, toml::to_string(&merged).unwrap()).unwrap();
+            Settings::load(Some(copy))
+                .unwrap_or_else(|e| panic!("{label} merged over Settings.toml: {e}"));
+            return true;
+        }
+
+        let provider = example
+            .get("ai")
+            .and_then(|ai| ai.get("provider"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("{label} has no [ai] provider"))
+            .to_string();
+        if !provider_is_built(&provider) {
+            return false;
+        }
+        std::fs::write(copy, text).unwrap();
+        let settings =
+            Settings::load(Some(copy)).unwrap_or_else(|e| panic!("{label} failed to load: {e}"));
+        // Vertex and Bedrock resolve cloud projects and credentials when the
+        // client is built, which a unit test has none of.
+        if !matches!(provider.as_str(), "bedrock" | "vertex") {
+            crate::ai::create_provider_from_ai(&settings.ai)
+                .unwrap_or_else(|e| panic!("{label} names no usable provider: {e}"));
+        }
+        true
     }
 
     #[test]

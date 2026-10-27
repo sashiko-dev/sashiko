@@ -672,6 +672,21 @@ mod tests {
         assert!(sashiko_config.tracked_nntp_groups().is_empty());
     }
 
+    /// The documented example parses, and so does every commented-out
+    /// section in it once uncommented, so copying any part of it works.
+    #[test]
+    fn test_example_policy_is_valid() {
+        let path = "docs/examples/mailing_lists.example.toml";
+        let text = std::fs::read_to_string(path).expect("example policy is readable");
+        EmailPolicyConfig::parse_content(&text).expect("example policy parses");
+
+        let uncommented = crate::settings::uncomment_examples(&text);
+        let config =
+            EmailPolicyConfig::parse_content(&uncommented).expect("uncommented example parses");
+        assert!(config.lists.contains_key("bpf@vger.kernel.org"));
+        assert!(config.lists["netdev@vger.kernel.org"].patchwork.enabled);
+    }
+
     #[tokio::test]
     async fn test_load_async() {
         let linux_config = EmailPolicyConfig::load_async("projects/linux/mailing_lists.toml")
