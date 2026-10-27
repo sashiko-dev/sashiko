@@ -1397,6 +1397,191 @@ pub struct FetchQueueRow {
     pub created_at: i64,
 }
 
+/// How far back an exact subject match may find a previous version.
+#[cfg(feature = "server")]
+const SUBJECT_LINK_WINDOW_SECS: i64 = 120 * 86400;
+
+#[cfg(feature = "server")]
+const LINEAGE_CANDIDATE_COLUMNS: &str =
+    "id, subject, subject_index, author, date, total_parts, cover_letter_message_id, version";
+
+/// Series-level signal that linked an email patchset to its previous
+/// version. Forge pull requests use their own "forge_mr" path.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionLinkSignal {
+    ChangeId,
+    MessageRef,
+    SubjectAuthor,
+}
+
+#[cfg(feature = "server")]
+impl VersionLinkSignal {
+    /// Signals from strongest to weakest; the first one with a qualifying
+    /// candidate decides.
+    const BY_RANK: [Self; 3] = [Self::ChangeId, Self::MessageRef, Self::SubjectAuthor];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ChangeId => "change_id",
+            Self::MessageRef => "message_ref",
+            Self::SubjectAuthor => "subject_author",
+        }
+    }
+
+    /// Whether this signal identifies every same-version candidate as the
+    /// same series, so the latest of them can be picked. Message
+    /// references can name unrelated patchsets, so two of them at the same
+    /// version are ambiguous.
+    fn same_version_is_same_series(self) -> bool {
+        match self {
+            Self::ChangeId | Self::SubjectAuthor => true,
+            Self::MessageRef => false,
+        }
+    }
+}
+
+/// What a patchset's subject row represents, for like-for-like subject
+/// matching.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectShape {
+    Cover,
+    SinglePatch,
+    Other,
+}
+
+#[cfg(feature = "server")]
+impl SubjectShape {
+    fn of(subject_index: u32, total_parts: u32) -> Self {
+        match (subject_index, total_parts) {
+            (0, _) => Self::Cover,
+            (1, 0 | 1) => Self::SinglePatch,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+fn is_placeholder_or_reply(subject: &str, subject_index: u32) -> bool {
+    subject == "(placeholder)" || (subject_index == 0 && Database::is_reply_subject(subject))
+}
+
+#[cfg(feature = "server")]
+fn effective_version(stored: Option<u32>, subject: &str) -> u32 {
+    stored
+        .filter(|&v| v > 0)
+        .or_else(|| crate::patch::parse_subject_version(subject))
+        .unwrap_or(1)
+}
+
+/// The patchset being reconciled, as stored.
+#[cfg(feature = "server")]
+struct LineageSubject {
+    subject: String,
+    subject_index: u32,
+    author: String,
+    date: i64,
+    total_parts: u32,
+    received_parts: u32,
+    cover_id: Option<String>,
+    mr_url: Option<String>,
+    mr_number: Option<i64>,
+    stored_version: Option<u32>,
+    change_id: Option<String>,
+    previous_patchset_id: Option<i64>,
+    version_link_signal: Option<String>,
+}
+
+#[cfg(feature = "server")]
+impl LineageSubject {
+    fn skips_reconciliation(&self, skip_intermediate_parts: bool) -> bool {
+        skip_intermediate_parts && self.received_parts > 1 && self.received_parts < self.total_parts
+    }
+
+    fn version(&self) -> u32 {
+        effective_version(self.stored_version, &self.subject)
+    }
+}
+
+/// A patchset that may be the previous version of the one reconciled.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone)]
+struct LineageCandidate {
+    id: i64,
+    subject: String,
+    subject_index: u32,
+    author: String,
+    date: i64,
+    total_parts: u32,
+    cover_id: Option<String>,
+    version: u32,
+}
+
+#[cfg(feature = "server")]
+impl LineageCandidate {
+    /// Parses a row selected with `LINEAGE_CANDIDATE_COLUMNS`.
+    fn from_row(row: &libsql::Row) -> Result<Self> {
+        let subject: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+        let stored_version: Option<u32> = row.get(7)?;
+        Ok(Self {
+            id: row.get(0)?,
+            version: effective_version(stored_version, &subject),
+            subject,
+            subject_index: row.get::<Option<u32>>(2)?.unwrap_or(9999),
+            author: row.get::<Option<String>>(3)?.unwrap_or_default(),
+            date: row.get::<Option<i64>>(4)?.unwrap_or(0),
+            total_parts: row.get::<Option<u32>>(5)?.unwrap_or(1),
+            cover_id: row.get(6)?,
+        })
+    }
+}
+
+/// Explicit references and prerequisites extracted from the cover letter
+/// and patch 1 of the patchset being reconciled.
+#[cfg(feature = "server")]
+#[derive(Default)]
+struct LineageReferences {
+    version_ref_msgids: Vec<String>,
+    prereq_msgids: std::collections::HashSet<String>,
+    prereq_patch_ids: std::collections::HashSet<String>,
+    own_msgids: std::collections::HashSet<String>,
+    own_git_patch_ids: std::collections::HashSet<String>,
+    detected_change_id: Option<String>,
+}
+
+#[cfg(feature = "server")]
+struct LineageContext<'a> {
+    patchset_id: i64,
+    subject: &'a str,
+    subject_index: u32,
+    total_parts: u32,
+    author: &'a str,
+    date: i64,
+    version: u32,
+    change_id: Option<&'a str>,
+    refs: &'a LineageReferences,
+}
+
+#[cfg(feature = "server")]
+enum PredecessorChoice {
+    NoCandidate,
+    Ambiguous(Vec<i64>),
+    Chosen(LineageCandidate),
+}
+
+/// Two authors are the same person only if they share an email address
+/// (case-insensitively, or through the b4 web relay alias). A display name
+/// alone never matches.
+#[cfg(feature = "server")]
+fn same_author_email(a: &str, b: &str) -> bool {
+    let email_a = crate::patch::extract_email(a);
+    let email_b = crate::patch::extract_email(b);
+    email_a.contains('@')
+        && email_b.contains('@')
+        && (email_a.eq_ignore_ascii_case(&email_b) || crate::patch::authors_match(a, b))
+}
+
 #[cfg(feature = "server")]
 impl Database {
     pub fn has_bug_actor(&self) -> bool {
@@ -11064,17 +11249,6 @@ impl Database {
         Ok(())
     }
 
-    fn version_signal_rank(signal: &str) -> u8 {
-        match signal {
-            "forge_mr" => 5,
-            "change_id" => 4,
-            "message_ref" => 3,
-            "subject_author" => 2,
-            "git_patch_id" => 1,
-            _ => 0,
-        }
-    }
-
     pub async fn reconcile_version_lineage(&self, patchset_id: i64) -> Result<usize> {
         self.reconcile_version_lineage_inner(patchset_id, false)
             .await
@@ -11223,254 +11397,43 @@ impl Database {
         patchset_id: i64,
         skip_intermediate_parts: bool,
     ) -> Result<usize> {
-        #[derive(Clone)]
-        struct LineageNode {
-            id: i64,
-            subject: String,
-            subject_index: u32,
-            author: String,
-            date: i64,
-            total_parts: u32,
-            received_parts: u32,
-            status: String,
-            cover_id: Option<String>,
-            ver: u32,
-            signal: Option<&'static str>,
-            existing_prev_id: Option<i64>,
-            existing_signal: Option<String>,
-        }
-
-        let read_patchset_meta = |conn: &libsql::Connection| {
-            let conn = conn.clone();
-            async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT id, subject, subject_index, author, date, total_parts, received_parts,
-                                status, cover_letter_message_id, mr_url, mr_number, version,
-                                change_id, previous_patchset_id, version_link_signal
-                         FROM patchsets WHERE id = ?",
-                        libsql::params![patchset_id],
-                    )
-                    .await?;
-                let Some(row) = rows.next().await? else {
-                    return Ok::<_, anyhow::Error>(None);
-                };
-                Ok(Some((
-                    row.get::<Option<String>>(1)?.unwrap_or_default(),
-                    row.get::<Option<u32>>(2)?.unwrap_or(9999),
-                    row.get::<Option<String>>(3)?.unwrap_or_default(),
-                    row.get::<Option<i64>>(4)?.unwrap_or(0),
-                    row.get::<Option<u32>>(5)?.unwrap_or(1),
-                    row.get::<Option<u32>>(6)?.unwrap_or(0),
-                    row.get::<Option<String>>(7)?.unwrap_or_default(),
-                    row.get::<Option<String>>(8)?,
-                    row.get::<Option<String>>(9)?,
-                    row.get::<Option<i64>>(10)?,
-                    row.get::<Option<u32>>(11)?,
-                    row.get::<Option<String>>(12)?,
-                    row.get::<Option<i64>>(13)?,
-                    row.get::<Option<String>>(14)?,
-                )))
-            }
-        };
-
-        // Pre-check skip conditions and extract cover/patch-1 payloads before
-        // acquiring the exclusive SQLite write transaction so intermediate
-        // patch insertions do not contend on BEGIN IMMEDIATE and gzip
-        // decompression + regex scanning run on the blocking pool outside the
-        // write lock.
-        let Some((
-            pre_subject,
-            pre_subject_index,
-            _,
-            _,
-            pre_total_parts,
-            pre_received_parts,
-            _,
-            pre_clid,
-            pre_mr_url,
-            pre_mr_number,
-            _,
-            pre_change_id,
-            _,
-            _,
-        )) = read_patchset_meta(&self.conn).await?
-        else {
+        let Some(pre) = Self::read_lineage_subject(&self.conn, patchset_id).await? else {
             return Ok(0);
         };
 
         // Avoid O(N^2) reconciliation across intermediate patch insertions in large series
         // (including multi-commit Forge PRs): cover letter (part_index == 0), patch 1
         // (part_index == 1), and explicit callers (`skip_intermediate_parts == false`) link
-        // the series and cancel superseded versions immediately even when arriving out of
-        // order, and the final patch (`received_parts >= total_parts`) reconciles full
-        // per-patch lineage once complete.
-        if skip_intermediate_parts && pre_received_parts > 1 && pre_received_parts < pre_total_parts
-        {
+        // the series immediately even when arriving out of order, and the final patch
+        // (`received_parts >= total_parts`) reconciles full per-patch lineage once complete.
+        if pre.skips_reconciliation(skip_intermediate_parts) {
             return Ok(0);
         }
 
-        if pre_mr_number.is_some() {
+        if pre.mr_number.is_some() {
             return self
                 .reconcile_superseded_pr_patchsets(
                     patchset_id,
-                    pre_mr_url.as_deref(),
-                    pre_mr_number,
+                    pre.mr_url.as_deref(),
+                    pre.mr_number,
                 )
                 .await;
         }
 
-        if pre_subject == "(placeholder)"
-            || (pre_subject_index == 0 && Self::is_reply_subject(&pre_subject))
-        {
+        if is_placeholder_or_reply(&pre.subject, pre.subject_index) {
             return Ok(0);
         }
 
-        let mut own_msgids = std::collections::HashSet::new();
-        let mut own_patch_msgids = std::collections::HashSet::new();
-        let mut own_git_patch_ids = std::collections::HashSet::new();
-        if let Some(ref clid) = pre_clid {
-            for c in Self::get_msgid_candidates(clid) {
-                own_msgids.insert(c);
-            }
-        }
-        let mut own_p_rows = self
-            .conn
-            .query(
-                "SELECT message_id, git_patch_id FROM patches WHERE patchset_id = ? LIMIT 256",
-                libsql::params![patchset_id],
+        // Extract cover/patch-1 payloads before acquiring the exclusive SQLite
+        // write transaction so gzip decompression and regex scanning run on
+        // the blocking pool outside the write lock.
+        let refs = self
+            .load_lineage_references(
+                patchset_id,
+                pre.cover_id.as_deref(),
+                pre.change_id.is_none(),
             )
             .await?;
-        while let Some(prow) = own_p_rows.next().await? {
-            let pmid = prow.get::<String>(0)?;
-            for c in Self::get_msgid_candidates(&pmid) {
-                own_msgids.insert(c.clone());
-                own_patch_msgids.insert(c);
-            }
-            if let Some(gpid) = prow.get::<Option<String>>(1)? {
-                own_git_patch_ids.insert(gpid);
-            }
-        }
-        drop(own_p_rows);
-
-        let cover_raw = if let Some(ref clid) = pre_clid {
-            let mut m_rows = self
-                .conn
-                .query(
-                    "SELECT body, subject FROM messages WHERE message_id = ? LIMIT 1",
-                    libsql::params![clid.as_str()],
-                )
-                .await?;
-            if let Some(mrow) = m_rows.next().await? {
-                Some((
-                    mrow.get::<libsql::Value>(0)?,
-                    mrow.get::<Option<String>>(1)?.unwrap_or_default(),
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let p1_raw = {
-            let mut p1_rows = self
-                .conn
-                .query(
-                    "SELECT m.body, p.diff
-                     FROM patches p
-                     LEFT JOIN messages m ON m.message_id = p.message_id
-                     WHERE p.patchset_id = ? AND p.part_index = 1
-                     LIMIT 1",
-                    libsql::params![patchset_id],
-                )
-                .await?;
-            if let Some(p1row) = p1_rows.next().await? {
-                Some((
-                    p1row.get::<libsql::Value>(0)?,
-                    p1row.get::<libsql::Value>(1)?,
-                ))
-            } else {
-                None
-            }
-        };
-
-        let need_change_id = pre_change_id.is_none();
-        let (
-            ref_msgids,
-            prereq_msgids,
-            prereq_patch_ids,
-            detected_change_id,
-            own_msgids,
-            has_cover_body,
-        ) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let mut ref_msgids = Vec::new();
-            let mut prereq_msgids = std::collections::HashSet::new();
-            let mut prereq_patch_ids = std::collections::HashSet::new();
-            let mut detected_change_id = None;
-            let mut has_cover_body = false;
-
-            if let Some((body_val, c_subj)) = cover_raw {
-                let body = crate::compression::decompress_string_value(&body_val)?;
-                if !body.trim().is_empty() && c_subj != "(placeholder)" {
-                    has_cover_body = true;
-                }
-                if need_change_id {
-                    detected_change_id = crate::patch::parse_b4_change_id(&body);
-                }
-                let (p_mids, p_pids) =
-                    crate::patch::extract_prerequisite_message_and_patch_ids(&body);
-                for pm in p_mids {
-                    for c in Self::get_msgid_candidates(&pm) {
-                        prereq_msgids.insert(c);
-                    }
-                }
-                prereq_patch_ids.extend(p_pids);
-                for rmid in crate::patch::extract_version_reference_msgids(&body) {
-                    if !own_msgids.contains(&rmid) && !ref_msgids.contains(&rmid) {
-                        ref_msgids.push(rmid);
-                    }
-                }
-            }
-
-            if let Some((body_val, diff_val)) = p1_raw {
-                let body = crate::compression::decompress_string_value(&body_val)?;
-                let diff = crate::compression::decompress_string_value(&diff_val)?;
-                for text in [&body, &diff] {
-                    if text.is_empty() {
-                        continue;
-                    }
-                    if need_change_id && detected_change_id.is_none() {
-                        detected_change_id = crate::patch::parse_b4_change_id(text);
-                    }
-                    let (p_mids, p_pids) =
-                        crate::patch::extract_prerequisite_message_and_patch_ids(text);
-                    for pm in p_mids {
-                        for c in Self::get_msgid_candidates(&pm) {
-                            prereq_msgids.insert(c);
-                        }
-                    }
-                    prereq_patch_ids.extend(p_pids);
-                }
-                let combined_text = if body.is_empty() { &diff } else { &body };
-                for rmid in crate::patch::extract_version_reference_msgids(combined_text) {
-                    if !own_msgids.contains(&rmid) && !ref_msgids.contains(&rmid) {
-                        ref_msgids.push(rmid);
-                    }
-                }
-            }
-
-            Ok((
-                ref_msgids,
-                prereq_msgids,
-                prereq_patch_ids,
-                detected_change_id,
-                own_msgids,
-                has_cover_body,
-            ))
-        })
-        .await
-        .context("lineage body decompression task failed")??;
 
         let tx_guard = if self.in_transaction {
             None
@@ -11482,702 +11445,564 @@ impl Database {
             None => self.with_connection(self.conn.clone()),
         };
 
-        let Some((
-            curr_subject,
-            curr_subject_index,
-            curr_author,
-            curr_date,
-            curr_total_parts,
-            curr_received_parts,
-            curr_status,
-            curr_clid,
-            curr_mr_url,
-            curr_mr_number,
-            stored_ver,
-            mut curr_change_id,
-            mut curr_prev_ps_id,
-            mut curr_existing_signal,
-        )) = read_patchset_meta(&tx_db.conn).await?
-        else {
-            if let Some(tx) = tx_guard {
-                tx.commit().await?;
-            }
-            return Ok(0);
-        };
-
-        if skip_intermediate_parts
-            && curr_received_parts > 1
-            && curr_received_parts < curr_total_parts
-        {
-            if let Some(tx) = tx_guard {
-                tx.commit().await?;
-            }
-            return Ok(0);
-        }
-
-        if curr_mr_number.is_some() {
-            let count = tx_db
-                .reconcile_superseded_pr_patchsets(
-                    patchset_id,
-                    curr_mr_url.as_deref(),
-                    curr_mr_number,
-                )
-                .await?;
-            if let Some(tx) = tx_guard {
-                tx.commit().await?;
-            }
-            return Ok(count);
-        }
-
-        if curr_subject == "(placeholder)"
-            || (curr_subject_index == 0 && Self::is_reply_subject(&curr_subject))
-        {
-            if let Some(tx) = tx_guard {
-                tx.commit().await?;
-            }
-            return Ok(0);
-        }
-
-        if let Some(prev_id) = curr_prev_ps_id {
-            let prev_clid_opt = {
-                let mut prows = tx_db
-                    .conn
-                    .query(
-                        "SELECT cover_letter_message_id FROM patchsets WHERE id = ?",
-                        libsql::params![prev_id],
-                    )
-                    .await?;
-                if let Some(prow) = prows.next().await? {
-                    prow.get::<Option<String>>(0)?
-                } else {
-                    None
-                }
-            };
-            if tx_db
-                .is_prereq_candidate(
-                    prev_id,
-                    prev_clid_opt.as_deref(),
-                    &prereq_msgids,
-                    &prereq_patch_ids,
-                    &own_msgids,
-                    &own_git_patch_ids,
-                )
-                .await?
-            {
-                tx_db
-                    .execute(
-                        "UPDATE patchsets SET previous_patchset_id = NULL, version_link_signal = NULL WHERE id = ?",
-                        libsql::params![patchset_id],
-                    )
-                    .await?;
-                tx_db
-                    .execute(
-                        "UPDATE patches SET previous_patch_id = NULL, previous_patch_status = NULL WHERE patchset_id = ?",
-                        libsql::params![patchset_id],
-                    )
-                    .await?;
-                curr_prev_ps_id = None;
-                curr_existing_signal = None;
-            }
-        }
-
-        let curr_ver = stored_ver
-            .filter(|&v| v > 0)
-            .or_else(|| crate::patch::parse_subject_version(&curr_subject))
-            .unwrap_or(1);
-
-        let new_change_id = if curr_change_id.is_none() {
-            if let Some(ref cid) = detected_change_id {
-                curr_change_id = Some(cid.clone());
-            }
-            detected_change_id
-        } else {
-            None
-        };
-
-        let mut family: std::collections::BTreeMap<i64, LineageNode> =
-            std::collections::BTreeMap::new();
-        family.insert(
-            patchset_id,
-            LineageNode {
-                id: patchset_id,
-                subject: curr_subject.clone(),
-                subject_index: curr_subject_index,
-                author: curr_author.clone(),
-                date: curr_date,
-                total_parts: curr_total_parts,
-                received_parts: curr_received_parts,
-                status: curr_status.clone(),
-                cover_id: curr_clid.clone(),
-                ver: curr_ver,
-                signal: None,
-                existing_prev_id: curr_prev_ps_id,
-                existing_signal: curr_existing_signal,
-            },
-        );
-
-        let parse_node_row =
-            |row: &libsql::Row, signal: Option<&'static str>| -> Result<LineageNode> {
-                let id: i64 = row.get(0)?;
-                let subject: String = row.get::<Option<String>>(1)?.unwrap_or_default();
-                let subject_index: u32 = row.get::<Option<u32>>(2)?.unwrap_or(9999);
-                let author: String = row.get::<Option<String>>(3)?.unwrap_or_default();
-                let date: i64 = row.get::<Option<i64>>(4)?.unwrap_or(0);
-                let total_parts: u32 = row.get::<Option<u32>>(5)?.unwrap_or(1);
-                let received_parts: u32 = row.get::<Option<u32>>(6)?.unwrap_or(0);
-                let status: String = row.get::<Option<String>>(7)?.unwrap_or_default();
-                let cover_id: Option<String> = row.get(8)?;
-                let s_ver: Option<u32> = row.get(9)?;
-                let existing_prev_id: Option<i64> = row.get(10)?;
-                let existing_signal: Option<String> = row.get(11)?;
-                let ver = s_ver
-                    .filter(|&v| v > 0)
-                    .or_else(|| crate::patch::parse_subject_version(&subject))
-                    .unwrap_or(1);
-                Ok(LineageNode {
-                    id,
-                    subject,
-                    subject_index,
-                    author,
-                    date,
-                    total_parts,
-                    received_parts,
-                    status,
-                    cover_id,
-                    ver,
-                    signal,
-                    existing_prev_id,
-                    existing_signal,
-                })
-            };
-
-        // Signal 2: b4 change-id
-        if let Some(ref cid) = curr_change_id {
-            let mut cid_candidates = Vec::new();
-            let mut rows = tx_db
-                .conn
-                .query(
-                    "SELECT id, subject, subject_index, author, date, total_parts, received_parts,
-                            status, cover_letter_message_id, version,
-                            previous_patchset_id, version_link_signal
-                     FROM patchsets
-                     WHERE change_id = ? AND id != ? AND mr_number IS NULL
-                     ORDER BY date ASC, id ASC LIMIT 50",
-                    libsql::params![cid.as_str(), patchset_id],
-                )
-                .await?;
-            while let Some(row) = rows.next().await? {
-                cid_candidates.push(parse_node_row(&row, Some("change_id"))?);
-            }
-            drop(rows);
-            for node in cid_candidates {
-                if !family.contains_key(&node.id)
-                    && node.subject != "(placeholder)"
-                    && !(node.subject_index == 0 && Self::is_reply_subject(&node.subject))
-                    && node.ver != curr_ver
-                    && crate::patch::authors_match(&node.author, &curr_author)
-                    && !tx_db
-                        .is_prereq_candidate(
-                            node.id,
-                            node.cover_id.as_deref(),
-                            &prereq_msgids,
-                            &prereq_patch_ids,
-                            &own_msgids,
-                            &own_git_patch_ids,
-                        )
-                        .await?
-                {
-                    family.insert(node.id, node);
-                }
-            }
-        }
-
-        // Signal 3: explicit previous-version links in the cover letter or patch 1 body
-        for ref_mid in &ref_msgids {
-            if prereq_msgids.contains(ref_mid) {
-                continue;
-            }
-            let mut found_ids = Vec::new();
-            for cand_mid in Self::get_msgid_candidates(ref_mid) {
-                let mut ps_rows = tx_db
-                    .conn
-                    .query(
-                        "SELECT id FROM patchsets WHERE cover_letter_message_id = ? AND id != ? AND mr_number IS NULL LIMIT 5",
-                        libsql::params![cand_mid.as_str(), patchset_id],
-                    )
-                    .await?;
-                while let Some(r) = ps_rows.next().await? {
-                    found_ids.push(r.get::<i64>(0)?);
-                }
-                drop(ps_rows);
-
-                let mut p_rows = tx_db
-                    .conn
-                    .query(
-                        "SELECT patchset_id FROM patches WHERE message_id = ? AND patchset_id != ? LIMIT 5",
-                        libsql::params![cand_mid.as_str(), patchset_id],
-                    )
-                    .await?;
-                while let Some(r) = p_rows.next().await? {
-                    found_ids.push(r.get::<i64>(0)?);
-                }
-                drop(p_rows);
-            }
-
-            for cand_id in found_ids {
-                if family.contains_key(&cand_id) {
-                    continue;
-                }
-                let mut crows = tx_db
-                    .conn
-                    .query(
-                        "SELECT id, subject, subject_index, author, date, total_parts, received_parts,
-                                status, cover_letter_message_id, version,
-                                previous_patchset_id, version_link_signal
-                         FROM patchsets WHERE id = ? AND mr_number IS NULL",
-                        libsql::params![cand_id],
-                    )
-                    .await?;
-                let node_opt = if let Some(crow) = crows.next().await? {
-                    Some(parse_node_row(&crow, Some("message_ref"))?)
-                } else {
-                    None
-                };
-                drop(crows);
-                if let Some(node) = node_opt
-                    && node.subject != "(placeholder)"
-                    && !(node.subject_index == 0 && Self::is_reply_subject(&node.subject))
-                    && node.ver != curr_ver
-                    && crate::patch::authors_match(&node.author, &curr_author)
-                    && !tx_db
-                        .is_prereq_candidate(
-                            node.id,
-                            node.cover_id.as_deref(),
-                            &prereq_msgids,
-                            &prereq_patch_ids,
-                            &own_msgids,
-                            &own_git_patch_ids,
-                        )
-                        .await?
-                {
-                    family.insert(node.id, node);
-                }
-            }
-        }
-
-        // Signal 4: Cleaned subject + author within 180 days
-        let clean_curr = crate::patch::clean_subject(&curr_subject);
-        let curr_prefixes = crate::patch::get_subject_prefixes(&curr_subject);
-        let window_start = curr_date.saturating_sub(86400 * 180);
-        let window_end = curr_date.saturating_add(86400 * 180);
-
-        if !clean_curr.is_empty() && !Self::is_generic_short_subject(&clean_curr, &curr_prefixes) {
-            let mut subj_candidates = Vec::new();
-            let [e0, e1, e2, e3] = Self::author_email_candidates(&curr_author);
-            // Indexed normalized author-email + date range lookup via
-            // idx_patchsets_author_email_date (preserving fuzzy display-name
-            // and b4 web relay alias matching without unindexed LIKE scans).
-            let query = format!(
-                "SELECT id, subject, subject_index, author, date, total_parts, received_parts,
-                        status, cover_letter_message_id, version,
-                        previous_patchset_id, version_link_signal
-                 FROM patchsets
-                 WHERE {} IN (?, ?, ?, ?) AND date BETWEEN ? AND ? AND id != ? AND mr_number IS NULL
-                 ORDER BY date DESC LIMIT 100",
-                Self::AUTHOR_EMAIL_EXPR
-            );
-            let mut rows_a = tx_db
-                .conn
-                .query(
-                    &query,
-                    libsql::params![e0, e1, e2, e3, window_start, window_end, patchset_id],
-                )
-                .await?;
-            while let Some(row) = rows_a.next().await? {
-                subj_candidates.push(parse_node_row(&row, Some("subject_author"))?);
-            }
-            drop(rows_a);
-
-            for cand in subj_candidates {
-                if family.contains_key(&cand.id)
-                    || cand.subject == "(placeholder)"
-                    || (cand.subject_index == 0 && Self::is_reply_subject(&cand.subject))
-                    || cand.ver == curr_ver
-                    || !crate::patch::authors_match(&cand.author, &curr_author)
-                {
-                    continue;
-                }
-
-                let cand_prefixes = crate::patch::get_subject_prefixes(&cand.subject);
-                let cand_clean = crate::patch::clean_subject(&cand.subject);
-                let mut series_matches = (cand.subject_index == curr_subject_index
-                    || cand.total_parts == 1
-                    || curr_total_parts == 1)
-                    && cand_prefixes == curr_prefixes
-                    && cand_clean == clean_curr;
-
-                if !series_matches {
-                    let target_idx = if curr_subject_index == 0 {
-                        1
-                    } else {
-                        curr_subject_index
-                    };
-                    let mut p_rows = tx_db
-                        .conn
-                        .query(
-                            "SELECT m.subject FROM patches p
-                             JOIN messages m ON m.message_id = p.message_id
-                             WHERE p.patchset_id = ? AND p.part_index = ? LIMIT 1",
-                            libsql::params![cand.id, target_idx],
-                        )
-                        .await?;
-                    if let Some(p_row) = p_rows.next().await? {
-                        let p_subj: String = p_row.get::<Option<String>>(0)?.unwrap_or_default();
-                        if crate::patch::get_subject_prefixes(&p_subj) == curr_prefixes
-                            && crate::patch::clean_subject(&p_subj) == clean_curr
-                        {
-                            series_matches = true;
-                        }
-                    }
-                    drop(p_rows);
-                }
-
-                if !series_matches && !cand_clean.is_empty() {
-                    let target_idx = if cand.subject_index == 0 {
-                        1
-                    } else {
-                        cand.subject_index
-                    };
-                    let mut p_rows = tx_db
-                        .conn
-                        .query(
-                            "SELECT m.subject FROM patches p
-                             JOIN messages m ON m.message_id = p.message_id
-                             WHERE p.patchset_id = ? AND p.part_index = ? LIMIT 1",
-                            libsql::params![patchset_id, target_idx],
-                        )
-                        .await?;
-                    if let Some(p_row) = p_rows.next().await? {
-                        let p_subj: String = p_row.get::<Option<String>>(0)?.unwrap_or_default();
-                        if crate::patch::get_subject_prefixes(&p_subj) == cand_prefixes
-                            && crate::patch::clean_subject(&p_subj) == cand_clean
-                        {
-                            series_matches = true;
-                        }
-                    }
-                    drop(p_rows);
-                }
-
-                if series_matches
-                    && !tx_db
-                        .is_prereq_candidate(
-                            cand.id,
-                            cand.cover_id.as_deref(),
-                            &prereq_msgids,
-                            &prereq_patch_ids,
-                            &own_msgids,
-                            &own_git_patch_ids,
-                        )
-                        .await?
-                {
-                    family.insert(cand.id, cand);
-                }
-            }
-        }
-
-        // Signal 5: git_patch_id overlap across series (excluding prerequisite series).
-        // For multi-patch series where patch 1/N arrived before the 0/N cover letter,
-        // defer Signal 5 until the distinct cover letter arrives or all parts are received
-        // so cover-letter prerequisite trailers are present before matching shared patches.
-        let has_distinct_cover = curr_subject_index == 0
-            || (has_cover_body
-                && curr_clid
-                    .as_deref()
-                    .is_some_and(|c| !own_patch_msgids.contains(c)));
-        if curr_total_parts <= 1 || curr_received_parts >= curr_total_parts || has_distinct_cover {
-            let prereq_pids_json = serde_json::to_string(&prereq_patch_ids)?;
-            let mut gpid_rows = tx_db
-                .conn
-                .query(
-                    "SELECT DISTINCT cand_ps.id, cand_ps.subject, cand_ps.subject_index,
-                            cand_ps.author, cand_ps.date, cand_ps.total_parts,
-                            cand_ps.received_parts, cand_ps.status,
-                            cand_ps.cover_letter_message_id, cand_ps.version,
-                            cand_ps.previous_patchset_id, cand_ps.version_link_signal
-                     FROM patches curr_p
-                     JOIN patches cand_p ON cand_p.git_patch_id = curr_p.git_patch_id
-                     JOIN patchsets cand_ps ON cand_ps.id = cand_p.patchset_id
-                     WHERE curr_p.patchset_id = ?
-                       AND curr_p.git_patch_id IS NOT NULL
-                       AND cand_p.patchset_id != ?
-                       AND cand_ps.mr_number IS NULL
-                       AND cand_ps.date BETWEEN ? AND ?
-                       AND NOT EXISTS (
-                           SELECT 1 FROM patches pp
-                           WHERE pp.patchset_id = cand_ps.id
-                             AND pp.git_patch_id IN (SELECT value FROM json_each(?))
-                       )
-                     ORDER BY cand_ps.date DESC
-                     LIMIT 50",
-                    libsql::params![
-                        patchset_id,
-                        patchset_id,
-                        window_start,
-                        window_end,
-                        prereq_pids_json
-                    ],
-                )
-                .await?;
-            let mut gpid_candidates = Vec::new();
-            while let Some(row) = gpid_rows.next().await? {
-                let node = parse_node_row(&row, Some("git_patch_id"))?;
-                gpid_candidates.push(node);
-            }
-            drop(gpid_rows);
-
-            for node in gpid_candidates {
-                if family.contains_key(&node.id) {
-                    continue;
-                }
-                if node.subject != "(placeholder)"
-                    && !(node.subject_index == 0 && Self::is_reply_subject(&node.subject))
-                    && node.ver != curr_ver
-                    && crate::patch::authors_match(&node.author, &curr_author)
-                    && !tx_db
-                        .is_prereq_candidate(
-                            node.id,
-                            node.cover_id.as_deref(),
-                            &prereq_msgids,
-                            &prereq_patch_ids,
-                            &own_msgids,
-                            &own_git_patch_ids,
-                        )
-                        .await?
-                {
-                    family.insert(node.id, node);
-                }
-            }
-        }
-
-        // Expand connected version chain members from all discovered nodes
-        {
-            let mut queue: std::collections::VecDeque<i64> =
-                family.values().filter_map(|n| n.existing_prev_id).collect();
-            for &known_id in family.keys() {
-                let mut next_rows = tx_db
-                    .conn
-                    .query(
-                        "SELECT id FROM patchsets WHERE previous_patchset_id = ? AND mr_number IS NULL LIMIT 16",
-                        libsql::params![known_id],
-                    )
-                    .await?;
-                while let Some(nrow) = next_rows.next().await? {
-                    queue.push_back(nrow.get::<i64>(0)?);
-                }
-            }
-
-            while let Some(cid) = queue.pop_front() {
-                if family.len() >= 32 || family.contains_key(&cid) {
-                    continue;
-                }
-                let mut crows = tx_db
-                    .conn
-                    .query(
-                        "SELECT id, subject, subject_index, author, date, total_parts, received_parts,
-                                status, cover_letter_message_id, version,
-                                previous_patchset_id, version_link_signal
-                         FROM patchsets WHERE id = ? AND mr_number IS NULL",
-                        libsql::params![cid],
-                    )
-                    .await?;
-                let node_opt = if let Some(crow) = crows.next().await? {
-                    Some(parse_node_row(&crow, None)?)
-                } else {
-                    None
-                };
-                drop(crows);
-                if let Some(node) = node_opt
-                    && node.subject != "(placeholder)"
-                    && !tx_db
-                        .is_prereq_candidate(
-                            node.id,
-                            node.cover_id.as_deref(),
-                            &prereq_msgids,
-                            &prereq_patch_ids,
-                            &own_msgids,
-                            &own_git_patch_ids,
-                        )
-                        .await?
-                {
-                    if let Some(pid) = node.existing_prev_id
-                        && !family.contains_key(&pid)
-                    {
-                        queue.push_back(pid);
-                    }
-                    let mut next_rows = tx_db
-                        .conn
-                        .query(
-                            "SELECT id FROM patchsets WHERE previous_patchset_id = ? AND mr_number IS NULL LIMIT 16",
-                            libsql::params![node.id],
-                        )
-                        .await?;
-                    while let Some(nrow) = next_rows.next().await? {
-                        let nid = nrow.get::<i64>(0)?;
-                        if !family.contains_key(&nid) {
-                            queue.push_back(nid);
-                        }
-                    }
-                    drop(next_rows);
-                    family.insert(node.id, node);
-                }
-            }
-        }
-
-        if stored_ver != Some(curr_ver) {
-            tx_db
-                .execute(
-                    "UPDATE patchsets SET version = ? WHERE id = ?",
-                    libsql::params![i64::from(curr_ver), patchset_id],
-                )
-                .await?;
-        }
-        if let Some(ref cid) = new_change_id {
-            tx_db
-                .execute(
-                    "UPDATE patchsets SET change_id = ? WHERE id = ?",
-                    libsql::params![cid.as_str(), patchset_id],
-                )
-                .await?;
-        }
-
-        if family.len() <= 1 {
-            if let Some(prev_id) = curr_prev_ps_id {
-                tx_db.reconcile_patch_lineage(prev_id, patchset_id).await?;
-            }
-            if let Some(tx) = tx_guard {
-                tx.commit().await?;
-            }
-            return Ok(0);
-        }
-
-        let mut by_ver: std::collections::BTreeMap<u32, Vec<LineageNode>> =
-            std::collections::BTreeMap::new();
-        for node in family.values() {
-            tx_db
-                .execute(
-                    "UPDATE patchsets SET version = ? WHERE id = ?",
-                    libsql::params![i64::from(node.ver), node.id],
-                )
-                .await?;
-            by_ver.entry(node.ver).or_default().push(node.clone());
-        }
-
-        if by_ver.len() <= 1 {
-            if let Some(tx) = tx_guard {
-                tx.commit().await?;
-            }
-            return Ok(0);
-        }
-
-        let max_ver = *by_ver.keys().next_back().unwrap();
-        let mut cancelled_count = 0;
-
-        // Cancel older in-flight versions superseded by a newer version in the family
-        for (&ver, nodes) in &mut by_ver {
-            if ver >= max_ver {
-                continue;
-            }
-            for node in nodes {
-                tx_db
-                    .cancel_outbox_for_patchset(
-                        node.id,
-                        "Cancelled: superseded by newer patchset version",
-                    )
-                    .await?;
-                if tx_db.cancel_patchset(node.id, true).await? {
-                    node.status = "Cancelled".to_string();
-                    cancelled_count += 1;
-                    info!(
-                        "Cancelled superseded patchset {} (v{}) after reconciling version family (max v{})",
-                        node.id, ver, max_ver
-                    );
-                }
-            }
-        }
-
-        // Select canonical representative per version and link all submissions at
-        // each version to the canonical representative of the preceding version.
-        let mut reps: Vec<LineageNode> = Vec::with_capacity(by_ver.len());
-        for nodes in by_ver.values() {
-            let best = nodes
-                .iter()
-                .max_by_key(|n| {
-                    let is_reviewed = u8::from(n.status == "Reviewed");
-                    let is_not_cancelled = u8::from(n.status != "Cancelled");
-                    (
-                        is_reviewed,
-                        is_not_cancelled,
-                        n.received_parts,
-                        n.date,
-                        n.id,
-                    )
-                })
-                .unwrap()
-                .clone();
-            reps.push(best);
-        }
-
-        for pair in reps.windows(2) {
-            let prev = &pair[0];
-            let next_rep = &pair[1];
-            if let Some(next_nodes) = by_ver.get(&next_rep.ver) {
-                for next in next_nodes {
-                    let discovered = if next.id == patchset_id {
-                        prev.signal
-                    } else if prev.id == patchset_id {
-                        next.signal
-                    } else {
-                        None
-                    };
-                    let existing = if next.existing_prev_id == Some(prev.id) {
-                        next.existing_signal.as_deref()
-                    } else {
-                        None
-                    };
-                    let signal = match (discovered, existing) {
-                        (Some(d), Some(e)) => {
-                            if Self::version_signal_rank(d) >= Self::version_signal_rank(e) {
-                                d
-                            } else {
-                                e
-                            }
-                        }
-                        (Some(d), None) => d,
-                        (None, Some(e)) => e,
-                        (None, None) => next
-                            .signal
-                            .or(next_rep.signal)
-                            .or(prev.signal)
-                            .unwrap_or("subject_author"),
-                    };
-                    tx_db
-                        .execute(
-                            "UPDATE patchsets
-                                SET previous_patchset_id = ?,
-                                    version_link_signal = ?
-                              WHERE id = ?",
-                            libsql::params![prev.id, signal, next.id],
-                        )
-                        .await?;
-                    tx_db.reconcile_patch_lineage(prev.id, next.id).await?;
-                }
-            }
-        }
+        let cancelled = tx_db
+            .reconcile_version_lineage_locked(patchset_id, skip_intermediate_parts, refs)
+            .await?;
 
         if let Some(tx) = tx_guard {
             tx.commit().await?;
         }
-        Ok(cancelled_count)
+        Ok(cancelled)
+    }
+
+    /// Runs under the write lock: re-reads the patchset, picks its previous
+    /// version and writes only the patchset's own lineage columns.
+    async fn reconcile_version_lineage_locked(
+        &self,
+        patchset_id: i64,
+        skip_intermediate_parts: bool,
+        refs: LineageReferences,
+    ) -> Result<usize> {
+        let Some(curr) = Self::read_lineage_subject(&self.conn, patchset_id).await? else {
+            return Ok(0);
+        };
+        if curr.skips_reconciliation(skip_intermediate_parts) {
+            return Ok(0);
+        }
+        if curr.mr_number.is_some() {
+            return self
+                .reconcile_superseded_pr_patchsets(
+                    patchset_id,
+                    curr.mr_url.as_deref(),
+                    curr.mr_number,
+                )
+                .await;
+        }
+        if is_placeholder_or_reply(&curr.subject, curr.subject_index) {
+            return Ok(0);
+        }
+
+        let new_change_id = if curr.change_id.is_none() {
+            refs.detected_change_id.clone()
+        } else {
+            None
+        };
+        let ctx = LineageContext {
+            patchset_id,
+            subject: &curr.subject,
+            subject_index: curr.subject_index,
+            total_parts: curr.total_parts,
+            author: &curr.author,
+            date: curr.date,
+            version: curr.version(),
+            change_id: curr.change_id.as_deref().or(new_change_id.as_deref()),
+            refs: &refs,
+        };
+
+        let chosen = self.find_previous_version(&ctx).await?;
+
+        if curr.stored_version != Some(ctx.version) {
+            self.execute(
+                "UPDATE patchsets SET version = ? WHERE id = ?",
+                libsql::params![i64::from(ctx.version), patchset_id],
+            )
+            .await?;
+        }
+        if let Some(ref cid) = new_change_id {
+            self.execute(
+                "UPDATE patchsets SET change_id = ? WHERE id = ?",
+                libsql::params![cid.as_str(), patchset_id],
+            )
+            .await?;
+        }
+
+        self.apply_previous_version(
+            &ctx,
+            curr.previous_patchset_id,
+            curr.version_link_signal.as_deref(),
+            chosen,
+        )
+        .await
+    }
+
+    async fn read_lineage_subject(
+        conn: &libsql::Connection,
+        patchset_id: i64,
+    ) -> Result<Option<LineageSubject>> {
+        let mut rows = conn
+            .query(
+                "SELECT subject, subject_index, author, date, total_parts, received_parts,
+                        cover_letter_message_id, mr_url, mr_number, version,
+                        change_id, previous_patchset_id, version_link_signal
+                 FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        Ok(Some(LineageSubject {
+            subject: row.get::<Option<String>>(0)?.unwrap_or_default(),
+            subject_index: row.get::<Option<u32>>(1)?.unwrap_or(9999),
+            author: row.get::<Option<String>>(2)?.unwrap_or_default(),
+            date: row.get::<Option<i64>>(3)?.unwrap_or(0),
+            total_parts: row.get::<Option<u32>>(4)?.unwrap_or(1),
+            received_parts: row.get::<Option<u32>>(5)?.unwrap_or(0),
+            cover_id: row.get(6)?,
+            mr_url: row.get(7)?,
+            mr_number: row.get(8)?,
+            stored_version: row.get(9)?,
+            change_id: row.get(10)?,
+            previous_patchset_id: row.get(11)?,
+            version_link_signal: row.get(12)?,
+        }))
+    }
+
+    /// Reads the cover letter and patch 1 of a patchset and extracts its
+    /// explicit previous-version references, prerequisites and b4
+    /// change-id.
+    async fn load_lineage_references(
+        &self,
+        patchset_id: i64,
+        cover_id: Option<&str>,
+        need_change_id: bool,
+    ) -> Result<LineageReferences> {
+        let mut own_msgids = std::collections::HashSet::new();
+        let mut own_git_patch_ids = std::collections::HashSet::new();
+        if let Some(clid) = cover_id {
+            own_msgids.extend(Self::get_msgid_candidates(clid));
+        }
+        let mut own_p_rows = self
+            .conn
+            .query(
+                "SELECT message_id, git_patch_id FROM patches WHERE patchset_id = ? LIMIT 256",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        while let Some(prow) = own_p_rows.next().await? {
+            own_msgids.extend(Self::get_msgid_candidates(&prow.get::<String>(0)?));
+            if let Some(gpid) = prow.get::<Option<String>>(1)? {
+                own_git_patch_ids.insert(gpid);
+            }
+        }
+        drop(own_p_rows);
+
+        let cover_body = if let Some(clid) = cover_id {
+            let mut m_rows = self
+                .conn
+                .query(
+                    "SELECT body FROM messages WHERE message_id = ? LIMIT 1",
+                    libsql::params![clid],
+                )
+                .await?;
+            match m_rows.next().await? {
+                Some(mrow) => Some(mrow.get::<libsql::Value>(0)?),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let p1_payload = {
+            let mut p1_rows = self
+                .conn
+                .query(
+                    "SELECT m.body, p.diff
+                     FROM patches p
+                     LEFT JOIN messages m ON m.message_id = p.message_id
+                     WHERE p.patchset_id = ? AND p.part_index = 1
+                     LIMIT 1",
+                    libsql::params![patchset_id],
+                )
+                .await?;
+            match p1_rows.next().await? {
+                Some(p1row) => Some((
+                    p1row.get::<libsql::Value>(0)?,
+                    p1row.get::<libsql::Value>(1)?,
+                )),
+                None => None,
+            }
+        };
+
+        tokio::task::spawn_blocking(move || {
+            Self::extract_lineage_references(
+                cover_body,
+                p1_payload,
+                need_change_id,
+                own_msgids,
+                own_git_patch_ids,
+            )
+        })
+        .await
+        .context("lineage body decompression task failed")?
+    }
+
+    fn extract_lineage_references(
+        cover_body: Option<libsql::Value>,
+        p1_payload: Option<(libsql::Value, libsql::Value)>,
+        need_change_id: bool,
+        own_msgids: std::collections::HashSet<String>,
+        own_git_patch_ids: std::collections::HashSet<String>,
+    ) -> Result<LineageReferences> {
+        let mut refs = LineageReferences {
+            own_msgids,
+            own_git_patch_ids,
+            ..LineageReferences::default()
+        };
+        let mut texts: Vec<(String, bool)> = Vec::new();
+        if let Some(body_val) = cover_body {
+            texts.push((
+                crate::compression::decompress_string_value(&body_val)?,
+                true,
+            ));
+        }
+        if let Some((body_val, diff_val)) = p1_payload {
+            let body = crate::compression::decompress_string_value(&body_val)?;
+            let diff = crate::compression::decompress_string_value(&diff_val)?;
+            // Version links are read from the patch 1 message body, or from
+            // the diff text when the body is stored empty.
+            if body.is_empty() {
+                texts.push((diff, true));
+            } else {
+                texts.push((body, true));
+                texts.push((diff, false));
+            }
+        }
+
+        for (text, scan_version_links) in &texts {
+            if text.is_empty() {
+                continue;
+            }
+            if need_change_id && refs.detected_change_id.is_none() {
+                refs.detected_change_id = crate::patch::parse_b4_change_id(text);
+            }
+            let (p_mids, p_pids) = crate::patch::extract_prerequisite_message_and_patch_ids(text);
+            for pm in p_mids {
+                refs.prereq_msgids.extend(Self::get_msgid_candidates(&pm));
+            }
+            refs.prereq_patch_ids.extend(p_pids);
+            if *scan_version_links {
+                for rmid in crate::patch::extract_version_reference_msgids(text) {
+                    if !refs.own_msgids.contains(&rmid) && !refs.version_ref_msgids.contains(&rmid)
+                    {
+                        refs.version_ref_msgids.push(rmid);
+                    }
+                }
+            }
+        }
+        Ok(refs)
+    }
+
+    /// Picks the single previous version of the patchset in `ctx`, or none.
+    /// The strongest signal with a qualifying candidate decides; an
+    /// ambiguous result at that rank links nothing.
+    async fn find_previous_version(
+        &self,
+        ctx: &LineageContext<'_>,
+    ) -> Result<Option<(LineageCandidate, VersionLinkSignal)>> {
+        for signal in VersionLinkSignal::BY_RANK {
+            let raw = match signal {
+                VersionLinkSignal::ChangeId => self.change_id_candidates(ctx).await?,
+                VersionLinkSignal::MessageRef => self.message_ref_candidates(ctx).await?,
+                VersionLinkSignal::SubjectAuthor => self.subject_author_candidates(ctx).await?,
+            };
+            let qualifying = self.qualifying_predecessors(ctx, raw).await?;
+            match Self::choose_predecessor(qualifying, signal) {
+                PredecessorChoice::NoCandidate => continue,
+                PredecessorChoice::Ambiguous(ids) => {
+                    info!(
+                        "Not linking patchset {} to a previous version: {} candidates {:?} are equally ranked",
+                        ctx.patchset_id,
+                        signal.as_str(),
+                        ids
+                    );
+                    return Ok(None);
+                }
+                PredecessorChoice::Chosen(pred) => return Ok(Some((pred, signal))),
+            }
+        }
+        Ok(None)
+    }
+
+    fn choose_predecessor(
+        mut candidates: Vec<LineageCandidate>,
+        signal: VersionLinkSignal,
+    ) -> PredecessorChoice {
+        let Some(top_version) = candidates.iter().map(|c| c.version).max() else {
+            return PredecessorChoice::NoCandidate;
+        };
+        candidates.retain(|c| c.version == top_version);
+        candidates.sort_by_key(|c| (c.date, c.id));
+        candidates.dedup_by_key(|c| c.id);
+        if candidates.len() > 1 && !signal.same_version_is_same_series() {
+            return PredecessorChoice::Ambiguous(candidates.iter().map(|c| c.id).collect());
+        }
+        match candidates.pop() {
+            Some(latest) => PredecessorChoice::Chosen(latest),
+            None => PredecessorChoice::NoCandidate,
+        }
+    }
+
+    /// Keeps the candidates that are strictly older, strictly lower
+    /// versioned, by the same author email, and not a prerequisite of (or
+    /// dependent on) the current patchset.
+    async fn qualifying_predecessors(
+        &self,
+        ctx: &LineageContext<'_>,
+        candidates: Vec<LineageCandidate>,
+    ) -> Result<Vec<LineageCandidate>> {
+        let mut out = Vec::new();
+        for cand in candidates {
+            if cand.id == ctx.patchset_id
+                || is_placeholder_or_reply(&cand.subject, cand.subject_index)
+                || cand.date >= ctx.date
+                || cand.version >= ctx.version
+                || !same_author_email(&cand.author, ctx.author)
+            {
+                continue;
+            }
+            if self
+                .is_prereq_candidate(
+                    cand.id,
+                    cand.cover_id.as_deref(),
+                    &ctx.refs.prereq_msgids,
+                    &ctx.refs.prereq_patch_ids,
+                    &ctx.refs.own_msgids,
+                    &ctx.refs.own_git_patch_ids,
+                )
+                .await?
+            {
+                continue;
+            }
+            out.push(cand);
+        }
+        Ok(out)
+    }
+
+    async fn change_id_candidates(
+        &self,
+        ctx: &LineageContext<'_>,
+    ) -> Result<Vec<LineageCandidate>> {
+        let Some(cid) = ctx.change_id else {
+            return Ok(Vec::new());
+        };
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {LINEAGE_CANDIDATE_COLUMNS}
+                     FROM patchsets
+                     WHERE change_id = ? AND id != ? AND mr_number IS NULL AND date < ?
+                     ORDER BY date DESC, id DESC LIMIT 50"
+                ),
+                libsql::params![cid, ctx.patchset_id, ctx.date],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(LineageCandidate::from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    async fn message_ref_candidates(
+        &self,
+        ctx: &LineageContext<'_>,
+    ) -> Result<Vec<LineageCandidate>> {
+        let mut ids = std::collections::BTreeSet::new();
+        for ref_mid in &ctx.refs.version_ref_msgids {
+            if ctx.refs.prereq_msgids.contains(ref_mid) {
+                continue;
+            }
+            for cand_mid in Self::get_msgid_candidates(ref_mid) {
+                let mut ps_rows = self
+                    .conn
+                    .query(
+                        "SELECT id FROM patchsets WHERE cover_letter_message_id = ? AND id != ? LIMIT 5",
+                        libsql::params![cand_mid.as_str(), ctx.patchset_id],
+                    )
+                    .await?;
+                while let Some(r) = ps_rows.next().await? {
+                    ids.insert(r.get::<i64>(0)?);
+                }
+                drop(ps_rows);
+
+                let mut p_rows = self
+                    .conn
+                    .query(
+                        "SELECT patchset_id FROM patches WHERE message_id = ? AND patchset_id != ? LIMIT 5",
+                        libsql::params![cand_mid.as_str(), ctx.patchset_id],
+                    )
+                    .await?;
+                while let Some(r) = p_rows.next().await? {
+                    ids.insert(r.get::<i64>(0)?);
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(cand) = self.load_lineage_candidate(id).await? {
+                out.push(cand);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn load_lineage_candidate(&self, id: i64) -> Result<Option<LineageCandidate>> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {LINEAGE_CANDIDATE_COLUMNS}
+                     FROM patchsets WHERE id = ? AND mr_number IS NULL"
+                ),
+                libsql::params![id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(LineageCandidate::from_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether an existing link of the current patchset still points to a
+    /// strict predecessor (older, lower version, same author email, not a
+    /// prerequisite). Such a link is kept when no signal finds a
+    /// predecessor on a later run, for example after two partial rows of
+    /// the series were merged.
+    async fn existing_link_still_qualifies(
+        &self,
+        ctx: &LineageContext<'_>,
+        existing_prev_id: i64,
+    ) -> Result<bool> {
+        let Some(cand) = self.load_lineage_candidate(existing_prev_id).await? else {
+            return Ok(false);
+        };
+        Ok(!self
+            .qualifying_predecessors(ctx, vec![cand])
+            .await?
+            .is_empty())
+    }
+
+    /// Exact cleaned subject and subsystem prefixes by the same author in
+    /// the 120 days before the current patchset, comparing a cover letter
+    /// only with a cover letter and a single patch only with a single
+    /// patch.
+    async fn subject_author_candidates(
+        &self,
+        ctx: &LineageContext<'_>,
+    ) -> Result<Vec<LineageCandidate>> {
+        let shape = SubjectShape::of(ctx.subject_index, ctx.total_parts);
+        let clean_curr = crate::patch::clean_subject(ctx.subject);
+        let curr_prefixes = crate::patch::get_subject_prefixes(ctx.subject);
+        if ctx.version <= 1
+            || shape == SubjectShape::Other
+            || clean_curr.is_empty()
+            || Self::is_generic_short_subject(&clean_curr, &curr_prefixes)
+        {
+            return Ok(Vec::new());
+        }
+
+        let [e0, e1, e2, e3] = Self::author_email_candidates(ctx.author);
+        let window_start = ctx.date.saturating_sub(SUBJECT_LINK_WINDOW_SECS);
+        // Indexed normalized author-email + date range lookup via
+        // idx_patchsets_author_email_date (including b4 web relay aliases
+        // without unindexed LIKE scans).
+        let query = format!(
+            "SELECT {LINEAGE_CANDIDATE_COLUMNS}
+             FROM patchsets
+             WHERE {} IN (?, ?, ?, ?) AND date >= ? AND date < ? AND id != ? AND mr_number IS NULL
+             ORDER BY date DESC LIMIT 100",
+            Self::AUTHOR_EMAIL_EXPR
+        );
+        let mut rows = self
+            .conn
+            .query(
+                &query,
+                libsql::params![e0, e1, e2, e3, window_start, ctx.date, ctx.patchset_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let cand = LineageCandidate::from_row(&row)?;
+            if SubjectShape::of(cand.subject_index, cand.total_parts) == shape
+                && crate::patch::clean_subject(&cand.subject) == clean_curr
+                && crate::patch::get_subject_prefixes(&cand.subject) == curr_prefixes
+            {
+                out.push(cand);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Writes the chosen previous version on the current patchset only (or,
+    /// without a choice, keeps an existing link that still qualifies and
+    /// clears any other), maps its patches, and cancels the predecessor
+    /// when the new link supersedes it.
+    async fn apply_previous_version(
+        &self,
+        ctx: &LineageContext<'_>,
+        existing_prev_id: Option<i64>,
+        existing_signal: Option<&str>,
+        chosen: Option<(LineageCandidate, VersionLinkSignal)>,
+    ) -> Result<usize> {
+        let Some((pred, signal)) = chosen else {
+            if let Some(prev_id) = existing_prev_id
+                && self.existing_link_still_qualifies(ctx, prev_id).await?
+            {
+                self.reconcile_patch_lineage(prev_id, ctx.patchset_id)
+                    .await?;
+                return Ok(0);
+            }
+            if existing_prev_id.is_some() || existing_signal.is_some() {
+                self.execute(
+                    "UPDATE patchsets SET previous_patchset_id = NULL, version_link_signal = NULL WHERE id = ?",
+                    libsql::params![ctx.patchset_id],
+                )
+                .await?;
+                self.execute(
+                    "UPDATE patches SET previous_patch_id = NULL, previous_patch_status = NULL WHERE patchset_id = ?",
+                    libsql::params![ctx.patchset_id],
+                )
+                .await?;
+            }
+            return Ok(0);
+        };
+
+        let is_new_link = existing_prev_id != Some(pred.id);
+        if is_new_link || existing_signal != Some(signal.as_str()) {
+            self.execute(
+                "UPDATE patchsets SET previous_patchset_id = ?, version_link_signal = ? WHERE id = ?",
+                libsql::params![pred.id, signal.as_str(), ctx.patchset_id],
+            )
+            .await?;
+            info!(
+                "Linked patchset {} (v{}) to previous version {} (v{}) via {}",
+                ctx.patchset_id,
+                ctx.version,
+                pred.id,
+                pred.version,
+                signal.as_str()
+            );
+        }
+        self.reconcile_patch_lineage(pred.id, ctx.patchset_id)
+            .await?;
+
+        // cancel_patchset only cancels a patchset (and its pending outbox)
+        // while it is still in flight.
+        if self.cancel_patchset(pred.id, true).await? {
+            info!(
+                "Cancelled superseded patchset {} (v{}) after linking patchset {} (v{}) via {}",
+                pred.id,
+                pred.version,
+                ctx.patchset_id,
+                ctx.version,
+                signal.as_str()
+            );
+            return Ok(1);
+        }
+        Ok(0)
     }
 
     pub async fn reconcile_superseded_series_patchsets(
@@ -28053,7 +27878,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_version_lineage_signal_4_out_of_order_and_reviewed_preservation() {
+    async fn test_version_lineage_out_of_order_arrival_and_reviewed_preservation() {
         let db = setup_db().await;
         let author = "Carol <carol@kernel.org>";
 
@@ -28158,19 +27983,29 @@ mod tests {
             .await
             .unwrap();
 
-        // v1 should be auto-cancelled because v3 > v1 already exists, and v3 should link to v1
-        assert_eq!(
+        // v1 arrives after v3: v1 has no older predecessor, v3 is not
+        // re-linked retroactively, and neither is cancelled.
+        assert_ne!(
             db.get_patchset_status(ps1).await.unwrap().as_deref(),
             Some("Cancelled")
         );
+        let d1_mid = db
+            .get_patchset_details(ps1, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(d1_mid["previous_patchset_id"].is_null());
         let d3_mid = db
             .get_patchset_details(ps3, None, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(d3_mid["previous_patchset_id"], ps1);
+        assert!(d3_mid["previous_patchset_id"].is_null());
+        assert_eq!(d3_mid["status"], "Reviewed");
 
-        // Now ingest v2 third: chain should re-stitch to v1 -> v2 -> v3!
+        // Now ingest v2 third: v2 links back to v1 (the display name differs,
+        // the email matches), but v3 is not re-stitched; that miss is
+        // accepted.
         let t2 = db
             .create_thread(
                 "ooo-v2@kernel.org",
@@ -28231,16 +28066,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(d2["previous_patchset_id"], ps1);
-        assert_eq!(d3["previous_patchset_id"], ps2);
+        assert_eq!(d2["version_link_signal"], "subject_author");
+        assert!(d3["previous_patchset_id"].is_null());
         assert_eq!(d3["status"], "Reviewed");
 
-        let chain: Vec<i64> = d3["versions"]
+        let chain: Vec<i64> = d2["versions"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v["id"].as_i64().unwrap())
             .collect();
-        assert_eq!(chain, vec![ps1, ps2, ps3]);
+        assert_eq!(chain, vec![ps1, ps2]);
 
         // Out-of-order 0/4 cover letter arriving after 2/4 and 3/4 (received_parts == 2 < 4)
         // must still reconcile immediately and link/cancel the prior version.
@@ -28387,7 +28223,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_version_lineage_signal_5_git_patch_id_and_prerequisite_exclusion() {
+    async fn test_version_lineage_git_patch_id_only_maps_patches_and_prerequisite_exclusion() {
         let db = setup_db().await;
         let author = "Dave <dave@kernel.org>";
         let shared_gpid = "1111222233334444555566667777888899990000";
@@ -28542,8 +28378,9 @@ mod tests {
             .unwrap();
         assert!(da["previous_patchset_id"].is_null());
 
-        // Now test valid Signal 5: v1 and v2 have different cover letter subjects and no change-id,
-        // but share an unchanged patch (`shared_gpid`).
+        // v1 and v2 have different cover letter subjects and no change-id,
+        // but share an unchanged patch (`shared_gpid`). A shared patch does
+        // not link two series.
         let tb1 = db
             .create_thread("sig5-v1@kernel.org", "[PATCH 0/2] Old cover title", 2000)
             .await
@@ -28741,15 +28578,16 @@ mod tests {
         )
         .await
         .unwrap();
-        db.create_patch_with_git_patch_id(
-            ps_b2,
-            "sig5-v2-p1@kernel.org",
-            1,
-            "diff prep",
-            Some(shared_gpid),
-        )
-        .await
-        .unwrap();
+        let p1_b2 = db
+            .create_patch_with_git_patch_id(
+                ps_b2,
+                "sig5-v2-p1@kernel.org",
+                1,
+                "diff prep",
+                Some(shared_gpid),
+            )
+            .await
+            .unwrap();
         db.create_message(
             "sig5-v2-p2@kernel.org",
             tb2,
@@ -28774,17 +28612,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(db2["previous_patchset_id"], ps_b1);
-        assert_eq!(db2["version_link_signal"], "git_patch_id");
-
+        assert!(db2["previous_patchset_id"].is_null());
+        assert!(db2["version_link_signal"].is_null());
         let patches_b2 = db2["patches"].as_array().unwrap();
         assert_eq!(patches_b2.len(), 2);
-        // Patch 1 is unchanged from v1; patch 2 of v2 is newly added.
-        assert_eq!(patches_b2[0]["previous_patch"]["status"], "unchanged");
+        assert!(patches_b2[0]["previous_patch"].is_null());
         assert!(patches_b2[1]["previous_patch"].is_null());
 
-        // Ingest v3 before v2 finishes review (v2 gets superseded/cancelled with 0 reviewed findings).
-        // Verify v3 keeps v2 as its immediate predecessor.
+        // v3 keeps v2's cover letter subject, so it links to v2, and the
+        // shared git_patch_id maps patch 1 as unchanged.
         let tb3 = db
             .create_thread("sig5-v3@kernel.org", "[PATCH v3 0/2] New cover title", 4000)
             .await
@@ -28857,6 +28693,685 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(db3["previous_patchset_id"], ps_b2);
+        assert_eq!(db3["version_link_signal"], "subject_author");
+        let patches_b3 = db3["patches"].as_array().unwrap();
+        assert_eq!(patches_b3[0]["previous_patch"]["id"], p1_b2);
+        assert_eq!(patches_b3[0]["previous_patch"]["status"], "unchanged");
+    }
+
+    /// One message of a test series: Message-ID, subject, body and an
+    /// optional git patch ID.
+    struct TestPart<'a> {
+        msgid: &'a str,
+        subject: &'a str,
+        body: &'a str,
+        git_patch_id: Option<&'a str>,
+    }
+
+    impl<'a> TestPart<'a> {
+        fn new(msgid: &'a str, subject: &'a str) -> Self {
+            Self {
+                msgid,
+                subject,
+                body: "",
+                git_patch_id: None,
+            }
+        }
+
+        fn body(mut self, body: &'a str) -> Self {
+            self.body = body;
+            self
+        }
+
+        fn git_patch_id(mut self, git_patch_id: &'a str) -> Self {
+            self.git_patch_id = Some(git_patch_id);
+            self
+        }
+    }
+
+    /// Ingests a series the way the email ingestion path does: the cover
+    /// letter (when given) or patch 1 creates the patchset, then every
+    /// patch is attached. The root message replies to `in_reply_to`.
+    async fn ingest_test_series(
+        db: &Database,
+        author: &str,
+        date: i64,
+        cover: Option<TestPart<'_>>,
+        patches: &[TestPart<'_>],
+        in_reply_to: Option<&str>,
+    ) -> i64 {
+        let total = u32::try_from(patches.len()).unwrap();
+        let (root, root_index) = match cover.as_ref() {
+            Some(c) => (c, 0),
+            None => (&patches[0], 1),
+        };
+        let thread = db
+            .create_thread(root.msgid, root.subject, date)
+            .await
+            .unwrap();
+        db.create_message(
+            root.msgid,
+            thread,
+            in_reply_to,
+            author,
+            root.subject,
+            date,
+            root.body,
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps = db
+            .create_patchset(
+                thread,
+                Some(root.msgid),
+                root.msgid,
+                root.subject,
+                author,
+                date,
+                total,
+                1,
+                "",
+                "",
+                crate::patch::parse_subject_version(root.subject),
+                root_index,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        for (i, part) in patches.iter().enumerate() {
+            let idx = u32::try_from(i).unwrap() + 1;
+            if root_index != 1 || idx != 1 {
+                db.create_message(
+                    part.msgid,
+                    thread,
+                    Some(root.msgid),
+                    author,
+                    part.subject,
+                    date,
+                    part.body,
+                    "",
+                    "",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            db.create_patch_with_git_patch_id(
+                ps,
+                part.msgid,
+                idx,
+                &format!("diff --git a/{0} b/{0}\n+{0}\n", part.msgid),
+                part.git_patch_id,
+            )
+            .await
+            .unwrap();
+        }
+        ps
+    }
+
+    async fn previous_patchset_of(db: &Database, id: i64) -> (Option<i64>, Option<String>) {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT previous_patchset_id, version_link_signal FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (row.get(0).unwrap(), row.get(1).unwrap())
+    }
+
+    async fn assert_not_linked(db: &Database, id: i64) {
+        assert_eq!(
+            previous_patchset_of(db, id).await,
+            (None, None),
+            "patchset {id} must not be linked to a previous version"
+        );
+    }
+
+    async fn assert_linked(db: &Database, id: i64, prev: i64, signal: &str) {
+        assert_eq!(
+            previous_patchset_of(db, id).await,
+            (Some(prev), Some(signal.to_string())),
+            "patchset {id} must be linked to {prev} via {signal}"
+        );
+    }
+
+    async fn assert_status(db: &Database, id: i64, status: &str) {
+        assert_eq!(
+            db.get_patchset_status(id).await.unwrap().as_deref(),
+            Some(status),
+            "patchset {id} status"
+        );
+    }
+
+    const DAY: i64 = 86400;
+
+    /// Oliver Hartkopp's CAN series (patchsets 87034, 90825 and 91985 in
+    /// the audited database) share one patch but are different series. A
+    /// shared git patch ID must not chain them, nor cancel the older ones.
+    #[tokio::test]
+    async fn test_version_lineage_regression_shared_patch_does_not_chain_series() {
+        let db = setup_db().await;
+        let author = "\"Oliver Hartkopp\" <socketcan@hartkopp.net>";
+        let shared = "1111111111111111111111111111111111111111";
+        let d0 = 1_791_548_073;
+
+        let ps_convert = ingest_test_series(
+            &db,
+            author,
+            d0,
+            None,
+            &[TestPart::new(
+                "20261009121115.61012-1-socketcan@hartkopp.net",
+                "[PATCH] can: convert unreliable ARPHRD_CAN type checks to robust can_get_ml_priv()",
+            )
+            .git_patch_id(shared)],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_convert, "Pending")
+            .await
+            .unwrap();
+
+        let ps_proc = ingest_test_series(
+            &db,
+            author,
+            d0 + 6 * DAY,
+            None,
+            &[TestPart::new(
+                "20261016110905.422684-1-socketcan@hartkopp.net",
+                "[PATCH can-next v2] can: proc: reset pkg_stats atomics individually",
+            )
+            .git_patch_id(shared)],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_proc, "Pending").await.unwrap();
+
+        let ps_rx_lock = ingest_test_series(
+            &db,
+            author,
+            d0 + 9 * DAY,
+            Some(TestPart::new(
+                "20261019074244.50391-1-socketcan@hartkopp.net",
+                "[PATCH can-next v3 0/2] can: protect the receive lists with a per-device lock",
+            )),
+            &[
+                TestPart::new(
+                    "20261019074244.50391-2-socketcan@hartkopp.net",
+                    "[PATCH can-next v3 1/2] can: proc: reset pkg_stats atomics individually",
+                )
+                .git_patch_id(shared),
+                TestPart::new(
+                    "20261019074244.50391-3-socketcan@hartkopp.net",
+                    "[PATCH can-next v3 2/2] can: protect the receive lists with a per-device lock",
+                ),
+            ],
+            None,
+        )
+        .await;
+
+        assert_not_linked(&db, ps_proc).await;
+        assert_not_linked(&db, ps_rx_lock).await;
+        assert_status(&db, ps_convert, "Pending").await;
+        assert_status(&db, ps_proc, "Pending").await;
+    }
+
+    /// Johannes Thumshirn's btrfs series 88601 (v2, "allocate METADATA on
+    /// conventional zones") and 93927 (v3, "fixes for generic/747") share
+    /// their first patches but have different cover letters. Patch
+    /// subjects must not be matched against the other series.
+    #[tokio::test]
+    async fn test_version_lineage_regression_same_author_different_cover_not_linked() {
+        let db = setup_db().await;
+        let author = "\"Johannes Thumshirn\" <johannes.thumshirn@wdc.com>";
+        let d0 = 1_791_876_623;
+        let patch_subjects_v2 = [
+            "[PATCH v2 01/12] btrfs: zoned: fix possible race for reserved_active_zones",
+            "[PATCH v2 02/12] btrfs: zoned: don't activate conventional zones of mixed block groups",
+        ];
+        let patch_subjects_v3 = [
+            "[PATCH v3 01/25] btrfs: zoned: fix possible race for reserved_active_zones",
+            "[PATCH v3 02/25] btrfs: zoned: don't activate conventional zones of mixed block groups",
+        ];
+
+        let ps_v2 = ingest_test_series(
+            &db,
+            author,
+            d0,
+            Some(TestPart::new(
+                "20261013072941.424029-1-johannes.thumshirn@wdc.com",
+                "[PATCH v2 00/12] btrfs: zoned: allocate METADATA on conventional zones",
+            )),
+            &[
+                TestPart::new(
+                    "20261013072941.424029-2-johannes.thumshirn@wdc.com",
+                    patch_subjects_v2[0],
+                ),
+                TestPart::new(
+                    "20261013072941.424029-3-johannes.thumshirn@wdc.com",
+                    patch_subjects_v2[1],
+                ),
+            ],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_v2, "In Review").await.unwrap();
+
+        let ps_v3 = ingest_test_series(
+            &db,
+            author,
+            d0 + 8 * DAY,
+            Some(TestPart::new(
+                "20261021080000.500000-1-johannes.thumshirn@wdc.com",
+                "[PATCH v3 00/25] btrfs: zoned: fixes for generic/747",
+            )),
+            &[
+                TestPart::new(
+                    "20261021080000.500000-2-johannes.thumshirn@wdc.com",
+                    patch_subjects_v3[0],
+                ),
+                TestPart::new(
+                    "20261021080000.500000-3-johannes.thumshirn@wdc.com",
+                    patch_subjects_v3[1],
+                ),
+            ],
+            None,
+        )
+        .await;
+
+        assert_not_linked(&db, ps_v3).await;
+        assert_status(&db, ps_v2, "In Review").await;
+    }
+
+    /// Hao Ge's vmalloc v3 cover letter (96268) cites a patch of his older
+    /// alloc_tag v10 series (74286) as a footnote below "Changes since
+    /// v2:" and links its real v2 with "v2 link:". Only v2 may be linked;
+    /// the alloc_tag series must neither be linked to nor cancel the
+    /// newer series, even when it is reconciled again afterwards.
+    #[tokio::test]
+    async fn test_version_lineage_regression_dependency_link_after_changelog_heading() {
+        let db = setup_db().await;
+        let author = "\"Hao Ge\" <hao.ge@linux.dev>";
+        let d_alloc_tag = 1_789_455_555;
+
+        let ps_alloc_tag = ingest_test_series(
+            &db,
+            author,
+            d_alloc_tag,
+            Some(TestPart::new(
+                "20260915070001.113559-1-hao.ge@linux.dev",
+                "[PATCH v10 0/2] alloc_tag and module codetag section fixes",
+            )),
+            &[
+                TestPart::new(
+                    "20260915070001.113559-2-hao.ge@linux.dev",
+                    "[PATCH v10 1/2] alloc_tag: move release_module_tags() above reserve_module_tags()",
+                ),
+                TestPart::new(
+                    "20260915070001.113559-3-hao.ge@linux.dev",
+                    "[PATCH v10 2/2] alloc_tag: roll back a failed module tags populate",
+                ),
+            ],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_alloc_tag, "Pending")
+            .await
+            .unwrap();
+
+        let ps_vmalloc_v2 = ingest_test_series(
+            &db,
+            author,
+            d_alloc_tag + 34 * DAY,
+            Some(TestPart::new(
+                "20261019054531.87652-1-hao.ge@linux.dev",
+                "[PATCH v2 0/1] mm/vmalloc: make the mapping functions undo their partial mappings",
+            )),
+            &[TestPart::new(
+                "20261019054531.87652-2-hao.ge@linux.dev",
+                "[PATCH v2 1/1] mm/vmalloc: undo partial mappings inside the mapping functions",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_vmalloc_v2, "Reviewed")
+            .await
+            .unwrap();
+
+        let v3_cover = "After discussing with Suren and Ulad [1], we move the rollback into\n\
+the mapping functions.\n\
+\n\
+Changes since v2:\n\
+- new patches fix the range checks and the error reporting\n\
+- commit messages reworded\n\
+\n\
+[1] https://lore.kernel.org/all/20260915070001.113559-3-hao.ge@linux.dev/\n\
+\n\
+v2 link: https://lore.kernel.org/all/20261019054531.87652-1-hao.ge@linux.dev/\n\
+v1 link: https://lore.kernel.org/all/20261009063619.112313-1-hao.ge@linux.dev/\n";
+        let ps_vmalloc_v3 = ingest_test_series(
+            &db,
+            author,
+            d_alloc_tag + 41 * DAY,
+            Some(
+                TestPart::new(
+                    "20261026080329.140244-1-hao.ge@linux.dev",
+                    "[PATCH v3 00/02] mm/vmalloc: fix up vmap error handling",
+                )
+                .body(v3_cover),
+            ),
+            &[
+                TestPart::new(
+                    "20261026080329.140244-2-hao.ge@linux.dev",
+                    "[PATCH v3 01/02] mm/kmsan: undo the shadow mapping when the origin mapping fails",
+                ),
+                TestPart::new(
+                    "20261026080329.140244-3-hao.ge@linux.dev",
+                    "[PATCH v3 02/02] mm/kmsan: skip vunmap_range_noflush when KMSAN is disabled",
+                ),
+            ],
+            None,
+        )
+        .await;
+
+        assert_linked(&db, ps_vmalloc_v3, ps_vmalloc_v2, "message_ref").await;
+        assert_not_linked(&db, ps_alloc_tag).await;
+        assert_status(&db, ps_alloc_tag, "Pending").await;
+        assert_status(&db, ps_vmalloc_v2, "Reviewed").await;
+
+        // A late reconciliation of the older alloc_tag series must not
+        // adopt the newer vmalloc series as its predecessor.
+        db.reconcile_version_lineage(ps_alloc_tag).await.unwrap();
+        assert_not_linked(&db, ps_alloc_tag).await;
+        assert_ne!(
+            db.get_patchset_status(ps_vmalloc_v3)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Cancelled")
+        );
+    }
+
+    /// A new series posted as a reply into an older thread of the same
+    /// author must not become the next version of that thread's series.
+    #[tokio::test]
+    async fn test_version_lineage_regression_reply_into_other_thread_not_linked() {
+        let db = setup_db().await;
+        let author = "Erin <erin@example.org>";
+
+        let ps_old = ingest_test_series(
+            &db,
+            author,
+            10_000,
+            None,
+            &[TestPart::new(
+                "erin-old-1@example.org",
+                "[PATCH] ipv6: raw: fix use-after-free in rawv6_send_hdrinc()",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_old, "Pending").await.unwrap();
+
+        let ps_new = ingest_test_series(
+            &db,
+            author,
+            10_000 + DAY,
+            None,
+            &[TestPart::new(
+                "erin-new-1@example.org",
+                "[PATCH v2] ipv6: raw: drop the stale hdrincl fast path",
+            )],
+            Some("erin-old-1@example.org"),
+        )
+        .await;
+
+        assert_not_linked(&db, ps_new).await;
+        assert_status(&db, ps_old, "Pending").await;
+    }
+
+    /// Kernel-version prose ("since v6.8") next to a Lore link does not
+    /// name a previous version.
+    #[tokio::test]
+    async fn test_version_lineage_regression_kernel_version_prose_not_linked() {
+        let db = setup_db().await;
+        let author = "Frank <frank@example.org>";
+
+        let ps_old = ingest_test_series(
+            &db,
+            author,
+            10_000,
+            None,
+            &[TestPart::new(
+                "frank-old-1@example.org",
+                "[PATCH] drm/amd/display: set allow_freesync before validating a new state",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_old, "Pending").await.unwrap();
+
+        let body = "This regressed since v6.8, see https://lore.kernel.org/r/frank-old-1@example.org\n\
+and was partially fixed in v6.12 (https://lore.kernel.org/all/frank-old-1@example.org/).\n";
+        let ps_new = ingest_test_series(
+            &db,
+            author,
+            10_000 + DAY,
+            None,
+            &[TestPart::new(
+                "frank-new-1@example.org",
+                "[PATCH v2] drm/amd/display: keep vrr state across modesets",
+            )
+            .body(body)],
+            None,
+        )
+        .await;
+
+        assert_not_linked(&db, ps_new).await;
+        assert_status(&db, ps_old, "Pending").await;
+    }
+
+    /// Karl Mehltretter's single patch 96263 was split out of his series
+    /// 91975 (it was patch 1/4 there). A single patch is only compared
+    /// with single patches, so it is not linked to the series.
+    #[tokio::test]
+    async fn test_version_lineage_regression_split_out_single_patch_not_linked() {
+        let db = setup_db().await;
+        let author = "\"Karl Mehltretter\" <kmehltretter@gmail.com>";
+        let d0 = 1_792_394_000;
+
+        let ps_series = ingest_test_series(
+            &db,
+            author,
+            d0,
+            Some(TestPart::new(
+                "20261019070000.10000-1-kmehltretter@gmail.com",
+                "[PATCH 0/2] media: synchronize CPU access to imported DMA-BUFs",
+            )),
+            &[
+                TestPart::new(
+                    "20261019070000.10000-2-kmehltretter@gmail.com",
+                    "[PATCH 1/2] media: videobuf2: finish prepared buffers in VIDIOC_REMOVE_BUFS",
+                ),
+                TestPart::new(
+                    "20261019070000.10000-3-kmehltretter@gmail.com",
+                    "[PATCH 2/2] media: videobuf2: add opt-in DMA-BUF CPU access",
+                ),
+            ],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_series, "Pending")
+            .await
+            .unwrap();
+
+        let ps_single = ingest_test_series(
+            &db,
+            author,
+            d0 + 7 * DAY,
+            None,
+            &[TestPart::new(
+                "20261026071735.37220-1-kmehltretter@gmail.com",
+                "[PATCH v2] media: videobuf2: finish prepared buffers in VIDIOC_REMOVE_BUFS",
+            )],
+            None,
+        )
+        .await;
+
+        assert_not_linked(&db, ps_single).await;
+        assert_status(&db, ps_series, "Pending").await;
+    }
+
+    /// Two different patchsets at the same top version linked from the
+    /// body are ambiguous: nothing is linked and nothing is cancelled.
+    #[tokio::test]
+    async fn test_version_lineage_equally_ranked_candidates_not_linked() {
+        let db = setup_db().await;
+        let author = "Grace <grace@example.org>";
+
+        let ps_a = ingest_test_series(
+            &db,
+            author,
+            10_000,
+            None,
+            &[TestPart::new(
+                "grace-a-1@example.org",
+                "[PATCH v2] mm: compaction: skip isolated pageblocks",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_a, "Pending").await.unwrap();
+        let ps_b = ingest_test_series(
+            &db,
+            author,
+            11_000,
+            None,
+            &[TestPart::new(
+                "grace-b-1@example.org",
+                "[PATCH v2] mm: page_alloc: drain pcp lists earlier",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_b, "Pending").await.unwrap();
+
+        let body = "Merged two series into one.\n\
+---\n\
+v2: https://lore.kernel.org/linux-mm/grace-a-1@example.org/\n\
+v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
+        let ps_new = ingest_test_series(
+            &db,
+            author,
+            12_000,
+            None,
+            &[TestPart::new(
+                "grace-new-1@example.org",
+                "[PATCH v3] mm: compaction: skip isolated pageblocks",
+            )
+            .body(body)],
+            None,
+        )
+        .await;
+
+        assert_not_linked(&db, ps_new).await;
+        assert_status(&db, ps_a, "Pending").await;
+        assert_status(&db, ps_b, "Pending").await;
+    }
+
+    /// Positive cases: an exact single-patch subject links v1 -> v2, b4's
+    /// "Link to v2" links a renamed v3, and an explicit "v3: <url>" links
+    /// v4. Each new link cancels only its direct in-flight predecessor.
+    #[tokio::test]
+    async fn test_version_lineage_explicit_links_and_exact_subject() {
+        let db = setup_db().await;
+        let author = "\"Andrea Amer\" <and.amer@gmail.com>";
+
+        let ps_v1 = ingest_test_series(
+            &db,
+            author,
+            10_000,
+            None,
+            &[TestPart::new(
+                "20261012-iio-rescale-offset-v1-1-14ed15979ff2@gmail.com",
+                "[PATCH] iio: afe: rescale: always expose offset",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_v1, "Reviewed").await.unwrap();
+
+        let ps_v2 = ingest_test_series(
+            &db,
+            author,
+            10_000 + 4 * DAY,
+            None,
+            &[TestPart::new(
+                "20261016-iio-rescale-offset-v2-1-02c825967139@gmail.com",
+                "[PATCH v2] iio: afe: rescale: always expose offset",
+            )
+            .body("Fix offset.\n---\nChanges in v2:\n- Use the source offset\n")],
+            None,
+        )
+        .await;
+        assert_linked(&db, ps_v2, ps_v1, "subject_author").await;
+        db.update_patchset_status(ps_v2, "Pending").await.unwrap();
+
+        let v3_body = "Expose offset.\n---\nChanges in v3:\n- Only expose offset when present\n\
+- Link to v2: https://lore.kernel.org/r/20261016-iio-rescale-offset-v2-1-02c825967139@gmail.com\n";
+        let ps_v3 = ingest_test_series(
+            &db,
+            author,
+            10_000 + 13 * DAY,
+            None,
+            &[TestPart::new(
+                "20261025-iio-rescale-offset-v3-1-aaaaaaaaaaaa@gmail.com",
+                "[PATCH v3] iio: afe: rescale: expose offset if rescaler or source has one",
+            )
+            .body(v3_body)],
+            None,
+        )
+        .await;
+        assert_linked(&db, ps_v3, ps_v2, "message_ref").await;
+        assert_status(&db, ps_v2, "Cancelled").await;
+        assert_status(&db, ps_v1, "Reviewed").await;
+
+        let v4_body = "Expose offset.\n---\nv3: https://lore.kernel.org/all/20261025-iio-rescale-offset-v3-1-aaaaaaaaaaaa@gmail.com/\n";
+        let ps_v4 = ingest_test_series(
+            &db,
+            author,
+            10_000 + 20 * DAY,
+            None,
+            &[TestPart::new(
+                "20261101-iio-rescale-offset-v4-1-bbbbbbbbbbbb@gmail.com",
+                "[PATCH v4] iio: afe: rescale: report the combined offset",
+            )
+            .body(v4_body)],
+            None,
+        )
+        .await;
+        assert_linked(&db, ps_v4, ps_v3, "message_ref").await;
+
+        let chain: Vec<i64> = db
+            .get_patchset_version_chain(ps_v4, 0)
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(chain, vec![ps_v1, ps_v2, ps_v3, ps_v4]);
     }
 
     #[test]
