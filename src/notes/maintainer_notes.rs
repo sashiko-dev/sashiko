@@ -179,6 +179,28 @@ pub fn diff_identifiers_all(diff: &str) -> HashSet<String> {
     out
 }
 
+/// Every identifier in a source slice (`source`). Unlike code-note focusing,
+/// short and common names count so subsystem prefixes such as `skb_` or `bpf`
+/// match maintainer notes during active scanning.
+pub fn source_identifiers_all(source: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut word = String::new();
+    for line in source.lines() {
+        for c in line.chars().chain(std::iter::once(' ')) {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                word.push(c);
+            } else if !word.is_empty() {
+                if !word.starts_with(|c: char| c.is_ascii_digit()) {
+                    out.insert(std::mem::take(&mut word));
+                } else {
+                    word.clear();
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Renders the review prompt block for `notes`.
 pub fn render_maintainer_notes(notes: &[&MaintainerNote]) -> String {
     if notes.is_empty() {
@@ -252,6 +274,14 @@ mod tests {
             assert!(ids.contains(id), "missing {id}");
         }
         assert!(!ids.contains("context_line") && !ids.contains("0x10"));
+
+        let src_ids = source_identifiers_all(
+            "static int bpf_prog_run(struct sk_buff *skb) { return 0x10; }\n",
+        );
+        for id in ["bpf_prog_run", "sk_buff", "skb", "int"] {
+            assert!(src_ids.contains(id), "missing {id}");
+        }
+        assert!(!src_ids.contains("0x10"));
     }
 
     #[test]
