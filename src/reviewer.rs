@@ -1038,13 +1038,10 @@ impl Reviewer {
 
                     let handle = tokio::spawn(async move {
                         let mut failed = 0;
-                        loop {
-                            let Some(job) = ({
-                                let mut q = queue.lock().await;
-                                q.pop()
-                            }) else {
-                                break;
-                            };
+                        while let Some(job) = {
+                            let mut q = queue.lock().await;
+                            q.pop()
+                        } {
                             match Self::check_patchset_claim_active_with_retry(
                                 &ctx_clone.db,
                                 patchset_id,
@@ -1122,13 +1119,10 @@ impl Reviewer {
 
             // Main worker loop uses the existing worktree
             let mut main_failed = 0;
-            loop {
-                let Some(job) = ({
-                    let mut q = valid_jobs_queue.lock().await;
-                    q.pop()
-                }) else {
-                    break;
-                };
+            while let Some(job) = {
+                let mut q = valid_jobs_queue.lock().await;
+                q.pop()
+            } {
                 match Self::check_patchset_claim_active_with_retry(&ctx.db, patchset_id).await {
                     Ok(true) => {}
                     Ok(false) => {
