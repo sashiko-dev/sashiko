@@ -47,6 +47,7 @@ pub struct WorkerSubprocessOverrides {
     pub prompts: Option<PathBuf>,
     pub settings_path: Option<PathBuf>,
     pub report_preexisting: bool,
+    pub skip_patch_ids: std::collections::HashSet<i64>,
 }
 
 #[derive(Clone)]
@@ -947,6 +948,14 @@ impl Reviewer {
             let mut valid_jobs = Vec::new();
 
             for (patch_id, index, diff, _subj, _auth, _date, _msg_id) in &diffs {
+                if ctx.worker_overrides.skip_patch_ids.contains(patch_id) {
+                    info!(
+                        "Skipping non-target benchmark patch {}/{}",
+                        patchset_id, index
+                    );
+                    continue;
+                }
+
                 let mut should_skip = false;
 
                 // Opt-out logic
