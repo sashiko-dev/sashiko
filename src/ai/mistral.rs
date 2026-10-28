@@ -19,7 +19,10 @@
 //! typed content blocks, where the chain of thought arrives as `thinking`
 //! blocks next to `text` blocks instead of a `reasoning_content` string. This
 //! provider speaks that shape natively, mapping `thinking` blocks to the
-//! response `thought` and joining `text` blocks into the content.
+//! response `thought` and joining `text` blocks into the content. A chain of
+//! thought kept in the conversation travels back on the next assistant turn
+//! as a `thinking` block, so multi-round tool use stays stateful for
+//! reasoning models.
 
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage,
@@ -55,19 +58,104 @@ pub struct MistralRequest {
     pub response_format: Option<Value>,
 }
 
-/// One message of a request. Requests carry plain string content: the API
-/// accepts it for every role, including an assistant turn that also names
-/// tool calls, and a null content for an assistant turn that only calls
-/// tools.
+/// One message of a request. Content is either a plain string — every role
+/// accepts it, including an assistant turn that also names tool calls, and
+/// the absent form fits an assistant turn that only calls tools — or typed
+/// content blocks, which is how an assistant turn re-emits a chain of
+/// thought the conversation kept.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MistralMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MistralRequestContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<MistralToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+impl MistralMessage {
+    /// The message's string content, creating an empty one when absent.
+    /// Only the roles that always carry plain text are appended to, so a
+    /// block-form message reports no text rather than being overwritten.
+    fn text_or_default_mut(&mut self) -> Option<&mut String> {
+        match self
+            .content
+            .get_or_insert_with(|| MistralRequestContent::Text(String::new()))
+        {
+            MistralRequestContent::Text(text) => Some(text),
+            MistralRequestContent::Blocks(_) => None,
+        }
+    }
+}
+
+/// A request message's content: the plain string every role accepts, or the
+/// typed blocks an assistant turn uses to carry a chain of thought.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum MistralRequestContent {
+    Text(String),
+    Blocks(Vec<MistralRequestBlock>),
+}
+
+impl From<String> for MistralRequestContent {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+/// A request-side content block. Only the two shapes the chat completions
+/// schema validates for assistant messages are produced: `text` and
+/// `thinking` (whose nested chunks carry the chain of thought).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct MistralRequestBlock {
+    #[serde(rename = "type")]
+    block_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Vec<MistralRequestThinkingPart>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct MistralRequestThinkingPart {
+    #[serde(rename = "type")]
+    part_type: String,
+    text: String,
+}
+
+/// Builds an assistant turn's content. A kept chain of thought is re-emitted
+/// as a `thinking` block ahead of the answer text, keeping reasoning models
+/// stateful across tool rounds; a turn without one stays a plain string, and
+/// a turn that only calls tools stays absent.
+fn assistant_content(
+    content: Option<String>,
+    thought: Option<String>,
+) -> Option<MistralRequestContent> {
+    let thought = thought.filter(|t| !t.trim().is_empty());
+    let text = content.filter(|c| !c.is_empty());
+    match (thought, text) {
+        (None, None) => None,
+        (None, text) => text.map(MistralRequestContent::Text),
+        (Some(thought), text) => {
+            let mut blocks = vec![MistralRequestBlock {
+                block_type: "thinking".to_string(),
+                text: None,
+                thinking: Some(vec![MistralRequestThinkingPart {
+                    part_type: "text".to_string(),
+                    text: thought,
+                }]),
+            }];
+            if let Some(text) = text {
+                blocks.push(MistralRequestBlock {
+                    block_type: "text".to_string(),
+                    text: Some(text),
+                    thinking: None,
+                });
+            }
+            Some(MistralRequestContent::Blocks(blocks))
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -246,10 +334,23 @@ impl MistralClient {
         api_timeout_secs: u64,
     ) -> Result<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
-        if !api_key.is_empty()
-            && let Ok(value) =
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", api_key))
-        {
+        if api_key.is_empty() {
+            // A keyless gateway is a legitimate deployment, but an operator
+            // hitting a remote 401 must not have to guess why no credentials
+            // were sent.
+            tracing::warn!(
+                "MISTRAL_API_KEY is not set; requests to the Mistral endpoint will be unauthenticated"
+            );
+        } else {
+            // A key with control characters (a stray newline from a
+            // copy/paste accident, say) can never authenticate, so it fails
+            // construction instead of degrading into unauthenticated posts.
+            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "MISTRAL_API_KEY is set but contains characters that cannot appear in an HTTP header value"
+                    )
+                })?;
             headers.insert("Authorization", value);
         }
 
@@ -322,7 +423,7 @@ impl MistralClient {
         if let Some(system_text) = request.system {
             messages.push(MistralMessage {
                 role: "system".to_string(),
-                content: Some(system_text),
+                content: Some(system_text.into()),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -333,7 +434,7 @@ impl MistralClient {
                 AiRole::System => {
                     messages.push(MistralMessage {
                         role: "system".to_string(),
-                        content: msg.content,
+                        content: msg.content.map(MistralRequestContent::Text),
                         tool_calls: None,
                         tool_call_id: None,
                     });
@@ -341,7 +442,7 @@ impl MistralClient {
                 AiRole::User => {
                     messages.push(MistralMessage {
                         role: "user".to_string(),
-                        content: msg.content,
+                        content: msg.content.map(MistralRequestContent::Text),
                         tool_calls: None,
                         tool_call_id: None,
                     });
@@ -349,7 +450,7 @@ impl MistralClient {
                 AiRole::Assistant => {
                     messages.push(MistralMessage {
                         role: "assistant".to_string(),
-                        content: msg.content,
+                        content: assistant_content(msg.content, msg.thought),
                         tool_calls: msg.tool_calls.map(|tc| {
                             tc.into_iter()
                                 .map(|t| MistralToolCall {
@@ -369,7 +470,7 @@ impl MistralClient {
                 AiRole::Tool => {
                     messages.push(MistralMessage {
                         role: "tool".to_string(),
-                        content: msg.content,
+                        content: msg.content.map(MistralRequestContent::Text),
                         tool_calls: None,
                         tool_call_id: msg.tool_call_id,
                     });
@@ -409,14 +510,15 @@ impl MistralClient {
             .is_some_and(|rf| rf["type"] == "json_object")
         {
             if let Some(user_msg) = messages.iter_mut().find(|m| m.role == "user") {
-                let content = user_msg.content.get_or_insert_default();
-                if !content.to_lowercase().contains("json") {
+                if let Some(content) = user_msg.text_or_default_mut()
+                    && !content.to_lowercase().contains("json")
+                {
                     content.push_str("\nRespond in JSON format.");
                 }
             } else {
                 messages.push(MistralMessage {
                     role: "user".to_string(),
-                    content: Some("Respond in JSON format.".to_string()),
+                    content: Some("Respond in JSON format.".to_string().into()),
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -454,7 +556,11 @@ impl MistralClient {
             Ok(res) => res,
             Err(e) => {
                 let err_str = redact_secret(&e.to_string());
-                tracing::error!("Mistral request failed (transport): {}", err_str);
+                tracing::error!(
+                    "{}Mistral request failed (transport): {}",
+                    crate::ai::get_log_prefix(),
+                    err_str
+                );
                 return Err(MistralError::TransientError(
                     Duration::from_secs(30),
                     err_str,
@@ -466,7 +572,11 @@ impl MistralClient {
             let status = res.status();
             let body_text = res.text().await.map_err(|e| {
                 let err_str = redact_secret(&e.to_string());
-                tracing::error!("Failed to read Mistral response body: {}", err_str);
+                tracing::error!(
+                    "{}Failed to read Mistral response body: {}",
+                    crate::ai::get_log_prefix(),
+                    err_str
+                );
                 MistralError::TransientError(Duration::from_secs(30), err_str)
             })?;
             return match serde_json::from_str::<MistralResponse>(&body_text) {
@@ -486,7 +596,11 @@ impl MistralClient {
                     Ok(response)
                 }
                 Err(e) => {
-                    tracing::error!("Failed to decode Mistral response: {}", e);
+                    tracing::error!(
+                        "{}Failed to decode Mistral response: {}",
+                        crate::ai::get_log_prefix(),
+                        e
+                    );
                     Err(MistralError::ApiError(
                         status,
                         format!("Parse error: {}", e),
@@ -511,14 +625,20 @@ impl MistralClient {
             429 => {
                 let retry_duration = retry_after_duration.unwrap_or(crate::ai::DEFAULT_RETRY_AFTER);
                 tracing::warn!(
-                    "Mistral 429 Rate Limit. Retry in {}s",
+                    "{}Mistral 429 Rate Limit. Retry in {}s",
+                    crate::ai::get_log_prefix(),
                     retry_duration.as_secs_f64()
                 );
                 Err(MistralError::RateLimitExceeded(retry_duration))
             }
             401 | 403 => Err(MistralError::AuthenticationError(error_text)),
             500..=599 => {
-                tracing::warn!("Mistral Server Error {}: {}", status, error_text);
+                tracing::warn!(
+                    "{}Mistral Server Error {}: {}",
+                    crate::ai::get_log_prefix(),
+                    status,
+                    error_text
+                );
                 Err(MistralError::TransientError(
                     retry_after_duration.unwrap_or(Duration::from_secs(0)),
                     error_text,
@@ -885,8 +1005,10 @@ mod tests {
             "json_object"
         );
         assert_eq!(
-            body.messages[0].content.as_deref(),
-            Some("list them\nRespond in JSON format.")
+            body.messages[0].content,
+            Some(MistralRequestContent::Text(
+                "list them\nRespond in JSON format.".to_string()
+            ))
         );
     }
 
@@ -901,8 +1023,78 @@ mod tests {
 
         let body = c.translate_request(request);
         assert_eq!(
-            body.messages[0].content.as_deref(),
-            Some("produce JSON please")
+            body.messages[0].content,
+            Some(MistralRequestContent::Text(
+                "produce JSON please".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn assistant_thought_travels_back_as_a_thinking_block() {
+        let c = client("https://api.mistral.ai");
+        let body = c.translate_request(AiRequest {
+            messages: vec![
+                message(AiRole::User, "hi"),
+                AiMessage {
+                    role: AiRole::Assistant,
+                    content: Some("mid answer".to_string()),
+                    thought: Some("hmm".to_string()),
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                message(AiRole::User, "go on"),
+            ],
+            ..empty_request()
+        });
+
+        // The chain of thought the session kept is re-sent as a typed
+        // thinking block ahead of the answer text, keeping a reasoning model
+        // stateful across tool rounds.
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            wire["messages"][1]["content"],
+            json!([
+                {"type": "thinking", "thinking": [{"type": "text", "text": "hmm"}]},
+                {"type": "text", "text": "mid answer"}
+            ])
+        );
+
+        // Without a thought the plain string form is used, and a blank
+        // thought is dropped rather than sent as an empty block.
+        let messages = c
+            .translate_request(AiRequest {
+                messages: vec![AiMessage {
+                    role: AiRole::Assistant,
+                    content: Some("answer".to_string()),
+                    thought: Some("   ".to_string()),
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ..empty_request()
+            })
+            .messages;
+        let wire = serde_json::to_value(&messages).unwrap();
+        assert_eq!(wire[0]["content"], json!("answer"));
+    }
+
+    #[test]
+    fn missing_api_key_builds_but_malformed_one_is_refused() {
+        // A keyless gateway is a legitimate deployment; it still builds.
+        let c = MistralClient::new_with_key("m".to_string(), None, "", 30).unwrap();
+        assert_eq!(c.get_capabilities().model_name, "m");
+
+        // A key that can never form a valid header value fails construction
+        // instead of degrading into unauthenticated requests.
+        let err = MistralClient::new_with_key("m".to_string(), None, "bad\nkey", 30)
+            .err()
+            .expect("a malformed key must fail construction");
+        assert!(
+            err.to_string()
+                .contains("characters that cannot appear in an HTTP header"),
+            "{err}"
         );
     }
 
@@ -1164,6 +1356,124 @@ mod tests {
         assert_eq!(response.thought.as_deref(), Some("hmm"));
         let usage = response.usage.unwrap();
         assert_eq!((usage.prompt_tokens, usage.total_tokens), (3, 5));
+        Ok(())
+    }
+
+    /// A stub chat completions server answering every POST with a fixed
+    /// status, optional Retry-After seconds, and body.
+    #[cfg(feature = "server")]
+    async fn status_server(
+        status: u16,
+        retry_after: Option<u64>,
+        body: &'static str,
+    ) -> anyhow::Result<String> {
+        use axum::{Router, response::IntoResponse, routing::post};
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move {
+                let mut res = (
+                    axum::http::StatusCode::from_u16(status).expect("test statuses are valid"),
+                    body,
+                )
+                    .into_response();
+                if let Some(secs) = retry_after {
+                    res.headers_mut()
+                        .insert("retry-after", axum::http::HeaderValue::from(secs));
+                }
+                res
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok(base_url)
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn post_request_maps_http_failures_to_error_variants() -> anyhow::Result<()> {
+        async fn probe(status: u16, retry_after: Option<u64>, body: &'static str) -> MistralError {
+            let base_url = status_server(status, retry_after, body).await.unwrap();
+            let client = MistralClient::new_with_key(
+                "m".to_string(),
+                Some(&settings(Some(&base_url), None)),
+                "k",
+                30,
+            )
+            .unwrap();
+            client
+                .post_request(&client.translate_request(empty_request()))
+                .await
+                .unwrap_err()
+        }
+
+        // A 429 honors the Retry-After header...
+        let err = probe(429, Some(7), "slow down").await;
+        assert!(
+            matches!(err, MistralError::RateLimitExceeded(d) if d == Duration::from_secs(7)),
+            "{err}"
+        );
+
+        // ...and falls back to the default when the header is absent.
+        let err = probe(429, None, "slow down").await;
+        assert!(
+            matches!(err, MistralError::RateLimitExceeded(d) if d == crate::ai::DEFAULT_RETRY_AFTER),
+            "{err}"
+        );
+
+        let err = probe(401, None, "{\"message\":\"bad key\"}").await;
+        assert!(
+            matches!(err, MistralError::AuthenticationError(ref t) if t.contains("bad key")),
+            "{err}"
+        );
+
+        // A 5xx is transient with the body as the reason, delayed by a
+        // Retry-After when the server sends one.
+        let err = probe(500, None, "boom").await;
+        assert!(
+            matches!(err, MistralError::TransientError(d, ref t) if d.is_zero() && t == "boom"),
+            "{err}"
+        );
+        let err = probe(500, Some(2), "boom").await;
+        assert!(
+            matches!(err, MistralError::TransientError(d, _) if d == Duration::from_secs(2)),
+            "{err}"
+        );
+
+        // A 2xx whose body is not a chat completion is an API error, not a
+        // silent success.
+        let err = probe(200, None, "<html>not json</html>").await;
+        assert!(
+            matches!(err, MistralError::ApiError(_, ref t) if t.starts_with("Parse error")),
+            "{err}"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn transport_failure_maps_to_a_transient_error() -> anyhow::Result<()> {
+        // A bound-then-dropped port refuses connections, exercising the send
+        // failure arm without depending on any outside endpoint.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+
+        let client = MistralClient::new_with_key(
+            "m".to_string(),
+            Some(&settings(Some(&format!("http://{addr}")), None)),
+            "k",
+            30,
+        )?;
+        let err = client
+            .post_request(&client.translate_request(empty_request()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MistralError::TransientError(..)), "{err}");
         Ok(())
     }
 }
