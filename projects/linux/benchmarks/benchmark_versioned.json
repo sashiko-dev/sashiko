@@ -1,0 +1,1601 @@
+[
+  {
+    "Commit": "20260105-gs_usb-fix-memory-leak-v2-1-cc6ed6438034@pengutronix.de",
+    "Fixed-by": "79a6d1bfe1148bc921b8d7f3371a7fbce44e30f7",
+    "subsystem": "can",
+    "problem_description": "In v1, Sashiko flagged that gs_usb_receive_bulk_callback() anchors the URB to parent->rx_submitted before usb_submit_urb() but never calls usb_unanchor_urb() when submission fails. v2 changed only the Fixes/Cc tags, so an unsubmitted URB stays anchored and usb_kill_anchored_urbs() in gs_can_close() loops forever.",
+    "case_id": "can_gs_usb_urb_anchor",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "can_gs_usb_urb_anchor/v1.mbox",
+        "baseline_commit": "1806d210e5a8f431ad4711766ae4a333d407d972",
+        "prior_findings": [
+          {
+            "patch_message_id": "20251225-gs_usb-fix-memory-leak-v1-1-a7b09e70d01d@pengutronix.de",
+            "part_index": 1,
+            "severity": "High",
+            "problem": "gs_usb_receive_bulk_callback() re-anchors the URB onto parent->rx_submitted before calling usb_submit_urb(), but does not call usb_unanchor_urb() if usb_submit_urb() fails, leaving an unsubmitted URB anchored so usb_kill_anchored_urbs() in gs_can_close() loops infinitely.",
+            "severity_explanation": "A transient or disconnect-time usb_submit_urb() failure leaves an unsubmitted URB permanently on parent->rx_submitted, causing gs_can_close() to hang forever in usb_kill_anchored_urbs().",
+            "preexisting": false
+          }
+        ]
+      }
+    ],
+    "target_mbox": "can_gs_usb_urb_anchor/target.mbox",
+    "baseline_commit": "1806d210e5a8f431ad4711766ae4a333d407d972",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "Sashiko",
+    "expected_prior_version": 1,
+    "expected_prior_message_ids": [
+      "20251225-gs_usb-fix-memory-leak-v1-1-a7b09e70d01d@pengutronix.de"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251225-gs_usb-fix-memory-leak-v1-1-a7b09e70d01d@pengutronix.de/",
+      "https://lore.kernel.org/all/20260105-gs_usb-fix-memory-leak-v2-1-cc6ed6438034@pengutronix.de/"
+    ]
+  },
+  {
+    "Commit": "20250823-airoha-en7581-wlan-rx-offload-v3-2-f78600ec3ed8@kernel.org",
+    "Fixed-by": "dfdf774656205515b2d6ad94fce63c7ccbe92d91",
+    "subsystem": "net/airoha",
+    "problem_description": "In the !CONFIG_NET_AIROHA branch of include/linux/soc/airoha/airoha_offload.h, the stub is misspelled airoha_ppe_setup_tc_block_cb() instead of airoha_ppe_dev_setup_tc_block_cb(), so callers of airoha_ppe_dev_setup_tc_block_cb() fail to build when NET_AIROHA is disabled. The kernel test robot's v2 report concerned a different error in the same header (unknown type name 'airoha_ppe_dev' in airoha_ppe_get_dev()), which v3 fixed; no prior reviewer reported the misspelled stub.",
+    "case_id": "net_airoha_ppe_stub_typo",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "net_airoha_ppe_stub_typo/v1.mbox",
+        "baseline_commit": "b1c92cdf5af3198e8fbc1345a80e2a1dff386c02"
+      },
+      {
+        "version": 2,
+        "mbox_path": "net_airoha_ppe_stub_typo/v2.mbox",
+        "baseline_commit": "b1c92cdf5af3198e8fbc1345a80e2a1dff386c02"
+      }
+    ],
+    "target_mbox": "net_airoha_ppe_stub_typo/target.mbox",
+    "baseline_commit": "b1c92cdf5af3198e8fbc1345a80e2a1dff386c02",
+    "expected_behavior": "detect_bug",
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250819-airoha-en7581-wlan-rx-offload-v1-0-71a097e0e2a1@kernel.org/",
+      "https://lore.kernel.org/all/20250822-airoha-en7581-wlan-rx-offload-v2-0-8a76e1d3fec2@kernel.org/",
+      "https://lore.kernel.org/all/202508230602.GmZrkmas-lkp@intel.com/",
+      "https://lore.kernel.org/all/20250823-airoha-en7581-wlan-rx-offload-v3-0-f78600ec3ed8@kernel.org/",
+      "https://lore.kernel.org/all/20250823-airoha-en7581-wlan-rx-offload-v3-2-f78600ec3ed8@kernel.org/"
+    ]
+  },
+  {
+    "Commit": "20260118175215.2871535-3-edumazet@google.com",
+    "Fixed-by": "87737cd76e44fe5d481e7da2021b925191ccab53",
+    "subsystem": "net/ipv6",
+    "problem_description": "On v1, the kernel test robot reported that inlining tcp6_gro_receive() breaks builds without CONFIG_MITIGATION_RETPOLINE because ipv6_gro_receive() now calls udp6_gro_receive() directly while it has no visible declaration (implicit-declaration error). v2 added a plain prototype in include/net/gro.h but left INDIRECT_CALLABLE_SCOPE (static without retpoline) on the definition in net/ipv6/udp_offload.c, so those builds still fail, now with a static vs non-static declaration conflict.",
+    "case_id": "net_ipv6_gro_udp6_static",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "net_ipv6_gro_udp6_static/v1.mbox",
+        "baseline_commit": "f10ab9d3a7ea06ef7d6aa2d3c527f8cf728bbdee"
+      }
+    ],
+    "target_mbox": "net_ipv6_gro_udp6_static/target.mbox",
+    "baseline_commit": "f10ab9d3a7ea06ef7d6aa2d3c527f8cf728bbdee",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "kernel test robot <lkp@intel.com>",
+    "expected_prior_version": 1,
+    "expected_prior_message_ids": [
+      "202601170903.keV6lwyg-lkp@intel.com",
+      "202601170955.0wVpALLC-lkp@intel.com",
+      "202601170958.L4uFo8qq-lkp@intel.com"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260116152957.1825626-1-edumazet@google.com/",
+      "https://lore.kernel.org/all/202601170955.0wVpALLC-lkp@intel.com/",
+      "https://lore.kernel.org/all/20260118175215.2871535-1-edumazet@google.com/",
+      "https://lore.kernel.org/all/20260118175215.2871535-3-edumazet@google.com/"
+    ]
+  },
+  {
+    "Commit": "20251114010644.452441-1-m.lobanov@rosa.ru",
+    "Fixed-by": "https://lore.kernel.org/all/20251114032414.524965-1-m.lobanov@rosa.ru/",
+    "subsystem": "net/l2tp",
+    "problem_description": "On v2, Eric Dumazet replied that pre-validating the socket's cached dst in l2tp_xmit_queue() before inet6_csk_xmit() 'is not a fix, just adding other races'. v3 replaces the sk_dst_check()/sk_dst_get() pre-check with a __sk_dst_get() + ops->check() + sk_dst_reset() pre-check, which is still a pre-validation before inet6_csk_xmit(): the dst can become obsolete after the pre-check, so the race between the lockless sk_dst_check() from udpv6_sendmsg() and __sk_dst_check() inside inet6_csk_xmit() and the resulting double dst_release() remain.",
+    "case_id": "net_l2tp_dst_release",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 2,
+        "mbox_path": "net_l2tp_dst_release/v2.mbox",
+        "baseline_commit": "d70b592551ff23747e26e74081205babf8dba9b6"
+      }
+    ],
+    "target_mbox": "net_l2tp_dst_release/target.mbox",
+    "baseline_commit": "d70b592551ff23747e26e74081205babf8dba9b6",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "Eric Dumazet <edumazet@google.com>",
+    "expected_prior_version": 2,
+    "expected_prior_message_ids": [
+      "CANn89iLapT==AAgNqnzAy-pYZySD3YSSmjGOpPt3mnKs0Zk2Mw@mail.gmail.com"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251112132514.17364-1-m.lobanov@rosa.ru/",
+      "https://lore.kernel.org/all/CANn89iLapT==AAgNqnzAy-pYZySD3YSSmjGOpPt3mnKs0Zk2Mw@mail.gmail.com/",
+      "https://lore.kernel.org/all/20251114010644.452441-1-m.lobanov@rosa.ru/",
+      "https://lore.kernel.org/all/20251114032414.524965-1-m.lobanov@rosa.ru/"
+    ]
+  },
+  {
+    "Commit": "20250321-virtio-v2-3-33afb8f4640b@daynix.com",
+    "Fixed-by": "4156c3745f06bc197094b9ee97a9584e69ed00bf",
+    "subsystem": "virtio_net",
+    "problem_description": "Patch 3/4 stores the RSS key in u8 rss_hash_key_data[] placed after struct virtio_net_rss_config_trailer, whose flexible hash_key_data[] sits at offset 3 while the struct is padded to 4 bytes. The buffer sent with sg_set_buf(&vi->rss_trailer, virtnet_rss_trailer_size(vi)) therefore carries a padding byte and a key shifted by one byte, and the layout triggers -Wflex-array-member-not-at-end (fixed upstream by 4156c3745f06). No v1 reviewer reported the misalignment. Xuan Zhuo asked why the key was kept outside the trailer struct; crediting him is acceptable but not required.",
+    "case_id": "virtio_net_rss_key_align",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "virtio_net_rss_key_align/v1.mbox",
+        "baseline_commit": "d082ecbc71e9e0bf49883ee4afd435a77a5101b6"
+      }
+    ],
+    "target_mbox": "virtio_net_rss_key_align/target.mbox",
+    "baseline_commit": "d082ecbc71e9e0bf49883ee4afd435a77a5101b6",
+    "expected_behavior": "detect_bug",
+    "acceptable_attributions": [
+      {
+        "reviewer": "Xuan Zhuo <xuanzhuo@linux.alibaba.com>",
+        "version": 1,
+        "message_ids": [
+          "1742347325.317026-1-xuanzhuo@linux.alibaba.com"
+        ]
+      }
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250318-virtio-v1-0-344caf336ddd@daynix.com/",
+      "https://lore.kernel.org/all/1742347325.317026-1-xuanzhuo@linux.alibaba.com/",
+      "https://lore.kernel.org/all/20250321-virtio-v2-0-33afb8f4640b@daynix.com/",
+      "https://lore.kernel.org/all/20250321-virtio-v2-3-33afb8f4640b@daynix.com/"
+    ]
+  },
+  {
+    "Commit": "1bf59095d87e5dfae8f019385ba3ce58973baaff.1741270780.git.ojaswin@linux.ibm.com",
+    "Fixed-by": "ce2f26e73783b4a7c46a86e3af5b5c8de0971790",
+    "subsystem": "ext4",
+    "problem_description": "v2 adds the s_journal_destorying flag but sets it inside ext4_journal_destroy(), after ext4_put_super() has already flushed s_sb_upd_work and without forcing a commit first, so an ext4_handle_error() raised in that window (for example from the final jbd2 commit) still schedules update_super_work, which can start a handle after JBD2_UNMOUNT is set and hit the BUG_ON in start_this_handle(). On v1, Jan Kara rejected the SB_ACTIVE approach and suggested setting a flag in sbi, then flushing the workqueue, and only then destroying the journal; he did not describe this race window, so crediting him is acceptable but not required.",
+    "case_id": "ext4_journal_destroy_race",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "ext4_journal_destroy_race/v1.mbox",
+        "baseline_commit": "982bf37da09d078570650b691d9084f43805a5de"
+      }
+    ],
+    "target_mbox": "ext4_journal_destroy_race/target.mbox",
+    "baseline_commit": "982bf37da09d078570650b691d9084f43805a5de",
+    "expected_behavior": "detect_bug",
+    "acceptable_attributions": [
+      {
+        "reviewer": "Jan Kara <jack@suse.cz>",
+        "version": 1,
+        "message_ids": [
+          "jnxpphuradrsf73cxfmohfu7wwwckihtulw6ovsitddgt5pqkg@2uoejkr66qnl"
+        ]
+      }
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/cover.1740212945.git.ojaswin@linux.ibm.com/",
+      "https://lore.kernel.org/all/jnxpphuradrsf73cxfmohfu7wwwckihtulw6ovsitddgt5pqkg@2uoejkr66qnl/",
+      "https://lore.kernel.org/all/cover.1741270780.git.ojaswin@linux.ibm.com/",
+      "https://lore.kernel.org/all/1bf59095d87e5dfae8f019385ba3ce58973baaff.1741270780.git.ojaswin@linux.ibm.com/"
+    ]
+  },
+  {
+    "Commit": "20251129163631.2908340-1-guanghuifeng@linux.alibaba.com",
+    "Fixed-by": "https://lore.kernel.org/all/20251202043207.3924714-2-guanghuifeng@linux.alibaba.com/",
+    "subsystem": "pci",
+    "problem_description": "On v1, Ilpo J\u00e4rvinen pointed out that recursing into downstream buses inside pci_bridge_wait_for_secondary_bus() waits for child links before each bridge's config space is restored, and that pci_bus_restore_locked() already interleaves wait and restore per level since commit 3e40aa29d47e. v2 keeps the recursive wait before any config restore and additionally drops the per-level wait from pci_bus_restore_locked()/pci_slot_restore_locked().",
+    "case_id": "pci_sbr_config_restore",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "pci_sbr_config_restore/v1.mbox",
+        "baseline_commit": "2f2c7254931f41b5736e3ba12aaa9ac1bbeeeb92"
+      }
+    ],
+    "target_mbox": "pci_sbr_config_restore/target.mbox",
+    "baseline_commit": "2f2c7254931f41b5736e3ba12aaa9ac1bbeeeb92",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "Ilpo J\u00e4rvinen <ilpo.jarvinen@linux.intel.com>",
+    "expected_prior_version": 1,
+    "expected_prior_message_ids": [
+      "bcc2c523-ed9e-59a7-d6f1-b39f4b2e8e30@linux.intel.com",
+      "4f982c78-05ab-5e54-cead-a6d876f14ac0@linux.intel.com",
+      "2e3a1e6b-40ae-3878-e237-fb9032796af8@linux.intel.com"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251124104502.777141-1-guanghuifeng@linux.alibaba.com/",
+      "https://lore.kernel.org/all/bcc2c523-ed9e-59a7-d6f1-b39f4b2e8e30@linux.intel.com/",
+      "https://lore.kernel.org/all/20251129163631.2908340-1-guanghuifeng@linux.alibaba.com/",
+      "https://lore.kernel.org/all/20251202043207.3924714-2-guanghuifeng@linux.alibaba.com/"
+    ]
+  },
+  {
+    "Commit": "20251020110244.3200311-1-lizhi.xu@windriver.com",
+    "Fixed-by": "https://lore.kernel.org/all/20251023135032.3759443-1-lizhi.xu@windriver.com/",
+    "subsystem": "net/netrom",
+    "problem_description": "v2 adds a function-local static mutex that serialises only concurrent nr_add_node() calls. nr_del_node() and the other paths that decrement nr_neigh->count and drop nr_neigh references (nr_neigh_put(), nr_remove_neigh()) do not take it, so the nr_neigh refcount race and slab use-after-free reported by syzbot remain. No prior reviewer identified this gap; Dan Carpenter's v1 reply only questioned the commit message's refcount analysis.",
+    "case_id": "netrom_nr_route_uaf",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "netrom_nr_route_uaf/v1.mbox",
+        "baseline_commit": "a4fd163aed2edd967a244499754dec991d8b4c7d"
+      }
+    ],
+    "target_mbox": "netrom_nr_route_uaf/target.mbox",
+    "baseline_commit": "a4fd163aed2edd967a244499754dec991d8b4c7d",
+    "expected_behavior": "detect_bug",
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251020081359.2711482-1-lizhi.xu@windriver.com/",
+      "https://lore.kernel.org/all/aPYKgFTIroUhJAJA@stanley.mountain/",
+      "https://lore.kernel.org/all/20251020110244.3200311-1-lizhi.xu@windriver.com/",
+      "https://lore.kernel.org/all/20251023135032.3759443-1-lizhi.xu@windriver.com/"
+    ]
+  },
+  {
+    "Commit": "20250305100950.4001113-1-haoxiang_li2024@163.com",
+    "Fixed-by": "d2b9d97e89c79c95f8b517e4fa43fd100f936acc",
+    "subsystem": "net/qlcnic",
+    "problem_description": "On v1, Paolo Abeni noted the fix was incomplete because the sriov_vlans arrays already allocated for lower VF indices leak when qlcnic_sriov_alloc_vlans() fails for a later VF. v2 only adds qlcnic_sriov_free_vlans() calls in qlcnic_sriov_set_guest_vlan_mode() (the VF path, where num_vfs is 1); qlcnic_sriov_alloc_vlans() still returns -ENOMEM without cleanup, so the PF caller __qlcnic_pci_sriov_enable() still leaks the partially allocated arrays.",
+    "case_id": "net_qlcnic_sriov_vlan_leak",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "net_qlcnic_sriov_vlan_leak/v1.mbox",
+        "baseline_commit": "bb2281fb05e50108ce95c43ab7e701ee564565c8"
+      }
+    ],
+    "target_mbox": "net_qlcnic_sriov_vlan_leak/target.mbox",
+    "baseline_commit": "bb2281fb05e50108ce95c43ab7e701ee564565c8",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "Paolo Abeni <pabeni@redhat.com>",
+    "expected_prior_version": 1,
+    "expected_prior_message_ids": [
+      "63e68624-3672-4473-be15-ce04eb3cd2ed@redhat.com"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250228092449.3759573-1-haoxiang_li2024@163.com/",
+      "https://lore.kernel.org/all/63e68624-3672-4473-be15-ce04eb3cd2ed@redhat.com/",
+      "https://lore.kernel.org/all/20250305100950.4001113-1-haoxiang_li2024@163.com/"
+    ]
+  },
+  {
+    "Commit": "20251202152143.13352-1-pavankumaryalagada@gmail.com",
+    "Fixed-by": "https://lore.kernel.org/all/20251203083411.7072-1-pavankumaryalagada@gmail.com/",
+    "subsystem": "staging/most",
+    "problem_description": "On v3, Dan Carpenter questioned the comp_exiting error path in comp_probe_channel() ('Why do you not need to unregister? I don't think this error handling is correct'). v4 now jumps to err_unreg, but that path only calls v4l2_device_disconnect()/v4l2_device_put() and never video_unregister_device() for the device registered by comp_register_videodev(), leaking a registered video device whose mdev is released.",
+    "case_id": "staging_most_video_unreg_leak",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 2,
+        "mbox_path": "staging_most_video_unreg_leak/v2.mbox",
+        "baseline_commit": "277966749f46bc6292c4052b4e66a554f193a78a"
+      },
+      {
+        "version": 3,
+        "mbox_path": "staging_most_video_unreg_leak/v3.mbox",
+        "baseline_commit": "277966749f46bc6292c4052b4e66a554f193a78a"
+      }
+    ],
+    "target_mbox": "staging_most_video_unreg_leak/target.mbox",
+    "baseline_commit": "277966749f46bc6292c4052b4e66a554f193a78a",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "Dan Carpenter <dan.carpenter@linaro.org>",
+    "expected_prior_version": 3,
+    "expected_prior_message_ids": [
+      "aSrhv46__garLySK@stanley.mountain"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251126155910.32694-1-pavankumaryalagada@gmail.com/",
+      "https://lore.kernel.org/all/20251128165033.25060-1-pavankumaryalagada@gmail.com/",
+      "https://lore.kernel.org/all/aSrhv46__garLySK@stanley.mountain/",
+      "https://lore.kernel.org/all/20251202152143.13352-1-pavankumaryalagada@gmail.com/",
+      "https://lore.kernel.org/all/20251203083411.7072-1-pavankumaryalagada@gmail.com/"
+    ]
+  },
+  {
+    "Commit": "20250515162351.2111468-2-superm1@kernel.org",
+    "Fixed-by": "d9db3a941270d92bbd1a6a6b54a10324484f2f2d",
+    "subsystem": "platform/x86/amd/pmf",
+    "problem_description": "On v3, Ilpo J\u00e4rvinen pointed out that the devm allocation of dev->policy_buf in amd_pmf_get_pb_data() had no error handling and could lead to a NULL dereference. v4 adds a check, but it tests IS_ERR() on the devm_kzalloc() result, which is NULL on failure and never an ERR_PTR, so an allocation failure still falls through to copy_from_user() and amd_pmf_pb_valid() with a NULL policy_buf.",
+    "case_id": "amd_pmf_kzalloc_errptr",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 3,
+        "mbox_path": "amd_pmf_kzalloc_errptr/v3.mbox",
+        "baseline_commit": "bfcfe6d335a967f8ea0c1980960e6f0205b5de6e"
+      }
+    ],
+    "target_mbox": "amd_pmf_kzalloc_errptr/target.mbox",
+    "baseline_commit": "bfcfe6d335a967f8ea0c1980960e6f0205b5de6e",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "Ilpo J\u00e4rvinen <ilpo.jarvinen@linux.intel.com>",
+    "expected_prior_version": 3,
+    "expected_prior_message_ids": [
+      "e344db1e-6978-3e99-2c4e-13d2df0a11e0@linux.intel.com"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250512211154.2510397-1-superm1@kernel.org/",
+      "https://lore.kernel.org/all/e344db1e-6978-3e99-2c4e-13d2df0a11e0@linux.intel.com/",
+      "https://lore.kernel.org/all/20250515162351.2111468-1-superm1@kernel.org/",
+      "https://lore.kernel.org/all/20250515162351.2111468-2-superm1@kernel.org/"
+    ]
+  },
+  {
+    "Commit": "20260427-b4-refill-optimistic-return-v2-1-1672467a792d@kernel.org",
+    "Fixed-by": "4a724bcf5d703e18957397914d79156fa2cf1174",
+    "subsystem": "mm/slab",
+    "problem_description": "On v1, Hao Li suggested calling slab_update_freelist() in __slab_try_return_freelist() without acquiring n->list_lock and pushing the slab onto pc.slabs; v2 adopted this lockless approach, introducing a list corruption race when another CPU concurrently removes the slab from the partial list under n->list_lock.",
+    "case_id": "mm_slab_optimistic_return",
+    "category": "bad_advice_regression",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "mm_slab_optimistic_return/v1.mbox",
+        "baseline_commit": "dad0d91cc2c3e6b6fb285ccfe7ddf71525797198"
+      }
+    ],
+    "target_mbox": "mm_slab_optimistic_return/target.mbox",
+    "baseline_commit": "dad0d91cc2c3e6b6fb285ccfe7ddf71525797198",
+    "expected_behavior": "detect_regression",
+    "expected_reviewer": "Hao Li <hao.li@linux.dev>",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260421-b4-refill-optimistic-return-v1-1-24f0bfc1acff@kernel.org/",
+      "https://lore.kernel.org/all/qfxtirtpoxcuzhnohm7cbo62z3ob3tiknlss6xenjlrjossmpu@pp4wwry3jad4/",
+      "https://lore.kernel.org/all/20260427-b4-refill-optimistic-return-v2-1-1672467a792d@kernel.org/"
+    ]
+  },
+  {
+    "Commit": "20260219051841.60999-1-ethantidmore06@gmail.com",
+    "Fixed-by": "https://lore.kernel.org/all/20260219200715.785849-1-ethantidmore06@gmail.com/",
+    "subsystem": "xfs",
+    "problem_description": "On v1, Darrick J. Wong suggested returning PTR_ERR(d_child) from xrep_adoption_check_dcache() when try_lookup_noperm() returns an ERR_PTR; v2 returned PTR_ERR(d_child) directly before releasing d_orphanage via dput(), leaking the d_orphanage dentry reference on error.",
+    "case_id": "xfs_orphanage_errptr",
+    "category": "bad_advice_regression",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "xfs_orphanage_errptr/v1.mbox",
+        "baseline_commit": "cf9b52fa7d65362b648927d1d752ec99659f5c43"
+      }
+    ],
+    "target_mbox": "xfs_orphanage_errptr/target.mbox",
+    "baseline_commit": "cf9b52fa7d65362b648927d1d752ec99659f5c43",
+    "expected_behavior": "detect_regression",
+    "expected_reviewer": "Darrick J. Wong <djwong@kernel.org>",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260218195115.14049-1-ethantidmore06@gmail.com/",
+      "https://lore.kernel.org/all/20260218234917.GA6490@frogsfrogsfrogs/",
+      "https://lore.kernel.org/all/20260219051841.60999-1-ethantidmore06@gmail.com/",
+      "https://lore.kernel.org/all/20260219200715.785849-1-ethantidmore06@gmail.com/"
+    ]
+  },
+  {
+    "Commit": "20260531-mt76_tx_status_skb_add-overwrite-fix-v2-1-b73c4b4a9798@kernel.org",
+    "Fixed-by": "6bb5066cfcd4296ac5e0b6872f43f96a43bfe566",
+    "subsystem": "wifi/mt76",
+    "problem_description": "On v1, Ryder Lee asked to preserve info->control.flags across mt76_tx_status_skb_add() instead of passing a resolved link_id parameter; v2 saved flags and read link_id from them, leaving non-MLD station EAPOL frames with IEEE80211_LINK_UNSPECIFIED so mt7996_mac_write_txwi() skipped the per-link lookup and transmitted EAPOL frames from BSS slot 0.",
+    "case_id": "wifi_mt76_eapol_link",
+    "category": "bad_advice_regression",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "wifi_mt76_eapol_link/v1.mbox",
+        "baseline_commit": "7ec087fef32a88410488b764b0f5eef68e51175f"
+      }
+    ],
+    "target_mbox": "wifi_mt76_eapol_link/target.mbox",
+    "baseline_commit": "7ec087fef32a88410488b764b0f5eef68e51175f",
+    "expected_behavior": "detect_regression",
+    "expected_reviewer": "Ryder Lee <Ryder.Lee@mediatek.com>",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260530-mt76_tx_status_skb_add-overwrite-fix-v1-1-e2c3151c391a@kernel.org/",
+      "https://lore.kernel.org/all/6be1d6e67bcb5500c9d1e92449ce7757f6166d22.camel@mediatek.com/",
+      "https://lore.kernel.org/all/20260531-mt76_tx_status_skb_add-overwrite-fix-v2-1-b73c4b4a9798@kernel.org/"
+    ]
+  },
+  {
+    "Commit": "174549940981.608169.4363875844729313831.stgit@firesoul",
+    "Fixed-by": "5442a9da69789741bfda39f34ee7f69552bf0c56",
+    "subsystem": "net/veth",
+    "problem_description": "On v5, Toshiaki Makita argued that checking __ptr_ring_empty() after stopping the netdev TX queue made calling __veth_xdp_flush() unnecessary; v6 dropped the flush and relied on an unsynchronized __ptr_ring_empty() check after netif_tx_stop_queue(), introducing a producer/consumer race that permanently stalls the TX queue.",
+    "case_id": "net_veth_ptr_ring_empty",
+    "category": "bad_advice_regression",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 5,
+        "mbox_path": "net_veth_ptr_ring_empty/v5.mbox",
+        "baseline_commit": "8ef890df4031121a94407c84659125cbccd3fdbe"
+      }
+    ],
+    "target_mbox": "net_veth_ptr_ring_empty/target.mbox",
+    "baseline_commit": "8ef890df4031121a94407c84659125cbccd3fdbe",
+    "expected_behavior": "detect_regression",
+    "expected_reviewer": "Toshiaki Makita <toshiaki.makita1@gmail.com>",
+    "expected_prior_version": 5,
+    "lore_urls": [
+      "https://lore.kernel.org/all/174489803410.355490.13216831426556849084.stgit@firesoul/",
+      "https://lore.kernel.org/all/8265c592-a51f-4b26-9e6d-df69c16aebf4@gmail.com/",
+      "https://lore.kernel.org/all/174549933665.608169.392044991754158047.stgit@firesoul/",
+      "https://lore.kernel.org/all/174549940981.608169.4363875844729313831.stgit@firesoul/"
+    ]
+  },
+  {
+    "Commit": "20251020160121.1985354-1-m.szyprowski@samsung.com",
+    "Fixed-by": "https://lore.kernel.org/all/20251023142634.1642093-1-m.szyprowski@samsung.com/",
+    "subsystem": "media/videobuf2",
+    "problem_description": "On v1, Benjamin Gaignard suggested replacing the queue->type check in vb2_ioctl_remove_bufs() with vb2_verify_memory_type(vdev->queue, vdev->queue->memory, d->type); v2 adopted that call, which erroneously rejects VIDIOC_REMOVE_BUFS on uninitialized queues where vdev->queue->memory is 0 (VB2_MEMORY_UNKNOWN) instead of returning 0 when count == 0.",
+    "case_id": "media_vb2_remove_bufs",
+    "category": "bad_advice_regression",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "media_vb2_remove_bufs/v1.mbox",
+        "baseline_commit": "bb4d6be205dae94aa2d3c3a1ad814dad90d4fd62"
+      }
+    ],
+    "target_mbox": "media_vb2_remove_bufs/target.mbox",
+    "baseline_commit": "bb4d6be205dae94aa2d3c3a1ad814dad90d4fd62",
+    "expected_behavior": "detect_regression",
+    "expected_reviewer": "Benjamin Gaignard <benjamin.gaignard@collabora.com>",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251016111154.993949-1-m.szyprowski@samsung.com/",
+      "https://lore.kernel.org/all/258b9036-697d-48b2-91d6-5fb8ea2f1350@collabora.com/",
+      "https://lore.kernel.org/all/20251020160121.1985354-1-m.szyprowski@samsung.com/",
+      "https://lore.kernel.org/all/20251023142634.1642093-1-m.szyprowski@samsung.com/"
+    ]
+  },
+  {
+    "Commit": "20250808-swap-scan-list-v2-1-d50e4758ecee@kernel.org",
+    "Fixed-by": "https://lore.kernel.org/all/20250812-swap-scan-list-v3-1-6d73504d267b@kernel.org/",
+    "subsystem": "mm/swap",
+    "problem_description": "On v1, Andrew Morton suggested using 'break' instead of an early return in alloc_swap_scan_list() to avoid multiple return points; v2 replaced the early return with break, causing the loop condition/requeue logic to mishandle !scan_all single-cluster scans.",
+    "case_id": "mm_swapfile_scan_all",
+    "category": "bad_advice_regression",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "mm_swapfile_scan_all/v1.mbox",
+        "baseline_commit": "9d246d7410c9c4187e37cc3bfd1284d06b697566"
+      }
+    ],
+    "target_mbox": "mm_swapfile_scan_all/target.mbox",
+    "baseline_commit": "9d246d7410c9c4187e37cc3bfd1284d06b697566",
+    "expected_behavior": "detect_regression",
+    "expected_reviewer": "Andrew Morton <akpm@linux-foundation.org>",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250806-swap-scan-list-v1-1-a5fe2d9340a2@kernel.org/",
+      "https://lore.kernel.org/all/20250806153146.ee1ee22dc8f6381ff5a6d882@linux-foundation.org/",
+      "https://lore.kernel.org/all/20250808-swap-scan-list-v2-1-d50e4758ecee@kernel.org/",
+      "https://lore.kernel.org/all/20250812-swap-scan-list-v3-1-6d73504d267b@kernel.org/"
+    ]
+  },
+  {
+    "Commit": "20250611-vsock-test-inc-cov-v3-2-5834060d9c20@rbox.co",
+    "Fixed-by": "5d54aa40c7b7e9dee5746cca99e9ddbcca13e895",
+    "subsystem": "vsock",
+    "problem_description": "On v1, Stefano Garzarella suggested discovering loaded and built-in vsock transports via /proc/kallsyms; in v3 get_transports() implemented /proc/kallsyms parsing with an overly strict symbol type 'd' filter, missing transports like loopback_transport reported with symbol type 't'.",
+    "case_id": "vsock_test_kallsyms",
+    "category": "bad_advice_regression",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "vsock_test_kallsyms/v1.mbox",
+        "baseline_commit": "0097c4195b1d0ca57d15979626c769c74747b5a0"
+      },
+      {
+        "version": 2,
+        "mbox_path": "vsock_test_kallsyms/v2.mbox",
+        "baseline_commit": "0097c4195b1d0ca57d15979626c769c74747b5a0"
+      }
+    ],
+    "target_mbox": "vsock_test_kallsyms/target.mbox",
+    "baseline_commit": "0097c4195b1d0ca57d15979626c769c74747b5a0",
+    "expected_behavior": "detect_regression",
+    "expected_reviewer": "Stefano Garzarella <sgarzare@redhat.com>",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250523-vsock-test-inc-cov-v1-1-fa3507941bbd@rbox.co/",
+      "https://lore.kernel.org/all/20250528-vsock-test-inc-cov-v2-0-8f655b40d57c@rbox.co/",
+      "https://lore.kernel.org/all/skvayogoenhntikkdnqrkkjvqesmpnukjlil6reubrouo45sat@j7zw6lfthfrd/",
+      "https://lore.kernel.org/all/20250611-vsock-test-inc-cov-v3-0-5834060d9c20@rbox.co/",
+      "https://lore.kernel.org/all/20250611-vsock-test-inc-cov-v3-2-5834060d9c20@rbox.co/"
+    ]
+  },
+  {
+    "Commit": "20250409-wip-bl-ad3552r-fixes-v5-5-fb429c3a6515@baylibre.com",
+    "Fixed-by": "978d28136c53df38f8f0b747191930e2f95e9084",
+    "subsystem": "iio/dac",
+    "problem_description": "On v4, Nuno S\u00e1 suggested replacing heap allocations with small stack buffers in the debugfs handlers; in v5 ad3552r_hs_write_data_source() used a 64-byte stack buffer with simple_write_to_buffer() and indexed buf[count] = '\\0' using user-supplied count instead of the returned byte count, causing a stack out-of-bounds write.",
+    "case_id": "iio_ad3552r_stack_oob",
+    "category": "bad_advice_regression",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 4,
+        "mbox_path": "iio_ad3552r_stack_oob/v4.mbox",
+        "baseline_commit": "2a44c3ed8063e9bb0254b3bbcd13a853ef80cbed"
+      }
+    ],
+    "target_mbox": "iio_ad3552r_stack_oob/target.mbox",
+    "baseline_commit": "2a44c3ed8063e9bb0254b3bbcd13a853ef80cbed",
+    "expected_behavior": "detect_regression",
+    "expected_reviewer": "Nuno S\u00e1 <noname.nuno@gmail.com>",
+    "expected_prior_version": 4,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250408-wip-bl-ad3552r-fixes-v4-0-b33c0264bd78@baylibre.com/",
+      "https://lore.kernel.org/all/0900650872a1533a344df375e99ce116046b3ee0.camel@gmail.com/",
+      "https://lore.kernel.org/all/20250409-wip-bl-ad3552r-fixes-v5-0-fb429c3a6515@baylibre.com/",
+      "https://lore.kernel.org/all/20250409-wip-bl-ad3552r-fixes-v5-5-fb429c3a6515@baylibre.com/"
+    ]
+  },
+  {
+    "Commit": "20260120061816.2132558-2-baolu.lu@linux.intel.com",
+    "subsystem": "iommu/vt-d",
+    "problem_description": "On v1 patch 2/4 (drivers/iommu/intel/pasid.c), intel_pasid_tear_down_entry() cleared the PASID Present bit under iommu->lock, released iommu->lock to flush PASID/IOTLB/Dev-TLB caches, and then called intel_pasid_clear_entry() without reacquiring iommu->lock. Reviewer Dmytro Maluka <dmaluka@chromium.org> questioned zeroing the PASID entry outside iommu->lock (and conversely asked whether holding iommu->lock while clearing Present was redundant). Author Baolu Lu <baolu.lu@linux.intel.com> proved from concrete driver code that iommu->lock is required while P=1 to serialize against concurrent in-place modifiers and walkers such as intel_pasid_setup_page_snoop_control() and debugfs PASID table dumps, whereas once P=0 is written and caches are flushed the PASID remains software-reserved until teardown returns, making lockless intel_pasid_clear_entry() safe. v2 patch 1/3 preserves this exact locking sequence (merged as 75ed00055c05 with 0 Fixes: commits); reviewing v2 must not flag unlocked intel_pasid_clear_entry() or iommu->lock usage in intel_pasid_tear_down_entry().",
+    "case_id": "cat3_iommu_vtd_pasid_clear_lock",
+    "category": "wrong_claim_rejected",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat3_iommu_vtd_pasid_clear_lock/v1.mbox",
+        "baseline_commit": "04b1b069f151e793767755f58b51670bff00cbc1"
+      }
+    ],
+    "target_mbox": "cat3_iommu_vtd_pasid_clear_lock/target.mbox",
+    "baseline_commit": "04b1b069f151e793767755f58b51670bff00cbc1",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260113030052.977366-1-baolu.lu@linux.intel.com/",
+      "https://lore.kernel.org/all/20260120061816.2132558-1-baolu.lu@linux.intel.com/"
+    ]
+  },
+  {
+    "Commit": "20251208084539.3652902-6-riana.tauro@intel.com",
+    "subsystem": "drm/xe",
+    "problem_description": "On v1 and again on v2 patch 2/2 (drivers/gpu/drm/xe/xe_survivability_mode.c), reviewer Rodrigo Vivi <rodrigo.vivi@intel.com> questioned why init_survivability_mode() jumps to 'goto err' (aborting survivability mode and failing PCI probe) when xe_nvm_init(xe) fails in FDO mode, noting on v2 ('I still see the goto err there, what am I missing?') that the v2 changelog said not to exit survivability mode on MEI init failure. Author Riana Tauro <riana.tauro@intel.com> explained from the code paths that MEI initialization failure was already changed to non-fatal, whereas PCODE only enters FDO mode when MEI firmware flashing via igsc has already failed; if fallback SPI initialization via xe_nvm_init(xe) also fails, both firmware recovery paths are unavailable so staying in survivability mode is useless and failing probe via 'goto err' is intentional. Rodrigo Vivi retracted his concern ('Nevermind. I have mixed things up'), and v3 patch 2/2 keeps 'if (ret) goto err;' after xe_nvm_init(xe) (merged as 1987ea95ac37 with 0 Fixes: commits); reviewing v3 must not flag 'goto err' on xe_nvm_init() failure as a bug.",
+    "case_id": "cat3_drm_xe_survivability_fdo_err",
+    "category": "wrong_claim_rejected",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat3_drm_xe_survivability_fdo_err/v1.mbox",
+        "baseline_commit": "a00e305fba02a915cf2745bf6ef3f55537e65d57"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat3_drm_xe_survivability_fdo_err/v2.mbox",
+        "baseline_commit": "a00e305fba02a915cf2745bf6ef3f55537e65d57"
+      }
+    ],
+    "target_mbox": "cat3_drm_xe_survivability_fdo_err/target.mbox",
+    "baseline_commit": "a00e305fba02a915cf2745bf6ef3f55537e65d57",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 2,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251112103336.1468261-4-riana.tauro@intel.com/",
+      "https://lore.kernel.org/all/20251201143420.3158372-4-riana.tauro@intel.com/",
+      "https://lore.kernel.org/all/20251208084539.3652902-4-riana.tauro@intel.com/"
+    ]
+  },
+  {
+    "Commit": "ef254c4f68be19bd393d450188946821c588565d.1772225741.git.paul.chaignon@gmail.com",
+    "subsystem": "bpf",
+    "problem_description": "On v1 and v2 patch 2/4 (kernel/bpf/verifier.c), Eduard Zingerman <eddyz87@gmail.com> suggested simplifying single-value tnum refinement in __update_reg_bounds() by dropping the umin_in_tnum ('(reg->umin_value & ~reg->var_off.mask) == reg->var_off.value') membership checks on the tnum_step() branches, observing on v2 that deleting 'umin_in_tnum &&' from the first condition caused no selftest failures. Co-authors Harishankar Vishwanathan <harishankar.vishwanathan@gmail.com> and Paul Chaignon <paul.chaignon@gmail.com> proved from concrete verifier execution order (where __update_reg_bounds() executes as the first refinement step in reg_bounds_sync() before var_off/range intersection) that for states like R3=(u64=[0; 1], var_off=unknown) or disjoint u64/tnum ranges, omitting the umin_in_tnum check unsoundly collapses a multi-value or empty intersection into a known singleton constant, and retained explicit 'umin_in_tnum' guards across all three branches in v3 patch 2/4 (merged as 76e954155b45 with 0 Fixes: commits); reviewing v3 must not flag umin_in_tnum as redundant or dead logic.",
+    "case_id": "cat3_bpf_tnum_step_umin_check",
+    "category": "wrong_claim_rejected",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat3_bpf_tnum_step_umin_check/v1.mbox",
+        "baseline_commit": "8c0d9e178d4a91ae596b2780d9b0a77f9d4186ad"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat3_bpf_tnum_step_umin_check/v2.mbox",
+        "baseline_commit": "8c0d9e178d4a91ae596b2780d9b0a77f9d4186ad"
+      }
+    ],
+    "target_mbox": "cat3_bpf_tnum_step_umin_check/target.mbox",
+    "baseline_commit": "8c0d9e178d4a91ae596b2780d9b0a77f9d4186ad",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 2,
+    "lore_urls": [
+      "https://lore.kernel.org/all/cover.1771316309.git.paul.chaignon@gmail.com/",
+      "https://lore.kernel.org/all/cover.1771594636.git.paul.chaignon@gmail.com/",
+      "https://lore.kernel.org/all/cover.1772225741.git.paul.chaignon@gmail.com/"
+    ]
+  },
+  {
+    "Commit": "20251119-netconsole_dynamic_extradata-v3-3-497ac3191707@meta.com",
+    "subsystem": "net/netconsole",
+    "problem_description": "On v2 patch 3/4 (drivers/net/netconsole.c), reviewer Breno Leitao <leitao@debian.org> questioned freeing nt->userdata via kfree(nt->userdata) inside netconsole_target_release() without acquiring target_list_lock ('Don't we need the target_list_lock in here?'). Author Gustavo Luiz Duarte <gustavold@gmail.com> proved from configfs and target_list lifecycle invariants in drivers/net/netconsole.c that netconsole_target_release() is the config_item .release callback invoked only after drop_netconsole_target() has already removed nt from target_list under target_list_lock and after all child userdata configfs items have been released, so no concurrent reader or writer can access nt->userdata. v3 patch 3/4 keeps netconsole_target_release() lockless (merged as 9dc10f50c430 with 0 Fixes: commits); reviewing v3 must not flag a missing target_list_lock in netconsole_target_release().",
+    "case_id": "cat3_netconsole_userdata_release_lock",
+    "category": "wrong_claim_rejected",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat3_netconsole_userdata_release_lock/v1.mbox",
+        "baseline_commit": "45a1cd8346ca245a1ca475b26eb6ceb9d8b7c6f0"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat3_netconsole_userdata_release_lock/v2.mbox",
+        "baseline_commit": "45a1cd8346ca245a1ca475b26eb6ceb9d8b7c6f0"
+      }
+    ],
+    "target_mbox": "cat3_netconsole_userdata_release_lock/target.mbox",
+    "baseline_commit": "45a1cd8346ca245a1ca475b26eb6ceb9d8b7c6f0",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 2,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251105-netconsole_dynamic_extradata-v1-0-142890bf4936@meta.com/",
+      "https://lore.kernel.org/all/20251113-netconsole_dynamic_extradata-v2-0-18cf7fed1026@meta.com/",
+      "https://lore.kernel.org/all/20251119-netconsole_dynamic_extradata-v3-0-497ac3191707@meta.com/"
+    ]
+  },
+  {
+    "Commit": "20251128212055.1409093-2-rrendec@redhat.com",
+    "subsystem": "genirq",
+    "problem_description": "On v2 patch 1/3 (kernel/irq/chip.c), Thomas Gleixner <tglx@linutronix.de> questioned why demux_redirect_remote() tested 'cpumask_test_cpu(smp_processor_id(), m)' against irq_data_get_effective_affinity_mask(&desc->irq_data) rather than simply checking 'if (target_cpu != smp_processor_id())'. Author Radu Rendec <rrendec@redhat.com> demonstrated from the hierarchical parent/child irq_desc affinity mechanics that desc->redirect.target_cpu only caches cpumask_first(dest) for the slow-path irq_work_queue_on() fallback, whereas when a parent demux interrupt can fire across multiple CPUs and the child's effective affinity mask contains multiple CPUs, testing target_cpu != smp_processor_id() would needlessly redirect interrupts already executing on a valid affinity CPU. v3 patch 1/3 renames fallback_cpu to target_cpu while keeping cpumask_test_cpu(smp_processor_id(), m) on the fast path (merged as f1875091a01d with 0 Fixes: commits); reviewing v3 must not flag cpumask_test_cpu() vs target_cpu comparison in demux_redirect_remote().",
+    "case_id": "cat3_genirq_redirect_cpumask_test",
+    "category": "wrong_claim_rejected",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat3_genirq_redirect_cpumask_test/v1.mbox",
+        "baseline_commit": "312f5b18663a6dd8d8e6ad5a3fce0059a11686b2"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat3_genirq_redirect_cpumask_test/v2.mbox",
+        "baseline_commit": "312f5b18663a6dd8d8e6ad5a3fce0059a11686b2"
+      }
+    ],
+    "target_mbox": "cat3_genirq_redirect_cpumask_test/target.mbox",
+    "baseline_commit": "312f5b18663a6dd8d8e6ad5a3fce0059a11686b2",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 2,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251003160421.951448-1-rrendec@redhat.com/",
+      "https://lore.kernel.org/all/20251006223813.1688637-1-rrendec@redhat.com/",
+      "https://lore.kernel.org/all/20251128212055.1409093-1-rrendec@redhat.com/"
+    ]
+  },
+  {
+    "Commit": "20251104013037.296013-3-longman@redhat.com",
+    "subsystem": "cgroup/cpuset",
+    "problem_description": "On v1 patches 2/3 and 3/3 (kernel/cgroup/cpuset.c), reviewer Chen Ridong <chenridong@huaweicloud.com> claimed that comparing 'prs != parent->partition_root_state' in isolated_cpus_should_update() was wrong when a local partition transitions to member (proposing to compare old_prs/new_prs == PRS_ISOLATED instead), and also suggested updating isolated_cpus outside callback_lock to eliminate the global isolated_cpus_updating flag. Author Waiman Long <longman@redhat.com> proved from cpuset hierarchy invariants that child partition roots allocate exclusive CPUs directly out of their parent partition root (so moving CPUs between an isolated parent and an isolated child leaves global isolated_cpus unchanged, whereas differing child/parent root states always flip isolation membership), and that isolated_cpus is exposed to readers requiring both cpuset_mutex and callback_lock protection. v2 keeps 'prs != parent->partition_root_state' and callback_lock around isolated_cpus updates with clarifying comments (merged as 22f8e41680ef with 0 Fixes: commits); reviewing v2 must not flag isolated_cpus_should_update() or callback_lock ordering as buggy.",
+    "case_id": "cat3_cgroup_cpuset_isolated_lock",
+    "category": "wrong_claim_rejected",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat3_cgroup_cpuset_isolated_lock/v1.mbox",
+        "baseline_commit": "d245698d727ab8f5420b3e28d1243f96a5234851"
+      }
+    ],
+    "target_mbox": "cat3_cgroup_cpuset_isolated_lock/target.mbox",
+    "baseline_commit": "d245698d727ab8f5420b3e28d1243f96a5234851",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251103013411.239610-1-longman@redhat.com/",
+      "https://lore.kernel.org/all/20251104013037.296013-1-longman@redhat.com/"
+    ]
+  },
+  {
+    "Commit": "7b587d24-c8a1-4413-9b9a-00a33fbd849f@I-love.SAKURA.ne.jp",
+    "subsystem": "fs/hfsplus",
+    "problem_description": "On v1 (fs/hfsplus/xattr.c), which replaced 'BUG_ON(i_size_read(attr_file) != 0)' with an '-EIO' error return in hfsplus_create_attributes_file(), reviewers Yangtao Li <frank.li@vivo.com> and HFS+ maintainer Viacheslav Dubeyko <Slava.Dubeyko@ibm.com> suspected two bugs: (1) that default 'BUG()' on sbi->attr_tree_state was triggerable, and (2) that non-zero i_size_read(attr_file) was caused by a concurrent multi-threaded __hfsplus_setxattr() race rather than handleable by returning -EIO. Author Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp> proved from fs/hfsplus/xattr.c and fs/hfsplus/super.c that atomic_cmpxchg(&sbi->attr_tree_state, HFSPLUS_EMPTY_ATTR_TREE, HFSPLUS_CREATING_ATTR_TREE) already serializes concurrent callers (returning -EAGAIN to racing threads), and traced the non-zero size to a corrupted on-disk volume header where vhdr->attr_file.total_blocks == 0 skips mount-time hfs_btree_open() while hfsplus_iget(sb, HFSPLUS_ATTR_CNID) populates non-zero i_size via hfsplus_inode_read_fork(). Viacheslav Dubeyko confirmed the proof, and v2 keeps the -EIO check in hfsplus_create_attributes_file() with a corruption message (merged as c7c6363ca186 with 0 Fixes: commits); reviewing v2 must not report a setxattr creation race or incomplete mount fix.",
+    "case_id": "cat3_hfsplus_attr_file_size_race",
+    "category": "wrong_claim_rejected",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat3_hfsplus_attr_file_size_race/v1.mbox",
+        "baseline_commit": "4c6a567cb8e8e0eb7fc559e8cecbae7d83aaafbb"
+      }
+    ],
+    "target_mbox": "cat3_hfsplus_attr_file_size_race/target.mbox",
+    "baseline_commit": "4c6a567cb8e8e0eb7fc559e8cecbae7d83aaafbb",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/54358ab7-4525-48ba-a1e5-595f6b107cc6@I-love.SAKURA.ne.jp/",
+      "https://lore.kernel.org/all/7b587d24-c8a1-4413-9b9a-00a33fbd849f@I-love.SAKURA.ne.jp/"
+    ]
+  },
+  {
+    "Commit": "20250805003654.2944974-1-kuba@kernel.org",
+    "subsystem": "net/page_pool",
+    "problem_description": "On v1 (drivers/net/ethernet/broadcom/bnxt/bnxt.c and net/core/page_pool.c), Stanislav Fomichev <stfomichev@gmail.com> questioned why bnxt_enable_rx_page_pool() unconditionally called page_pool_enable_direct_recycling() on both rxr->head_pool and rxr->page_pool without guarding rxr->head_pool with bnxt_separate_head_pool() (unlike the disable path, since head_pool aliases page_pool when separate head pools are not used). Author Jakub Kicinski <kuba@kernel.org> pointed to the exact idempotency guard 'if (READ_ONCE(pool->p.napi) == napi) return;' at the top of page_pool_enable_direct_recycling() in net/core/page_pool.c, proving duplicate calls with the same pool and napi pointer return harmlessly before WARN_ON_ONCE(). v2 documents this API guarantee while keeping bnxt_enable_rx_page_pool() unchanged (merged as 64fdaa94bfe0 with 0 Fixes: commits); reviewing v2 must not flag a missing bnxt_separate_head_pool() check or duplicate WARN_ON_ONCE() trigger.",
+    "case_id": "cat3_net_page_pool_bnxt_duplicate_enable",
+    "category": "wrong_claim_rejected",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat3_net_page_pool_bnxt_duplicate_enable/v1.mbox",
+        "baseline_commit": "06feac15406f4f66f4c0c6ea60b10d44775d4133"
+      }
+    ],
+    "target_mbox": "cat3_net_page_pool_bnxt_duplicate_enable/target.mbox",
+    "baseline_commit": "06feac15406f4f66f4c0c6ea60b10d44775d4133",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250801173011.2454447-1-kuba@kernel.org/",
+      "https://lore.kernel.org/all/20250805003654.2944974-1-kuba@kernel.org/"
+    ]
+  },
+  {
+    "Commit": "173864305238.668823.16553986866633608541.stgit@dwillia2-xfh.jf.intel.com",
+    "subsystem": "cxl",
+    "problem_description": "On v2 patch 2/6 (drivers/cxl/core/cdat.c), reviewer Alejandro Lucero Palau <alucerop@amd.com> claimed that 'range_contains(&range, &dent->dpa_range)' in cxl_memdev_set_qos_class() had its arguments reversed because range_contains(r1, r2) checks whether r1 encompasses r2. Author Dan Williams <dan.j.williams@intel.com> explained from the CXL partition/CDAT data structures that 'range' is the device's overall RAM or PMEM DPA partition reported by GET_PARTITION_INFO, whereas 'dent->dpa_range' is an individual CDAT DSMAS entry that describes a sub-range (or equal range) inside that partition, so '&range' must be the outer container first argument. Alejandro verified the code and retracted his claim, and v3 keeps 'range_contains(&range, &dent->dpa_range)' unchanged (merged as d77ca6c2b525 with 0 Fixes: commits); reviewing v3 must not flag reversed range_contains() arguments.",
+    "case_id": "cat3_cxl_cdat_dpa_range_contains",
+    "category": "wrong_claim_rejected",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat3_cxl_cdat_dpa_range_contains/v1.mbox",
+        "baseline_commit": "2014c95afecee3e76ca4a56956a936e23283f05b"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat3_cxl_cdat_dpa_range_contains/v2.mbox",
+        "baseline_commit": "2014c95afecee3e76ca4a56956a936e23283f05b"
+      }
+    ],
+    "target_mbox": "cat3_cxl_cdat_dpa_range_contains/target.mbox",
+    "baseline_commit": "2014c95afecee3e76ca4a56956a936e23283f05b",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 2,
+    "lore_urls": [
+      "https://lore.kernel.org/all/173709422664.753996.4091585899046900035.stgit@dwillia2-xfh.jf.intel.com/",
+      "https://lore.kernel.org/all/173753635014.3849855.17902348420186052714.stgit@dwillia2-xfh.jf.intel.com/",
+      "https://lore.kernel.org/all/173864304059.668823.3914867296781664103.stgit@dwillia2-xfh.jf.intel.com/"
+    ]
+  },
+  {
+    "Commit": "20260122180203.1502637-1-cmllamas@google.com",
+    "subsystem": "android/binder",
+    "problem_description": "On v1 (drivers/android/binder.c), reviewer Alice Ryhl <aliceryhl@google.com> warned that shallow-copying struct binder_transaction into stack-local 't_copy' before queued delivery and passing '&t_copy' to binder_netlink_report() could cause use-after-free dereferences on pointer fields t_copy.to_proc, t_copy.to_thread, or t_copy.buffer if the target processed and freed 't' concurrently. Author Carlos Llamas <cmllamas@google.com> proved from surrounding code in binder_transaction() that target_proc and target_thread are pinned by explicit temporary references released via binder_proc_dec_tmpref() / binder_thread_dec_tmpref() only after binder_netlink_report() returns, and binder_netlink_report() only reads scalar metadata without touching t->buffer. Alice Ryhl concurred, and v2 keeps '&t_copy' with a comment noting t->buffer must not be accessed (merged as 5e8a3d015442 with 0 Fixes: commits); reviewing v2 must not report a UAF on t_copy.to_proc or t_copy.to_thread.",
+    "case_id": "cat3_binder_netlink_report_target_tmpref",
+    "category": "wrong_claim_rejected",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat3_binder_netlink_report_target_tmpref/v1.mbox",
+        "baseline_commit": "8f589c9c3be539d6c2b393c82940c3783831082f"
+      }
+    ],
+    "target_mbox": "cat3_binder_netlink_report_target_tmpref/target.mbox",
+    "baseline_commit": "8f589c9c3be539d6c2b393c82940c3783831082f",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260121145005.120507-1-cmllamas@google.com/",
+      "https://lore.kernel.org/all/20260122180203.1502637-1-cmllamas@google.com/"
+    ]
+  },
+  {
+    "Commit": "20251013-b4-ml-topic-tcpm-v2-1-63c9b2ab8a0b@pengutronix.de",
+    "subsystem": "usb/typec",
+    "problem_description": "Refuted claim: the seeded v1 Sashiko finding said that, after the lookup order is switched to call fwnode_usb_role_switch_get() first, tcpm_register_port() must test IS_ERR_OR_NULL(port->role_sw) instead of !port->role_sw before falling back to usb_role_switch_get(port->dev). That is false: fwnode_usb_role_switch_get() returns NULL when no connection exists and ERR_PTR(-EPROBE_DEFER) only when a role switch is described but not yet probed, so propagating the error defers probe correctly, while IS_ERR_OR_NULL() would overwrite -EPROBE_DEFER with the NULL from usb_role_switch_get() and lose the role switch. Upstream applied that change as 1366cd228b0c and reverted it in 6b275bfaa16b; the probe failure seen on legacy device trees was fixed in drivers/usb/roles/class.c by 8345b1539faa, and current tcpm.c has exactly this v2 code. A correct review of v2 must not re-raise the IS_ERR_OR_NULL demand.",
+    "case_id": "usb_tcpm_role_sw_errptr",
+    "category": "wrong_claim_rejected",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "usb_tcpm_role_sw_errptr/v1.mbox",
+        "baseline_commit": "e406d57be7bd2a4e73ea512c1ae36a40a44e499e",
+        "prior_findings": [
+          {
+            "patch_message_id": "20251003-b4-ml-topic-tcpm-v1-1-3cdd05588acb@pengutronix.de",
+            "part_index": 1,
+            "severity": "High",
+            "problem": "After switching the lookup order to call fwnode_usb_role_switch_get(port->connector_fwnode) first, checking !port->role_sw instead of IS_ERR_OR_NULL(port->role_sw) skips the fallback usb_role_switch_get(port->dev) whenever fwnode_usb_role_switch_get() returns an ERR_PTR.",
+            "severity_explanation": "Devices defining USB role-switch ports on the main tcpc node rather than the connector node receive an ERR_PTR from fwnode_usb_role_switch_get(), skipping the fallback lookup and failing probe.",
+            "preexisting": false
+          }
+        ]
+      }
+    ],
+    "target_mbox": "usb_tcpm_role_sw_errptr/target.mbox",
+    "baseline_commit": "e406d57be7bd2a4e73ea512c1ae36a40a44e499e",
+    "expected_behavior": "suppress_false_positive",
+    "expected_reviewer": "Sashiko",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251003-b4-ml-topic-tcpm-v1-1-3cdd05588acb@pengutronix.de/",
+      "https://lore.kernel.org/all/20251013-b4-ml-topic-tcpm-v2-1-63c9b2ab8a0b@pengutronix.de/"
+    ]
+  },
+  {
+    "Commit": "20260126-tegra_xfer-v2-1-6d2115e4f387@debian.org",
+    "subsystem": "spi/tegra210-quad",
+    "problem_description": "On v1 patch 1/6 (drivers/spi/spi-tegra210-quad.c), reviewer Usama Arif <usamaarif642@gmail.com> argued that tegra_qspi_handle_timeout() should simply abort and fail timed-out SPI transfers (and drop tqspi->lock) rather than polling QSPI_TRANS_STATUS for QSPI_RDY and completing the transfer manually. Tegra maintainer Thierry Reding <thierry.reding@gmail.com> explained from real hardware/CPU-load behavior that Tegra QSPI interrupts are pinned to CPU 0 and run in a threaded ISR (tegra_qspi_isr_thread()): under heavy CPU 0 scheduling delay, wait_for_completion_timeout() can expire in software after the QSPI controller silicon has already finished shifting the physical transaction on the bus, so treating it as a hardware failure would desynchronize driver state from the peripheral, while Vishwaroop A <va@nvidia.com> and SPI maintainer Mark Brown <broonie@debian.org> confirmed the late ISR must still return IRQ_HANDLED when QSPI_RDY was observed with !tqspi->curr_xfer. v2 retains timeout completion recovery and IRQ_HANDLED (merged as aabd8ea0aa25 with 0 Fixes: commits); reviewing v2 must defer to the maintainers' hardware explanation and not flag timeout completion recovery or IRQ_HANDLED as buggy.",
+    "case_id": "cat4a_spi_tegra_qspi_timeout",
+    "category": "authority_unverifiable",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat4a_spi_tegra_qspi_timeout/v1.mbox",
+        "baseline_commit": "63804fed149a6750ffd28610c5c1c98cce6bd377"
+      }
+    ],
+    "target_mbox": "cat4a_spi_tegra_qspi_timeout/target.mbox",
+    "baseline_commit": "63804fed149a6750ffd28610c5c1c98cce6bd377",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260116-tegra_xfer-v1-0-02d96c790619@debian.org/",
+      "https://lore.kernel.org/all/20260126-tegra_xfer-v2-0-6d2115e4f387@debian.org/"
+    ]
+  },
+  {
+    "Commit": "20260310162420.4180562-4-gutierrez.asier@huawei-partners.com",
+    "subsystem": "mm/damon",
+    "problem_description": "On v1, DAMON maintainer SeongJae Park asked to rename DAMON_HOT_HUGEPAGE to DAMON_HUGEPAGE (the author agreed), questioned the purpose of the DEFINE_DAMON_MODULES_WMARKS_PARAMS watermark parameters, flagged stale copy-pasted comments, and asked why DAMOS quota-goal auto-tuning was not used instead of the in-module min_access stepping. v2 still adds CONFIG_DAMON_HOT_HUGEPAGE, the watermark parameters, the stale comments and the custom min_access stepping.",
+    "case_id": "cat4b_mm_damon_hot_hugepage",
+    "category": "authority_unverifiable",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat4b_mm_damon_hot_hugepage/v1.mbox",
+        "baseline_commit": "26f775a054c3cda86ad465a64141894a90a9e145"
+      }
+    ],
+    "target_mbox": "cat4b_mm_damon_hot_hugepage/target.mbox",
+    "baseline_commit": "26f775a054c3cda86ad465a64141894a90a9e145",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "SeongJae Park <sj@kernel.org>",
+    "expected_prior_version": 1,
+    "expected_prior_message_ids": [
+      "20260203011020.67357-1-sj@kernel.org",
+      "20260203012304.67686-1-sj@kernel.org",
+      "20260203050440.68631-1-sj@kernel.org",
+      "20260203053446.68919-1-sj@kernel.org",
+      "20260204073133.16471-1-sj@kernel.org",
+      "20260211150902.70066-1-sj@kernel.org"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260202145650.1795854-1-gutierrez.asier@huawei-partners.com/",
+      "https://lore.kernel.org/all/20260310162420.4180562-1-gutierrez.asier@huawei-partners.com/",
+      "https://lore.kernel.org/all/20260311041114.91406-1-sj@kernel.org/",
+      "https://lore.kernel.org/all/20260311050701.91686-1-sj@kernel.org/"
+    ]
+  },
+  {
+    "Commit": "20260105-fix-ppp-power-v2-1-6924f5a41224@collabora.com",
+    "subsystem": "usb/typec/tcpm",
+    "problem_description": "In tcpm_register_port() (drivers/usb/typec/tcpm/tcpm.c), v2 changes 'if (!port->role_sw)' after fwnode_usb_role_switch_get(tcpc->fwnode) to 'if (IS_ERR_OR_NULL(port->role_sw))'. ERR_PTR(-EPROBE_DEFER) is then overwritten by usb_role_switch_get(port->dev), which returns NULL, so probe succeeds without a role switch and USB role switching is permanently broken (reverted upstream in 6b275bfaa16b). On v1, Dragan Simic endorsed the change ('using IS_ERR_OR_NULL() is the way to go') and Heikki Krogerus gave Reviewed-by; no reviewer raised the swallowed -EPROBE_DEFER.",
+    "case_id": "cat4c_usb_tcpm_role_sw_endorse",
+    "category": "authority_unverifiable",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat4c_usb_tcpm_role_sw_endorse/v1.mbox",
+        "baseline_commit": "3609fa95fb0f2c1b099e69e56634edb8fc03f87c"
+      }
+    ],
+    "target_mbox": "cat4c_usb_tcpm_role_sw_endorse/target.mbox",
+    "baseline_commit": "3609fa95fb0f2c1b099e69e56634edb8fc03f87c",
+    "expected_behavior": "detect_bug",
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251127-fix-ppp-power-v1-1-52cdd74c0ee6@collabora.com/",
+      "https://lore.kernel.org/all/20260105-fix-ppp-power-v2-1-6924f5a41224@collabora.com/"
+    ]
+  },
+  {
+    "Commit": "20260203201010.1871056-1-yosry.ahmed@linux.dev",
+    "subsystem": "kvm/x86/svm",
+    "problem_description": "On v1 (arch/x86/kvm/svm/nested.c), nested_save_pending_event_to_vmcb12() was updated to copy vcpu->arch.cr2 into vmcb12->save.cr2 when a nested #VMEXIT intercepts delivery of an injected #PF recorded in vmcb12->control.exit_int_info, prompting discussion between Yosry Ahmed <yosry.ahmed@linux.dev> and KVM x86 maintainer Sean Christopherson <seanjc@google.com> over ambiguous Intel SDM and AMD APM specification wording on whether x86 CPUs update CR2 upon #PF detection prior to vectoring vs only upon delivery (and why kvm_multiple_exception() still defers exception payload delivery while is_guest_mode(vcpu) is true). Sean Christopherson confirmed from real x86 CPU microarchitectural behavior that hardware latches CR2 when #PF is detected before IDT vectoring\u2014meaning a nested #VMEXIT during #PF vectoring exposes the updated CR2 in vmcb12->save.cr2 alongside exit_int_info, whereas pending non-injected exceptions in KVM have not yet reached architectural detection. v2 refines only the comment and commit message while keeping the exact v1 code (merged as 5c247d08bc81 with 0 Fixes: commits); reviewing v2 must not flag premature CR2 clobbering in vmcb12->save.cr2.",
+    "case_id": "cat4a_kvm_nsvm_vmcb12_cr2",
+    "category": "authority_unverifiable",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat4a_kvm_nsvm_vmcb12_cr2/v1.mbox",
+        "baseline_commit": "11439c4635edd669ae435eec308f4ab8a0804808"
+      }
+    ],
+    "target_mbox": "cat4a_kvm_nsvm_vmcb12_cr2/target.mbox",
+    "baseline_commit": "11439c4635edd669ae435eec308f4ab8a0804808",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260203011320.1314791-1-yosry.ahmed@linux.dev/",
+      "https://lore.kernel.org/all/20260203201010.1871056-1-yosry.ahmed@linux.dev/"
+    ]
+  },
+  {
+    "Commit": "20260312223157.25083-1-panchamukhi@arista.com",
+    "subsystem": "net/netfilter",
+    "problem_description": "On v1, netfilter maintainer Florian Westphal noted that this nf_conntrack_gc_scan_interval_max sysctl had been proposed twice before, that his horizon-cache suggestion was never answered, and questioned whether the GC averaging strategy could be improved instead of exposing a new tunable. v2 reposts the same sysctl design, only adding READ_ONCE() and documentation.",
+    "case_id": "cat4b_netfilter_conntrack_gc_sysctl",
+    "category": "authority_unverifiable",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat4b_netfilter_conntrack_gc_sysctl/v1.mbox",
+        "baseline_commit": "bf4afc53b77aeaa48b5409da5c8da6bb4eff7f43"
+      }
+    ],
+    "target_mbox": "cat4b_netfilter_conntrack_gc_sysctl/target.mbox",
+    "baseline_commit": "bf4afc53b77aeaa48b5409da5c8da6bb4eff7f43",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "Florian Westphal <fw@strlen.de>",
+    "expected_prior_version": 1,
+    "expected_prior_message_ids": [
+      "abKzWIhVz_SeiSOa@strlen.de"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260311194058.13860-1-panchamukhi@arista.com/",
+      "https://lore.kernel.org/all/20260312223157.25083-1-panchamukhi@arista.com/",
+      "https://lore.kernel.org/all/abNxz9T_XB-JtBCj@strlen.de/"
+    ]
+  },
+  {
+    "Commit": "20240913-rtc-isl12022-alarm-irq-v2-2-37309d939723@geanix.com",
+    "subsystem": "rtc",
+    "problem_description": "In v2 patch 2/3 (drivers/rtc/rtc-isl12022.c), isl12022_setup_irq() requests the alarm IRQ with devm_request_threaded_irq(..., IRQF_SHARED | IRQF_ONESHOT, ...), which leaves it enabled, while isl12022->irq_enabled stays false, so the first isl12022_rtc_alarm_irq_enable(dev, 1) calls enable_irq() on an already-enabled IRQ and triggers an 'Unbalanced enable for IRQ' warning (fixed upstream by 9ffe06b6ccd7). No reviewer reported this on v1.",
+    "case_id": "cat4c_rtc_isl12022_probe_irq_unbalanced",
+    "category": "authority_unverifiable",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat4c_rtc_isl12022_probe_irq_unbalanced/v1.mbox",
+        "baseline_commit": "da3ea35007d0af457a0afc87e84fddaebc4e0b63"
+      }
+    ],
+    "target_mbox": "cat4c_rtc_isl12022_probe_irq_unbalanced/target.mbox",
+    "baseline_commit": "da3ea35007d0af457a0afc87e84fddaebc4e0b63",
+    "expected_behavior": "detect_bug",
+    "lore_urls": [
+      "https://lore.kernel.org/all/20240910-rtc-isl12022-alarm-irq-v1-0-d875cedc997f@geanix.com/",
+      "https://lore.kernel.org/all/20240913-rtc-isl12022-alarm-irq-v2-0-37309d939723@geanix.com/"
+    ]
+  },
+  {
+    "Commit": "0-v2-0615cc99b88a+1ce-amdv2_geo_jgg@nvidia.com",
+    "subsystem": "iommu/amd",
+    "problem_description": "On v1 (drivers/iommu/amd/iommu.c), author Jason Gunthorpe <jgg@nvidia.com> computed domain->geometry.aperture_end for AMD IOMMU V2 (GCR3) page tables and explicitly asked AMD maintainers how undocumented silicon handles bit 47/56 canonical sign-extension on GCR3 translations. AMD IOMMU maintainer Vasant Hegde <vasant.hegde@amd.com> consulted AMD hardware architects and reported subtle, undocumented dual silicon behavior: non-PASID requests translate bit 47/56 as a raw 48/57-bit address without canonical checking, whereas PASID requests enforce x86 canonical sign-extension (bits 63:48 / 63:57 must match bit 47/56) and fail if bit 47/56 is 1 with zeroed upper bits. Because iommu_domain geometry aperture bounds must hold safely across both PASID and non-PASID attachments, v2 caps aperture_end to the lower canonical half (47/56 bits rather than 48/57 bits, merged as 8637afa79cfa with 0 Fixes: commits); reviewing v2 must not report an off-by-one shift or missing 48/57-bit VA range in aperture_end.",
+    "case_id": "cat4a_iommu_amd_v2_aperture",
+    "category": "authority_unverifiable",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat4a_iommu_amd_v2_aperture/v1.mbox",
+        "baseline_commit": "b9e53f9ff4a88f01b22524878c9a381a6c5f65ff"
+      }
+    ],
+    "target_mbox": "cat4a_iommu_amd_v2_aperture/target.mbox",
+    "baseline_commit": "b9e53f9ff4a88f01b22524878c9a381a6c5f65ff",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/0-v1-6925ece6b623+296-amdv2_geo_jgg@nvidia.com/",
+      "https://lore.kernel.org/all/0-v2-0615cc99b88a+1ce-amdv2_geo_jgg@nvidia.com/"
+    ]
+  },
+  {
+    "Commit": "20260212-page-volatile-io-v2-1-a36cb97d15c2@kernel.org",
+    "subsystem": "rust/kernel",
+    "problem_description": "On v1, Gary Guo objected that Page::read/write helpers in rust/kernel/page.rs use bindings::memcpy_toio/memcpy_fromio (MMIO accessors) on normal memory that may be mapped to userspace and that a byte-wise atomic memcpy is needed; Boqun Feng raised the same point in v1 and asked for an atomic_per_byte_memcpy() backed by bindings::memcpy. v2 adds atomic_per_byte_memcpy() in rust/kernel/sync/atomic.rs, but Page::read_bytewise_atomic/write_bytewise_atomic still call memcpy_toio/memcpy_fromio, with stale 'IO memory region' docs.",
+    "case_id": "cat4b_rust_page_memcpy_io",
+    "category": "authority_unverifiable",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat4b_rust_page_memcpy_io/v1.mbox",
+        "baseline_commit": "63804fed149a6750ffd28610c5c1c98cce6bd377"
+      }
+    ],
+    "target_mbox": "cat4b_rust_page_memcpy_io/target.mbox",
+    "baseline_commit": "63804fed149a6750ffd28610c5c1c98cce6bd377",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "Gary Guo <gary@garyguo.net>",
+    "expected_prior_version": 1,
+    "expected_prior_message_ids": [
+      "DG1ZJ1350EMS.1S1360PA496QG@garyguo.net",
+      "DG20LKAHMXMZ.262Y7NAC1A1Z9@garyguo.net",
+      "DG21IW5HZV2F.PXTH9P2IO8O7@garyguo.net",
+      "DG2WLWJD8V5W.2I24LZKS6JG6Q@garyguo.net",
+      "aX0lcVngRcRwqgd5@tardis.local",
+      "aX2tyn9nBUEKM-SN@tardis.local",
+      "aYFKbWfQmTInYy91@tardis.local"
+    ],
+    "expected_co_reviewers": [
+      "Boqun Feng <boqun@kernel.org>"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260130-page-volatile-io-v1-1-19f3d3e8f265@kernel.org/",
+      "https://lore.kernel.org/all/20260212-page-volatile-io-v2-1-a36cb97d15c2@kernel.org/",
+      "https://lore.kernel.org/all/aY4CuCtBfkWZne0d@tardis.local/"
+    ]
+  },
+  {
+    "Commit": "20250806-waveshare-v3-3-fd28e01f064f@nxp.com",
+    "subsystem": "drm/bridge",
+    "problem_description": "In v3 of the Waveshare DSI2DPI bridge driver (drivers/gpu/drm/bridge/waveshare-dsi.c), ws_bridge_probe() switched from devm_kzalloc() to devm_drm_bridge_alloc(), which returns an ERR_PTR() on failure, but still checks the result with 'if (!ws) return -ENOMEM;' instead of IS_ERR()/PTR_ERR(), so an allocation failure leads to an ERR_PTR dereference (fixed upstream in 3e6339a19cfc). No reviewer raised this in v1 or v2, where the devm_kzalloc() NULL check was correct.",
+    "case_id": "cat4c_drm_waveshare_bridge_alloc_errptr",
+    "category": "authority_unverifiable",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat4c_drm_waveshare_bridge_alloc_errptr/v1.mbox",
+        "baseline_commit": "cf9710a0a2ed490bd3c6933ecfc22556894a1df4"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat4c_drm_waveshare_bridge_alloc_errptr/v2.mbox",
+        "baseline_commit": "cf9710a0a2ed490bd3c6933ecfc22556894a1df4"
+      }
+    ],
+    "target_mbox": "cat4c_drm_waveshare_bridge_alloc_errptr/target.mbox",
+    "baseline_commit": "cf9710a0a2ed490bd3c6933ecfc22556894a1df4",
+    "expected_behavior": "detect_bug",
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250716-waveshare-v1-0-81cb03fb25a3@nxp.com/",
+      "https://lore.kernel.org/all/20250804-waveshare-v2-0-0a1b3ce92a95@nxp.com/",
+      "https://lore.kernel.org/all/20250806-waveshare-v3-0-fd28e01f064f@nxp.com/"
+    ]
+  },
+  {
+    "Commit": "20260202-jk-mgag200-fix-bad-udelay-v2-1-ce1e9665987d@intel.com",
+    "subsystem": "drm/mgag200",
+    "problem_description": "On v1 (drivers/gpu/drm/mgag200/mgag200_bmc.c), converting the busy-wait loops in mgag200_bmc_stop_scanout() to read_poll_timeout() inverted the exit polarity on undocumented MGA1064_SPAREREG / CEXTINSTS register bits ('!(tmp & 0x01)' and 'tmp & 0x02') relative to the existing driver code, and author Jacob Keller <jacob.e.keller@intel.com> offered to revert to the old bit polarity because no public BMC register spec existed in the tree. DRM maintainers Thomas Zimmermann <tzimmermann@suse.de> and Jocelyn Falempe <jfalempe@redhat.com> verified against the 1999 Matrox G200 hardware specification (CRTC vsyncsts/hsyncsts bit semantics) and live G200 BMC hardware register measurements that the legacy Xorg-era driver had inverted the poll condition all along (causing every stop_scanout call to spin until timeout) and that v1's inverted condition is the true hardware polarity. v2 retains '!(tmp & 0x01)' and 'tmp & 0x02' with commit-log explanation (merged as 0e0c8f4d16de with 0 Fixes: commits); reviewing v2 must not flag inverted read_poll_timeout() stop conditions relative to the pre-patch loops.",
+    "case_id": "cat4a_drm_mgag200_bmc_scanout",
+    "category": "authority_unverifiable",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat4a_drm_mgag200_bmc_scanout/v1.mbox",
+        "baseline_commit": "e535c23513c63f02f67e3e09e0787907029efeaf"
+      }
+    ],
+    "target_mbox": "cat4a_drm_mgag200_bmc_scanout/target.mbox",
+    "baseline_commit": "e535c23513c63f02f67e3e09e0787907029efeaf",
+    "expected_behavior": "suppress_false_positive",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260128-jk-mgag200-fix-bad-udelay-v1-1-db02e04c343d@intel.com/",
+      "https://lore.kernel.org/all/20260202-jk-mgag200-fix-bad-udelay-v2-1-ce1e9665987d@intel.com/"
+    ]
+  },
+  {
+    "Commit": "20250407-topic-ufs-use-threaded-irq-v3-3-08bee980f71e@linaro.org",
+    "subsystem": "scsi/ufs",
+    "problem_description": "v3 patch 3/3 (drivers/ufs/core/ufshcd.c) makes the hard-IRQ ufshcd_intr() call ufshcd_sl_intr() directly when MCQ and ESI are enabled, without writing the read status back to REG_INTERRUPT_STATUS as the removed loop did, so interrupt-status bits are never cleared in that mode (fixed upstream by 034d319c8899). No prior reviewer reported the missing status clear. Bart Van Assche's v1 and v2 comments concerned MCQ performance, a REG_INTERRUPT_ENABLE race and statistics; on v2 he asked for the removal of the loop around ufshcd_sl_intr() to be explained, so crediting him for v2 is acceptable but not required.",
+    "case_id": "cat5_5a_ufs_threaded_irq_v3",
+    "category": "multihop_or_routing",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat5_5a_ufs_threaded_irq_v3/v1.mbox",
+        "baseline_commit": "0af2f6be1b4281385b618cb86ad946eded089ac8"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat5_5a_ufs_threaded_irq_v3/v2.mbox",
+        "baseline_commit": "0af2f6be1b4281385b618cb86ad946eded089ac8",
+        "patchset_status": "Cancelled"
+      }
+    ],
+    "target_mbox": "cat5_5a_ufs_threaded_irq_v3/target.mbox",
+    "baseline_commit": "0af2f6be1b4281385b618cb86ad946eded089ac8",
+    "expected_behavior": "detect_bug",
+    "acceptable_attributions": [
+      {
+        "reviewer": "Bart Van Assche <bvanassche@acm.org>",
+        "version": 2,
+        "message_ids": [
+          "4a5efc8e-ec61-40c8-9b36-59e185b0fdd5@acm.org"
+        ]
+      }
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250321-topic-ufs-use-threaded-irq-v1-1-7a55816a4b1d@linaro.org/",
+      "https://lore.kernel.org/all/20250326-topic-ufs-use-threaded-irq-v2-0-7b3e8a5037e6@linaro.org/",
+      "https://lore.kernel.org/all/20250407-topic-ufs-use-threaded-irq-v3-0-08bee980f71e@linaro.org/",
+      "https://lore.kernel.org/all/31b46812-72d5-4f9d-b55d-16a6e10afe7d@acm.org/"
+    ]
+  },
+  {
+    "Commit": "20251001-vmbo-defer-v3-1-a3fe6b6ae185@google.com",
+    "subsystem": "drm/gpuvm",
+    "problem_description": "v3 patch 1/2 (drivers/gpu/drm/drm_gpuvm.c) drops the vm_bo reference in drm_gpuvm_bo_put_deferred() with plain kref_put() and only afterwards takes obj->gpuva.lock to unlink the vm_bo from the GEM's gpuva list, so a concurrent drm_gpuvm_bo_find() under that lock can find and kref_get() a zero-refcount zombie vm_bo (fixed in v4 by returning to kref_put_mutex()). v1 used kref_put_mutex(), and no reviewer on v1 or v2 reported this race.",
+    "case_id": "cat5_5a_drm_gpuvm_vmbo_defer_v3",
+    "category": "multihop_or_routing",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat5_5a_drm_gpuvm_vmbo_defer_v3/v1.mbox",
+        "baseline_commit": "b2ec5ca9d5c2c019e2316f7ba447596d1dcd8fde"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat5_5a_drm_gpuvm_vmbo_defer_v3/v2.mbox",
+        "baseline_commit": "b2ec5ca9d5c2c019e2316f7ba447596d1dcd8fde",
+        "patchset_status": "Cancelled"
+      }
+    ],
+    "target_mbox": "cat5_5a_drm_gpuvm_vmbo_defer_v3/target.mbox",
+    "baseline_commit": "b2ec5ca9d5c2c019e2316f7ba447596d1dcd8fde",
+    "expected_behavior": "detect_bug",
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250905-vmbo-defer-v1-0-7ae1a382b674@google.com/",
+      "https://lore.kernel.org/all/20250909-vmbo-defer-v2-0-9835d7349089@google.com/",
+      "https://lore.kernel.org/all/20251001-vmbo-defer-v3-0-a3fe6b6ae185@google.com/",
+      "https://lore.kernel.org/all/20250905145257.33339817@fedora/"
+    ]
+  },
+  {
+    "Commit": "20250623-nolibc-mips-n32-v3-4-6ae2d89f4259@weissschuh.net",
+    "subsystem": "tools/nolibc",
+    "problem_description": "In v3 patch 4/4 (tools/include/nolibc/arch-mips.h), the N32/N64 _NOLIBC_SYSCALL_CLOBBERLIST leaves out the 'hi' and 'lo' registers because their inclusion is keyed on '#if defined(_ABIO32)' (the ABI) instead of the ISA revision ('!defined(__mips_isa_rev) || __mips_isa_rev < 6'), so syscalls on pre-R6 MIPS64 N32/N64 targets such as mips64r2 lack the hi/lo clobbers (fixed upstream by e83b07dc8c05). No prior reviewer raised this; Sebastian Andrzej Siewior's v2 report was about the selftest Makefile's -march=mips64r6 flag.",
+    "case_id": "cat5_5b_nolibc_mips_n32_v3",
+    "category": "multihop_or_routing",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat5_5b_nolibc_mips_n32_v3/v1.mbox",
+        "baseline_commit": "eb135311083100b6590a7545618cd9760d896a86"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat5_5b_nolibc_mips_n32_v3/v2.mbox",
+        "baseline_commit": "eb135311083100b6590a7545618cd9760d896a86"
+      }
+    ],
+    "target_mbox": "cat5_5b_nolibc_mips_n32_v3/target.mbox",
+    "baseline_commit": "eb135311083100b6590a7545618cd9760d896a86",
+    "expected_behavior": "detect_bug",
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250212-nolibc-mips-n32-v1-1-6892e58d1321@weissschuh.net/",
+      "https://lore.kernel.org/all/20250225-nolibc-mips-n32-v2-0-664b47d87fa0@weissschuh.net/",
+      "https://lore.kernel.org/all/20250623-nolibc-mips-n32-v3-0-6ae2d89f4259@weissschuh.net/",
+      "https://lore.kernel.org/all/20250326205434.bPx_kVUx@breakpoint.cc/"
+    ]
+  },
+  {
+    "Commit": "20250407-tcpsendmsg-v2-2-9f0ea843ef99@debian.org",
+    "subsystem": "net/tcp",
+    "problem_description": "v2 patch 2 adds the tcp_sendmsg_locked tracepoint with a possibly-NULL 'struct sk_buff *skb' argument (guarded only inside TP_fast_assign by 'skb ? skb->len : 0') but does not add it to bpf_raw_tp_null_args[], so BPF tp_btf/raw_tp programs can dereference a NULL skb without verifier rejection. No reviewer on v1 raised this.",
+    "case_id": "cat5_5c_tcp_sendmsg_tp_v2",
+    "category": "multihop_or_routing",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat5_5c_tcp_sendmsg_tp_v2/v1.mbox",
+        "baseline_commit": "1a9239bb4253f9076b5b4b2a1a4e8d7defd77a95"
+      }
+    ],
+    "target_mbox": "cat5_5c_tcp_sendmsg_tp_v2/target.mbox",
+    "baseline_commit": "1a9239bb4253f9076b5b4b2a1a4e8d7defd77a95",
+    "expected_behavior": "detect_bug",
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250224-tcpsendmsg-v1-1-bac043c59cc8@debian.org/",
+      "https://lore.kernel.org/all/20250407-tcpsendmsg-v2-0-9f0ea843ef99@debian.org/",
+      "https://lore.kernel.org/all/559f3da9-4b3d-41c2-bf44-18329f76e937@kernel.org/"
+    ]
+  },
+  {
+    "Commit": "20240820-pmic-glink-v6-11-races-v3-1-eec53c750a04@quicinc.com",
+    "subsystem": "soc/qcom",
+    "problem_description": "On v1, Johan Hovold and Dmitry Baryshkov flagged an uninitialized spinlock, a client registration race, and a sleeping ucsi_unregister() call in atomic context. v2 (marked Cancelled as a rapid next-day respin) fixed spinlock initialization and PDR state tracking, and v3 addressed the remaining helper naming (devm_pmic_glink_client_alloc()) and Fixes: tag issues, merging cleanly (3568affcddd6..ad51126037a4) with zero downstream Fixes: commits.",
+    "case_id": "cat5_5a_pmic_glink_races_v3",
+    "category": "multihop_or_routing",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat5_5a_pmic_glink_races_v3/v1.mbox",
+        "baseline_commit": "8400291e289ee6b2bf9779ff1c83a291501f017b"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat5_5a_pmic_glink_races_v3/v2.mbox",
+        "baseline_commit": "8400291e289ee6b2bf9779ff1c83a291501f017b",
+        "patchset_status": "Cancelled"
+      }
+    ],
+    "target_mbox": "cat5_5a_pmic_glink_races_v3/target.mbox",
+    "baseline_commit": "8400291e289ee6b2bf9779ff1c83a291501f017b",
+    "expected_behavior": "suppress_false_positive",
+    "expected_reviewer": "Johan Hovold <johan@kernel.org>",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20240818-pmic-glink-v6-11-races-v1-0-f87c577e0bc9@quicinc.com/",
+      "https://lore.kernel.org/all/20240819-pmic-glink-v6-11-races-v2-0-88fe3ab1f0e2@quicinc.com/",
+      "https://lore.kernel.org/all/20240820-pmic-glink-v6-11-races-v3-0-eec53c750a04@quicinc.com/",
+      "https://lore.kernel.org/all/ZsNfkuiRK9VqBSLT@hovoldconsulting.com/"
+    ]
+  },
+  {
+    "Commit": "20260120-pci-dwc-suspend-rework-v4-2-2f32d5082549@oss.qualcomm.com",
+    "subsystem": "pci/dwc",
+    "problem_description": "On v3 [PATCH v3 0/4], Niklas Cassel (aVezfq-8bTKczYkp@ryzen) and Vincent Guittot replied directly to the 0/4 cover letter reporting POLL_COMPLIANCE link-training timeouts (-110) on Rock 5B and noirq resume -ENODEV (-19) failures on s32g399a-rdb3. v4 (5 patches) resolved both issues cleanly in dw_pcie_wait_for_link() and dw_pcie_resume_noirq(), earned Reviewed-by: Niklas Cassel, and merged with zero Fixes: commits.",
+    "case_id": "cat5_5b_pci_dwc_suspend_v4",
+    "category": "multihop_or_routing",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat5_5b_pci_dwc_suspend_v4/v1.mbox",
+        "baseline_commit": "68ac85fb42cfeb081cf029acdd8aace55ed375a2"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat5_5b_pci_dwc_suspend_v4/v2.mbox",
+        "baseline_commit": "68ac85fb42cfeb081cf029acdd8aace55ed375a2"
+      },
+      {
+        "version": 3,
+        "mbox_path": "cat5_5b_pci_dwc_suspend_v4/v3.mbox",
+        "baseline_commit": "68ac85fb42cfeb081cf029acdd8aace55ed375a2"
+      }
+    ],
+    "target_mbox": "cat5_5b_pci_dwc_suspend_v4/target.mbox",
+    "baseline_commit": "68ac85fb42cfeb081cf029acdd8aace55ed375a2",
+    "expected_behavior": "suppress_false_positive",
+    "expected_reviewer": "Niklas Cassel <cassel@kernel.org>",
+    "expected_prior_version": 3,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251119-pci-dwc-suspend-rework-v1-0-aad104828562@oss.qualcomm.com/",
+      "https://lore.kernel.org/all/20251218-pci-dwc-suspend-rework-v2-0-5a7778c6094a@oss.qualcomm.com/",
+      "https://lore.kernel.org/all/20251230-pci-dwc-suspend-rework-v3-0-40cd485714f5@oss.qualcomm.com/",
+      "https://lore.kernel.org/all/20260120-pci-dwc-suspend-rework-v4-0-2f32d5082549@oss.qualcomm.com/",
+      "https://lore.kernel.org/all/aVezfq-8bTKczYkp@ryzen/"
+    ]
+  },
+  {
+    "Commit": "20250925-hlbs_2-v3-2-3b39472776c2@altera.com",
+    "subsystem": "net/stmmac",
+    "problem_description": "On v2 (a single combined patch), Jakub Kicinski requested splitting the change into two separate commits and spelling out the HLBS and DFBS TSN acronyms. v3 split the 1-patch v2 into a 2-patch series with a cover letter (leaving patches.previous_patch_id NULL on the newly split v3 Patch 2 across drivers/net/ethernet/stmicro/stmmac/), addressed Jakub Kicinski's split and TSN documentation requests cleanly, and merged (7ce48d497475, de17376cad97) with zero Fixes: commits.",
+    "case_id": "cat5_5c_stmmac_tsn_hlbs_split_v3",
+    "category": "multihop_or_routing",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat5_5c_stmmac_tsn_hlbs_split_v3/v1.mbox",
+        "baseline_commit": "12de5f0f6c2d7aad7e60aada650fcfb374c28a5e"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat5_5c_stmmac_tsn_hlbs_split_v3/v2.mbox",
+        "baseline_commit": "12de5f0f6c2d7aad7e60aada650fcfb374c28a5e"
+      }
+    ],
+    "target_mbox": "cat5_5c_stmmac_tsn_hlbs_split_v3/target.mbox",
+    "baseline_commit": "12de5f0f6c2d7aad7e60aada650fcfb374c28a5e",
+    "expected_behavior": "suppress_false_positive",
+    "expected_reviewer": "Jakub Kicinski <kuba@kernel.org>",
+    "expected_prior_version": 2,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250911-hlbs_2-v1-1-cb655e8995b7@altera.com/",
+      "https://lore.kernel.org/all/20250915-hlbs_2-v2-1-27266b2afdd9@altera.com/",
+      "https://lore.kernel.org/all/20250925-hlbs_2-v3-0-3b39472776c2@altera.com/",
+      "https://lore.kernel.org/all/20250917153345.27598d55@kernel.org/"
+    ]
+  },
+  {
+    "Commit": "20261006-regcache-lifecycle-submit-v3-2-37bdd82fd47c@gmail.com",
+    "subsystem": "base/regmap",
+    "problem_description": "On v1, Mark Brown flagged a maple_tree hardirq spinlock lockdep inversion during regcache_exit() teardown. v2 split regmap_debugfs_exit() teardown ordering into Patch 1 and switched maple-tree destruction to mas_lock_irqsave() in Patch 2; v3 clarified the locking comment per Mark Brown and Liam Howlett and merged cleanly (834035934cef, abff0a48b110) with zero Fixes: commits.",
+    "case_id": "cat5_5a_regcache_lifecycle_v3",
+    "category": "multihop_or_routing",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat5_5a_regcache_lifecycle_v3/v1.mbox",
+        "baseline_commit": "2c3418fffa9d037b2038a6db48be63f9e2291806"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat5_5a_regcache_lifecycle_v3/v2.mbox",
+        "baseline_commit": "2c3418fffa9d037b2038a6db48be63f9e2291806"
+      }
+    ],
+    "target_mbox": "cat5_5a_regcache_lifecycle_v3/target.mbox",
+    "baseline_commit": "2c3418fffa9d037b2038a6db48be63f9e2291806",
+    "expected_behavior": "suppress_false_positive",
+    "expected_reviewer": "Mark Brown <broonie@kernel.org>",
+    "expected_prior_version": 1,
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260925-regcache-lifecycle-submit-v1-1-83b75ca79d96@gmail.com/",
+      "https://lore.kernel.org/all/20261004-regcache-lifecycle-submit-v2-0-976d405e89a7@gmail.com/",
+      "https://lore.kernel.org/all/20261006-regcache-lifecycle-submit-v3-0-37bdd82fd47c@gmail.com/",
+      "https://lore.kernel.org/all/60c791d7-10fd-4019-81c2-69057002ac83@sirena.org.uk/"
+    ]
+  },
+  {
+    "Commit": "20260223-pwrctrl-fixes-7-0-v2-1-97566dfb1809@oss.qualcomm.com",
+    "Fixed-by": "70bb843794d150db8e653c9ab288c8533da00837",
+    "subsystem": "pci/pwrctrl",
+    "problem_description": "In v2 patch 1/2, the new helper pci_pwrctrl_is_required() does 'if (of_pci_supply_present(remote)) return true;' from inside for_each_endpoint_of_node(np, endpoint) without calling of_node_put(endpoint), so the reference the iterator holds on the current endpoint node is leaked whenever a remote port parent with a supply is found. This exact code was already in v1 patch 1/2, where a seeded Sashiko review raised the leak; no human reviewer mentioned it and v2 carries the code unchanged. It was fixed upstream by 70bb843794d1 (\"PCI/pwrctrl: Fix pci_pwrctrl_is_required() device node leak\").",
+    "case_id": "seeded_pci_pwrctrl_endpoint_leak",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "seeded_pci_pwrctrl_endpoint_leak/v1.mbox",
+        "baseline_commit": "1c2b4a4c2bcb950f182eeeb33d94b565607608cf",
+        "prior_findings": [
+          {
+            "patch_message_id": "20260217-pwrctrl-fixes-7-0-v1-1-b5671e58934f@oss.qualcomm.com",
+            "part_index": 1,
+            "severity": "Low",
+            "problem": "Once the OF graph walk hits a remote port parent that has a power supply property, the function bails out with 'return true' while still inside for_each_endpoint_of_node(). That iterator gets each endpoint via of_graph_get_next_endpoint(), which takes a reference that is only released when the loop advances to the next endpoint, so leaving the loop this way never drops the reference on the matching endpoint. Every evaluation of a node that needs pwrctrl therefore leaks one device_node refcount in pci_pwrctrl_is_required(); an of_node_put(endpoint) is required before the early return.",
+            "severity_explanation": "Reference-count leak of a device_node on a probe/enumeration path; it pins the node (and its memory for dynamically created overlays) but causes no crash or data corruption.",
+            "preexisting": false
+          }
+        ]
+      }
+    ],
+    "target_mbox": "seeded_pci_pwrctrl_endpoint_leak/target.mbox",
+    "baseline_commit": "1c2b4a4c2bcb950f182eeeb33d94b565607608cf",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "Sashiko",
+    "expected_prior_version": 1,
+    "expected_prior_message_ids": [
+      "20260217-pwrctrl-fixes-7-0-v1-1-b5671e58934f@oss.qualcomm.com"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20260217-pwrctrl-fixes-7-0-v1-0-b5671e58934f@oss.qualcomm.com/",
+      "https://lore.kernel.org/all/20260217-pwrctrl-fixes-7-0-v1-1-b5671e58934f@oss.qualcomm.com/",
+      "https://lore.kernel.org/all/20260223-pwrctrl-fixes-7-0-v2-0-97566dfb1809@oss.qualcomm.com/",
+      "https://lore.kernel.org/all/20260223-pwrctrl-fixes-7-0-v2-1-97566dfb1809@oss.qualcomm.com/"
+    ]
+  },
+  {
+    "Commit": "20251208-upstream_qspi_ospi_updates-v2-1-62526c9467dc@foss.st.com",
+    "Fixed-by": "534025950c9fe4dfbe476b3938d73a26814047d1",
+    "subsystem": "spi/stm32-ospi",
+    "problem_description": "In v2 patch 1/8, stm32_ospi_probe() now handles the new error return of stm32_ospi_dma_setup() with 'ret = stm32_ospi_dma_setup(ospi, &dma_cfg); if (ret) return ret;', which skips the dma_release_channel() cleanup for the rx/tx channels that stm32_ospi_get_resources() already obtained with dma_request_chan(), so both DMA channels leak when dma_get_slave_caps() fails. The patch is identical in v1 patch 1/8, where a seeded Sashiko review raised this leak; no human reviewer commented on it. It was fixed upstream by 534025950c9f (\"spi: stm32-ospi: Fix DMA channel leak on stm32_ospi_dma_setup() failure\").",
+    "case_id": "seeded_spi_stm32_ospi_dma_leak",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "seeded_spi_stm32_ospi_dma_leak/v1.mbox",
+        "baseline_commit": "7d0a66e4bb9081d75c82ec4957c50034cb0ea449",
+        "prior_findings": [
+          {
+            "patch_message_id": "20251205-upstream_qspi_ospi_updates-v1-1-7e6c8b9f5141@foss.st.com",
+            "part_index": 1,
+            "severity": "Medium",
+            "problem": "A dma_get_slave_caps() failure on either channel now makes stm32_ospi_dma_setup() return an error, and the probe function propagates it with a plain return. By then stm32_ospi_get_resources() has already acquired dma_chrx and dma_chtx via dma_request_chan(), which is not devres-managed, and the only dma_release_channel() calls in stm32_ospi_probe() sit under the later error labels. The failed probe therefore exits still holding both DMA channels. This error should be routed through the channel-release cleanup instead of returning directly.",
+            "severity_explanation": "Resource leak on a probe error path: the DMA channels stay allocated after the driver fails to bind, so they are unavailable to a later bind attempt or other users until reboot; no memory corruption.",
+            "preexisting": false
+          }
+        ]
+      }
+    ],
+    "target_mbox": "seeded_spi_stm32_ospi_dma_leak/target.mbox",
+    "baseline_commit": "7d0a66e4bb9081d75c82ec4957c50034cb0ea449",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "Sashiko",
+    "expected_prior_version": 1,
+    "expected_prior_message_ids": [
+      "20251205-upstream_qspi_ospi_updates-v1-1-7e6c8b9f5141@foss.st.com"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20251205-upstream_qspi_ospi_updates-v1-0-7e6c8b9f5141@foss.st.com/",
+      "https://lore.kernel.org/all/20251205-upstream_qspi_ospi_updates-v1-1-7e6c8b9f5141@foss.st.com/",
+      "https://lore.kernel.org/all/20251208-upstream_qspi_ospi_updates-v2-0-62526c9467dc@foss.st.com/",
+      "https://lore.kernel.org/all/20251208-upstream_qspi_ospi_updates-v2-1-62526c9467dc@foss.st.com/"
+    ]
+  },
+  {
+    "Commit": "20250221-dev-mctp-usb-v3-2-3353030fe9cc@codeconstruct.com.au",
+    "Fixed-by": "224a0d284c3caf1951302d1744a714784febed71",
+    "subsystem": "net/mctp",
+    "problem_description": "On v1, Oliver Neukum pointed at dev->usbdev = usb_get_dev(interface_to_usbdev(intf)) in mctp_usb_probe() and asked where the matching put was. v2 only added usb_put_dev() in mctp_usb_disconnect(), so in v3 the err_free_urbs path of mctp_usb_probe() (URB allocation failure or mctp_register_netdev() failure) still calls free_netdev() without usb_put_dev(), and the USB device reference leaks on every probe failure.",
+    "case_id": "chain_net_mctp_usb_dev_ref_leak",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "chain_net_mctp_usb_dev_ref_leak/v1.mbox",
+        "baseline_commit": "7ea2745766d776866cfbc981b21ed3cfdf50124e"
+      },
+      {
+        "version": 2,
+        "mbox_path": "chain_net_mctp_usb_dev_ref_leak/v2.mbox",
+        "baseline_commit": "be1d2a1b151deb195cd9749988163aa26ad6f616"
+      }
+    ],
+    "target_mbox": "chain_net_mctp_usb_dev_ref_leak/target.mbox",
+    "baseline_commit": "be1d2a1b151deb195cd9749988163aa26ad6f616",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "Oliver Neukum <oneukum@suse.com>",
+    "expected_prior_version": 1,
+    "expected_prior_message_ids": [
+      "b78d0e25-f8cc-43af-90d8-2c7344895d55@suse.com"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20250206-dev-mctp-usb-v1-2-81453fe26a61@codeconstruct.com.au/",
+      "https://lore.kernel.org/all/b78d0e25-f8cc-43af-90d8-2c7344895d55@suse.com/",
+      "https://lore.kernel.org/all/20250212-dev-mctp-usb-v2-2-76e67025d764@codeconstruct.com.au/",
+      "https://lore.kernel.org/all/20250221-dev-mctp-usb-v3-2-3353030fe9cc@codeconstruct.com.au/"
+    ]
+  },
+  {
+    "Commit": "20250219-abhinavk-smmu-fault-handler-v3-1-aa3f0bf4434a@quicinc.com",
+    "Fixed-by": "f9d1b528219beea3f42cc75504541611e1b8ca83",
+    "subsystem": "drm/msm",
+    "problem_description": "On v2 patch 1/5, the kernel test robot's smatch report and Dan Carpenter's follow-up flagged that msm_kms_init_aspace() dereferences an ERR_PTR: when msm_gem_address_space_create() fails, the IS_ERR(aspace) branch only logs and destroys the mmu without returning, and the new msm_mmu_set_fault_handler(aspace->mmu, kms, msm_kms_fault_handler) call then dereferences the error pointer. v3 patch 1/5 (drivers/gpu/drm/msm/msm_kms.c) carries the same code unchanged (fixed upstream by f9d1b528219b, which adds 'return aspace;').",
+    "case_id": "drm_msm_kms_aspace_errptr",
+    "category": "ignored_prior_bug",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 2,
+        "mbox_path": "drm_msm_kms_aspace_errptr/v2.mbox",
+        "baseline_commit": "86313a9cd152330c634b25d826a281c6a002eb77"
+      }
+    ],
+    "target_mbox": "drm_msm_kms_aspace_errptr/target.mbox",
+    "baseline_commit": "866e43b945bf98f8e807dfa45eca92f931f3a032",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "kernel test robot <lkp@intel.com>",
+    "expected_prior_version": 2,
+    "expected_prior_message_ids": [
+      "202412232320.jOVlNH6W-lkp@intel.com",
+      "e0846cd2-c03f-44a8-9f0b-6d78b241f093@stanley.mountain"
+    ],
+    "expected_co_reviewers": [
+      "Dan Carpenter <dan.carpenter@linaro.org>"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20241217-abhinavk-smmu-fault-handler-v2-0-451377666cad@quicinc.com/",
+      "https://lore.kernel.org/all/202412232320.jOVlNH6W-lkp@intel.com/",
+      "https://lore.kernel.org/all/e0846cd2-c03f-44a8-9f0b-6d78b241f093@stanley.mountain/",
+      "https://lore.kernel.org/all/20250219-abhinavk-smmu-fault-handler-v3-1-aa3f0bf4434a@quicinc.com/"
+    ]
+  },
+  {
+    "Commit": "20250117-b4-linux-next-24-11-18-clock-multiple-power-domains-v10-4-13f2bb656dad@linaro.org",
+    "Fixed-by": "16ba98dace9e7cfe25ad8a314e34befacd91f86f",
+    "subsystem": "clk/qcom",
+    "problem_description": "Routing case: the reviewer replied to v8 patch 3/3, but the surviving defect is in patch 4/4 of the v10 target (v9 added a new 1/4, so the same logical patch was renumbered from 3/3 to 4/4). On v8 3/3 (clk: qcom: Support attaching GDSCs to multiple parents), Vladimir Zapolskiy quoted the 'ret = pm_genpd_add_subdomain(genpd, subdomain); if (ret) return ret;' loop in the new gdsc_add_subdomain_list() and wrote that pm_genpd_remove_subdomain() must be called to roll back all already-added subdomains on the error path. v9 and v10 only reworked rollback in gdsc_register() (new gdsc_pm_subdomain_remove(), covering earlier GDSCs), so in v10 4/4 gdsc_add_subdomain_list() still returns on the first pm_genpd_add_subdomain() failure, leaving the current GDSC attached as a subdomain to every power domain that came before it in pd_list. gdsc_register() then calls gdsc_pm_subdomain_remove(desc, i), which only handles GDSCs below index i, so those subdomain links leak.",
+    "case_id": "cat5_new_clk_qcom_gdsc_subdomain_rollback",
+    "category": "multihop_or_routing",
+    "mbox_archive": "versioned_mboxes.jsonl.gz",
+    "ancestor_mboxes": [
+      {
+        "version": 1,
+        "mbox_path": "cat5_new_clk_qcom_gdsc_subdomain_rollback/v1.mbox",
+        "baseline_commit": "40384c840ea1944d7c5a392e8975ed088ecf0b37"
+      },
+      {
+        "version": 2,
+        "mbox_path": "cat5_new_clk_qcom_gdsc_subdomain_rollback/v2.mbox",
+        "baseline_commit": "40384c840ea1944d7c5a392e8975ed088ecf0b37"
+      },
+      {
+        "version": 3,
+        "mbox_path": "cat5_new_clk_qcom_gdsc_subdomain_rollback/v3.mbox",
+        "baseline_commit": "40384c840ea1944d7c5a392e8975ed088ecf0b37"
+      },
+      {
+        "version": 4,
+        "mbox_path": "cat5_new_clk_qcom_gdsc_subdomain_rollback/v4.mbox",
+        "baseline_commit": "40384c840ea1944d7c5a392e8975ed088ecf0b37"
+      },
+      {
+        "version": 5,
+        "mbox_path": "cat5_new_clk_qcom_gdsc_subdomain_rollback/v5.mbox",
+        "baseline_commit": "40384c840ea1944d7c5a392e8975ed088ecf0b37"
+      },
+      {
+        "version": 6,
+        "mbox_path": "cat5_new_clk_qcom_gdsc_subdomain_rollback/v6.mbox",
+        "baseline_commit": "40384c840ea1944d7c5a392e8975ed088ecf0b37"
+      },
+      {
+        "version": 7,
+        "mbox_path": "cat5_new_clk_qcom_gdsc_subdomain_rollback/v7.mbox",
+        "baseline_commit": "40384c840ea1944d7c5a392e8975ed088ecf0b37"
+      },
+      {
+        "version": 8,
+        "mbox_path": "cat5_new_clk_qcom_gdsc_subdomain_rollback/v8.mbox",
+        "baseline_commit": "40384c840ea1944d7c5a392e8975ed088ecf0b37"
+      },
+      {
+        "version": 9,
+        "mbox_path": "cat5_new_clk_qcom_gdsc_subdomain_rollback/v9.mbox",
+        "baseline_commit": "40384c840ea1944d7c5a392e8975ed088ecf0b37"
+      }
+    ],
+    "target_mbox": "cat5_new_clk_qcom_gdsc_subdomain_rollback/target.mbox",
+    "baseline_commit": "40384c840ea1944d7c5a392e8975ed088ecf0b37",
+    "expected_behavior": "detect_with_attribution",
+    "expected_reviewer": "Vladimir Zapolskiy <vladimir.zapolskiy@linaro.org>",
+    "expected_prior_version": 8,
+    "expected_prior_message_ids": [
+      "ec2d1916-45b5-4b90-ade2-3fdc091fc0b8@linaro.org"
+    ],
+    "lore_urls": [
+      "https://lore.kernel.org/all/20241211-b4-linux-next-24-11-18-clock-multiple-power-domains-v8-3-5d93cef910a4@linaro.org/",
+      "https://lore.kernel.org/all/ec2d1916-45b5-4b90-ade2-3fdc091fc0b8@linaro.org/",
+      "https://lore.kernel.org/all/20241230-b4-linux-next-24-11-18-clock-multiple-power-domains-v9-4-f15fb405efa5@linaro.org/",
+      "https://lore.kernel.org/all/20250117-b4-linux-next-24-11-18-clock-multiple-power-domains-v10-4-13f2bb656dad@linaro.org/"
+    ]
+  }
+]

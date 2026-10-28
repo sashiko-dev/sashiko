@@ -57,7 +57,8 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `benchmark.rs`: Built-in benchmark runner, per-run database/artifact preservation, and structured AI judge telemetry (`#[cfg(feature = "server")]`).
 - `worker/`: Background workers (`bug_worker.rs`, `email.rs`, `forge.rs`, `patchwork.rs`, `repack.rs`, `sync.rs`, `prefetch.rs`, `prompts.rs`).
 - `workflow/`: Core state-machine LLM workflow engine.
-- `workflows/`: Declarative review and bug pipelines per project (`linux_patch_review.rs`, `linux_bug.rs`, `sashiko_patch_review.rs`, `qemu_patch_review.rs`), plus shared security/normalization helpers (`guard.rs`) and the review-map lineage builder (`review_map.rs`).
+- `workflows/`: Declarative review and bug pipelines per project (`linux_patch_review.rs`, `linux_bug.rs`, `sashiko_patch_review.rs`, `gcc_patch_review.rs`, `qemu_patch_review.rs`), prior-version feedback auditing (`prior_feedback.rs`), shared security/normalization helpers (`guard.rs`), and the review-map lineage builder (`review_map.rs`).
+- `authority.rs` & `prior_context.rs`: Programmatic contributor social score engine (`ContributorAuthority`) and transport-agnostic ancestor feedback context (`PriorVersionContext`).
 - `toolbox/`: Agent tools for inspecting git repositories and worktrees.
 - `ai/`: LLM provider integrations, session runner, and response caching.
 - `auth.rs` & `access.rs`: Authentication (`LocalToken`, JWTs) and capability/subsystem bug access control (`Principal`, `BugAccess`).
@@ -94,7 +95,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 
 # Benchmarking
 
-**CRITICAL RULE:** Never run the full (`benchmark.json`) or small (`benchmark_small.json`) benchmarks without an explicit human request.
+**CRITICAL RULE:** Never run the full (`benchmark.json`), small (`benchmark_small.json`), or versioned (`benchmark_versioned.json`) benchmarks without an explicit human request.
 
 See `docs/benchmarking.md` for full setup and CLI options (`sashiko benchmark <path>` or `cargo run --bin sashiko -- benchmark <path>`). Available suites in `projects/linux/benchmarks/`:
 - `benchmark.json` (999 entries, full suite)
@@ -102,6 +103,7 @@ See `docs/benchmarking.md` for full setup and CLI options (`sashiko benchmark <p
 - `benchmark_tiny.json` (9 entries, quick iteration)
 - `benchmark_missed.json` (upstream fixes for bugs missed by Sashiko after public launch)
 - `benchmark_preexisting.json` (known Linux bugs for testing the pre-existing bug pipeline)
+- `benchmark_versioned.json` (53 multi-version LKML patchset stories testing prior-version feedback verification, attribution, and suppression)
 
 # LLM Workflow Design
 

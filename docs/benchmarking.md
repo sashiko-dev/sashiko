@@ -135,6 +135,53 @@ versioned entries:
   vacuously. Such passes are counted as "suppressed with zero findings", so
   they are visible next to the suppression rate.
 
+### Versioned suite contents
+
+`benchmark_versioned.json` contains 53 entries built from real LKML
+multi-version series:
+
+| Category | Entries | `detect_with_attribution` | `detect_bug` | `detect_regression` | `suppress_false_positive` |
+|---|---:|---:|---:|---:|---:|
+| `ignored_prior_bug` | 15 | 11 | 4 | 0 | 0 |
+| `bad_advice_regression` | 8 | 0 | 0 | 8 | 0 |
+| `wrong_claim_rejected` | 11 | 0 | 0 | 0 | 11 |
+| `authority_unverifiable` | 10 | 3 | 3 | 0 | 4 |
+| `multihop_or_routing` | 9 | 1 | 4 | 0 | 4 |
+| **Total** | **53** | **15** | **11** | **8** | **19** |
+
+- **Ancestor chains:** 35 entries have one ancestor version and 16 have two.
+  `cat5_5b_pci_dwc_suspend_v4` has three, and
+  `cat5_new_clk_qcom_gdsc_subdomain_rollback` has nine (v1 to v9). In that
+  case the reviewer replied to v8 patch 3/3, and the same logical patch is
+  4/4 in the v10 target.
+- **Optional credit:** three `detect_bug` entries carry
+  `acceptable_attributions` for borderline earlier comments:
+  `ext4_journal_destroy_race` (Jan Kara, v1), `virtio_net_rss_key_align`
+  (Xuan Zhuo, v1), and `cat5_5a_ufs_threaded_irq_v3` (Bart Van Assche, v2).
+- **Synthetic cancellations:** in three entries (`cat5_5a_ufs_threaded_irq_v3`,
+  `cat5_5a_drm_gpuvm_vmbo_defer_v3`, and `cat5_5a_pmic_glink_races_v3`), the
+  intermediate v2 ancestor is marked `Cancelled`. This simulates a revision
+  that was superseded before Sashiko finished reviewing it; the real v2 was
+  reviewed upstream. The human replies to v2 are still in the fixture.
+- **Seeded Sashiko findings:** four entries seed a synthetic prior Sashiko
+  finding on v1 through `prior_findings`: `can_gs_usb_urb_anchor`,
+  `seeded_pci_pwrctrl_endpoint_leak`, `seeded_spi_stm32_ospi_dma_leak`, and
+  `usb_tcpm_role_sw_errptr`. In the two `seeded_*` entries, the seed text is
+  written independently of the ground-truth description. In
+  `can_gs_usb_urb_anchor`, the seed text is close to the description. In
+  `usb_tcpm_role_sw_errptr`, the seed is a refuted claim (upstream reverted the
+  change it asks for), and the entry tests that Sashiko does not repeat its own
+  wrong finding.
+- **Archive format:** mboxes are stored as lore threads, with transport
+  headers stripped and duplicate Message-IDs removed. Messages in legacy 8-bit
+  charsets are re-encoded as UTF-8. Target mboxes contain only the cover letter
+  and the patches, never review replies.
+
+A unit test checks every `expected_prior_message_ids` entry, and every
+`acceptable_attributions` Message-ID, against the bundled mbox for the
+credited version. The message must exist, and its `From:` address must be the
+credited reviewer or a listed co-reviewer.
+
 ## Command-line options
 
 ```
