@@ -26,7 +26,7 @@ use crate::workflows::linux_patch_review::{
     AnalysisStage, LinuxPatchReviewState, SERIES_CONTEXT_PLACEHOLDER, VERIFICATION_STAGE_NAMES,
     VerificationOutput, apply_verification_shard_output, batch_clusters_for_verification,
     effective_clusters, extra_prompt_paths_for_clusters, format_verification_shard_feedback,
-    validate_verification_shard_output,
+    render_clusters_with_untrusted_prior_context, validate_verification_shard_output,
 };
 
 /// Project-specific inputs of a verification shard stage.
@@ -54,7 +54,7 @@ const LINEAGE_RULES: &str = r#"Return ONLY a JSON object with 'findings', 'incon
   - Category 2 'inconclusive_concerns[].source_ids' may reference any contested, speculative, or promoted cluster.
   - Category 1b 'dismissed_ids' is an array of cluster ID strings (e.g. ["G2", "G4"]) for well-justified standalone dismissal clusters ONLY (clusters with empty "concerns" and concrete local proof in "dismissed_concerns"). Do NOT re-serialize dismissed_concerns objects—Rust preserves the full original dismissal records automatically from 'dismissed_ids'."#;
 
-const INCONCLUSIVE_RULE: &str = r#"- Each object in 'inconclusive_concerns' MUST use the keys: "source_ids" (non-empty array of cluster G* IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments", "dismissal_arguments", "verification_question", "preexisting" (boolean), and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION")."#;
+const INCONCLUSIVE_RULE: &str = r#"- Each object in 'inconclusive_concerns' MUST use the keys: "source_ids" (non-empty array of cluster G* IDs), "type", "description" (plain text, never use markdown backticks), "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (plain text, never use markdown backticks), "dismissal_arguments" (plain text, never use markdown backticks), "verification_question" (plain text, never use markdown backticks), "preexisting" (boolean), and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION")."#;
 
 fn shard_user_template(profile: &VerificationShardProfile) -> String {
     let series_context = if profile.wants_series_context {
@@ -90,7 +90,7 @@ pub fn verification_shard_stage(
     temperature: f32,
     effort: Option<crate::ai::EffortMode>,
 ) -> Stage<LinuxPatchReviewState, VerificationOutput> {
-    let clusters_block = serde_json::to_string_pretty(&shard_clusters).unwrap_or_default();
+    let clusters_block = render_clusters_with_untrusted_prior_context(&shard_clusters);
     let clusters_for_prompts = shard_clusters.clone();
     let clusters_for_validate = shard_clusters.clone();
     let clusters_for_reduce = shard_clusters;

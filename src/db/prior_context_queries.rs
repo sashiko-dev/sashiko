@@ -229,6 +229,22 @@ pub struct PriorContextOptions<'a> {
 }
 
 impl Database {
+    /// Returns `previous_patchset_id` for `patchset_id`, or `None` when the
+    /// patchset does not exist or is the first version in its lineage.
+    pub async fn get_previous_patchset_id(&self, patchset_id: i64) -> Result<Option<i64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT previous_patchset_id FROM patchsets WHERE id = ? LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        Ok(row.get(0)?)
+    }
+
     /// Upserts fetched Forge PR review summaries, inline diff comments, and
     /// issue comments with transparent gzip compression on `body`.
     pub async fn upsert_forge_comments(&self, comments: &[ForgeFetchedComment]) -> Result<usize> {
@@ -3762,6 +3778,7 @@ mod tests {
             "EXPLAIN QUERY PLAN SELECT message_id FROM patches WHERE message_id IN (SELECT value FROM json_each('[\"x@k.org\"]'))",
             "EXPLAIN QUERY PLAN SELECT id, body FROM messages WHERE id IN (SELECT value FROM json_each('[1, 2]'))",
             "EXPLAIN QUERY PLAN SELECT id, comment_source, remote_comment_id, in_reply_to_id, author, author_association, commit_id, file_path, line, body, html_url, created_at FROM forge_comments WHERE provider = 'github' AND repo = 'a/b' AND pr_number = 1 ORDER BY created_at ASC, id ASC",
+            "EXPLAIN QUERY PLAN SELECT review_id, patchset_id, patch_id, version, author, verdict, v_n_outcome, summary, reasoning, reference_url FROM prior_feedback_resolutions WHERE origin_kind = 'human_reviewer' AND verdict = 'still_unaddressed' AND also_found_by_sashiko = 0",
         ];
 
         for q in queries {
@@ -3884,5 +3901,154 @@ mod tests {
         assign_effective_versions(&mut curr, &mut ancestors);
         assert_eq!(ancestors[0].effective_version, u32::MAX);
         assert_eq!(curr.effective_version, u32::MAX);
+    }
+
+    #[tokio::test]
+    async fn test_prior_feedback_resolutions_and_finding_provenance_queryable() {
+        let db = setup_db().await;
+        let tid = db
+            .create_thread("cover@example.com", "[PATCH v2] net: fix leak", 1000)
+            .await
+            .unwrap();
+        insert_test_message(
+            &db,
+            "cover@example.com",
+            tid,
+            None,
+            "Author <a@example.com>",
+            "[PATCH v2] net: fix leak",
+            1000,
+            "Cover letter",
+        )
+        .await;
+        insert_test_message(
+            &db,
+            "patch1@example.com",
+            tid,
+            Some("cover@example.com"),
+            "Author <a@example.com>",
+            "[PATCH v2 1/1] net: fix leak",
+            1001,
+            "Patch body",
+        )
+        .await;
+        let ps_id = db
+            .create_patchset(
+                tid,
+                Some("cover@example.com"),
+                "patch1@example.com",
+                "[PATCH v2] net: fix leak",
+                "Author <a@example.com>",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                Some(2),
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "patch1@example.com", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await
+            .unwrap();
+
+        let attr = crate::prior_context::PriorAttribution {
+            originally_raised_by: "Oliver Neukum".to_string(),
+            originally_raised_in_version: 1,
+            origin_kind: crate::prior_context::OriginKind::HumanReviewer,
+            reference_url: Some("https://lore.kernel.org/r/hm1@suse.com".to_string()),
+            raised_by_identities: vec!["oneukum@suse.com".to_string()],
+            evidence: Vec::new(),
+            found_by: Some(crate::prior_context::FoundBy::PriorFeedback),
+            attribution_line: Some("As reported by Oliver Neukum on v1".to_string()),
+        };
+        db.create_finding_with_provenance(
+            crate::db::Finding {
+                review_id,
+                severity: crate::db::Severity::High,
+                severity_explanation: Some("Leaks usbdev ref".to_string()),
+                problem: "Missing usb_put_dev() on probe error path".to_string(),
+                preexisting: Some(false),
+                locations: None,
+            },
+            Some(&attr),
+            Some("prior_feedback"),
+        )
+        .await
+        .unwrap();
+
+        db.insert_prior_feedback_resolutions(
+            review_id,
+            ps_id,
+            Some(patch_id),
+            &[serde_json::json!({
+                "prior_id": "HM1",
+                "origin_kind": "human_reviewer",
+                "version": 1,
+                "thread_participants": ["Oliver Neukum <oneukum@suse.com>"],
+                "message_id": "hm1@suse.com",
+                "reference_url": "https://lore.kernel.org/r/hm1@suse.com",
+                "verdict": "still_unaddressed",
+                "summary": "Missing usb_put_dev() matching usb_get_dev()",
+                "reasoning": "mctp_usb_probe() still omits usb_put_dev() on error.",
+                "quote": "Taking a reference. Where is the corresponding put?",
+                "also_found_by_sashiko": false,
+                "v_n_outcome": "confirmed_finding"
+            })],
+        )
+        .await
+        .unwrap();
+
+        let mut f_rows = db
+            .conn
+            .query(
+                "SELECT originally_raised_by, originally_raised_in_version, prior_reference_url
+                 FROM findings
+                 WHERE origin_kind = 'human_reviewer' AND found_by = 'prior_feedback'",
+                (),
+            )
+            .await
+            .unwrap();
+        let f_row = f_rows.next().await.unwrap().expect("finding row");
+        assert_eq!(f_row.get::<String>(0).unwrap(), "Oliver Neukum");
+        assert_eq!(f_row.get::<i64>(1).unwrap(), 1);
+        assert_eq!(
+            f_row.get::<String>(2).unwrap(),
+            "https://lore.kernel.org/r/hm1@suse.com"
+        );
+
+        let mut r_rows = db
+            .conn
+            .query(
+                "SELECT author, summary, v_n_outcome
+                 FROM prior_feedback_resolutions
+                 WHERE origin_kind = 'human_reviewer'
+                   AND verdict = 'still_unaddressed'
+                   AND also_found_by_sashiko = 0",
+                (),
+            )
+            .await
+            .unwrap();
+        let r_row = r_rows.next().await.unwrap().expect("resolution row");
+        assert_eq!(
+            r_row.get::<String>(0).unwrap(),
+            "Oliver Neukum <oneukum@suse.com>"
+        );
+        assert_eq!(
+            r_row.get::<String>(1).unwrap(),
+            "Missing usb_put_dev() matching usb_get_dev()"
+        );
+        assert_eq!(r_row.get::<String>(2).unwrap(), "confirmed_finding");
     }
 }

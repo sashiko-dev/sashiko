@@ -44,6 +44,16 @@ pub enum OriginKind {
     AutomatedBot,
 }
 
+impl OriginKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::HumanReviewer => "human_reviewer",
+            Self::SashikoReview => "sashiko_review",
+            Self::AutomatedBot => "automated_bot",
+        }
+    }
+}
+
 /// How the current review arrived at an attributed finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +64,16 @@ pub enum FoundBy {
     PriorFeedback,
     /// Both fresh analysis and the prior-feedback audit raised it.
     Both,
+}
+
+impl FoundBy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::PriorFeedback => "prior_feedback",
+            Self::Both => "both",
+        }
+    }
 }
 
 /// Explicit provenance attached to findings that originated in `v1..v(N-1)`.

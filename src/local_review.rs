@@ -240,6 +240,7 @@ pub async fn build_review_input_from_git(
             date: Some(meta.timestamp),
             message_id: None,
             commit_id: Some(sha),
+            prior_version_context: None,
         });
     }
 
@@ -841,11 +842,13 @@ fn append_patch_inline_review(
 /// Pre-existing concerns are preserved in the payload so that daemon-spawned
 /// worker reviews can hand them to the standalone Linux bug pipeline for
 /// verification, deduplication, and database tracking.
+#[allow(clippy::too_many_arguments)]
 fn build_review_output(
     summary: String,
     findings: Vec<Value>,
     concerns: Vec<Value>,
     dismissed_concerns: Vec<Value>,
+    prior_resolutions: Vec<Value>,
     concerns_count: u64,
     dismissed_concerns_count: u64,
     review_map: Option<Value>,
@@ -855,6 +858,7 @@ fn build_review_output(
         "findings": findings,
         "concerns": concerns,
         "dismissed_concerns": dismissed_concerns,
+        "prior_resolutions": prior_resolutions,
         "concerns_count": concerns_count,
         "dismissed_concerns_count": dismissed_concerns_count
     });
@@ -1051,7 +1055,8 @@ async fn run_worker_in_worktree(
                 "diff": p.diff,
                 "commit_id": patch_shas.get(&p.index).cloned().or_else(|| p.commit_id.clone()),
                 "git_show": patch_shows.get(&p.index).cloned(),
-                "commit_message_full": patch_messages.get(&p.index).cloned()
+                "commit_message_full": patch_messages.get(&p.index).cloned(),
+                "prior_version_context": p.prior_version_context,
             })
         })
         .collect();
@@ -1126,6 +1131,7 @@ async fn run_worker_in_worktree(
     let mut combined_findings = Vec::new();
     let mut combined_concerns = Vec::new();
     let mut combined_dismissed_concerns = Vec::new();
+    let mut combined_prior_resolutions = Vec::new();
     let mut combined_inline = String::new();
     let mut combined_history = Vec::new();
     let mut combined_input_context = String::new();
@@ -1189,6 +1195,14 @@ async fn run_worker_in_worktree(
             if let Some(dismissed) = review.get("dismissed_concerns").and_then(|v| v.as_array()) {
                 combined_dismissed_concerns.extend(dismissed.clone());
             }
+            if let Some(resolutions) = review.get("prior_resolutions").and_then(|v| v.as_array()) {
+                for r in resolutions {
+                    let mut r_val = r.clone();
+                    r_val["patch_index"] = json!(p_idx);
+                    r_val["patch_subject"] = json!(patch_subject);
+                    combined_prior_resolutions.push(r_val);
+                }
+            }
 
             if let Some(cc) = review.get("concerns_count").and_then(|v| v.as_u64()) {
                 total_concerns_count = total_concerns_count.saturating_add(cc);
@@ -1240,6 +1254,7 @@ async fn run_worker_in_worktree(
         combined_findings,
         combined_concerns,
         combined_dismissed_concerns,
+        combined_prior_resolutions,
         total_concerns_count,
         total_dismissed_concerns_count,
         single_review_map,
@@ -1962,6 +1977,7 @@ mod tests {
             date: None,
             message_id: Some("some-msg-id".to_string()),
             commit_id: Some(feature_sha),
+            prior_version_context: None,
         };
 
         let mut patch_shas = HashMap::new();
@@ -2000,6 +2016,7 @@ mod tests {
             date: None,
             message_id: Some("some-msg-id".to_string()),
             commit_id: Some("0000000000000000000000000000000000000000".to_string()),
+            prior_version_context: None,
         };
 
         let mut patch_shas = HashMap::new();
@@ -2037,6 +2054,7 @@ mod tests {
             date: None,
             message_id: Some(feature_sha),
             commit_id: None,
+            prior_version_context: None,
         };
 
         let mut patch_shas = HashMap::new();
@@ -2072,6 +2090,7 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: Some("sha1".to_string()),
+            prior_version_context: None,
         };
         let p2 = PatchInput {
             index: 2,
@@ -2081,6 +2100,7 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: Some("sha2".to_string()),
+            prior_version_context: None,
         };
         let all_patches = vec![p1.clone(), p2.clone()];
         let mut patch_shas = HashMap::new();
@@ -2116,6 +2136,7 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: Some("sha1".to_string()),
+            prior_version_context: None,
         };
         let p2 = PatchInput {
             index: 2,
@@ -2125,6 +2146,7 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: Some("sha2".to_string()),
+            prior_version_context: None,
         };
         let all_patches = vec![p1.clone(), p2.clone()];
         let mut patch_shas = HashMap::new();
@@ -2227,15 +2249,18 @@ mod tests {
             vec![json!({"problem": "new regression"})],
             vec![json!({"problem": "preexisting bug"})],
             vec![],
+            vec![json!({"item_id": "PF1", "resolution": "addressed_in_vn"})],
             3,
             0,
             Some(offset_review_map_log_bounds(&single_map, 0)),
         );
 
-        // Pre-existing candidates, summary, and review_map must be preserved so daemon-spawned
-        // worker reviews store them in ai_interactions.output.
+        // Pre-existing candidates, summary, prior_resolutions, and review_map must be preserved so
+        // daemon-spawned worker reviews store them in ai_interactions.output.
         assert_eq!(output["summary"], "Adds dev-queue routing heuristic.");
         assert_eq!(output["concerns"].as_array().unwrap().len(), 1);
+        assert_eq!(output["prior_resolutions"].as_array().unwrap().len(), 1);
+        assert_eq!(output["prior_resolutions"][0]["item_id"], "PF1");
         assert_eq!(output["concerns_count"], 3);
         assert_eq!(output["findings"].as_array().unwrap().len(), 1);
         assert_eq!(output["review_map"], single_map);

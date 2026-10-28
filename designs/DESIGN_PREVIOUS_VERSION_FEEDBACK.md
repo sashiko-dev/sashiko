@@ -138,8 +138,7 @@ flowchart TD
     Verify -->|"Category 2: inconclusive_concerns[]\n(contested, speculative, or authority-dependent)"| PostVerify["post-verification-1..10 (Parallel, ToolScope::All)"]
     PostVerify --> Final
     Final --> Attribution["prior-attribution(-1..M) (ToolScope::None)\nverbatim quotes validated in Rust"]
-    Attribution --> Check["prior-attribution-check(-1..M)\nadversarial same-issue verdicts"]
-    Check --> Report["report Stage"]
+    Attribution --> Report["report Stage"]
 ```
 
 #### Stage 1a: 7 Fresh Specialist Stages (Unchanged Inputs)
@@ -182,12 +181,11 @@ flowchart TD
 - **Addressable evidence:** Every message in every `HM*` thread has a stable ref `HM<k>.<m>` (1-based message index); every prior Sashiko finding is citable as `PF<k>`. A message's *own text* is its body with `>`-quoted lines, reply attribution lines (`On ..., X wrote:`), and quote-trimming markers removed; for a `PF*` it is its `problem` and `severity_explanation`.
 - **Stage:** `prior-attribution` (`ToolScope::None`, one turn, required, `ParallelPolicy::FailFast`) runs on the final validated findings in batches of at most 10. Every batch sees the **entire** `PriorVersionContext`, so it can find the earliest version. The stage is skipped when there are no findings or no prior items. Existing `prior_source_ids` are passed only as a non-authoritative hint. Output per finding: `{"finding_id": "F1", "evidence": [{"source_ref": "HM2.3", "quote": "..."}]}`; an empty list means not previously raised.
 - **Validator (actionable retry errors):** the finding ID exists and appears exactly once; each `source_ref` exists; an `HM*` message is not by the `PatchAuthor`; the quote has at least 24 characters after whitespace normalization and is a case-insensitive substring of the cited message's own text; no ref repeats within a finding.
-- **Rust-computed `PriorAttribution`:** `originally_raised_in_version` is the minimum version among the evidence; the credited speakers are the distinct authors of the evidence at that version (Sashiko for a `PF*`); `reference_url` is the URL of the earliest evidence message; `origin_kind` follows the speaker role (`AutomatedBot` role gives `automated_bot`, a `<sashiko-outbox-*>` email or `PF*` gives `sashiko_review`, otherwise `human_reviewer`). A human who ties with Sashiko on the same version is listed alongside it and determines `origin_kind`. Any `prior_attribution` emitted by an LLM anywhere in the pipeline is stripped.
-- **Adversarial relevance check (`prior-attribution-check`):** Quote validation proves who said something, not that the message raised the same issue. A second required stage (batched like `prior-attribution`, run only when at least one finding has validated evidence, read-only Git tools allowed) receives each attributed finding (`problem`, `locations`, `severity_explanation`) and every cited evidence item (ref, version, author role, verbatim quote, and the full own text of the message). It must return exactly one verdict per `(finding, ref)` pair from `same_issue`, `different_issue`, or `insufficient`, with a one-sentence reason, and is instructed to default to rejection unless the message's own words describe the same defect in the same code. Rust keeps only `same_issue` items and recomputes the attribution with the same rules, so dropping the earliest item moves the version and dropping every item removes the attribution. Each dropped item (finding ID, ref, version, Message-ID, verdict, reason) is logged in the review output as `attribution_rejections`.
+- **Rust-computed `PriorAttribution`:** `originally_raised_in_version` is the minimum version among the evidence; the credited speaker is the earliest reporter at that version (display name only, without email address, or `"Sashiko"` for a `PF*`); `reference_url` is the URL of the earliest evidence message; `origin_kind` follows the speaker role (`AutomatedBot` role gives `automated_bot`, a `<sashiko-outbox-*>` email or `PF*` gives `sashiko_review`, otherwise `human_reviewer`); `found_by` classifies whether the finding was discovered by Sashiko's fresh specialist stages (`"fresh"`), only by the prior-feedback audit (`"prior_feedback"`), or both (`"both"`). Any `prior_attribution` emitted by an LLM anywhere in the pipeline is stripped.
 
 ---
 
-## 5. Transport-Agnostic Ingestion & Report Attribution
+## 5. Transport-Agnostic Ingestion, Report Attribution & SQLite Queryability
 
 ### 5.1 Forge PR Comment Ingestion (`src/forge.rs` & Migration `017_forge_comments.sql`)
 
@@ -195,23 +193,49 @@ To ensure the review pipeline does not depend on whether feedback came via email
 - Add `forge_comments` in SQLite storing PR review summaries (`pulls/{pr}/reviews`), inline diff comments (`pulls/{pr}/comments` with `commit_id`, `path`, `line`, `in_reply_to_id`), and top-level PR timeline comments (`issues/{pr}/comments`) fetched before a PR revision review starts.
 - Map `commit_id` / `path` to the corresponding ancestor `patch_id`, normalize author identity (resolving GitHub noreply/login to commit author email when available in the repo or PR commits), and convert into the exact same `PriorVersionContext` structs used for mailing-list `messages`.
 
-### 5.2 Explicit Attribution in `report` and `review_map`
+### 5.2 Explicit Attribution in `report`, `review_map`, and SQLite (`findings` & `prior_feedback_resolutions`)
 
 Findings with validated evidence (Section 4.2) carry Rust-computed metadata:
 ```json
 "prior_attribution": {
-  "originally_raised_by": "Jakub Kicinski <kuba@kernel.org>",
+  "originally_raised_by": "Jakub Kicinski",
   "originally_raised_in_version": 1,
   "origin_kind": "human_reviewer",
   "reference_url": "https://lore.kernel.org/r/<msgid>",
   "raised_by_identities": ["kuba@kernel.org"],
+  "found_by": "both",
+  "attribution_line": "As reported by Jakub Kicinski on v1",
   "evidence": [
     {"source_ref": "HM3.2", "version": 1, "message_id": "<msgid>", "quote": "..."}
   ]
 }
 ```
 `raised_by_identities` holds lowercase canonical emails (`"sashiko"` for prior Sashiko reviews). `evidence[].message_id` is the cited email's `Message-ID` without angle brackets (or a forge comment id); for a `PF*` it is the `Message-ID` of the ancestor patch email the prior review was attached to.
-`inline-template.md` (`linux`, `gcc`) and `github-summary-template.md` (`sashiko`) instruct `report` to cite this provenance explicitly (e.g., *"In v1, Jakub Kicinski noted that ... [1], and this error path still ..."* or *"As Sashiko noted on v1 [1], ..."*). `review_map.rs` and `static/index.html` render `prior-feedback` resolutions and `prior_attribution` badges in the Web UI.
+`inline-template.md` (`linux`, `gcc`) and `github-summary-template.md` (`sashiko`) instruct `report` to cite this provenance explicitly (e.g., *"As reported by Jakub Kicinski on v1 [1], ..."* or *"As reported by Sashiko on v1 [1], ..."*, with sequentially numbered reference links at the bottom of the email). `review_map.rs` and `static/index.html` render `prior-feedback` resolutions and `prior_attribution` badges in the Web UI.
+
+To support direct SQLite analysis of issues reported by human reviewers on `v1..v(N-1)` that Sashiko's fresh review stages missed:
+1. **`findings` columns:** `found_by` (`'fresh'`, `'prior_feedback'`, `'both'`), `origin_kind` (`'human_reviewer'`, `'automated_bot'`, `'sashiko_review'`), `originally_raised_by`, `originally_raised_in_version`, `prior_reference_url`, and `prior_attribution`.
+   ```sql
+   -- Unaddressed human-reported bugs on vN missed by Sashiko's fresh stages:
+   SELECT f.id, f.review_id, r.patchset_id, r.patch_id,
+          f.severity, f.problem, f.originally_raised_by,
+          f.originally_raised_in_version, f.prior_reference_url
+   FROM findings f
+   JOIN reviews r ON r.id = f.review_id
+   WHERE f.origin_kind = 'human_reviewer'
+     AND f.found_by = 'prior_feedback';
+   ```
+2. **`prior_feedback_resolutions` table:** Stores every audited `PF*`/`HM*` item (`review_id`, `patchset_id`, `patch_id`, `prior_id`, `origin_kind`, `version`, `author`, `message_id`, `reference_url`, `verdict`, `summary`, `reasoning`, `quote`, `also_found_by_sashiko`, `v_n_outcome`), indexed on `(origin_kind, verdict, also_found_by_sashiko)`.
+   ```sql
+   -- All human-reported bugs across v1..v(N-1) (both unaddressed and fixed in vN)
+   -- where Sashiko did not independently find the issue:
+   SELECT review_id, patchset_id, patch_id, version, author,
+          verdict, v_n_outcome, summary, reasoning, reference_url
+   FROM prior_feedback_resolutions
+   WHERE origin_kind = 'human_reviewer'
+     AND verdict IN ('still_unaddressed', 'addressed_in_vN')
+     AND also_found_by_sashiko = 0;
+   ```
 
 ---
 
