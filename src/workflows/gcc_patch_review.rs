@@ -34,15 +34,15 @@ use crate::workflows::guard::{normalize_guide_name, normalize_stage_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConsolidationStage, LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES,
     PlanningOutput, PostVerificationOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
-    VerificationOutput, append_stage_dismissed_concerns_with_prompts,
+    VERIFICATION_STAGE_NAMES, VerificationOutput, append_stage_dismissed_concerns_with_prompts,
     append_stage_items_with_prompts, apply_planning_stage_output,
     apply_post_verification_stage_output, apply_verification_stage_output,
     batch_inconclusive_concerns_by_severity, build_stage_efforts_schema, collect_stage_prompts,
-    extra_prompt_paths_for_items, extra_prompt_paths_for_state, format_planning_feedback,
-    format_post_verification_feedback, format_verification_stage_feedback,
-    has_valid_proof_location, resolve_stage_effort, validate_locations_side,
-    validate_planning_stage_efforts, validate_post_verification_batch_items,
-    validate_verification_stage_output,
+    deduplication_stage_with_effort, extra_prompt_paths_for_items, extra_prompt_paths_for_state,
+    format_planning_feedback, format_post_verification_feedback,
+    format_verification_stage_feedback, has_valid_proof_location, resolve_stage_effort,
+    validate_locations_side, validate_planning_stage_efforts,
+    validate_post_verification_batch_items, validate_verification_stage_output,
 };
 
 /// State container for a GCC patch review run.
@@ -439,6 +439,12 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
     },
 ];
 
+pub static DEDUPLICATION: ConsolidationStage = ConsolidationStage {
+    name: "deduplication",
+    short: "Deduplication",
+    wants_series_context: false,
+};
+
 pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     name: "verification",
     short: "Verification",
@@ -458,7 +464,7 @@ pub static REPORT: ConsolidationStage = ConsolidationStage {
 };
 
 pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] =
-    &[&VERIFICATION, &POST_VERIFICATION, &REPORT];
+    &[&DEDUPLICATION, &VERIFICATION, &POST_VERIFICATION, &REPORT];
 
 fn series_context_placeholder(wants: bool) -> &'static str {
     if wants {
@@ -490,6 +496,9 @@ pub fn analysis_stage_by_name(name: &str) -> Option<&'static AnalysisStage> {
 
 pub fn consolidation_stage_by_name(name: &str) -> Option<&'static ConsolidationStage> {
     let normalized = normalize_stage_name(name);
+    if VERIFICATION_STAGE_NAMES.contains(&normalized.as_str()) {
+        return Some(&VERIFICATION);
+    }
     if POST_VERIFICATION_STAGE_NAMES.contains(&normalized.as_str()) {
         return Some(&POST_VERIFICATION);
     }
@@ -875,6 +884,49 @@ pub fn resolve_analysis_stages_with_options(
     stages
 }
 
+/// Gcc inputs of the shared verification shard stage.
+pub static GCC_VERIFICATION_PROFILE:
+    crate::workflows::verification_shards::VerificationShardProfile =
+    crate::workflows::verification_shards::VerificationShardProfile {
+        stage_name: "verification",
+        instruction: STAGE_VERIFICATION_INSTRUCTION,
+        problem_rule: r#""problem" (a short naming string under 80 characters starting with a GCC component prefix like 'tree-optimization:', 'c++:', 'target:', 'middle-end:', 'rtl-optimization:', 'fortran:', 'ipa:', 'libstdc++:', 'c:', NEVER using backquotes, using fn_name() format for functions, describing the root cause)"#,
+        example_output: "",
+        wants_series_context: true,
+        system_prompt: gcc_system_prompt,
+        stage_lookup: analysis_stage_by_name,
+    };
+
+pub fn verification_shard_stage_with_effort(
+    stage_name: &'static str,
+    shard_clusters: Vec<Value>,
+    max_turns: usize,
+    temperature: f32,
+    effort: Option<crate::ai::EffortMode>,
+) -> Stage<GccPatchReviewState, VerificationOutput> {
+    crate::workflows::verification_shards::verification_shard_stage(
+        &GCC_VERIFICATION_PROFILE,
+        stage_name,
+        shard_clusters,
+        max_turns,
+        temperature,
+        effort,
+    )
+}
+
+pub fn resolve_verification_stages_with_options(
+    state: &GccPatchReviewState,
+    max_turns: usize,
+    temperature: f32,
+) -> Vec<Box<dyn ExecutableStage<GccPatchReviewState>>> {
+    crate::workflows::verification_shards::resolve_verification_stages(
+        &GCC_VERIFICATION_PROFILE,
+        state,
+        max_turns,
+        temperature,
+    )
+}
+
 pub fn verification_stage(
     max_turns: usize,
     temperature: f32,
@@ -1159,7 +1211,15 @@ pub fn build_gcc_patch_review_workflow_with_effort(
             "No concerns or dismissed concerns raised in initial analysis stages",
         )
         .dynamic_parallel(
-            verification_stage_with_effort(stage_max_turns, temperature, effort),
+            deduplication_stage_with_effort(temperature, effort),
+            move |state| {
+                resolve_verification_stages_with_options(state, stage_max_turns, temperature)
+            },
+            // A failed verification shard aborts the review instead of
+            // silently dropping its clusters.
+            ParallelPolicy::FailFast,
+        )
+        .resolved_parallel(
             move |state| {
                 resolve_post_verification_stages_with_options(state, stage_max_turns, temperature)
             },
@@ -1438,6 +1498,7 @@ In check_def(), gimple_bb(def_stmt) returns NULL for default definitions.
                 }),
             ],
             inconclusive_concerns: vec![],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![json!({
                 "description": "Verified dismissal",
                 "reasoning": "Guarded locally",

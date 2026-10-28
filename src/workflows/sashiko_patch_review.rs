@@ -29,15 +29,15 @@ use crate::workflows::guard::{normalize_guide_name, normalize_stage_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConsolidationStage, LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES,
     PlanningOutput, PostVerificationOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
-    VerificationOutput, append_stage_dismissed_concerns_with_prompts,
+    VERIFICATION_STAGE_NAMES, VerificationOutput, append_stage_dismissed_concerns_with_prompts,
     append_stage_items_with_prompts, apply_planning_stage_output,
     apply_post_verification_stage_output, apply_verification_stage_output,
     batch_inconclusive_concerns_by_severity, build_stage_efforts_schema, collect_stage_prompts,
-    extra_prompt_paths_for_items, extra_prompt_paths_for_state, format_planning_feedback,
-    format_post_verification_feedback, format_verification_stage_feedback,
-    has_valid_proof_location, resolve_stage_effort, validate_locations_side,
-    validate_planning_stage_efforts, validate_post_verification_batch_items,
-    validate_verification_stage_output,
+    deduplication_stage_with_effort, extra_prompt_paths_for_items, extra_prompt_paths_for_state,
+    format_planning_feedback, format_post_verification_feedback,
+    format_verification_stage_feedback, has_valid_proof_location, resolve_stage_effort,
+    validate_locations_side, validate_planning_stage_efforts,
+    validate_post_verification_batch_items, validate_verification_stage_output,
 };
 
 /// State container for a Sashiko patch review run.
@@ -453,6 +453,12 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
     },
 ];
 
+pub static DEDUPLICATION: ConsolidationStage = ConsolidationStage {
+    name: "deduplication",
+    short: "Deduplication",
+    wants_series_context: false,
+};
+
 pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     name: "verification",
     short: "Verification",
@@ -477,8 +483,13 @@ pub static SUMMARY: ConsolidationStage = ConsolidationStage {
     wants_series_context: false,
 };
 
-pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] =
-    &[&VERIFICATION, &POST_VERIFICATION, &REPORT, &SUMMARY];
+pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] = &[
+    &DEDUPLICATION,
+    &VERIFICATION,
+    &POST_VERIFICATION,
+    &REPORT,
+    &SUMMARY,
+];
 
 fn series_context_placeholder(wants: bool) -> &'static str {
     if wants {
@@ -510,6 +521,9 @@ pub fn analysis_stage_by_name(name: &str) -> Option<&'static AnalysisStage> {
 
 pub fn consolidation_stage_by_name(name: &str) -> Option<&'static ConsolidationStage> {
     let normalized = normalize_stage_name(name);
+    if VERIFICATION_STAGE_NAMES.contains(&normalized.as_str()) {
+        return Some(&VERIFICATION);
+    }
     if POST_VERIFICATION_STAGE_NAMES.contains(&normalized.as_str()) {
         return Some(&POST_VERIFICATION);
     }
@@ -942,6 +956,49 @@ pub fn resolve_analysis_stages_with_options(
     stages
 }
 
+/// Sashiko inputs of the shared verification shard stage.
+pub static SASHIKO_VERIFICATION_PROFILE:
+    crate::workflows::verification_shards::VerificationShardProfile =
+    crate::workflows::verification_shards::VerificationShardProfile {
+        stage_name: "verification",
+        instruction: STAGE_VERIFICATION_INSTRUCTION,
+        problem_rule: r#""problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes)"#,
+        example_output: "",
+        wants_series_context: true,
+        system_prompt: sashiko_system_prompt,
+        stage_lookup: analysis_stage_by_name,
+    };
+
+pub fn verification_shard_stage_with_effort(
+    stage_name: &'static str,
+    shard_clusters: Vec<Value>,
+    max_turns: usize,
+    temperature: f32,
+    effort: Option<crate::ai::EffortMode>,
+) -> Stage<SashikoPatchReviewState, VerificationOutput> {
+    crate::workflows::verification_shards::verification_shard_stage(
+        &SASHIKO_VERIFICATION_PROFILE,
+        stage_name,
+        shard_clusters,
+        max_turns,
+        temperature,
+        effort,
+    )
+}
+
+pub fn resolve_verification_stages_with_options(
+    state: &SashikoPatchReviewState,
+    max_turns: usize,
+    temperature: f32,
+) -> Vec<Box<dyn ExecutableStage<SashikoPatchReviewState>>> {
+    crate::workflows::verification_shards::resolve_verification_stages(
+        &SASHIKO_VERIFICATION_PROFILE,
+        state,
+        max_turns,
+        temperature,
+    )
+}
+
 pub fn verification_stage(
     max_turns: usize,
     temperature: f32,
@@ -1277,8 +1334,15 @@ pub fn build_sashiko_patch_review_workflow_with_effort(
             move |state| resolve_analysis_stages_with_options(state, max_turns, temperature),
             ParallelPolicy::BestEffort,
         )
+        // Verification shards are the only path from a candidate cluster to
+        // a finding, so a failed shard aborts the review instead of silently
+        // dropping its clusters.
         .dynamic_parallel(
-            verification_stage_with_effort(max_turns, temperature, effort),
+            deduplication_stage_with_effort(temperature, effort),
+            move |state| resolve_verification_stages_with_options(state, max_turns, temperature),
+            ParallelPolicy::FailFast,
+        )
+        .resolved_parallel(
             move |state| {
                 resolve_post_verification_stages_with_options(state, max_turns, temperature)
             },
@@ -1478,7 +1542,7 @@ mod tests {
     fn test_build_sashiko_patch_review_workflow() {
         let wf = build_sashiko_patch_review_workflow();
         assert_eq!(wf.name, "sashiko_patch_review");
-        assert_eq!(wf.steps.len(), 4);
+        assert_eq!(wf.steps.len(), 5);
         assert_eq!(
             planning_stage_with_effort(1.0, None).policy.temperature,
             1.0

@@ -25,6 +25,7 @@ pub mod notes_corpus;
 pub mod qemu_patch_review;
 pub mod review_map;
 pub mod sashiko_patch_review;
+pub mod verification_shards;
 
 /// Returns the short UI label for a review stage belonging to `project`.
 pub fn stage_short_label(project: ProjectId, stage: &str) -> Option<&'static str> {
@@ -135,19 +136,27 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
     }
 }
 
-/// Replaces the `"post-verification"` placeholder in `planned_stages` with the
-/// concrete `post-verification-*` stages resolved after `verification` (which
-/// may be empty when no inconclusive concerns exist, or up to 10 stages when inconclusive concerns
-/// fan out in parallel).
+/// Replaces a dynamic consolidation placeholder (`"verification"` or
+/// `"post-verification"`) in `planned_stages` with the concrete stages
+/// resolved at runtime (for example `"verification-1..M"` when verification
+/// shards >10 candidate clusters, or 0..=10 `"post-verification-*"` stages).
 pub fn refine_planned_stages_with_post_verification(
     planned_stages: &[String],
-    post_verification_stages: &[&'static str],
+    resolved_stages: &[&'static str],
 ) -> Vec<String> {
+    let target_placeholder = if resolved_stages
+        .first()
+        .is_some_and(|name| name.starts_with(linux_patch_review::VERIFICATION.name))
+    {
+        linux_patch_review::VERIFICATION.name
+    } else {
+        linux_patch_review::POST_VERIFICATION.name
+    };
     let mut updated =
-        Vec::with_capacity(planned_stages.len().saturating_sub(1) + post_verification_stages.len());
+        Vec::with_capacity(planned_stages.len().saturating_sub(1) + resolved_stages.len());
     for stage in planned_stages {
-        if stage == linux_patch_review::POST_VERIFICATION.name {
-            updated.extend(post_verification_stages.iter().map(|s| (*s).to_string()));
+        if stage == target_placeholder {
+            updated.extend(resolved_stages.iter().map(|s| (*s).to_string()));
         } else {
             updated.push(stage.clone());
         }

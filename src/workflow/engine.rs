@@ -220,6 +220,26 @@ impl WorkflowEngine {
                     }
                 }
 
+                WorkflowStep::ResolvedParallel { resolver, policy } => {
+                    let dynamic_stages = resolver(state);
+                    if let Some(cb) = event_cb {
+                        cb(WorkflowEvent::ParallelResolved {
+                            stage_names: dynamic_stages.iter().map(|s| s.name()).collect(),
+                        });
+                    }
+                    if !dynamic_stages.is_empty() {
+                        execute_parallel_batch(
+                            &dynamic_stages,
+                            *policy,
+                            env,
+                            state,
+                            event_cb,
+                            outcome,
+                        )
+                        .await?;
+                    }
+                }
+
                 WorkflowStep::Branch {
                     condition,
                     then_flow,
@@ -335,6 +355,7 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
 
             let mut successes = 0usize;
             let mut first_error = None;
+            let mut required_error = None;
 
             for (stage, res) in stages.iter().zip(results) {
                 match res {
@@ -350,7 +371,14 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                             err
                         );
                         record_stage_outcome(outcome, stage.name(), stage_outcome_from_error(&err));
-                        if first_error.is_none() {
+                        if stage.is_required() {
+                            if required_error.is_none() {
+                                required_error = Some(err.context(format!(
+                                    "Required parallel stage '{}' failed",
+                                    stage.name()
+                                )));
+                            }
+                        } else if first_error.is_none() {
                             first_error = Some(err.context(format!(
                                 "All {} parallel stages failed under BestEffort policy (first failure in stage '{}')",
                                 stages.len(),
@@ -361,6 +389,9 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                 }
             }
 
+            if let Some(err) = required_error {
+                return Err(err);
+            }
             if !stages.is_empty()
                 && successes == 0
                 && let Some(err) = first_error
@@ -634,6 +665,55 @@ mod tests {
         assert!(!outcome.stage_runs[1].skipped);
         assert_eq!(outcome.stage_runs[1].history_start, 1);
         assert_eq!(outcome.stage_runs[1].history_end, 3);
+    }
+
+    #[tokio::test]
+    async fn test_workflow_best_effort_required_stage_failure_aborts() {
+        let provider = Arc::new(MockProvider::queued(vec![
+            "__ERROR__".to_string(),
+            r#"{"items": ["concern_ok"]}"#.to_string(),
+        ]));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+        let workflow = Workflow::builder("best_effort_required")
+            .parallel(
+                vec![
+                    Box::new(
+                        Stage::builder("stage_required")
+                            .user_prompt(PromptTemplate::new("Fail"))
+                            .output_format(OutputFormat::json())
+                            .required()
+                            .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                                s.concerns.extend(out.items);
+                            })
+                            .build(),
+                    ),
+                    Box::new(
+                        Stage::builder("stage_ok")
+                            .user_prompt(PromptTemplate::new("Succeed"))
+                            .output_format(OutputFormat::json())
+                            .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                                s.concerns.extend(out.items);
+                            })
+                            .build(),
+                    ),
+                ],
+                ParallelPolicy::BestEffort,
+            )
+            .build();
+
+        let err = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+            .await
+            .expect_err("a failed required stage must abort a BestEffort batch");
+        assert!(format!("{err:#}").contains("stage_required"));
     }
 
     #[tokio::test]
@@ -929,5 +1009,107 @@ mod tests {
         assert_eq!(wf.outcome.stage_runs[1].name, "stage_fail");
         assert_eq!(wf.outcome.tokens_in, 40);
         assert_eq!(wf.outcome.tokens_out, 20);
+    }
+
+    #[tokio::test]
+    async fn test_workflow_resolved_parallel_after_dynamic_parallel() {
+        let provider = Arc::new(MockProvider::queued(vec![
+            r#"{"stages": [1]}"#.to_string(),
+            r#"{"items": ["from_dyn"]}"#.to_string(),
+            r#"{"items": ["from_res_1"]}"#.to_string(),
+            r#"{"items": ["from_res_2"]}"#.to_string(),
+        ]));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+        let workflow = Workflow::builder("resolved_parallel_flow")
+            .dynamic_parallel(
+                Stage::builder("planner")
+                    .user_prompt(PromptTemplate::new("Plan"))
+                    .output_format(OutputFormat::json())
+                    .reduce(|s: &mut DummyState, out: DummyPlanningOutput| {
+                        s.selected_stages = out.stages;
+                    })
+                    .build(),
+                |s: &DummyState| {
+                    s.selected_stages
+                        .iter()
+                        .map(|idx| {
+                            let name = match *idx {
+                                1 => "dyn_1",
+                                _ => "dyn_other",
+                            };
+                            Box::new(
+                                Stage::builder(name)
+                                    .user_prompt(PromptTemplate::new("Dyn"))
+                                    .output_format(OutputFormat::json())
+                                    .reduce(|st: &mut DummyState, out: DummyConcernsOutput| {
+                                        st.concerns.extend(out.items);
+                                    })
+                                    .build(),
+                            )
+                                as Box<dyn crate::workflow::stage::ExecutableStage<DummyState>>
+                        })
+                        .collect()
+                },
+                ParallelPolicy::BestEffort,
+            )
+            .resolved_parallel(
+                |s: &DummyState| {
+                    if s.concerns.is_empty() {
+                        return Vec::new();
+                    }
+                    vec![
+                        Box::new(
+                            Stage::builder("res_1")
+                                .user_prompt(PromptTemplate::new("Res 1"))
+                                .output_format(OutputFormat::json())
+                                .reduce(|st: &mut DummyState, out: DummyConcernsOutput| {
+                                    st.findings.extend(out.items);
+                                })
+                                .build(),
+                        ),
+                        Box::new(
+                            Stage::builder("res_2")
+                                .user_prompt(PromptTemplate::new("Res 2"))
+                                .output_format(OutputFormat::json())
+                                .reduce(|st: &mut DummyState, out: DummyConcernsOutput| {
+                                    st.findings.extend(out.items);
+                                })
+                                .build(),
+                        ),
+                    ]
+                },
+                ParallelPolicy::BestEffort,
+            )
+            .build();
+
+        let resolved_batches = std::sync::Mutex::new(Vec::new());
+        let record = |event: WorkflowEvent| {
+            if let WorkflowEvent::ParallelResolved { stage_names } = event {
+                resolved_batches.lock().unwrap().push(stage_names);
+            }
+        };
+
+        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, Some(&record))
+            .await
+            .unwrap();
+        assert!(!outcome.early_exit);
+        assert_eq!(state.concerns, vec!["from_dyn"]);
+        assert_eq!(state.findings, vec!["from_res_1", "from_res_2"]);
+        assert_eq!(
+            *resolved_batches.lock().unwrap(),
+            vec![
+                vec!["dyn_1".to_string()],
+                vec!["res_1".to_string(), "res_2".to_string()],
+            ]
+        );
     }
 }

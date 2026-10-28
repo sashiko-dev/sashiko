@@ -6112,15 +6112,16 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         vIds.forEach(vid => {
                             const vf = vfById.get(String(vid));
                             if (!vf) return;
+                            const vStage = String(vf.verification_stage || 'verification');
                             if (Array.isArray(vf.locations) && vf.locations.length > 0) primaryLocations = vf.locations;
                             historySteps.push(`
                                 <div style="margin-top:8px;">
                                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
                                         <span>
-                                            <span class="tag">verification</span>
+                                            <span class="tag">${escapeHtml(vStage)}</span>
                                             <span class="text-muted-sm">Verified</span>
                                         </span>
-                                        ${renderStageLogLink('verification')}
+                                        ${renderStageLogLink(vStage)}
                                     </div>
                                     ${vf.severity_explanation ? `<div class="log-inline-block">${escapeHtml(String(vf.severity_explanation))}</div>` : ''}
                                 </div>
@@ -6130,15 +6131,16 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         vIds.forEach(vid => {
                             const vd = vdById.get(String(vid));
                             if (!vd) return;
+                            const vStage = String(vd.verification_stage || 'verification');
                             if (Array.isArray(vd.locations) && vd.locations.length > 0) primaryLocations = vd.locations;
                             historySteps.push(`
                                 <div style="margin-top:8px;">
                                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
                                         <span>
-                                            <span class="tag">verification</span>
+                                            <span class="tag">${escapeHtml(vStage)}</span>
                                             <span class="text-muted-sm">Dismissed</span>
                                         </span>
-                                        ${renderStageLogLink('verification')}
+                                        ${renderStageLogLink(vStage)}
                                     </div>
                                     ${vd.reasoning ? `<div class="log-inline-block">${escapeHtml(String(vd.reasoning))}</div>` : ''}
                                 </div>
@@ -6150,6 +6152,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         vIds.forEach(iid => {
                             const ic = icById.get(String(iid));
                             if (!ic) return;
+                            const vStage = String(ic.verification_stage || 'verification');
                             if (Array.isArray(ic.locations) && ic.locations.length > 0) primaryLocations = ic.locations;
                             // For a single uncontested raw concern (1 C*, 0 D*, empty dismissal_arguments),
                             // the raw stage's full reasoning is already shown in the step immediately above;
@@ -6173,10 +6176,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                 <div style="margin-top:8px;">
                                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
                                         <span>
-                                            <span class="tag">verification</span>
+                                            <span class="tag">${escapeHtml(vStage)}</span>
                                             <span class="text-muted-sm">Escalated${t.post_verification_id ? ` to <code>${escapeHtml(pvStage)}</code>` : ''} &mdash; verification question</span>
                                         </span>
-                                        ${renderStageLogLink('verification')}
+                                        ${renderStageLogLink(vStage)}
                                     </div>
                                     ${icBody ? `<div class="log-inline-block">${escapeHtml(icBody)}</div>` : ''}
                                 </div>
@@ -6285,6 +6288,14 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             const dCount = s.dismissed_count || 0;
                             if (cCount > 0) outputParts.push(`${cCount} confirmed`);
                             if (dCount > 0) outputParts.push(`${dCount} dismissed`);
+                        } else if (String(s.name || '').startsWith('verification-')) {
+                            const cCount = s.concerns_count || 0;
+                            const dCount = s.dismissed_count || 0;
+                            if (cCount > 0) outputParts.push(`${cCount} kept`);
+                            if (dCount > 0) outputParts.push(`${dCount} dismissed`);
+                        } else if (s.name === 'deduplication') {
+                            const cCount = s.concerns_count || 0;
+                            if (cCount > 0) outputParts.push(`${cCount} ${cCount === 1 ? 'cluster' : 'clusters'}`);
                         } else {
                             const cCount = s.concerns_count || 0;
                             const dCount = s.dismissed_count || 0;
