@@ -143,6 +143,31 @@ impl ForgeWorker {
             .filter(|s| !s.is_empty())
     }
 
+    /// Fetches GitHub PR reviews, inline review comments, and issue comments
+    /// for `(repo, pr_number)` and upserts them into `forge_comments`.
+    pub async fn sync_pr_feedback(&self, repo: &str, pr_number: i64) -> Result<usize, String> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+        let token = self.resolve_optional_token(&client).await;
+        let comments = crate::forge::fetch_github_pr_feedback(
+            &client,
+            &self.api_base,
+            repo,
+            pr_number,
+            token.as_deref(),
+            self.settings.bot_login.as_deref(),
+        )
+        .await?;
+        let count = comments.len();
+        self.db
+            .upsert_forge_comments(&comments)
+            .await
+            .map_err(|e| format!("failed to upsert forge comments: {e}"))?;
+        Ok(count)
+    }
+
     pub async fn resolve_polled_github_repos(&self) -> Vec<String> {
         if self
             .settings

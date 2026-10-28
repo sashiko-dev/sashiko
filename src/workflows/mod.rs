@@ -22,6 +22,8 @@ pub mod linux_bug;
 pub mod linux_patch_review;
 pub mod notes_agenda;
 pub mod notes_corpus;
+pub mod prior_attribution;
+pub mod prior_feedback;
 pub mod qemu_patch_review;
 pub mod review_map;
 pub mod sashiko_patch_review;
@@ -76,7 +78,10 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
         ProjectId::Linux => {
             let mut planned: Vec<String> = stage_names
                 .iter()
-                .filter(|n| linux_patch_review::analysis_stage_by_name(n).is_some())
+                .filter(|n| {
+                    linux_patch_review::analysis_stage_by_name(n).is_some()
+                        || prior_feedback::is_prior_feedback_stage_name(n)
+                })
                 .map(|n| n.to_string())
                 .collect();
             if !planned.is_empty() {
@@ -91,7 +96,10 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
         ProjectId::Sashiko => {
             let mut planned: Vec<String> = stage_names
                 .iter()
-                .filter(|n| sashiko_patch_review::analysis_stage_by_name(n).is_some())
+                .filter(|n| {
+                    sashiko_patch_review::analysis_stage_by_name(n).is_some()
+                        || prior_feedback::is_prior_feedback_stage_name(n)
+                })
                 .map(|n| n.to_string())
                 .collect();
             if !planned.is_empty() {
@@ -106,7 +114,10 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
         ProjectId::Gcc => {
             let mut planned: Vec<String> = stage_names
                 .iter()
-                .filter(|n| gcc_patch_review::analysis_stage_by_name(n).is_some())
+                .filter(|n| {
+                    gcc_patch_review::analysis_stage_by_name(n).is_some()
+                        || prior_feedback::is_prior_feedback_stage_name(n)
+                })
                 .map(|n| n.to_string())
                 .collect();
             if !planned.is_empty() {
@@ -144,6 +155,24 @@ pub fn refine_planned_stages_with_post_verification(
     planned_stages: &[String],
     resolved_stages: &[&'static str],
 ) -> Vec<String> {
+    if resolved_stages
+        .first()
+        .is_some_and(|name| prior_attribution::is_prior_attribution_stage_name(name))
+    {
+        // `prior-attribution` has no placeholder: it runs only when there
+        // are findings and prior context, so its batches are inserted ahead
+        // of the report stages once resolved.
+        let insert_at = planned_stages
+            .iter()
+            .position(|s| s == "report" || s == "summary")
+            .unwrap_or(planned_stages.len());
+        let mut updated = planned_stages.to_vec();
+        updated.splice(
+            insert_at..insert_at,
+            resolved_stages.iter().map(|s| (*s).to_string()),
+        );
+        return updated;
+    }
     let target_placeholder = if resolved_stages
         .first()
         .is_some_and(|name| name.starts_with(linux_patch_review::VERIFICATION.name))

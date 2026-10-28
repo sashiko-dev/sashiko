@@ -32,6 +32,8 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 #[cfg(feature = "server")]
+mod patch_lineage;
+#[cfg(feature = "server")]
 mod prior_context_queries;
 #[cfg(feature = "server")]
 pub use prior_context_queries::PriorContextOptions;
@@ -3198,6 +3200,19 @@ impl Database {
         finding: Finding,
         prior_attribution: Option<&crate::prior_context::PriorAttribution>,
     ) -> Result<()> {
+        let found_by = prior_attribution
+            .and_then(|attr| attr.found_by)
+            .map(|fb| fb.as_str());
+        self.create_finding_with_provenance(finding, prior_attribution, found_by)
+            .await
+    }
+
+    pub async fn create_finding_with_provenance(
+        &self,
+        finding: Finding,
+        prior_attribution: Option<&crate::prior_context::PriorAttribution>,
+        found_by: Option<&str>,
+    ) -> Result<()> {
         let (claim_ps_id, claim_gen) = self.claim_params();
         let val = finding.preexisting.map(|b| if b { 1 } else { 0 });
         let locations_val = finding
@@ -3205,10 +3220,26 @@ impl Database {
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
         let attribution_val = prior_attribution.and_then(|attr| serde_json::to_string(attr).ok());
+        let found_by_val = found_by
+            .or_else(|| {
+                prior_attribution
+                    .and_then(|attr| attr.found_by)
+                    .map(|fb| fb.as_str())
+            })
+            .map(str::to_string);
+        let origin_kind_val = prior_attribution.map(|attr| attr.origin_kind.as_str().to_string());
+        let raised_by_val = prior_attribution.map(|attr| attr.originally_raised_by.clone());
+        let raised_in_version_val =
+            prior_attribution.map(|attr| i64::from(attr.originally_raised_in_version));
+        let reference_url_val = prior_attribution.and_then(|attr| attr.reference_url.clone());
         let inserted = self
             .execute(
-                "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations, prior_attribution)
-                 SELECT ?, ?, ?, ?, ?, ?, ?
+                "INSERT INTO findings (
+                    review_id, severity, severity_explanation, problem, preexisting,
+                    locations, prior_attribution, found_by, origin_kind,
+                    originally_raised_by, originally_raised_in_version, prior_reference_url
+                 )
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                  FROM reviews
                  WHERE id = ?
                    AND COALESCE(status, '') != 'Cancelled'
@@ -3234,6 +3265,11 @@ impl Database {
                     val,
                     locations_val,
                     attribution_val,
+                    found_by_val,
+                    origin_kind_val,
+                    raised_by_val,
+                    raised_in_version_val,
+                    reference_url_val,
                     finding.review_id,
                     claim_ps_id,
                     claim_ps_id,
@@ -3246,6 +3282,180 @@ impl Database {
                 "review {} no longer exists for finding insertion",
                 finding.review_id
             );
+        }
+        Ok(())
+    }
+
+    pub async fn insert_prior_feedback_resolutions(
+        &self,
+        review_id: i64,
+        patchset_id: i64,
+        patch_id: Option<i64>,
+        resolutions: &[serde_json::Value],
+    ) -> Result<()> {
+        if resolutions.is_empty() {
+            return Ok(());
+        }
+        let (claim_ps_id, claim_gen) = self.claim_params();
+        let tx_guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.begin_immediate_transaction().await?)
+        };
+        let tx_db = match tx_guard.as_ref() {
+            Some(tx) => self.with_connection((**tx).clone()),
+            None => self.with_connection(self.conn.clone()),
+        };
+
+        tx_db
+            .execute(
+                "DELETE FROM prior_feedback_resolutions
+                  WHERE review_id = ?
+                    AND EXISTS (
+                        SELECT 1 FROM reviews
+                         WHERE reviews.id = ?
+                           AND COALESCE(reviews.status, '') != 'Cancelled'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM patchsets ps
+                                WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                           )
+                           AND (? IS NULL OR (
+                               reviews.patchset_id = ?
+                               AND EXISTS (
+                                   SELECT 1 FROM patchsets ps_claim
+                                   JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                                   WHERE ps_claim.id = reviews.patchset_id
+                                     AND ps_claim.status = 'In Review'
+                                     AND CAST(m_claim.value AS INTEGER) = ?
+                               )
+                           ))
+                    )",
+                libsql::params![
+                    review_id,
+                    review_id,
+                    claim_ps_id,
+                    claim_ps_id,
+                    claim_gen,
+                ],
+            )
+            .await?;
+
+        for res in resolutions {
+            let prior_id = res
+                .get("prior_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if prior_id.is_empty() {
+                continue;
+            }
+            let origin_kind = res.get("origin_kind").and_then(|v| v.as_str()).unwrap_or(
+                if prior_id.starts_with("PF") {
+                    "sashiko_review"
+                } else {
+                    "human_reviewer"
+                },
+            );
+            let version = res
+                .get("version")
+                .and_then(|v| v.as_i64())
+                .filter(|&v| v > 0);
+            let author = res
+                .get("thread_participants")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let message_id = res
+                .get("message_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let reference_url = res
+                .get("reference_url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let verdict = res
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let summary = res
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let reasoning = res
+                .get("reasoning")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let quote = res
+                .get("quote")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let also_found = i64::from(
+                res.get("also_found_by_sashiko")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            );
+            let v_n_outcome = res
+                .get("v_n_outcome")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let inserted = tx_db
+                .execute(
+                    "INSERT INTO prior_feedback_resolutions (
+                        review_id, patchset_id, patch_id, prior_id, origin_kind,
+                        version, author, message_id, reference_url, verdict,
+                        summary, reasoning, quote, also_found_by_sashiko, v_n_outcome
+                     )
+                     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                     FROM reviews
+                     WHERE id = ?
+                       AND COALESCE(status, '') != 'Cancelled'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM patchsets ps
+                            WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                       )
+                       AND (? IS NULL OR (
+                           reviews.patchset_id = ?
+                           AND EXISTS (
+                               SELECT 1 FROM patchsets ps_claim
+                               JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                               WHERE ps_claim.id = reviews.patchset_id
+                                 AND ps_claim.status = 'In Review'
+                                 AND CAST(m_claim.value AS INTEGER) = ?
+                           )
+                       ))",
+                    libsql::params![
+                        review_id,
+                        patchset_id,
+                        patch_id,
+                        prior_id,
+                        origin_kind,
+                        version,
+                        author,
+                        message_id,
+                        reference_url,
+                        verdict,
+                        summary,
+                        reasoning,
+                        quote,
+                        also_found,
+                        v_n_outcome,
+                        review_id,
+                        claim_ps_id,
+                        claim_ps_id,
+                        claim_gen,
+                    ],
+                )
+                .await?;
+            if inserted == 0 {
+                bail!(
+                    "review {} no longer exists for prior_feedback_resolutions insertion",
+                    review_id
+                );
+            }
+        }
+        if let Some(tx) = tx_guard {
+            tx.commit().await?;
         }
         Ok(())
     }
@@ -7897,6 +8107,25 @@ impl Database {
                     )
                     .await?;
 
+                    tx.execute(
+                        "UPDATE prior_feedback_resolutions
+                            SET patch_id = (
+                                    SELECT tp.id
+                                      FROM patches tp
+                                      JOIN patches mp ON mp.message_id = tp.message_id
+                                     WHERE tp.patchset_id = ?
+                                       AND mp.id = prior_feedback_resolutions.patch_id
+                                )
+                          WHERE patch_id IN (
+                                    SELECT mp.id
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)
+                                )",
+                        libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
+
                     // Preserve Sent/Sending outbox status when merging duplicate patches
                     // or patchsets so an already-delivered or in-flight email is never
                     // replaced by a Pending duplicate.
@@ -8061,6 +8290,11 @@ impl Database {
                     // Reassign reviews
                     tx.execute(
                         "UPDATE reviews SET patchset_id = ? WHERE patchset_id = ?",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE prior_feedback_resolutions SET patchset_id = ? WHERE patchset_id = ?",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
@@ -10941,7 +11175,12 @@ impl Database {
             )
             .await?;
 
-        for table in ["tool_usages", "findings", "bug_reviews"] {
+        for table in [
+            "tool_usages",
+            "findings",
+            "prior_feedback_resolutions",
+            "bug_reviews",
+        ] {
             tx_db
                 .execute(
                     &format!(
@@ -11193,15 +11432,6 @@ impl Database {
             None => self.with_connection(self.conn.clone()),
         };
 
-        struct PatchInfo {
-            id: i64,
-            part_index: i64,
-            git_patch_id: Option<String>,
-            clean_subject: String,
-            existing_prev_id: Option<i64>,
-            existing_prev_status: Option<String>,
-        }
-
         let mut prev_patches = Vec::new();
         let mut prev_rows = tx_db
             .conn
@@ -11217,7 +11447,7 @@ impl Database {
             .await?;
         while let Some(row) = prev_rows.next().await? {
             let subj: String = row.get(3)?;
-            prev_patches.push(PatchInfo {
+            prev_patches.push(patch_lineage::LineagePatch {
                 id: row.get(0)?,
                 part_index: row.get(1)?,
                 git_patch_id: row.get::<Option<String>>(2)?.filter(|s| !s.is_empty()),
@@ -11244,7 +11474,7 @@ impl Database {
             .await?;
         while let Some(row) = curr_rows.next().await? {
             let subj: String = row.get(3)?;
-            curr_patches.push(PatchInfo {
+            curr_patches.push(patch_lineage::LineagePatch {
                 id: row.get(0)?,
                 part_index: row.get(1)?,
                 git_patch_id: row.get::<Option<String>>(2)?.filter(|s| !s.is_empty()),
@@ -11262,51 +11492,8 @@ impl Database {
             return Ok(());
         }
 
-        let mut matched_prev_ids = std::collections::HashSet::new();
-        let mut assignments: std::collections::HashMap<i64, (Option<i64>, Option<&'static str>)> =
-            std::collections::HashMap::new();
-
-        // Tier 1: Exact git_patch_id match -> 'unchanged'
-        for curr in &curr_patches {
-            let Some(ref gpid) = curr.git_patch_id else {
-                continue;
-            };
-            let best_prev = prev_patches
-                .iter()
-                .filter(|prev| {
-                    !matched_prev_ids.contains(&prev.id)
-                        && prev.git_patch_id.as_deref() == Some(gpid.as_str())
-                })
-                .min_by_key(|prev| {
-                    let subj_diff = usize::from(prev.clean_subject != curr.clean_subject);
-                    let dist = prev.part_index.abs_diff(curr.part_index);
-                    (subj_diff, dist, prev.part_index)
-                });
-            if let Some(prev) = best_prev {
-                matched_prev_ids.insert(prev.id);
-                assignments.insert(curr.id, (Some(prev.id), Some("unchanged")));
-            }
-        }
-
-        // Tier 2: Cleaned subject match -> 'modified'
-        for curr in &curr_patches {
-            if assignments.contains_key(&curr.id) || curr.clean_subject.is_empty() {
-                continue;
-            }
-            let best_prev = prev_patches
-                .iter()
-                .filter(|prev| {
-                    !matched_prev_ids.contains(&prev.id) && prev.clean_subject == curr.clean_subject
-                })
-                .min_by_key(|prev| {
-                    let dist = prev.part_index.abs_diff(curr.part_index);
-                    (dist, prev.part_index)
-                });
-            if let Some(prev) = best_prev {
-                matched_prev_ids.insert(prev.id);
-                assignments.insert(curr.id, (Some(prev.id), Some("modified")));
-            }
-        }
+        let (mut assignments, mut matched_prev_ids) =
+            patch_lineage::match_patch_lineage(&prev_patches, &curr_patches);
 
         // Tier 3: Singleton fallback when linked via high-confidence series signal
         if assignments.is_empty() && prev_patches.len() == 1 && curr_patches.len() == 1 {
@@ -12249,6 +12436,16 @@ impl Database {
 
         self.execute(
             &format!(
+                "DELETE FROM prior_feedback_resolutions WHERE review_id IN (
+                    SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
+                )"
+            ),
+            libsql::params![id],
+        )
+        .await?;
+
+        self.execute(
+            &format!(
                 "DELETE FROM bug_reviews WHERE review_id IN (
                     SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
                 )"
@@ -12442,6 +12639,11 @@ impl Database {
         .await?;
         self.execute(
             "DELETE FROM findings WHERE review_id = ?",
+            libsql::params![review_id],
+        )
+        .await?;
+        self.execute(
+            "DELETE FROM prior_feedback_resolutions WHERE review_id = ?",
             libsql::params![review_id],
         )
         .await?;

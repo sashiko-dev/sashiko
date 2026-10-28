@@ -858,10 +858,64 @@ impl Reviewer {
                 );
             }
 
+            let has_ancestor = ctx
+                .db
+                .get_previous_patchset_id(patchset_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            let prior_contexts = if has_ancestor {
+                if ctx.settings.forge.enabled
+                    && let Some(mr_url) = patchset.mr_url.as_deref()
+                    && mr_url.starts_with("https://github.com/")
+                    && let Some(repo) = crate::forge::extract_owner_repo_from_mr_url(mr_url)
+                    && let Some(pr_number) = patchset.mr_number
+                {
+                    let fw = crate::worker::forge::ForgeWorker::new(
+                        ctx.db.clone(),
+                        ctx.settings.forge.clone(),
+                        1,
+                    );
+                    if let Err(e) = fw.sync_pr_feedback(&repo, pr_number).await {
+                        warn!(
+                            "Best-effort GitHub PR feedback sync failed for {}#{}: {}",
+                            repo, pr_number, e
+                        );
+                    }
+                }
+
+                let forge = &ctx.settings.forge;
+                let prior_opts = crate::db::PriorContextOptions {
+                    repo_path: Some(&worktree.repo_path),
+                    baseline_commit: Some(review_baseline.as_str()),
+                    maintainers: None,
+                    project: ctx.settings.project.kind.unwrap_or_default(),
+                    forge_provider: forge.provider.as_deref().filter(|_| forge.enabled),
+                    forge_bot_login: forge.bot_login.as_deref(),
+                };
+                match ctx
+                    .db
+                    .build_prior_version_contexts_with(patchset_id, &prior_opts)
+                    .await
+                {
+                    Ok(map) => map,
+                    Err(e) => {
+                        warn!(
+                            "Failed to build prior version contexts for patchset {}: {}",
+                            patchset_id, e
+                        );
+                        std::collections::HashMap::new()
+                    }
+                }
+            } else {
+                std::collections::HashMap::new()
+            };
+
             // patches_json for input payload (contains all patches)
             let patches_json: Vec<_> = diffs
                 .iter()
-                .map(|(_id, idx, diff, subj, auth, date, msg_id)| {
+                .map(|(id, idx, diff, subj, auth, date, msg_id)| {
                     let resolved_sha = patch_commits.get(idx);
                     let is_msg_sha =
                         msg_id.len() == 40 && msg_id.chars().all(|c| c.is_ascii_hexdigit());
@@ -881,7 +935,8 @@ impl Reviewer {
                         "author": auth,
                         "date": date,
                         "message_id": msg_id,
-                        "commit_id": commit_id
+                        "commit_id": commit_id,
+                        "prior_version_context": prior_contexts.get(id),
                     })
                 })
                 .collect();
@@ -2473,17 +2528,28 @@ impl Reviewer {
                                             continue;
                                         }
                                         let locations = f.get("locations").cloned();
+                                        let prior_attribution: Option<
+                                            crate::prior_context::PriorAttribution,
+                                        > = f
+                                            .get("prior_attribution")
+                                            .filter(|v| !v.is_null())
+                                            .and_then(|v| serde_json::from_value(v.clone()).ok());
+                                        let found_by = f.get("found_by").and_then(|v| v.as_str());
 
                                         if let Err(e) = ctx
                                             .db
-                                            .create_finding(Finding {
-                                                review_id,
-                                                severity,
-                                                severity_explanation,
-                                                problem,
-                                                preexisting,
-                                                locations,
-                                            })
+                                            .create_finding_with_provenance(
+                                                Finding {
+                                                    review_id,
+                                                    severity,
+                                                    severity_explanation,
+                                                    problem,
+                                                    preexisting,
+                                                    locations,
+                                                },
+                                                prior_attribution.as_ref(),
+                                                found_by,
+                                            )
                                             .await
                                         {
                                             if Self::is_deleted_review_error(&e) {
@@ -2496,6 +2562,30 @@ impl Reviewer {
                                             return Err(e);
                                         }
                                     }
+                                }
+
+                                if let Some(resolutions_arr) = review_content
+                                    .get("prior_resolutions")
+                                    .and_then(|v| v.as_array())
+                                    && !resolutions_arr.is_empty()
+                                    && let Err(e) = ctx
+                                        .db
+                                        .insert_prior_feedback_resolutions(
+                                            review_id,
+                                            patchset_id,
+                                            Some(patch_id),
+                                            resolutions_arr,
+                                        )
+                                        .await
+                                {
+                                    if Self::is_deleted_review_error(&e) {
+                                        info!(
+                                            "Review {} for patch {}/{} was deleted by a concurrent rerun while saving prior resolutions, aborting",
+                                            review_id, patchset_id, index
+                                        );
+                                        return Ok(PatchResult::Cancelled);
+                                    }
+                                    return Err(e);
                                 }
 
                                 let summary =

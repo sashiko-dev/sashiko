@@ -86,6 +86,8 @@ pub struct PatchInput {
     pub message_id: Option<String>,
     #[serde(default)]
     pub commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_version_context: Option<crate::prior_context::PriorVersionContext>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -355,6 +357,8 @@ impl Worker {
             target_commit_sha = vhead;
         }
 
+        let mut prior_version_context: Option<crate::prior_context::PriorVersionContext> = None;
+
         if let Some(patches) = patchset["patches"].as_array() {
             let target_patches: Vec<&Value> = if let Some(idx) = patchset["patch_index"].as_i64() {
                 let filtered: Vec<&Value> = patches
@@ -369,6 +373,18 @@ impl Worker {
             } else {
                 patches.iter().collect()
             };
+
+            if let Some(first) = target_patches.first()
+                && let Some(raw_ctx) = first.get("prior_version_context")
+                && !raw_ctx.is_null()
+            {
+                match serde_json::from_value(raw_ctx.clone()) {
+                    Ok(parsed) => prior_version_context = Some(parsed),
+                    Err(err) => {
+                        tracing::warn!("Failed to deserialize prior_version_context: {err}");
+                    }
+                }
+            }
 
             for p in target_patches {
                 let diff_body = p["diff"].as_str().unwrap_or("");
@@ -465,6 +481,8 @@ impl Worker {
             skip_report: self.skip_report,
             report_preexisting: self.report_preexisting,
             project: self.project.as_str().to_string(),
+            prior_version_context,
+            prior_resolutions: Vec::new(),
             all_concerns: Vec::new(),
             all_dismissed_concerns: Vec::new(),
             deduplicated_clusters: Vec::new(),
@@ -628,6 +646,7 @@ impl Worker {
             .map_err(|e| anyhow::anyhow!("spawn_blocking failed for location resolution: {}", e))?;
         }
 
+        crate::workflows::review_map::enrich_prior_resolutions(&mut state);
         let review_map = crate::workflows::review_map::build_review_map(
             self.project,
             &state,
@@ -654,6 +673,7 @@ impl Worker {
             "findings": state.findings,
             "dismissed_concerns": dismissed_concerns,
             "concerns": state.concerns,
+            "prior_resolutions": state.prior_resolutions,
             "review_inline": review_inline,
             "fixes": state.fixes,
             "concerns_count": concerns_count,
@@ -1045,6 +1065,7 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: commit_id.map(str::to_string),
+            prior_version_context: None,
         };
         let p1 = make_patch(1, Some("sha1"));
         let p2 = make_patch(2, Some("sha2"));
