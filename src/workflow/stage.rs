@@ -136,6 +136,12 @@ pub trait ExecutableStage<S: Send + Sync>: Send + Sync {
     /// Returns the human-readable name of the stage.
     fn name(&self) -> &'static str;
 
+    /// Whether a failure of this stage must abort its parallel batch even
+    /// under `ParallelPolicy::BestEffort`.
+    fn is_required(&self) -> bool {
+        false
+    }
+
     /// Executes the stage in isolation against immutable state `&S`, returning
     /// execution metrics and a deferred reducer mutation to apply to `&mut S`.
     async fn execute_isolated(
@@ -177,6 +183,9 @@ pub struct Stage<S, T> {
     pub reducer: StageReducer<S, T>,
     pub outcome_reducer: Option<StageOutcomeReducer<S, T>>,
     pub skip_if: Option<StageCondition<S>>,
+    /// A required stage aborts its parallel batch on failure even under
+    /// `ParallelPolicy::BestEffort`, so its output is never silently lost.
+    pub required: bool,
 }
 
 impl<S: 'static, T: 'static> Stage<S, T> {
@@ -196,6 +205,7 @@ pub struct StageBuilder<S, T> {
     reducer: Option<StageReducer<S, T>>,
     outcome_reducer: Option<StageOutcomeReducer<S, T>>,
     skip_if: Option<StageCondition<S>>,
+    required: bool,
 }
 
 impl<S: 'static, T: 'static> StageBuilder<S, T> {
@@ -209,6 +219,7 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
             reducer: None,
             outcome_reducer: None,
             skip_if: None,
+            required: false,
         }
     }
 
@@ -300,6 +311,13 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
         self
     }
 
+    /// Marks the stage as required: its failure aborts the enclosing parallel
+    /// batch regardless of the batch's `ParallelPolicy`.
+    pub fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
     /// Builds the stage.
     pub fn build(self) -> Stage<S, T> {
         let user_prompt = self
@@ -319,6 +337,7 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
             reducer,
             outcome_reducer: self.outcome_reducer,
             skip_if: self.skip_if,
+            required: self.required,
         }
     }
 }
@@ -509,6 +528,10 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
 {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    fn is_required(&self) -> bool {
+        self.required
     }
 
     async fn execute_isolated(

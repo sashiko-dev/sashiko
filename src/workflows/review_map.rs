@@ -272,7 +272,7 @@ fn static_stage_guides(project: ProjectId, stage_name: &str) -> Vec<String> {
 
     match stage_name {
         "pre-screen" => push_unique(&mut guides, "subsystem/subsystem.md"),
-        "verification" => {
+        s if s == "verification" || s.starts_with("verification-") => {
             push_unique(&mut guides, "false-positive-guide.md");
             push_unique(&mut guides, "severity.md");
         }
@@ -354,14 +354,38 @@ fn build_prompts_manifest(
 }
 
 fn stage_signal_counts(state: &LinuxPatchReviewState, stage_name: &str) -> (usize, usize) {
-    if stage_name == "verification" {
-        return (
-            state
-                .verification_findings
-                .len()
-                .saturating_add(state.inconclusive_concerns.len()),
-            state.verification_dismissed.len(),
-        );
+    if stage_name == "deduplication" {
+        return (state.deduplicated_clusters.len(), 0);
+    }
+    if stage_name == "verification" || stage_name.starts_with("verification-") {
+        let matches_stage = |item: &Value| {
+            let origin = item
+                .get("verification_stage")
+                .or_else(|| item.get("origin"))
+                .and_then(Value::as_str);
+            match origin {
+                Some(s) => s == stage_name,
+                None => stage_name == "verification",
+            }
+        };
+        let kept = state
+            .verification_findings
+            .iter()
+            .filter(|f| matches_stage(f))
+            .count()
+            .saturating_add(
+                state
+                    .inconclusive_concerns
+                    .iter()
+                    .filter(|h| matches_stage(h))
+                    .count(),
+            );
+        let dismissed = state
+            .verification_dismissed
+            .iter()
+            .filter(|d| matches_stage(d))
+            .count();
+        return (kept, dismissed);
     }
     if stage_name.starts_with("post-verification") {
         let confirmed = state
@@ -711,6 +735,7 @@ pub fn build_review_map(
         "stages": stages,
         "raw_concerns": state.all_concerns,
         "raw_dismissed_concerns": state.all_dismissed_concerns,
+        "deduplicated_clusters": state.deduplicated_clusters,
         "verification": {
             "findings": state.verification_findings,
             "inconclusive_concerns": state.inconclusive_concerns,

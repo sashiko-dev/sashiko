@@ -467,6 +467,7 @@ impl Worker {
             project: self.project.as_str().to_string(),
             all_concerns: Vec::new(),
             all_dismissed_concerns: Vec::new(),
+            deduplicated_clusters: Vec::new(),
             verification_findings: Vec::new(),
             verification_dismissed: Vec::new(),
             post_verification_findings: Vec::new(),
@@ -922,6 +923,7 @@ mod tests {
                 "goal",
                 "implementation",
                 "locking",
+                "deduplication",
                 "verification",
                 "post-verification",
                 "report"
@@ -937,6 +939,7 @@ mod tests {
                 "implementation",
                 "concurrency",
                 "llm-pipeline",
+                "deduplication",
                 "verification",
                 "post-verification",
                 "report",
@@ -953,23 +956,48 @@ mod tests {
             Vec::<String>::new()
         );
 
-        // Once verification resolves the concrete post-verification batch
-        // fan-out, the placeholder is replaced by 0..=10 concrete stages.
+        // Once deduplication resolves sharded verification stages (when >10 clusters)
+        // and verification resolves concrete post-verification stages (0..=10),
+        // each placeholder is replaced without disturbing the others.
         let initial =
             crate::workflows::planned_stages_from(ProjectId::Linux, &["goal", "implementation"]);
         assert_eq!(
             crate::workflows::refine_planned_stages_with_post_verification(&initial, &[]),
-            ["goal", "implementation", "verification", "report"]
+            [
+                "goal",
+                "implementation",
+                "deduplication",
+                "verification",
+                "report"
+            ]
+        );
+        let sharded_ver = crate::workflows::refine_planned_stages_with_post_verification(
+            &initial,
+            &["verification-1", "verification-2"],
+        );
+        assert_eq!(
+            sharded_ver,
+            [
+                "goal",
+                "implementation",
+                "deduplication",
+                "verification-1",
+                "verification-2",
+                "post-verification",
+                "report"
+            ]
         );
         assert_eq!(
             crate::workflows::refine_planned_stages_with_post_verification(
-                &initial,
+                &sharded_ver,
                 &["post-verification-1", "post-verification-2"]
             ),
             [
                 "goal",
                 "implementation",
-                "verification",
+                "deduplication",
+                "verification-1",
+                "verification-2",
                 "post-verification-1",
                 "post-verification-2",
                 "report"

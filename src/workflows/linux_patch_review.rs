@@ -75,6 +75,8 @@ pub struct LinuxPatchReviewState {
     pub all_concerns: Vec<Value>,
     /// Aggregated raw dismissed concerns collected from the analysis stages.
     pub all_dismissed_concerns: Vec<Value>,
+    /// Pre-verification candidate clusters (G1..GK) built by deduplication.
+    pub deduplicated_clusters: Vec<Value>,
 
     /// Direct findings (Category 1a, VF1..VFp) emitted by the verification stage.
     pub verification_findings: Vec<Value>,
@@ -137,6 +139,20 @@ impl LinuxPatchReviewState {
                 collection,
             );
         }
+        // Deduplication clones raw items into each cluster, and the review
+        // map stores those copies, so ground them like the flat collections.
+        for cluster in &mut self.deduplicated_clusters {
+            for key in ["concerns", "dismissed_concerns"] {
+                if let Some(Value::Array(items)) = cluster.get_mut(key) {
+                    crate::worker::resolve_finding_locations_with_parsed_diff(
+                        &worktree,
+                        rev,
+                        &parsed_diff,
+                        items,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -164,9 +180,25 @@ pub struct StageConcernsOutput {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
+pub struct DeduplicationClusterSpec {
+    #[serde(default)]
+    pub id: String,
+    pub title: String,
+    pub source_ids: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+pub struct DeduplicationOutput {
+    pub clusters: Vec<DeduplicationClusterSpec>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
 pub struct VerificationOutput {
     pub findings: Vec<Value>,
     pub inconclusive_concerns: Vec<Value>,
+    #[serde(default)]
+    pub dismissed_ids: Vec<String>,
+    #[serde(default)]
     pub dismissed_concerns: Vec<Value>,
 }
 
@@ -582,6 +614,405 @@ fn validate_finding_object(finding: &Value, idx: usize) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_inconclusive_concern_object(
+    inconclusive_concern: &Value,
+    idx: usize,
+) -> Result<(), String> {
+    let has_type = inconclusive_concern
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_desc = inconclusive_concern
+        .get("description")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_severity = inconclusive_concern
+        .get("estimated_severity")
+        .and_then(Value::as_str)
+        .is_some_and(|s| matches!(s, "Low" | "Medium" | "High" | "Critical" | "Unknown"));
+    let has_signal_reason = inconclusive_concern
+        .get("signal_reason")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_args = inconclusive_concern
+        .get("concern_arguments")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_dismissal_args = inconclusive_concern
+        .get("dismissal_arguments")
+        .is_some_and(|v| v.is_string() || v.is_null());
+    let has_question = inconclusive_concern
+        .get("verification_question")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_preexisting = inconclusive_concern
+        .get("preexisting")
+        .is_some_and(Value::is_boolean);
+    let has_locations = inconclusive_concern
+        .get("locations")
+        .is_some_and(Value::is_array);
+    if !has_type
+        || !has_desc
+        || !has_severity
+        || !has_signal_reason
+        || !has_args
+        || !has_dismissal_args
+        || !has_question
+        || !has_preexisting
+        || !has_locations
+    {
+        return Err(format!(
+            "inconclusive_concerns[{idx}] must have non-empty 'type', 'description', 'signal_reason', 'concern_arguments', and 'verification_question' strings, valid 'estimated_severity' (Low, Medium, High, Critical, or Unknown), string 'dismissal_arguments', boolean 'preexisting', and a 'locations' array."
+        ));
+    }
+    if let Some(locations) = inconclusive_concern
+        .get("locations")
+        .and_then(Value::as_array)
+    {
+        validate_locations_side(locations, "inconclusive_concerns", idx)?;
+    }
+    Ok(())
+}
+
+pub fn validate_deduplication_output(
+    output: &DeduplicationOutput,
+    state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    let valid_ids: Vec<&str> = state
+        .all_concerns
+        .iter()
+        .chain(state.all_dismissed_concerns.iter())
+        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::trim))
+        .filter(|id| !id.is_empty())
+        .collect();
+    if valid_ids.is_empty() {
+        return Ok(());
+    }
+    if output.clusters.is_empty() {
+        return Err(
+            "clusters must not be empty when input concerns or dismissed_concerns are present."
+                .to_string(),
+        );
+    }
+
+    let valid_label = valid_ids.join(", ");
+    let mut accounted = std::collections::BTreeSet::new();
+    for (idx, cluster) in output.clusters.iter().enumerate() {
+        if cluster.title.trim().is_empty() {
+            return Err(format!(
+                "clusters[{idx}] must have a non-empty 'title' string."
+            ));
+        }
+        let cleaned: Vec<&str> = cluster
+            .source_ids
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if cleaned.is_empty() || cleaned.len() != cluster.source_ids.len() {
+            return Err(format!(
+                "clusters[{idx}] must have a non-empty 'source_ids' array of non-empty string IDs ({valid_label})."
+            ));
+        }
+        for sid in cleaned {
+            if !valid_ids.contains(&sid) {
+                return Err(format!(
+                    "clusters[{idx}].source_ids contains unknown ID '{sid}'. Valid input IDs are: {valid_label}."
+                ));
+            }
+            if !accounted.insert(sid) {
+                return Err(format!(
+                    "clusters[{idx}].source_ids repeats ID '{sid}', which already belongs to another cluster (or appears twice in this one). Every input ID must appear in exactly one cluster."
+                ));
+            }
+        }
+    }
+
+    let missing: Vec<&str> = valid_ids
+        .into_iter()
+        .filter(|id| !accounted.contains(id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Deduplication output failed to account for input ID(s): {}. Every input ID must appear in 'source_ids' of at least one cluster.",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+pub fn format_deduplication_feedback(violation: &str) -> String {
+    format!(
+        "\n\nPrevious attempt was rejected: {}. Return ONLY a JSON object with a 'clusters' array where each cluster has 'id', non-empty 'title', and non-empty 'source_ids', with every input ID in exactly one cluster.",
+        violation
+    )
+}
+
+pub fn validate_verification_shard_output(
+    output: &VerificationOutput,
+    shard_clusters: &[Value],
+) -> Result<(), String> {
+    for (idx, finding) in output.findings.iter().enumerate() {
+        validate_finding_object(finding, idx)?;
+    }
+    for (idx, inconclusive_concern) in output.inconclusive_concerns.iter().enumerate() {
+        validate_inconclusive_concern_object(inconclusive_concern, idx)?;
+    }
+    for (idx, dismissed) in output.dismissed_concerns.iter().enumerate() {
+        let desc = dismissed
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        let has_reasoning = dismissed
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if desc.is_empty() || !has_reasoning {
+            return Err(format!(
+                "dismissed_concerns[{idx}] must have non-empty 'description' and 'reasoning' strings."
+            ));
+        }
+        if let Some(locations) = dismissed.get("locations").and_then(Value::as_array) {
+            validate_locations_side(locations, "dismissed_concerns", idx)?;
+        }
+        if !has_valid_proof_location(dismissed) {
+            return Err(format!(
+                "dismissed_concerns[{idx}] must include at least one entry in 'locations' with non-empty 'file', 'function_or_symbol', valid 'side' ('PARENT' or 'REVISION'), and disproving 'code_snippet'."
+            ));
+        }
+    }
+    for (idx, did) in output.dismissed_ids.iter().enumerate() {
+        if did.trim().is_empty() {
+            return Err(format!(
+                "dismissed_ids[{idx}] must be a non-empty cluster ID string."
+            ));
+        }
+    }
+
+    if shard_clusters.is_empty() {
+        return Ok(());
+    }
+
+    struct ClusterInfo<'a> {
+        id: &'a str,
+        has_concerns: bool,
+        has_dismissed: bool,
+        concern_ids: Vec<&'a str>,
+        dismissed_ids: Vec<&'a str>,
+    }
+
+    let mut infos = Vec::with_capacity(shard_clusters.len());
+    let mut valid_tokens = Vec::new();
+    for cluster in shard_clusters {
+        let Some(cid) = cluster.get("id").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if cid.is_empty() {
+            continue;
+        }
+        let c_ids: Vec<&str> = cluster
+            .get("concerns")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.get("id").and_then(Value::as_str).map(str::trim))
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let d_ids: Vec<&str> = cluster
+            .get("dismissed_concerns")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.get("id").and_then(Value::as_str).map(str::trim))
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        valid_tokens.push(cid);
+        infos.push(ClusterInfo {
+            id: cid,
+            has_concerns: !c_ids.is_empty(),
+            has_dismissed: !d_ids.is_empty(),
+            concern_ids: c_ids,
+            dismissed_ids: d_ids,
+        });
+    }
+    if infos.is_empty() {
+        return Ok(());
+    }
+
+    let valid_label = valid_tokens.join(", ");
+    let mut accounted_clusters = std::collections::BTreeSet::new();
+    let mut accounted_raw_ids = std::collections::BTreeSet::<String>::new();
+
+    let mut check_ref = |where_label: &str,
+                         sid: &str,
+                         allow_concerns: bool,
+                         allow_dismissed: bool|
+     -> Result<(), String> {
+        if let Some(info) = infos.iter().find(|i| i.id == sid) {
+            if !allow_concerns && info.has_concerns {
+                return Err(format!(
+                    "{where_label} references cluster '{sid}' which contains raised concern(s) ({}). Raised concerns must never be dismissed in verification; classify into 'findings' or 'inconclusive_concerns'.",
+                    info.concern_ids.join(", ")
+                ));
+            }
+            if !allow_dismissed && info.has_dismissed {
+                return Err(format!(
+                    "{where_label} references cluster '{sid}' which contains dismissed_concern(s) ({}). Category 1a 'findings' are strictly for uncontested raised-concern clusters; route contested or promoted-dismissal clusters to 'inconclusive_concerns'.",
+                    info.dismissed_ids.join(", ")
+                ));
+            }
+            accounted_clusters.insert(info.id);
+            return Ok(());
+        }
+        // Also tolerate raw IDs belonging to one of this shard's clusters.
+        let matching_raw: Vec<&ClusterInfo<'_>> = infos
+            .iter()
+            .filter(|i| i.concern_ids.contains(&sid) || i.dismissed_ids.contains(&sid))
+            .collect();
+        if matching_raw.is_empty() {
+            return Err(format!(
+                "{where_label} contains unknown ID '{sid}'. Valid cluster IDs in this shard are: {valid_label}."
+            ));
+        }
+        for info in matching_raw {
+            let is_concern = info.concern_ids.contains(&sid);
+            let is_dismissed = info.dismissed_ids.contains(&sid);
+            if !allow_concerns && (is_concern || info.has_concerns) {
+                return Err(format!(
+                    "{where_label} references '{sid}' from cluster '{}' which contains raised concern(s) ({}). Raised concerns and contested clusters must never be dismissed in verification; classify into 'findings' or 'inconclusive_concerns'.",
+                    info.id,
+                    info.concern_ids.join(", ")
+                ));
+            }
+            if !allow_dismissed && (is_dismissed || info.has_dismissed) {
+                return Err(format!(
+                    "{where_label} references '{sid}' from cluster '{}' which involves a dismissed_concern. Route contested or promoted-dismissal clusters to 'inconclusive_concerns'.",
+                    info.id
+                ));
+            }
+            accounted_raw_ids.insert(sid.to_string());
+        }
+        Ok(())
+    };
+
+    for (collection_name, items, allow_concerns, allow_dismissed) in [
+        ("findings", &output.findings, true, false),
+        (
+            "inconclusive_concerns",
+            &output.inconclusive_concerns,
+            true,
+            true,
+        ),
+        (
+            "dismissed_concerns",
+            &output.dismissed_concerns,
+            false,
+            true,
+        ),
+    ] {
+        for (idx, item) in items.iter().enumerate() {
+            let sids = extract_non_empty_source_ids(collection_name, idx, item, &valid_label)?;
+            for sid in sids {
+                check_ref(
+                    &format!("{collection_name}[{idx}].source_ids"),
+                    sid,
+                    allow_concerns,
+                    allow_dismissed,
+                )?;
+            }
+        }
+    }
+
+    for (idx, did) in output.dismissed_ids.iter().enumerate() {
+        check_ref(&format!("dismissed_ids[{idx}]"), did.trim(), false, true)?;
+    }
+
+    for info in &infos {
+        if !accounted_clusters.contains(info.id) {
+            let all_raw_covered = info
+                .concern_ids
+                .iter()
+                .chain(info.dismissed_ids.iter())
+                .all(|rid| accounted_raw_ids.contains(*rid));
+            if all_raw_covered && (info.has_concerns || info.has_dismissed) {
+                accounted_clusters.insert(info.id);
+            }
+        }
+    }
+
+    let missing: Vec<&str> = infos
+        .iter()
+        .map(|i| i.id)
+        .filter(|id| !accounted_clusters.contains(id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Verification shard output failed to account for cluster ID(s): {}. Every candidate cluster ID in this shard must appear in 'findings[].source_ids', 'inconclusive_concerns[].source_ids', or 'dismissed_ids'.",
+            missing.join(", ")
+        ));
+    }
+
+    let merged: Vec<(&str, &[&str])> = infos
+        .iter()
+        .map(|i| (i.id, i.concern_ids.as_slice()))
+        .collect();
+    validate_merged_concerns_kept(output, &merged)
+}
+
+/// A cluster that merges several raised concerns must keep each of them
+/// visible: every raised concern ID has to be named in some
+/// `findings[].source_ids` or `inconclusive_concerns[].source_ids`, so a distinct bug
+/// merged into a cluster cannot vanish behind a single cluster reference.
+fn validate_merged_concerns_kept(
+    output: &VerificationOutput,
+    clusters: &[(&str, &[&str])],
+) -> Result<(), String> {
+    let kept_ids: std::collections::BTreeSet<&str> = output
+        .findings
+        .iter()
+        .chain(output.inconclusive_concerns.iter())
+        .flat_map(|item| {
+            item.get("source_ids")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+        })
+        .collect();
+    for (cluster_id, concern_ids) in clusters {
+        if concern_ids.len() < 2 {
+            continue;
+        }
+        let unnamed: Vec<&str> = concern_ids
+            .iter()
+            .copied()
+            .filter(|cid| !kept_ids.contains(cid))
+            .collect();
+        if !unnamed.is_empty() {
+            return Err(format!(
+                "Cluster '{cluster_id}' merges {} raised concerns ({}), but concern ID(s) {} are not named in any 'findings[].source_ids' or 'inconclusive_concerns[].source_ids'. When a cluster contains several raised concerns, list each raw concern ID explicitly in the source_ids of the finding or inconclusive concern that covers it (a separate item for each distinct bug).",
+                concern_ids.len(),
+                concern_ids.join(", "),
+                unnamed.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn format_verification_shard_feedback(violation: &str) -> String {
+    format!(
+        "\n\nPrevious attempt was rejected: {}. Return ONLY a JSON object with 'findings', 'inconclusive_concerns', and 'dismissed_ids' arrays accounting for every cluster ID in this shard.",
+        violation
+    )
+}
+
 pub fn validate_verification_stage_output(
     output: &VerificationOutput,
     state: &LinuxPatchReviewState,
@@ -590,62 +1021,23 @@ pub fn validate_verification_stage_output(
         validate_finding_object(finding, idx)?;
     }
 
-    for (idx, inconclusive) in output.inconclusive_concerns.iter().enumerate() {
-        let has_type = inconclusive
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_desc = inconclusive
-            .get("description")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_severity = inconclusive
-            .get("estimated_severity")
-            .and_then(Value::as_str)
-            .is_some_and(|s| matches!(s, "Low" | "Medium" | "High" | "Critical" | "Unknown"));
-        let has_signal_reason = inconclusive
-            .get("signal_reason")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_args = inconclusive
-            .get("concern_arguments")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_dismissal_args = inconclusive
-            .get("dismissal_arguments")
-            .is_some_and(|v| v.is_string() || v.is_null());
-        let has_question = inconclusive
-            .get("verification_question")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_preexisting = inconclusive
-            .get("preexisting")
-            .is_some_and(Value::is_boolean);
-        let has_locations = inconclusive.get("locations").is_some_and(Value::is_array);
-        if !has_type
-            || !has_desc
-            || !has_severity
-            || !has_signal_reason
-            || !has_args
-            || !has_dismissal_args
-            || !has_question
-            || !has_preexisting
-            || !has_locations
-        {
-            return Err(format!(
-                "inconclusive_concerns[{idx}] must have non-empty 'type', 'description', 'signal_reason', 'concern_arguments', and 'verification_question' strings, valid 'estimated_severity' (Low, Medium, High, Critical, or Unknown), string 'dismissal_arguments', boolean 'preexisting', and a 'locations' array."
-            ));
-        }
-        if let Some(locations) = inconclusive.get("locations").and_then(Value::as_array) {
-            validate_locations_side(locations, "inconclusive_concerns", idx)?;
-        }
+    for (idx, inconclusive_concern) in output.inconclusive_concerns.iter().enumerate() {
+        validate_inconclusive_concern_object(inconclusive_concern, idx)?;
     }
 
-    if state.all_dismissed_concerns.is_empty() && !output.dismissed_concerns.is_empty() {
+    let total_dismissed_out = output.dismissed_concerns.len() + output.dismissed_ids.len();
+    if state.all_dismissed_concerns.is_empty() && total_dismissed_out > 0 {
         return Err(format!(
-            "dismissed_concerns contains {} entries, but input dismissed_concerns is empty. Raised concerns from all_concerns must never be placed into dismissed_concerns in verification; route any disputed, speculative, or questionable concern to inconclusive_concerns.",
-            output.dismissed_concerns.len(),
+            "dismissed_concerns/dismissed_ids contains {total_dismissed_out} entries, but input dismissed_concerns is empty. Raised concerns from all_concerns must never be placed into dismissed_concerns in verification; route any disputed, speculative, or questionable concern to inconclusive_concerns.",
         ));
+    }
+
+    for (idx, did) in output.dismissed_ids.iter().enumerate() {
+        if did.trim().is_empty() {
+            return Err(format!(
+                "dismissed_ids[{idx}] must be a non-empty input dismissal ID string."
+            ));
+        }
     }
 
     for (idx, dismissed) in output.dismissed_concerns.iter().enumerate() {
@@ -694,11 +1086,11 @@ pub fn validate_verification_stage_output(
     }
 
     if !state.all_dismissed_concerns.is_empty()
-        && output.dismissed_concerns.is_empty()
+        && total_dismissed_out == 0
         && output.inconclusive_concerns.is_empty()
     {
         return Err(
-            "At least one dismissed_concern was provided in input, so 'dismissed_concerns' and 'inconclusive_concerns' cannot both be empty. Every input dismissed_concern must be classified into either 'dismissed_concerns' (if backed by concrete disproving code) or 'inconclusive_concerns' (if contested or relying on unproven assumptions)."
+            "At least one dismissed_concern was provided in input, so 'dismissed_concerns' and 'inconclusive_concerns' cannot both be empty (unless 'dismissed_ids' is populated). Every input dismissed_concern must be classified into either 'dismissed_concerns'/'dismissed_ids' (if backed by concrete disproving code) or 'inconclusive_concerns' (if contested or relying on unproven assumptions)."
                 .to_string(),
         );
     }
@@ -800,13 +1192,28 @@ fn validate_verification_source_ids(
         }
     }
 
+    for (idx, raw_did) in output.dismissed_ids.iter().enumerate() {
+        let sid = raw_did.trim();
+        if !all_valid.contains(&sid) {
+            return Err(format!(
+                "dismissed_ids[{idx}] contains unknown ID '{sid}'. Valid input IDs are: {valid_label}."
+            ));
+        }
+        if concern_ids.contains(&sid) {
+            return Err(format!(
+                "dismissed_ids[{idx}] references raised concern ID '{sid}'. Raised concerns (C*) must never be dismissed in verification; classify any contested or questionable concern into 'inconclusive_concerns'."
+            ));
+        }
+        accounted.insert(sid);
+    }
+
     let missing: Vec<&str> = all_valid
         .into_iter()
         .filter(|id| !accounted.contains(id))
         .collect();
     if !missing.is_empty() {
         return Err(format!(
-            "Verification output failed to account for input ID(s): {}. Every input concern (C*) and dismissed_concern (D*) ID must appear in 'source_ids' of at least one item in 'findings', 'inconclusive_concerns', or 'dismissed_concerns'.",
+            "Verification output failed to account for input ID(s): {}. Every input concern (C*) and dismissed_concern (D*) ID must appear in 'source_ids' or 'dismissed_ids'.",
             missing.join(", ")
         ));
     }
@@ -816,7 +1223,7 @@ fn validate_verification_source_ids(
 
 pub fn format_verification_stage_feedback(violation: &str) -> String {
     format!(
-        "\n\nPrevious attempt was rejected: {}. Return ONLY a JSON object with 'findings', 'inconclusive_concerns', and 'dismissed_concerns' arrays.",
+        "\n\nPrevious attempt was rejected: {}. Return ONLY a JSON object with 'findings', 'inconclusive_concerns', and 'dismissed_concerns' (or 'dismissed_ids') arrays.",
         violation
     )
 }
@@ -1458,7 +1865,18 @@ pub fn enrich_verification_output(
     outcome: &crate::workflow::stage::StageOutcome,
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
+    enrich_verification_output_for_stage(state, VERIFICATION.name, out, outcome, stage_lookup);
+}
+
+pub fn enrich_verification_output_for_stage(
+    state: &LinuxPatchReviewState,
+    stage_name: &str,
+    out: &mut VerificationOutput,
+    outcome: &crate::workflow::stage::StageOutcome,
+    stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
+) {
     let read_prompts = outcome.read_prompts();
+    let vf_base = state.verification_findings.len();
     for (idx, finding) in out.findings.iter_mut().enumerate() {
         // Category 1a findings originate strictly from C* concerns.
         enrich_item_provenance(
@@ -1470,12 +1888,14 @@ pub fn enrich_verification_output(
             stage_lookup,
         );
         if let Some(map) = finding.as_object_mut() {
-            let vf_id = format!("VF{}", idx.saturating_add(1));
+            let vf_id = format!("VF{}", vf_base.saturating_add(idx).saturating_add(1));
             map.insert("id".to_string(), json!(vf_id));
             map.insert("stage_item_id".to_string(), json!(vf_id));
-            map.insert("origin".to_string(), json!("verification"));
+            map.insert("origin".to_string(), json!(stage_name));
+            map.insert("verification_stage".to_string(), json!(stage_name));
         }
     }
+    let ic_base = state.inconclusive_concerns.len();
     for (idx, inconclusive) in out.inconclusive_concerns.iter_mut().enumerate() {
         // Category 2 inconclusive concerns can originate from both C* concerns and D* dismissals.
         let primary_concerns = &state.all_concerns;
@@ -1491,25 +1911,17 @@ pub fn enrich_verification_output(
         if let Some(map) = inconclusive.as_object_mut() {
             map.insert(
                 "id".to_string(),
-                json!(format!("I{}", idx.saturating_add(1))),
+                json!(format!(
+                    "I{}",
+                    ic_base.saturating_add(idx).saturating_add(1)
+                )),
             );
+            map.insert("origin".to_string(), json!(stage_name));
+            map.insert("verification_stage".to_string(), json!(stage_name));
         }
     }
-    let planned_batches = batch_inconclusive_concerns_by_severity(&out.inconclusive_concerns);
-    for (batch_idx, batch) in planned_batches.iter().enumerate() {
-        let assigned_stage = POST_VERIFICATION_STAGE_NAMES[batch_idx];
-        for batch_item in batch {
-            if let Some(iid) = batch_item.get("id").and_then(Value::as_str) {
-                for ic in &mut out.inconclusive_concerns {
-                    if ic.get("id").and_then(Value::as_str) == Some(iid)
-                        && let Some(map) = ic.as_object_mut()
-                    {
-                        map.insert("assigned_stage".to_string(), json!(assigned_stage));
-                    }
-                }
-            }
-        }
-    }
+    assign_inconclusive_concerns_stages(&mut out.inconclusive_concerns);
+    let vd_base = state.verification_dismissed.len();
     for (idx, dismissed) in out.dismissed_concerns.iter_mut().enumerate() {
         enrich_item_provenance(
             dismissed,
@@ -1522,9 +1934,31 @@ pub fn enrich_verification_output(
         if let Some(map) = dismissed.as_object_mut() {
             map.insert(
                 "id".to_string(),
-                json!(format!("VD{}", idx.saturating_add(1))),
+                json!(format!(
+                    "VD{}",
+                    vd_base.saturating_add(idx).saturating_add(1)
+                )),
             );
-            map.insert("origin".to_string(), json!("verification"));
+            map.insert("origin".to_string(), json!(stage_name));
+            map.insert("verification_stage".to_string(), json!(stage_name));
+        }
+    }
+}
+
+pub(crate) fn assign_inconclusive_concerns_stages(inconclusive_concerns: &mut [Value]) {
+    let planned_batches = batch_inconclusive_concerns_by_severity(inconclusive_concerns);
+    for (batch_idx, batch) in planned_batches.iter().enumerate() {
+        let assigned_stage = POST_VERIFICATION_STAGE_NAMES[batch_idx];
+        for batch_item in batch {
+            if let Some(iid) = batch_item.get("id").and_then(Value::as_str) {
+                for ic in inconclusive_concerns.iter_mut() {
+                    if ic.get("id").and_then(Value::as_str) == Some(iid)
+                        && let Some(map) = ic.as_object_mut()
+                    {
+                        map.insert("assigned_stage".to_string(), json!(assigned_stage));
+                    }
+                }
+            }
         }
     }
 }
@@ -1893,6 +2327,12 @@ pub struct ConsolidationStage {
     pub wants_series_context: bool,
 }
 
+pub static DEDUPLICATION: ConsolidationStage = ConsolidationStage {
+    name: "deduplication",
+    short: "Deduplication",
+    wants_series_context: false,
+};
+
 pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     name: "verification",
     short: "Verification",
@@ -1915,7 +2355,37 @@ pub static REPORT: ConsolidationStage = ConsolidationStage {
 /// definition above, so the name a stage registers under is the same string
 /// this list recognises and labels.
 pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] =
-    &[&VERIFICATION, &POST_VERIFICATION, &REPORT];
+    &[&DEDUPLICATION, &VERIFICATION, &POST_VERIFICATION, &REPORT];
+
+/// Maximum number of candidate items that fast-path skips LLM deduplication
+/// when no prior-version surviving items (`PC*`/`PD*`) exist.
+pub const DEDUPLICATION_FAST_PATH_MAX_ITEMS: usize = 4;
+
+/// Maximum number of candidate clusters processed by a single verification shard.
+pub const MAX_VERIFICATION_SHARD_SIZE: usize = 10;
+
+/// Maximum number of parallel verification shards executed concurrently.
+pub const MAX_VERIFICATION_STAGES: usize = 16;
+
+/// Static stage names for parallel sharded verification when >10 clusters exist.
+pub static VERIFICATION_STAGE_NAMES: [&str; MAX_VERIFICATION_STAGES] = [
+    "verification-1",
+    "verification-2",
+    "verification-3",
+    "verification-4",
+    "verification-5",
+    "verification-6",
+    "verification-7",
+    "verification-8",
+    "verification-9",
+    "verification-10",
+    "verification-11",
+    "verification-12",
+    "verification-13",
+    "verification-14",
+    "verification-15",
+    "verification-16",
+];
 
 /// Maximum number of parallel post-verification stages executed concurrently.
 pub const MAX_POST_VERIFICATION_STAGES: usize = 10;
@@ -1971,6 +2441,9 @@ use crate::workflows::guard::normalize_stage_name;
 
 pub fn consolidation_stage_by_name(name: &str) -> Option<&'static ConsolidationStage> {
     let normalized = normalize_stage_name(name);
+    if VERIFICATION_STAGE_NAMES.contains(&normalized.as_str()) {
+        return Some(&VERIFICATION);
+    }
     if POST_VERIFICATION_STAGE_NAMES.contains(&normalized.as_str()) {
         return Some(&POST_VERIFICATION);
     }
@@ -2233,22 +2706,433 @@ pub(crate) fn record_verified_findings(state: &mut LinuxPatchReviewState, findin
     }
 }
 
+pub fn has_prior_surviving_items(state: &LinuxPatchReviewState) -> bool {
+    state
+        .all_concerns
+        .iter()
+        .chain(state.all_dismissed_concerns.iter())
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .any(|id| id.starts_with("PC") || id.starts_with("PD"))
+}
+
+pub fn should_skip_deduplication(state: &LinuxPatchReviewState) -> bool {
+    let total = state.all_concerns.len() + state.all_dismissed_concerns.len();
+    total == 0 || (total <= DEDUPLICATION_FAST_PATH_MAX_ITEMS && !has_prior_surviving_items(state))
+}
+
+fn default_cluster_title(item: &Value) -> String {
+    for key in ["description", "problem", "type"] {
+        if let Some(s) = item
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return s.to_string();
+        }
+    }
+    "Candidate issue".to_string()
+}
+
+pub fn apply_deduplication_stage_output(
+    state: &mut LinuxPatchReviewState,
+    out: DeduplicationOutput,
+) {
+    let mut clusters = Vec::with_capacity(out.clusters.len());
+    for (idx, spec) in out.clusters.into_iter().enumerate() {
+        let gid = format!("G{}", idx.saturating_add(1));
+        let mut sids = Vec::new();
+        for raw_sid in spec.source_ids {
+            push_unique_string(&mut sids, &raw_sid);
+        }
+        let concerns: Vec<Value> = state
+            .all_concerns
+            .iter()
+            .filter(|c| {
+                c.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| sids.iter().any(|s| s == id.trim()))
+            })
+            .cloned()
+            .collect();
+        let dismissed: Vec<Value> = state
+            .all_dismissed_concerns
+            .iter()
+            .filter(|d| {
+                d.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| sids.iter().any(|s| s == id.trim()))
+            })
+            .cloned()
+            .collect();
+        clusters.push(json!({
+            "id": gid,
+            "title": spec.title.trim(),
+            "source_ids": sids,
+            "concerns": concerns,
+            "dismissed_concerns": dismissed,
+        }));
+    }
+    state.deduplicated_clusters = clusters;
+}
+
+pub fn build_singleton_clusters(state: &LinuxPatchReviewState) -> Vec<Value> {
+    let mut clusters =
+        Vec::with_capacity(state.all_concerns.len() + state.all_dismissed_concerns.len());
+    for c in &state.all_concerns {
+        let gid = format!("G{}", clusters.len().saturating_add(1));
+        let raw_id = c
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("C{}", clusters.len().saturating_add(1)));
+        clusters.push(json!({
+            "id": gid,
+            "title": default_cluster_title(c),
+            "source_ids": [raw_id],
+            "concerns": [c],
+            "dismissed_concerns": [],
+        }));
+    }
+    for d in &state.all_dismissed_concerns {
+        let gid = format!("G{}", clusters.len().saturating_add(1));
+        let raw_id = d
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("D{}", clusters.len().saturating_add(1)));
+        clusters.push(json!({
+            "id": gid,
+            "title": default_cluster_title(d),
+            "source_ids": [raw_id],
+            "concerns": [],
+            "dismissed_concerns": [d],
+        }));
+    }
+    clusters
+}
+
+pub fn effective_clusters(state: &LinuxPatchReviewState) -> Vec<Value> {
+    if !state.deduplicated_clusters.is_empty() {
+        state.deduplicated_clusters.clone()
+    } else {
+        build_singleton_clusters(state)
+    }
+}
+
+fn first_cluster_file(cluster: &Value) -> String {
+    for array_key in ["concerns", "dismissed_concerns"] {
+        if let Some(items) = cluster.get(array_key).and_then(Value::as_array) {
+            for item in items {
+                if let Some(locs) = item.get("locations").and_then(Value::as_array) {
+                    for loc in locs {
+                        if let Some(f) = loc
+                            .get("file")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            return f.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Partitions candidate clusters into balanced verification shards of at most
+/// [`MAX_VERIFICATION_SHARD_SIZE`] clusters (capped at [`MAX_VERIFICATION_STAGES`]).
+pub fn batch_clusters_for_verification(clusters: &[Value]) -> Vec<Vec<Value>> {
+    if clusters.is_empty() {
+        return Vec::new();
+    }
+    if clusters.len() <= MAX_VERIFICATION_SHARD_SIZE {
+        return vec![clusters.to_vec()];
+    }
+
+    let mut indexed: Vec<(usize, Value)> = clusters.iter().cloned().enumerate().collect();
+    indexed.sort_by(|(idx_a, a), (idx_b, b)| {
+        first_cluster_file(a)
+            .cmp(&first_cluster_file(b))
+            .then_with(|| idx_a.cmp(idx_b))
+    });
+    let sorted: Vec<Value> = indexed.into_iter().map(|(_, v)| v).collect();
+
+    let total = sorted.len();
+    let num_shards = total
+        .div_ceil(MAX_VERIFICATION_SHARD_SIZE)
+        .min(MAX_VERIFICATION_STAGES);
+    let base_size = total / num_shards;
+    let remainder = total % num_shards;
+
+    let mut batches = Vec::with_capacity(num_shards);
+    let mut offset = 0;
+    for shard_idx in 0..num_shards {
+        let extra = usize::from(shard_idx < remainder);
+        let size = base_size + extra;
+        batches.push(sorted[offset..offset + size].to_vec());
+        offset += size;
+    }
+    batches
+}
+
+fn materialize_dismissal_from_items(
+    cluster_id: Option<&str>,
+    fallback_title: Option<&str>,
+    items: &[Value],
+) -> Option<Value> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut source_ids = Vec::new();
+    let mut item_type = String::new();
+    let mut description = String::new();
+    let mut reasonings = Vec::new();
+    let mut locations = Vec::new();
+
+    for item in items {
+        if let Some(id) = item.get("id").and_then(Value::as_str) {
+            push_unique_string(&mut source_ids, id);
+        }
+        if item_type.is_empty()
+            && let Some(t) = item
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            item_type = t.to_string();
+        }
+        if description.is_empty()
+            && let Some(d) = item
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            description = d.to_string();
+        }
+        if let Some(r) = item
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            push_unique_string(&mut reasonings, r);
+        }
+        if let Some(locs) = item.get("locations").and_then(Value::as_array) {
+            for loc in locs {
+                if !locations.iter().any(|existing| existing == loc) {
+                    locations.push(loc.clone());
+                }
+            }
+        }
+    }
+
+    if description.is_empty()
+        && let Some(title) = fallback_title.map(str::trim).filter(|s| !s.is_empty())
+    {
+        description = title.to_string();
+    }
+    if item_type.is_empty() {
+        item_type = "General".to_string();
+    }
+
+    let mut obj = json!({
+        "source_ids": source_ids,
+        "type": item_type,
+        "description": description,
+        "reasoning": reasonings.join("\n\n"),
+        "locations": locations,
+    });
+    if let Some(cid) = cluster_id
+        && let Some(map) = obj.as_object_mut()
+    {
+        map.insert("cluster_ids".to_string(), json!([cid]));
+    }
+    Some(obj)
+}
+
+/// Replaces the cluster `G*` IDs in `item.source_ids` with the raw item IDs
+/// they stand for, recording the clusters in `cluster_ids`.
+///
+/// When a multi-concern cluster is split into separate items, each item also
+/// names the raw concern IDs it covers (see `LINEAGE_RULES`). Those explicit
+/// IDs are kept as the item's own concerns, together with the cluster's
+/// dismissals, so per-item provenance (stages, prompts, prior-version
+/// context) is not merged across the split. A cluster referenced without any
+/// of its raw concern IDs expands to all of its source IDs.
+fn expand_item_source_ids<'a>(item: &mut Value, find_cluster: &dyn Fn(&str) -> Option<&'a Value>) {
+    let explicit = extract_id_list(item, "source_ids");
+    if explicit.is_empty() {
+        return;
+    }
+    let item_ids = |cluster: &Value, key: &str| -> Vec<String> {
+        cluster
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.get("id").and_then(Value::as_str))
+                    .map(|id| id.trim().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut raw_ids = Vec::new();
+    let mut cluster_ids = Vec::new();
+    for sid in &explicit {
+        let Some(cluster) = find_cluster(sid) else {
+            push_unique_string(&mut raw_ids, sid);
+            continue;
+        };
+        push_unique_string(&mut cluster_ids, sid);
+        let concern_ids = item_ids(cluster, "concerns");
+        let named_concerns = concern_ids.iter().any(|cid| explicit.contains(cid));
+        if named_concerns {
+            for did in item_ids(cluster, "dismissed_concerns") {
+                push_unique_string(&mut raw_ids, &did);
+            }
+        } else {
+            for rid in extract_id_list(cluster, "source_ids") {
+                push_unique_string(&mut raw_ids, &rid);
+            }
+        }
+    }
+    if let Some(map) = item.as_object_mut() {
+        if !raw_ids.is_empty() {
+            map.insert("source_ids".to_string(), json!(raw_ids));
+        }
+        if !cluster_ids.is_empty() {
+            map.insert("cluster_ids".to_string(), json!(cluster_ids));
+        }
+    }
+}
+
+pub fn expand_verification_shard_output(
+    shard_clusters: &[Value],
+    mut out: VerificationOutput,
+) -> VerificationOutput {
+    let find_cluster = |id: &str| -> Option<&Value> {
+        shard_clusters
+            .iter()
+            .find(|c| c.get("id").and_then(Value::as_str).map(str::trim) == Some(id))
+    };
+
+    for collection in [
+        &mut out.findings,
+        &mut out.inconclusive_concerns,
+        &mut out.dismissed_concerns,
+    ] {
+        for item in collection.iter_mut() {
+            expand_item_source_ids(item, &find_cluster);
+        }
+    }
+
+    let mut seen_dismissed = std::collections::BTreeSet::new();
+    for raw_did in std::mem::take(&mut out.dismissed_ids) {
+        let did = raw_did.trim();
+        if did.is_empty() || !seen_dismissed.insert(did.to_string()) {
+            continue;
+        }
+        if let Some(cluster) = find_cluster(did) {
+            let items: Vec<Value> = cluster
+                .get("dismissed_concerns")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let title = cluster.get("title").and_then(Value::as_str);
+            if let Some(vd) = materialize_dismissal_from_items(Some(did), title, &items) {
+                out.dismissed_concerns.push(vd);
+            }
+        } else {
+            let items: Vec<Value> = shard_clusters
+                .iter()
+                .filter_map(|c| c.get("dismissed_concerns").and_then(Value::as_array))
+                .flatten()
+                .filter(|d| d.get("id").and_then(Value::as_str).map(str::trim) == Some(did))
+                .cloned()
+                .collect();
+            if let Some(vd) = materialize_dismissal_from_items(None, None, &items) {
+                out.dismissed_concerns.push(vd);
+            }
+        }
+    }
+
+    out
+}
+
+fn expand_direct_dismissed_ids(state: &LinuxPatchReviewState, out: &mut VerificationOutput) {
+    if out.dismissed_ids.is_empty() {
+        return;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for raw_did in std::mem::take(&mut out.dismissed_ids) {
+        let did = raw_did.trim();
+        if did.is_empty() || !seen.insert(did.to_string()) {
+            continue;
+        }
+        let matching: Vec<Value> = state
+            .all_dismissed_concerns
+            .iter()
+            .filter(|d| d.get("id").and_then(Value::as_str).map(str::trim) == Some(did))
+            .cloned()
+            .collect();
+        if let Some(vd) = materialize_dismissal_from_items(None, None, &matching) {
+            out.dismissed_concerns.push(vd);
+        }
+    }
+}
+
 pub fn apply_verification_stage_output(
     state: &mut LinuxPatchReviewState,
+    out: VerificationOutput,
+    outcome: &crate::workflow::stage::StageOutcome,
+    stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
+) {
+    apply_verification_stage_output_for_stage(state, VERIFICATION.name, out, outcome, stage_lookup);
+}
+
+pub fn apply_verification_stage_output_for_stage(
+    state: &mut LinuxPatchReviewState,
+    stage_name: &str,
     mut out: VerificationOutput,
     outcome: &crate::workflow::stage::StageOutcome,
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
-    enrich_verification_output(state, &mut out, outcome, stage_lookup);
+    expand_direct_dismissed_ids(state, &mut out);
+    enrich_verification_output_for_stage(state, stage_name, &mut out, outcome, stage_lookup);
     state.verification_findings.extend(out.findings.clone());
     state
         .verification_dismissed
         .extend(out.dismissed_concerns.clone());
     record_verified_findings(state, out.findings);
-    state.inconclusive_concerns = out.inconclusive_concerns;
+    state
+        .inconclusive_concerns
+        .extend(out.inconclusive_concerns);
+    assign_inconclusive_concerns_stages(&mut state.inconclusive_concerns);
     state
         .deduplicated_dismissed_concerns
         .extend(out.dismissed_concerns);
+}
+
+pub fn apply_verification_shard_output(
+    state: &mut LinuxPatchReviewState,
+    stage_name: &str,
+    shard_clusters: &[Value],
+    out: VerificationOutput,
+    outcome: &crate::workflow::stage::StageOutcome,
+    stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
+) {
+    let expanded = expand_verification_shard_output(shard_clusters, out);
+    apply_verification_stage_output_for_stage(state, stage_name, expanded, outcome, stage_lookup);
 }
 
 pub fn apply_post_verification_stage_output(
@@ -2291,6 +3175,208 @@ pub fn apply_post_verification_stage_output(
     state
         .deduplicated_dismissed_concerns
         .extend(out.dismissed_concerns);
+}
+
+pub const STAGE_DEDUPLICATION_INSTRUCTION: &str = r#"# Lossless pre-verification candidate deduplication
+
+Group overlapping candidate `concerns` (`C*`, `PC*`) and `dismissed_concerns` (`D*`, `PD*`) into candidate clusters (`G1`, `G2`, ...) purely by referencing their `source_ids`.
+1. **EXACT ROOT-CAUSE & LIFECYCLE BOUNDARY:** Merge items into the same cluster ONLY when they describe the exact same underlying root cause in the same function/lifecycle phase (including when one item raises a concern `C*`/`PC*` and another item dismisses that exact mechanism `D*`/`PD*`).
+2. **NEVER OVER-MERGE DISTINCT ISSUES:**
+   - Do NOT merge a setup/init/probe bug with a teardown/cleanup/remove bug in a separate function.
+   - Do NOT merge distinct races, resources, or fields (e.g., timer race vs. workqueue race, memory leak vs. lock ordering) even in the same function.
+   - Do NOT merge a concrete functional/concurrency/resource defect into a weaker style, refactoring, or assertion note.
+   - When in doubt, keep items in separate clusters.
+3. **100% LOSSLESS ID ACCOUNTING:** Do NOT rewrite, summarize, or drop any input item. Rust automatically attaches the verbatim input objects from `source_ids`. Every input ID across `Aggregated Concerns` and `Aggregated Dismissed Concerns` MUST appear in `source_ids` of exactly one cluster. If a single input item spans two distinct bugs, put it in the cluster of its primary bug; verification keeps every raised concern of a cluster individually accounted for."#;
+
+pub fn deduplication_system_prompt() -> PromptTemplate<LinuxPatchReviewState> {
+    PromptTemplate::<LinuxPatchReviewState>::new(
+        r#"You are a senior code review lead organizing candidate review items into root-cause clusters before deep verification.
+No repository exploration tools are available in this stage; do not attempt to call tools. Derive clusters strictly from the provided diff and candidate items.
+
+=== Target Commit ===
+{{target_commit_diff}}"#,
+    )
+    .with_var("target_commit_diff", |s: &LinuxPatchReviewState| {
+        s.target_commit_diff.clone()
+    })
+}
+
+pub fn deduplication_stage(temperature: f32) -> Stage<LinuxPatchReviewState, DeduplicationOutput> {
+    deduplication_stage_with_effort(temperature, None)
+}
+
+pub fn deduplication_stage_with_effort(
+    temperature: f32,
+    effort: Option<crate::ai::EffortMode>,
+) -> Stage<LinuxPatchReviewState, DeduplicationOutput> {
+    let user_template = PromptTemplate::<LinuxPatchReviewState>::new(format!(
+        r#"{STAGE_DEDUPLICATION_INSTRUCTION}
+
+Aggregated Concerns:
+{{{{aggregated_concerns}}}}
+
+Aggregated Dismissed Concerns:
+{{{{aggregated_dismissed_concerns}}}}
+
+Return ONLY a JSON object with a "clusters" array. Each cluster object MUST contain:
+- "id": sequential cluster identifier ("G1", "G2", ...)
+- "title": concise neutral summary of the shared root cause and function
+- "source_ids": non-empty array of input IDs ("C*", "D*", "PC*", "PD*") belonging to this cluster. Every input ID MUST appear in exactly one cluster.
+
+Example Output:
+```json
+{{
+  "clusters": [
+    {{
+      "id": "G1",
+      "title": "Potential leaked node on parse_tree() error return",
+      "source_ids": ["C1", "D2"]
+    }},
+    {{
+      "id": "G2",
+      "title": "Unlocked read of dev->state in foo_poll()",
+      "source_ids": ["C2"]
+    }}
+  ]
+}}
+```"#
+    ))
+    .with_var("aggregated_concerns", |s: &LinuxPatchReviewState| {
+        serde_json::to_string_pretty(&s.all_concerns).unwrap_or_default()
+    })
+    .with_var(
+        "aggregated_dismissed_concerns",
+        |s: &LinuxPatchReviewState| {
+            serde_json::to_string_pretty(&s.all_dismissed_concerns).unwrap_or_default()
+        },
+    );
+
+    Stage::builder(DEDUPLICATION.name)
+        .system_prompt(deduplication_system_prompt())
+        .user_prompt(user_template)
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_deduplication_output)
+                .with_feedback_formatter(format_deduplication_feedback),
+        )
+        .policy(StagePolicy {
+            tools: ToolScope::None,
+            max_turns: 1,
+            temperature,
+            reasoning_effort: effort.map(crate::ai::EffortMode::lightweight_stage_effort),
+            ..Default::default()
+        })
+        .skip_if(should_skip_deduplication)
+        .reduce(apply_deduplication_stage_output)
+        .build()
+}
+
+pub fn extra_prompt_paths_for_clusters(
+    selected_guides: &[String],
+    clusters: &[Value],
+    stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
+) -> Vec<PathBuf> {
+    let mut items = Vec::new();
+    for cluster in clusters {
+        for key in ["concerns", "dismissed_concerns"] {
+            if let Some(arr) = cluster.get(key).and_then(Value::as_array) {
+                items.extend(arr.iter().cloned());
+            }
+        }
+    }
+    extra_prompt_paths_for_items(selected_guides, &items, stage_lookup)
+}
+
+const LINUX_VERIFICATION_EXAMPLE: &str = r#"Example Output:
+```json
+{
+  "findings": [
+    {
+      "source_ids": ["G1"],
+      "problem": "mm: memory leak in func_x() due to unmet condition Y",
+      "severity": "High",
+      "severity_explanation": "1. Condition Y is met.\n2. The buffer is allocated but not freed before return.",
+      "preexisting": false,
+      "locations": [
+        {
+          "file": "path/to/file.c",
+          "function_or_symbol": "function_name",
+          "line": 123,
+          "code_snippet": "problematic_code();",
+          "side": "REVISION",
+          "why_this_location_matters": "This is where the newly allocated resource is dropped on the error path."
+        }
+      ]
+    }
+  ],
+  "inconclusive_concerns": [
+    {
+      "source_ids": ["G2"],
+      "type": "Resource Management",
+      "description": "Potential leak of child node in parse_tree() on error return",
+      "estimated_severity": "Medium",
+      "signal_reason": "speculative_dismissal",
+      "concern_arguments": "parse_tree() allocates node via kzalloc() and returns -EINVAL on line 88 without freeing it.",
+      "dismissal_arguments": "Dismissed by resources stage assuming caller frees partial state on error.",
+      "verification_question": "Inspect all callers of parse_tree() using git_grep and git_read_files to verify whether node is reachable or freed when parse_tree() returns an error.",
+      "preexisting": false,
+      "locations": [
+        {
+          "file": "path/to/file.c",
+          "function_or_symbol": "parse_tree",
+          "line": 88,
+          "code_snippet": "return -EINVAL;",
+          "side": "REVISION",
+          "why_this_location_matters": "Early error return after allocation without local kfree."
+        }
+      ]
+    }
+  ],
+  "dismissed_ids": ["G3"]
+}
+```"#;
+
+/// Linux inputs of the shared verification shard stage.
+pub static LINUX_VERIFICATION_PROFILE:
+    crate::workflows::verification_shards::VerificationShardProfile =
+    crate::workflows::verification_shards::VerificationShardProfile {
+        stage_name: "verification",
+        instruction: STAGE_VERIFICATION_INSTRUCTION,
+        problem_rule: "\"problem\" (short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause)",
+        example_output: LINUX_VERIFICATION_EXAMPLE,
+        wants_series_context: true,
+        system_prompt: linux_system_prompt,
+        stage_lookup: analysis_stage_by_name,
+    };
+
+pub fn verification_shard_stage_with_effort(
+    stage_name: &'static str,
+    shard_clusters: Vec<Value>,
+    max_turns: usize,
+    temperature: f32,
+    effort: Option<crate::ai::EffortMode>,
+) -> Stage<LinuxPatchReviewState, VerificationOutput> {
+    crate::workflows::verification_shards::verification_shard_stage(
+        &LINUX_VERIFICATION_PROFILE,
+        stage_name,
+        shard_clusters,
+        max_turns,
+        temperature,
+        effort,
+    )
+}
+
+pub fn resolve_verification_stages_with_options(
+    state: &LinuxPatchReviewState,
+    max_turns: usize,
+    temperature: f32,
+) -> Vec<Box<dyn ExecutableStage<LinuxPatchReviewState>>> {
+    crate::workflows::verification_shards::resolve_verification_stages(
+        &LINUX_VERIFICATION_PROFILE,
+        state,
+        max_turns,
+        temperature,
+    )
 }
 
 pub fn verification_stage(
@@ -2662,8 +3748,15 @@ pub fn build_linux_patch_review_workflow_with_effort(
             |s| s.all_concerns.is_empty() && s.all_dismissed_concerns.is_empty(),
             "No concerns or dismissed concerns raised in initial analysis stages",
         )
+        // Verification shards are the only path from a candidate cluster to
+        // a finding, so a failed shard aborts the review instead of silently
+        // dropping its clusters.
         .dynamic_parallel(
-            verification_stage_with_effort(max_turns, temperature, effort),
+            deduplication_stage_with_effort(temperature, effort),
+            move |state| resolve_verification_stages_with_options(state, max_turns, temperature),
+            ParallelPolicy::FailFast,
+        )
+        .resolved_parallel(
             move |state| {
                 resolve_post_verification_stages_with_options(state, max_turns, temperature)
             },
@@ -2681,6 +3774,30 @@ pub fn build_linux_patch_review_workflow_with_effort(
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_expand_keeps_per_item_concerns_when_a_cluster_is_split() {
+        let clusters = vec![json!({
+            "id": "G1",
+            "source_ids": ["C1", "C2", "D1"],
+            "concerns": [{"id": "C1"}, {"id": "C2"}],
+            "dismissed_concerns": [{"id": "D1"}],
+        })];
+        let out = VerificationOutput {
+            findings: vec![
+                json!({"source_ids": ["G1", "C1"], "problem": "a"}),
+                json!({"source_ids": ["G1", "C2"], "problem": "b"}),
+                json!({"source_ids": ["G1"], "problem": "c"}),
+            ],
+            ..Default::default()
+        };
+        let out = expand_verification_shard_output(&clusters, out);
+        assert_eq!(out.findings[0]["source_ids"], json!(["D1", "C1"]));
+        assert_eq!(out.findings[1]["source_ids"], json!(["D1", "C2"]));
+        assert_eq!(out.findings[2]["source_ids"], json!(["C1", "C2", "D1"]));
+        for f in &out.findings {
+            assert_eq!(f["cluster_ids"], json!(["G1"]));
+        }
+    }
     #[test]
     fn test_each_stage_declares_whether_it_needs_the_commit_message() {
         // This was a numeric range in a free function, which kept compiling
@@ -3264,6 +4381,7 @@ mod tests {
         let unexpected_dismissed = VerificationOutput {
             findings: vec![],
             inconclusive_concerns: vec![],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![json!({"description": "Dropped concern 1"})],
         };
         let err = validate_verification_stage_output(&unexpected_dismissed, &state_no_dismissed)
@@ -3280,6 +4398,7 @@ mod tests {
                 "locations": [{"file": "mm/foo.c", "function_or_symbol": "foo", "side": "REVISION"}]
             })],
             inconclusive_concerns: vec![],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![json!({
                 "type": "Locking",
                 "description": "Race condition in bar()",
@@ -3301,6 +4420,7 @@ mod tests {
         let both_empty_concerns = VerificationOutput {
             findings: vec![],
             inconclusive_concerns: vec![],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![json!({
                 "type": "Null Deref",
                 "description": "Suspected NULL deref in baz()",
@@ -3333,6 +4453,7 @@ mod tests {
                 "locations": [{"file": "mm/foo.c", "function_or_symbol": "foo", "side": "REVISION"}]
             })],
             inconclusive_concerns: vec![],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![],
         };
         let err_empty_dismissed = validate_verification_stage_output(
@@ -3367,6 +4488,7 @@ mod tests {
                 "preexisting": false,
                 "locations": [{"file": "mm/bar.c", "function_or_symbol": "bar", "side": "REVISION"}]
             })],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![
                 json!({
                     "type": "Null Deref",
@@ -3617,7 +4739,7 @@ mod tests {
     fn test_build_workflow_graph_structure() {
         let workflow = build_linux_patch_review_workflow();
         assert_eq!(workflow.name, "linux_patch_review");
-        assert_eq!(workflow.steps.len(), 5);
+        assert_eq!(workflow.steps.len(), 6);
     }
 
     #[test]
@@ -3783,6 +4905,7 @@ mod tests {
                 "description": "contested issue",
                 "estimated_severity": "High",
             })],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![json!({
                 "description": "new dismissed",
             })],
@@ -3900,6 +5023,7 @@ mod tests {
                 "locations": [{"file": "net/foo.c", "function_or_symbol": "foo_tx", "line": 42, "code_snippet": "x++;", "side": "REVISION", "why_this_location_matters": "unlocked"}]
             })],
             inconclusive_concerns: vec![],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![],
         };
 
@@ -4069,6 +5193,7 @@ mod tests {
                 "preexisting": false,
                 "locations": [{"file": "net/core/dev.c", "function_or_symbol": "foo_lock", "line": 42, "side": "REVISION"}]
             })],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![],
         };
         let outcome_ver = ver_stage.outcome_reducer.as_ref().unwrap();
@@ -4181,6 +5306,7 @@ mod tests {
                 "locations": []
             })],
             inconclusive_concerns: vec![],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![json!({
                 "source_ids": ["D1"],
                 "type": "Locking",
@@ -4203,6 +5329,7 @@ mod tests {
                 "locations": []
             })],
             inconclusive_concerns: vec![],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![json!({
                 "source_ids": ["C2", "D1"],
                 "type": "Locking",
@@ -4236,6 +5363,7 @@ mod tests {
                 "preexisting": false,
                 "locations": []
             })],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![],
         };
         let err = validate_verification_stage_output(&illegal_1a, &state).unwrap_err();
@@ -4263,6 +5391,7 @@ mod tests {
                 "preexisting": false,
                 "locations": []
             })],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![json!({
                 "source_ids": ["D1"],
                 "type": "Locking",
@@ -4385,6 +5514,7 @@ mod tests {
                 }]
             })],
             inconclusive_concerns: vec![],
+            dismissed_ids: vec![],
             dismissed_concerns: vec![],
         };
 
@@ -4445,5 +5575,412 @@ mod tests {
             state.inconclusive_concerns[0]["locations"][0]["in_diff"],
             false
         );
+    }
+
+    #[test]
+    fn test_deduplication_validator_fast_path_and_materialization() {
+        let mut state = LinuxPatchReviewState::default();
+        append_stage_items_with_prompts(
+            &mut state.all_concerns,
+            &[
+                json!({"description": "Leak on error path in foo()", "reasoning": "r1"}),
+                json!({"description": "Unlocked write in bar()", "reasoning": "r2"}),
+            ],
+            "resources",
+            "General",
+            &["resources.md".to_string()],
+        );
+        append_stage_dismissed_concerns_with_prompts(
+            &mut state.all_dismissed_concerns,
+            &[json!({"description": "Leak on error path in foo()", "reasoning": "d1"})],
+            "execution-flow",
+            &["callstack.md".to_string()],
+        );
+
+        // <= 4 items and no PC*/PD* items triggers the fast-path skip.
+        assert!(should_skip_deduplication(&state));
+        let singletons = effective_clusters(&state);
+        assert_eq!(singletons.len(), 3);
+        assert_eq!(singletons[0]["id"], "G1");
+        assert_eq!(singletons[0]["source_ids"], json!(["C1"]));
+        assert_eq!(singletons[2]["id"], "G3");
+        assert_eq!(singletons[2]["source_ids"], json!(["D1"]));
+
+        // Adding a prior-version concern PC1 disables the fast-path skip even when total <= 4.
+        state.all_concerns.push(json!({
+            "id": "PC1",
+            "stage": "prior-feedback-1",
+            "stages": ["prior-feedback-1"],
+            "description": "Prior reviewer concern on foo()",
+            "prior_quote": "Please free buf before returning -ENOMEM",
+        }));
+        assert!(!should_skip_deduplication(&state));
+
+        // Missing D1 in deduplication output is rejected.
+        let incomplete = DeduplicationOutput {
+            clusters: vec![
+                DeduplicationClusterSpec {
+                    id: "G1".to_string(),
+                    title: "foo() leak".to_string(),
+                    source_ids: vec!["C1".to_string(), "PC1".to_string()],
+                },
+                DeduplicationClusterSpec {
+                    id: "G2".to_string(),
+                    title: "bar() race".to_string(),
+                    source_ids: vec!["C2".to_string()],
+                },
+            ],
+        };
+        let err = validate_deduplication_output(&incomplete, &state).unwrap_err();
+        assert!(err.contains("D1"));
+
+        // Unknown ID C99 is rejected.
+        let unknown = DeduplicationOutput {
+            clusters: vec![DeduplicationClusterSpec {
+                id: "G1".to_string(),
+                title: "everything".to_string(),
+                source_ids: vec![
+                    "C1".to_string(),
+                    "C2".to_string(),
+                    "PC1".to_string(),
+                    "D1".to_string(),
+                    "C99".to_string(),
+                ],
+            }],
+        };
+        let err_unk = validate_deduplication_output(&unknown, &state).unwrap_err();
+        assert!(err_unk.contains("C99"));
+
+        // Valid lossless clustering preserves verbatim objects including prior_quote.
+        let valid = DeduplicationOutput {
+            clusters: vec![
+                DeduplicationClusterSpec {
+                    id: "G1".to_string(),
+                    title: "Contested foo() error-path leak".to_string(),
+                    source_ids: vec!["C1".to_string(), "PC1".to_string(), "D1".to_string()],
+                },
+                DeduplicationClusterSpec {
+                    id: "G2".to_string(),
+                    title: "bar() unlocked write".to_string(),
+                    source_ids: vec!["C2".to_string()],
+                },
+            ],
+        };
+        assert!(validate_deduplication_output(&valid, &state).is_ok());
+        apply_deduplication_stage_output(&mut state, valid);
+        assert_eq!(state.deduplicated_clusters.len(), 2);
+        assert_eq!(state.deduplicated_clusters[0]["id"], "G1");
+        assert_eq!(
+            state.deduplicated_clusters[0]["concerns"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            state.deduplicated_clusters[0]["concerns"][1]["prior_quote"],
+            "Please free buf before returning -ENOMEM"
+        );
+        assert_eq!(
+            state.deduplicated_clusters[0]["dismissed_concerns"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_sharded_verification_batches_validators_and_multi_shard_reduction() {
+        let mut state = LinuxPatchReviewState {
+            project: "linux".to_string(),
+            ..Default::default()
+        };
+        let mut concerns = Vec::new();
+        for idx in 1..=12 {
+            concerns.push(json!({
+                "type": "Bug",
+                "description": format!("Candidate bug {idx}"),
+                "reasoning": format!("Reason {idx}"),
+                "locations": [{"file": "mm/page_alloc.c", "function_or_symbol": "alloc_pages", "line": idx, "code_snippet": "x++;", "side": "REVISION"}]
+            }));
+        }
+        append_stage_items_with_prompts(
+            &mut state.all_concerns,
+            &concerns,
+            "goal",
+            "General",
+            &["review-core.md".to_string()],
+        );
+        append_stage_dismissed_concerns_with_prompts(
+            &mut state.all_dismissed_concerns,
+            &[
+                json!({
+                    "type": "Locking",
+                    "description": "Dismissed check 1",
+                    "reasoning": "Guarded by lock_a",
+                    "locations": [{"file": "mm/page_alloc.c", "function_or_symbol": "free_pages", "line": 100, "code_snippet": "spin_lock(&lock_a);", "side": "REVISION"}]
+                }),
+                json!({
+                    "type": "Locking",
+                    "description": "Dismissed check 2",
+                    "reasoning": "Guarded by lock_b",
+                    "locations": [{"file": "mm/page_alloc.c", "function_or_symbol": "free_pages", "line": 110, "code_snippet": "spin_lock(&lock_b);", "side": "REVISION"}]
+                }),
+            ],
+            "locking",
+            &["locking.md".to_string()],
+        );
+
+        // 14 items > 4 triggers deduplication; simulate 14 singleton clusters G1..G14.
+        assert!(!should_skip_deduplication(&state));
+        let clusters = effective_clusters(&state);
+        assert_eq!(clusters.len(), 14);
+        let shards = batch_clusters_for_verification(&clusters);
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].len(), 7);
+        assert_eq!(shards[1].len(), 7);
+
+        let stages = resolve_verification_stages_with_options(&state, 20, 0.0);
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].name(), "verification-1");
+        assert_eq!(stages[1].name(), "verification-2");
+
+        // Validator rejects putting a concern cluster (G1) into dismissed_ids.
+        let bad_dismiss = VerificationOutput {
+            findings: vec![],
+            inconclusive_concerns: (2..=7)
+                .map(|i| {
+                    json!({
+                        "source_ids": [format!("G{i}")],
+                        "type": "Bug",
+                        "description": "desc",
+                        "estimated_severity": "Medium",
+                        "signal_reason": "speculative_concern",
+                        "concern_arguments": "arg",
+                        "dismissal_arguments": "",
+                        "verification_question": "q",
+                        "preexisting": false,
+                        "locations": []
+                    })
+                })
+                .collect(),
+            dismissed_ids: vec!["G1".to_string()],
+            dismissed_concerns: vec![],
+        };
+        let err = validate_verification_shard_output(&bad_dismiss, &shards[0]).unwrap_err();
+        assert!(err.contains("G1"));
+
+        // Shard 1 validates G1 as VF1 and routes G2..G7 to H1..H6.
+        let out_shard_1 = VerificationOutput {
+            findings: vec![json!({
+                "source_ids": ["G1"],
+                "problem": "mm: bug 1 in alloc_pages()",
+                "severity": "High",
+                "severity_explanation": "proven",
+                "preexisting": false,
+                "locations": [{"file": "mm/page_alloc.c", "function_or_symbol": "alloc_pages", "line": 1, "code_snippet": "x++;", "side": "REVISION"}]
+            })],
+            inconclusive_concerns: (2..=7)
+                .map(|i| {
+                    json!({
+                        "source_ids": [format!("G{i}")],
+                        "type": "Bug",
+                        "description": format!("Inconclusive concern {i}"),
+                        "estimated_severity": "Medium",
+                        "signal_reason": "speculative_concern",
+                        "concern_arguments": "arg",
+                        "dismissal_arguments": "",
+                        "verification_question": "q",
+                        "preexisting": false,
+                        "locations": []
+                    })
+                })
+                .collect(),
+            dismissed_ids: vec![],
+            dismissed_concerns: vec![],
+        };
+        assert!(validate_verification_shard_output(&out_shard_1, &shards[0]).is_ok());
+        apply_verification_shard_output(
+            &mut state,
+            "verification-1",
+            &shards[0],
+            out_shard_1,
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+
+        // Shard 2 validates G8 as VF2, routes G9..G12 to H7..H10, and dismisses G13, G14 via slim dismissed_ids.
+        let out_shard_2 = VerificationOutput {
+            findings: vec![json!({
+                "source_ids": ["G8"],
+                "problem": "mm: bug 8 in alloc_pages()",
+                "severity": "Medium",
+                "severity_explanation": "proven",
+                "preexisting": false,
+                "locations": [{"file": "mm/page_alloc.c", "function_or_symbol": "alloc_pages", "line": 8, "code_snippet": "x++;", "side": "REVISION"}]
+            })],
+            inconclusive_concerns: (9..=12)
+                .map(|i| {
+                    json!({
+                        "source_ids": [format!("G{i}")],
+                        "type": "Bug",
+                        "description": format!("Inconclusive concern {i}"),
+                        "estimated_severity": "High",
+                        "signal_reason": "speculative_concern",
+                        "concern_arguments": "arg",
+                        "dismissal_arguments": "",
+                        "verification_question": "q",
+                        "preexisting": false,
+                        "locations": []
+                    })
+                })
+                .collect(),
+            dismissed_ids: vec!["G13".to_string(), "G14".to_string()],
+            dismissed_concerns: vec![],
+        };
+        assert!(validate_verification_shard_output(&out_shard_2, &shards[1]).is_ok());
+        apply_verification_shard_output(
+            &mut state,
+            "verification-2",
+            &shards[1],
+            out_shard_2,
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+
+        // Verify monotonic IDs, raw C*/D* expansion, and materialized VD1/VD2 across both shards.
+        assert_eq!(state.verification_findings.len(), 2);
+        assert_eq!(state.verification_findings[0]["id"], "VF1");
+        assert_eq!(state.verification_findings[0]["source_ids"], json!(["C1"]));
+        assert_eq!(state.verification_findings[0]["cluster_ids"], json!(["G1"]));
+        assert_eq!(state.verification_findings[1]["id"], "VF2");
+        assert_eq!(state.verification_findings[1]["source_ids"], json!(["C8"]));
+        assert_eq!(state.inconclusive_concerns.len(), 10);
+        assert_eq!(state.inconclusive_concerns[0]["id"], "I1");
+        assert_eq!(state.inconclusive_concerns[9]["id"], "I10");
+        assert!(state.inconclusive_concerns[9]["assigned_stage"].is_string());
+        assert_eq!(state.verification_dismissed.len(), 2);
+        assert_eq!(state.verification_dismissed[0]["id"], "VD1");
+        assert_eq!(state.verification_dismissed[0]["source_ids"], json!(["D1"]));
+        assert_eq!(
+            state.verification_dismissed[0]["description"],
+            "Dismissed check 1"
+        );
+        assert_eq!(state.verification_dismissed[1]["id"], "VD2");
+        assert_eq!(state.verification_dismissed[1]["source_ids"], json!(["D2"]));
+    }
+
+    fn inconclusive_concern_for(source_ids: Value) -> Value {
+        json!({
+            "source_ids": source_ids,
+            "type": "Locking",
+            "description": "d",
+            "estimated_severity": "High",
+            "signal_reason": "other",
+            "concern_arguments": "a",
+            "dismissal_arguments": "",
+            "verification_question": "q",
+            "preexisting": false,
+            "locations": []
+        })
+    }
+
+    #[test]
+    fn test_merged_cluster_requires_every_raised_concern_named() {
+        let shard = vec![json!({
+            "id": "G1",
+            "title": "Two bugs in foo()",
+            "source_ids": ["C1", "C2"],
+            "concerns": [
+                {"id": "C1", "description": "leak", "reasoning": "r", "locations": []},
+                {"id": "C2", "description": "race", "reasoning": "r", "locations": []}
+            ],
+            "dismissed_concerns": []
+        })];
+        let cluster_only = VerificationOutput {
+            inconclusive_concerns: vec![inconclusive_concern_for(json!(["G1"]))],
+            ..Default::default()
+        };
+        let err = validate_verification_shard_output(&cluster_only, &shard)
+            .expect_err("a merged cluster must name each raised concern");
+        assert!(err.contains("C1, C2"), "{err}");
+        let one_named = VerificationOutput {
+            inconclusive_concerns: vec![inconclusive_concern_for(json!(["G1", "C1"]))],
+            ..Default::default()
+        };
+        assert!(
+            validate_verification_shard_output(&one_named, &shard)
+                .unwrap_err()
+                .contains("C2")
+        );
+        let both_named = VerificationOutput {
+            inconclusive_concerns: vec![
+                inconclusive_concern_for(json!(["C1"])),
+                inconclusive_concern_for(json!(["C2"])),
+            ],
+            ..Default::default()
+        };
+        validate_verification_shard_output(&both_named, &shard).expect("both bugs kept");
+    }
+
+    #[test]
+    fn test_deduplication_rejects_id_in_two_clusters() {
+        let state = LinuxPatchReviewState {
+            all_concerns: vec![json!({"id": "C1"}), json!({"id": "C2"})],
+            ..Default::default()
+        };
+        let dup = DeduplicationOutput {
+            clusters: vec![
+                DeduplicationClusterSpec {
+                    id: "G1".to_string(),
+                    title: "a".to_string(),
+                    source_ids: vec!["C1".to_string(), "C2".to_string()],
+                },
+                DeduplicationClusterSpec {
+                    id: "G2".to_string(),
+                    title: "b".to_string(),
+                    source_ids: vec!["C2".to_string()],
+                },
+            ],
+        };
+        let err = validate_deduplication_output(&dup, &state).unwrap_err();
+        assert!(
+            err.contains("'C2'") && err.contains("exactly one cluster"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_verification_shard_output_rejects_raw_id_splitting_contested_cluster() {
+        let contested_shard = vec![json!({
+            "id": "G1",
+            "title": "Contested locking issue in foo_lock()",
+            "source_ids": ["C1", "D1"],
+            "concerns": [{"id": "C1", "description": "Missing lock", "reasoning": "r1", "locations": []}],
+            "dismissed_concerns": [{"id": "D1", "description": "Lock held by caller", "reasoning": "r2", "locations": []}]
+        })];
+
+        let split_attempt = VerificationOutput {
+            findings: vec![],
+            inconclusive_concerns: vec![json!({
+                "source_ids": ["C1"],
+                "type": "Locking",
+                "description": "Missing lock in foo_lock()",
+                "estimated_severity": "High",
+                "signal_reason": "mixed_signals",
+                "concern_arguments": "Missing lock",
+                "dismissal_arguments": "Caller holds lock",
+                "verification_question": "Check callers",
+                "preexisting": false,
+                "locations": []
+            })],
+            dismissed_ids: vec!["D1".to_string()],
+            dismissed_concerns: vec![],
+        };
+
+        let err = validate_verification_shard_output(&split_attempt, &contested_shard)
+            .expect_err("splitting contested cluster via raw D1 dismissal must fail");
+        assert!(err.contains("G1") && err.contains("C1"));
     }
 }
