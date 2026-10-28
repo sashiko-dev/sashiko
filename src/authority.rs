@@ -128,6 +128,33 @@ impl ContributorAuthority {
             },
         }
     }
+
+    /// Elevates maintainer role and trust tier when an authenticated forge API
+    /// confirms repository maintainer permission (`OWNER`, `MEMBER`, or
+    /// `COLLABORATOR`), while preserving `AutomatedBot` and `PatchAuthor` rules.
+    pub fn with_forge_association(mut self, author_association: Option<&str>) -> Self {
+        let is_repo_maintainer = author_association.is_some_and(|assoc| {
+            matches!(
+                assoc.trim().to_ascii_uppercase().as_str(),
+                "OWNER" | "MEMBER" | "COLLABORATOR"
+            )
+        });
+        if is_repo_maintainer && self.speaker_role != SpeakerRole::AutomatedBot {
+            if matches!(
+                self.maintainer_role,
+                MaintainerRole::None | MaintainerRole::OtherSubsystemMaintainer
+            ) {
+                self.maintainer_role = MaintainerRole::SubsystemMaintainer;
+            }
+            self.tier = TrustTier::High;
+            self.unverifiable_claim_trust = Self::effective_unverifiable_trust(
+                self.tier,
+                self.speaker_role,
+                self.maintainer_role,
+            );
+        }
+        self
+    }
 }
 
 /// Project whitelist of automated bots whose reports (build failures,
@@ -545,6 +572,57 @@ fn patch_author_name_key(raw_author: &str) -> Option<String> {
     (key.split_whitespace().count() >= 2).then_some(key)
 }
 
+/// Matches a bare Forge login handle (such as `"octocat"`, `"Contributor"`, or
+/// `"jane-doe"`, with no `@` or `<...>`) against a series/patch author string
+/// `"Name <email>"` (and its `.mailmap`-canonicalized email `canon_pa`).
+fn bare_forge_login_matches_patch_author(raw_speaker: &str, pa: &str, canon_pa: &str) -> bool {
+    let trimmed = raw_speaker.trim().trim_matches(['"', '\'']).trim();
+    if trimmed.is_empty() || trimmed.contains('@') || trimmed.contains('<') || trimmed.contains('>')
+    {
+        return false;
+    }
+    let login = normalize_display_name(trimmed);
+    if login.is_empty() {
+        return false;
+    }
+    let compact_alnum =
+        |s: &str| -> String { s.chars().filter(char::is_ascii_alphanumeric).collect() };
+    let login_compact = compact_alnum(&login);
+
+    let (pa_name, pa_email) = split_author_name_and_email(pa);
+    if let Some(name) = pa_name {
+        let clean_name = name.strip_suffix(" via B4 Relay").unwrap_or(name);
+        let norm_name = normalize_display_name(clean_name);
+        if norm_name == login {
+            return true;
+        }
+        if norm_name.split_whitespace().count() >= 2
+            && login_compact.len() >= 3
+            && compact_alnum(&norm_name) == login_compact
+        {
+            return true;
+        }
+    }
+
+    for addr in [pa_email.as_str(), canon_pa] {
+        let Some((local, domain)) = addr.split_once('@') else {
+            continue;
+        };
+        if matches!(
+            domain,
+            "users.noreply.github.com" | "github.com" | "users.noreply.gitlab.com" | "gitlab.com"
+        ) {
+            let handle = local.rsplit('+').next().unwrap_or(local);
+            if handle == login
+                || (login_compact.len() >= 3 && compact_alnum(handle) == login_compact)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Checks whether a speaker is one of the series/patch authors: the same
 /// address, the same `.mailmap` identity, or the same full display name.
 ///
@@ -575,6 +653,9 @@ pub fn is_speaker_patch_author(
             return true;
         }
         if speaker_name.is_some() && speaker_name == patch_author_name_key(pa) {
+            return true;
+        }
+        if bare_forge_login_matches_patch_author(raw_speaker, pa, &canon_pa) {
             return true;
         }
     }
@@ -1187,6 +1268,21 @@ F:\tmm/damon/
     }
 
     #[test]
+    fn test_forge_association_grants_high_trust() {
+        let auth = classify_contributor(
+            MaintainerRole::None,
+            Vec::new(),
+            SpeakerRole::Reviewer,
+            "octocat".to_string(),
+            false,
+        )
+        .with_forge_association(Some("MEMBER"));
+        assert_eq!(auth.tier, TrustTier::High);
+        assert_eq!(auth.maintainer_role, MaintainerRole::SubsystemMaintainer);
+        assert_eq!(auth.unverifiable_claim_trust, TrustTier::High);
+    }
+
+    #[test]
     fn test_patch_author_replying_from_second_address_stays_patch_author() {
         let mailmap = Mailmap::from_reader(TEST_MAILMAP.as_bytes());
         let authors = vec!["Jane Q Developer <jane@corp.example.com>".to_string()];
@@ -1205,12 +1301,36 @@ F:\tmm/damon/
             speaker, &canonical, &authors, &mailmap, &is_known
         ));
 
-        // A single shared first name is not enough.
+        // A single shared first name is not enough when both sides carry emails.
         let authors = vec!["Jane <jane@corp.example.com>".to_string()];
         let speaker = "Jane <someone.else@example.org>";
         let canonical = canonicalize_speaker_identity(speaker, &mailmap, &is_known);
         assert!(!is_speaker_patch_author(
             speaker, &canonical, &authors, &mailmap, &is_known
+        ));
+
+        // Bare Forge logins match the commit author by display name or
+        // GitHub/GitLab noreply handle.
+        let authors = vec![
+            "Contributor <c@example.com>".to_string(),
+            "Jane Doe <jane@example.com>".to_string(),
+            "Some Author <12345+octocat@users.noreply.github.com>".to_string(),
+        ];
+        for login in ["Contributor", "jane-doe", "octocat"] {
+            let canonical = canonicalize_speaker_identity(login, &mailmap, &is_known);
+            assert!(
+                is_speaker_patch_author(login, &canonical, &authors, &mailmap, &is_known),
+                "expected bare Forge login {login} to match patch authors"
+            );
+        }
+        let reviewer_login = "repo-maintainer";
+        let canonical = canonicalize_speaker_identity(reviewer_login, &mailmap, &is_known);
+        assert!(!is_speaker_patch_author(
+            reviewer_login,
+            &canonical,
+            &authors,
+            &mailmap,
+            &is_known
         ));
     }
 

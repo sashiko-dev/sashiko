@@ -1032,6 +1032,288 @@ pub async fn post_github_pr_comment(
     }
 }
 
+/// Source endpoint of a persisted Forge pull/merge request comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeCommentSource {
+    Review,
+    ReviewComment,
+    IssueComment,
+}
+
+impl ForgeCommentSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ForgeCommentSource::Review => "review",
+            ForgeCommentSource::ReviewComment => "review_comment",
+            ForgeCommentSource::IssueComment => "issue_comment",
+        }
+    }
+}
+
+impl std::str::FromStr for ForgeCommentSource {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "review" => Ok(ForgeCommentSource::Review),
+            "review_comment" => Ok(ForgeCommentSource::ReviewComment),
+            "issue_comment" => Ok(ForgeCommentSource::IssueComment),
+            other => Err(format!("unknown forge comment source: {other}")),
+        }
+    }
+}
+
+/// Normalized Forge PR review/diff/issue comment ready for `forge_comments` persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeFetchedComment {
+    pub provider: String,
+    pub repo: String,
+    pub pr_number: i64,
+    pub comment_source: ForgeCommentSource,
+    pub remote_comment_id: i64,
+    pub in_reply_to_id: Option<i64>,
+    pub author: String,
+    pub author_association: Option<String>,
+    pub commit_id: Option<String>,
+    pub file_path: Option<String>,
+    pub line: Option<i64>,
+    pub body: String,
+    pub html_url: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Returns `true` when a forge comment is an outbound review summary posted
+/// by Sashiko: the body starts with `### Sashiko review` and `author` is
+/// Sashiko's own account. That account is `sashiko_login` (`forge.bot_login`)
+/// when configured, and otherwise any GitHub App account (`<app>[bot]`),
+/// which a person cannot post as. Anyone else using the header keeps their
+/// comment, and human replies quoting Sashiko (`> ### Sashiko review`) start
+/// with `>` and are preserved too.
+pub fn is_sashiko_pr_review_comment(author: &str, body: &str, sashiko_login: Option<&str>) -> bool {
+    if !body.trim_start().starts_with("### Sashiko review") {
+        return false;
+    }
+    let author = author.trim();
+    match sashiko_login.map(str::trim).filter(|l| !l.is_empty()) {
+        Some(login) => author.eq_ignore_ascii_case(login),
+        None => author.to_ascii_lowercase().ends_with("[bot]"),
+    }
+}
+
+/// Resolves an optional GitHub bearer token from `ForgeSettings` (preferring
+/// GitHub App installation credentials and falling back to `api_token`).
+pub async fn resolve_optional_github_token(
+    client: &reqwest::Client,
+    api_base: &str,
+    settings: &crate::settings::ForgeSettings,
+) -> Option<String> {
+    if let (Some(app_id), Some(installation_id)) = (settings.app_id, settings.installation_id) {
+        let pem_opt = settings
+            .app_private_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                settings
+                    .app_private_key_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+            });
+        if let Some(pem) = pem_opt
+            && let Ok(jwt) = mint_github_app_jwt(app_id, &pem)
+            && let Ok(tok) =
+                exchange_github_installation_token(client, api_base, installation_id, &jwt).await
+        {
+            return Some(tok);
+        }
+    }
+    settings
+        .api_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Safety bound on feedback pages fetched per PR and comment kind (100
+/// comments each); reaching it is logged, never silent.
+const MAX_FEEDBACK_PAGES: u32 = 200;
+const FEEDBACK_PER_PAGE: u32 = 100;
+
+/// Fetches review summaries, inline diff comments, and top-level issue comments
+/// for a GitHub pull request, filtering out empty reviews and Sashiko's own bot
+/// summary comments (see `is_sashiko_pr_review_comment` for `sashiko_login`).
+pub async fn fetch_github_pr_feedback(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &str,
+    pr_number: i64,
+    token: Option<&str>,
+    sashiko_login: Option<&str>,
+) -> Result<Vec<ForgeFetchedComment>, String> {
+    if pr_number <= 0 {
+        return Err(format!("invalid pull request number: {pr_number}"));
+    }
+    let repo = normalize_github_repo_slug(repo)
+        .ok_or_else(|| format!("invalid GitHub repository slug: {}", loggable(repo)))?;
+
+    let mut all = Vec::new();
+    for (source, subpath) in [
+        (
+            ForgeCommentSource::Review,
+            format!("pulls/{pr_number}/reviews"),
+        ),
+        (
+            ForgeCommentSource::ReviewComment,
+            format!("pulls/{pr_number}/comments"),
+        ),
+        (
+            ForgeCommentSource::IssueComment,
+            format!("issues/{pr_number}/comments"),
+        ),
+    ] {
+        let items = fetch_github_comment_pages(client, api_base, &repo, &subpath, token).await?;
+        for item in items {
+            if let Some(parsed) = parse_github_feedback_item(&repo, pr_number, source, &item)
+                && !is_sashiko_pr_review_comment(&parsed.author, &parsed.body, sashiko_login)
+            {
+                all.push(parsed);
+            }
+        }
+    }
+    all.sort_by_key(|c| (c.created_at, c.remote_comment_id));
+    Ok(all)
+}
+
+async fn fetch_github_comment_pages(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &str,
+    subpath: &str,
+    token: Option<&str>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = Vec::new();
+    for page in 1..=MAX_FEEDBACK_PAGES {
+        let url = format!(
+            "{}/repos/{}/{}?per_page={}&page={}",
+            api_base.trim_end_matches('/'),
+            repo,
+            subpath,
+            FEEDBACK_PER_PAGE,
+            page
+        );
+        let mut req = client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "sashiko")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(tok) = token.map(str::trim).filter(|s| !s.is_empty()) {
+            req = req.header("Authorization", format!("Bearer {tok}"));
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("GitHub feedback GET failed for {repo}/{subpath}: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            let redacted = crate::utils::redact_secret(&text);
+            return Err(format!(
+                "GitHub feedback API returned {status} for {repo}/{subpath}: {redacted}"
+            ));
+        }
+        let page_items: Vec<serde_json::Value> = resp.json().await.map_err(|e| {
+            format!("invalid JSON array from GitHub {repo}/{subpath} ({status}): {e}")
+        })?;
+        let count = page_items.len();
+        out.extend(page_items);
+        if count < FEEDBACK_PER_PAGE as usize {
+            return Ok(out);
+        }
+    }
+    tracing::warn!(
+        "GitHub feedback for {repo}/{subpath} stopped at the {MAX_FEEDBACK_PAGES}-page safety bound ({} comments)",
+        out.len()
+    );
+    Ok(out)
+}
+
+fn parse_github_feedback_item(
+    repo: &str,
+    pr_number: i64,
+    source: ForgeCommentSource,
+    item: &serde_json::Value,
+) -> Option<ForgeFetchedComment> {
+    let remote_comment_id = item["id"].as_i64().filter(|&id| id > 0)?;
+    let body = item["body"].as_str().unwrap_or("").trim();
+    if body.is_empty() {
+        return None;
+    }
+    let author = item["user"]["login"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let ts_str = item["submitted_at"]
+        .as_str()
+        .or_else(|| item["created_at"].as_str())?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(ts_str)
+        .ok()?
+        .timestamp();
+    let updated_at = item["updated_at"]
+        .as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp())
+        .unwrap_or(created_at);
+
+    let commit_id = item["original_commit_id"]
+        .as_str()
+        .or_else(|| item["commit_id"].as_str())
+        .filter(|sha| is_valid_git_sha(sha))
+        .map(str::to_ascii_lowercase);
+    let file_path = item["path"]
+        .as_str()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    let line = item["line"]
+        .as_i64()
+        .or_else(|| item["original_line"].as_i64())
+        .filter(|&l| l > 0);
+    let in_reply_to_id = item["in_reply_to_id"].as_i64().filter(|&id| id > 0);
+    let author_association = item["author_association"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let html_url = item["html_url"]
+        .as_str()
+        .and_then(crate::prior_context::safe_external_reference_url);
+
+    Some(ForgeFetchedComment {
+        provider: "github".to_string(),
+        repo: repo.to_string(),
+        pr_number,
+        comment_source: source,
+        remote_comment_id,
+        in_reply_to_id,
+        author,
+        author_association,
+        commit_id,
+        file_path,
+        line,
+        body: body.to_string(),
+        html_url,
+        created_at,
+        updated_at,
+    })
+}
+
 /// Registry for forge providers
 pub struct ForgeRegistry {
     providers: HashMap<String, Arc<dyn ForgeProvider>>,
@@ -2186,5 +2468,139 @@ bfBnKqGjJguuHd5ta5Vh5B51\n\
             detect_github_repo_from_git_dir(dir.path()).await,
             Some("sashiko-dev/sashiko".to_string())
         );
+    }
+
+    #[test]
+    fn test_sashiko_review_comment_requires_sashiko_author() {
+        let body = "### Sashiko review\n\nNo issues found.";
+        assert!(is_sashiko_pr_review_comment("sashiko-bot[bot]", body, None));
+        // A person pasting the header keeps their comment.
+        assert!(!is_sashiko_pr_review_comment("maintainer1", body, None));
+        assert!(!is_sashiko_pr_review_comment(
+            "maintainer1",
+            "> ### Sashiko review\nfix",
+            None
+        ));
+        // A configured login is the only identity accepted.
+        assert!(is_sashiko_pr_review_comment(
+            "Sashiko-Poster",
+            body,
+            Some("sashiko-poster")
+        ));
+        assert!(!is_sashiko_pr_review_comment(
+            "other-app[bot]",
+            body,
+            Some("sashiko-poster")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_github_pr_feedback_parses_all_sources_and_skips_sashiko_bot() {
+        use axum::{Json, Router, routing::get};
+
+        let app = Router::new()
+            .route(
+                "/repos/sashiko-dev/sashiko/pulls/42/reviews",
+                get(|| async {
+                    Json(serde_json::json!([
+                        {
+                            "id": 1001,
+                            "user": { "login": "maintainer1" },
+                            "author_association": "MEMBER",
+                            "body": "",
+                            "state": "APPROVED",
+                            "submitted_at": "2026-03-01T10:00:00Z"
+                        },
+                        {
+                            "id": 1002,
+                            "user": { "login": "maintainer1" },
+                            "author_association": "MEMBER",
+                            "body": "Please avoid holding the mutex across await.",
+                            "commit_id": "1111111111111111111111111111111111111111",
+                            "html_url": "https://github.com/sashiko-dev/sashiko/pull/42#pullrequestreview-1002",
+                            "submitted_at": "2026-03-01T10:05:00Z"
+                        }
+                    ]))
+                }),
+            )
+            .route(
+                "/repos/sashiko-dev/sashiko/pulls/42/comments",
+                get(|| async {
+                    Json(serde_json::json!([
+                        {
+                            "id": 2001,
+                            "user": { "login": "reviewer2" },
+                            "author_association": "CONTRIBUTOR",
+                            "body": "Off-by-one when buffer is empty.",
+                            "path": "src/db.rs",
+                            "line": 120,
+                            "original_commit_id": "1111111111111111111111111111111111111111",
+                            "html_url": "https://github.com/sashiko-dev/sashiko/pull/42#discussion_r2001",
+                            "created_at": "2026-03-01T10:10:00Z",
+                            "updated_at": "2026-03-01T10:10:00Z"
+                        },
+                        {
+                            "id": 2002,
+                            "in_reply_to_id": 2001,
+                            "user": { "login": "pr-author" },
+                            "author_association": "NONE",
+                            "body": "Good catch, will fix in v2.",
+                            "path": "src/db.rs",
+                            "line": 120,
+                            "original_commit_id": "1111111111111111111111111111111111111111",
+                            "html_url": "https://github.com/sashiko-dev/sashiko/pull/42#discussion_r2002",
+                            "created_at": "2026-03-01T10:15:00Z",
+                            "updated_at": "2026-03-01T10:15:00Z"
+                        }
+                    ]))
+                }),
+            )
+            .route(
+                "/repos/sashiko-dev/sashiko/issues/42/comments",
+                get(|| async {
+                    Json(serde_json::json!([
+                        {
+                            "id": 3001,
+                            "user": { "login": "sashiko-bot[bot]" },
+                            "author_association": "NONE",
+                            "body": "### Sashiko review\n\n✓ **No issues found** across 1 commit.",
+                            "created_at": "2026-03-01T10:20:00Z"
+                        },
+                        {
+                            "id": 3002,
+                            "user": { "login": "maintainer1" },
+                            "author_association": "OWNER",
+                            "body": "> ### Sashiko review\nI still see a race in shutdown.",
+                            "html_url": "https://github.com/sashiko-dev/sashiko/pull/42#issuecomment-3002",
+                            "created_at": "2026-03-01T10:25:00Z"
+                        }
+                    ]))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let api_base = format!("http://{addr}");
+        let comments =
+            fetch_github_pr_feedback(&client, &api_base, "sashiko-dev/sashiko", 42, None, None)
+                .await
+                .unwrap();
+
+        assert_eq!(comments.len(), 4);
+        assert_eq!(comments[0].comment_source, ForgeCommentSource::Review);
+        assert_eq!(comments[0].remote_comment_id, 1002);
+        assert_eq!(
+            comments[1].comment_source,
+            ForgeCommentSource::ReviewComment
+        );
+        assert_eq!(comments[1].file_path.as_deref(), Some("src/db.rs"));
+        assert_eq!(comments[2].in_reply_to_id, Some(2001));
+        assert_eq!(comments[3].comment_source, ForgeCommentSource::IssueComment);
+        assert_eq!(comments[3].remote_comment_id, 3002);
     }
 }
