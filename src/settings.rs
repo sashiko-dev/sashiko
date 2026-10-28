@@ -129,6 +129,12 @@ pub struct ForgeSettings {
     /// ingestion active).
     #[serde(default = "default_forge_poll_interval_secs")]
     pub poll_interval_secs: u64,
+    /// Forge login Sashiko posts reviews as. Fetched PR comments carrying
+    /// the Sashiko review header are dropped as Sashiko's own output only
+    /// when posted by this login; when unset, only by a GitHub App account
+    /// (a login ending in `[bot]`).
+    #[serde(default)]
+    pub bot_login: Option<String>,
 }
 
 fn default_forge_poll_interval_secs() -> u64 {
@@ -1443,6 +1449,7 @@ fn default_forge() -> ForgeSettings {
         app_private_key_path: None,
         repos: Vec::new(),
         poll_interval_secs: default_forge_poll_interval_secs(),
+        bot_login: None,
     }
 }
 

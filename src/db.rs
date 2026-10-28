@@ -31,6 +31,11 @@ use std::sync::Arc;
 #[cfg(feature = "server")]
 use tracing::{info, warn};
 
+#[cfg(feature = "server")]
+mod prior_context_queries;
+#[cfg(feature = "server")]
+pub use prior_context_queries::PriorContextOptions;
+
 /// The SQL form of [`Database::is_closed_to_new_parts`], for the statements
 /// that have to ask the question of a row they are updating. The two must
 /// answer alike, which a test below checks.
@@ -2507,6 +2512,83 @@ impl Database {
             }
         }
 
+        if current_version < 17 {
+            info!(
+                "Applying database migration version 17 (forge comments and prior attribution)..."
+            );
+            // Built outside the migration transaction for the same reason as
+            // version 5: CREATE INDEX walks every row of messages, and holding
+            // a write transaction open for that would stall the shared
+            // connection. It runs before the version bump so a crash in
+            // between leaves version 16 behind and the next start rebuilds
+            // it, which IF NOT EXISTS makes idempotent.
+            let has_messages_table = {
+                let mut rows = self
+                    .conn
+                    .query(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+                        (),
+                    )
+                    .await?;
+                rows.next().await?.is_some()
+            };
+            if has_messages_table {
+                self.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_messages_in_reply_to
+                     ON messages(in_reply_to) WHERE in_reply_to IS NOT NULL",
+                    (),
+                )
+                .await?;
+            }
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 17 {
+                info!(
+                    "Database already at version {} under the migration lock; skipping version 17.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                tx.execute_batch(include_str!("migrations/017_forge_comments.sql"))
+                    .await?;
+                let (has_findings_table, existing_cols) = {
+                    let mut columns = tx.query("PRAGMA table_info(findings)", ()).await?;
+                    let mut table_exists = false;
+                    let mut cols = std::collections::BTreeSet::new();
+                    while let Some(row) = columns.next().await? {
+                        table_exists = true;
+                        let name: String = row.get(1)?;
+                        cols.insert(name);
+                    }
+                    (table_exists, cols)
+                };
+                if has_findings_table {
+                    for (col_name, col_type) in [
+                        ("prior_attribution", "TEXT"),
+                        ("found_by", "TEXT"),
+                        ("origin_kind", "TEXT"),
+                        ("originally_raised_by", "TEXT"),
+                        ("originally_raised_in_version", "INTEGER"),
+                        ("prior_reference_url", "TEXT"),
+                    ] {
+                        if !existing_cols.contains(col_name) {
+                            let sql =
+                                format!("ALTER TABLE findings ADD COLUMN {col_name} {col_type}");
+                            tx.execute(&sql, ()).await?;
+                        }
+                    }
+                }
+                tx.execute("PRAGMA user_version = 17", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
         let has_patchwork_outbox = {
             let mut rows = self
                 .conn
@@ -2525,7 +2607,7 @@ impl Database {
             .await?;
         }
 
-        info!("Database schema is up to date at version 16.");
+        info!("Database schema is up to date at version 17.");
 
         Ok(())
     }
@@ -3108,16 +3190,25 @@ impl Database {
     }
 
     pub async fn create_finding(&self, finding: Finding) -> Result<()> {
+        self.create_finding_with_attribution(finding, None).await
+    }
+
+    pub async fn create_finding_with_attribution(
+        &self,
+        finding: Finding,
+        prior_attribution: Option<&crate::prior_context::PriorAttribution>,
+    ) -> Result<()> {
         let (claim_ps_id, claim_gen) = self.claim_params();
         let val = finding.preexisting.map(|b| if b { 1 } else { 0 });
         let locations_val = finding
             .locations
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
+        let attribution_val = prior_attribution.and_then(|attr| serde_json::to_string(attr).ok());
         let inserted = self
             .execute(
-                "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations)
-                 SELECT ?, ?, ?, ?, ?, ?
+                "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations, prior_attribution)
+                 SELECT ?, ?, ?, ?, ?, ?, ?
                  FROM reviews
                  WHERE id = ?
                    AND COALESCE(status, '') != 'Cancelled'
@@ -3142,6 +3233,7 @@ impl Database {
                     finding.problem,
                     val,
                     locations_val,
+                    attribution_val,
                     finding.review_id,
                     claim_ps_id,
                     claim_ps_id,
@@ -26945,7 +27037,7 @@ mod tests {
         let db = setup_db().await;
         let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
         let version: u32 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
 
         for (table, expected_cols) in [
             (

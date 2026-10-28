@@ -73,6 +73,7 @@ Optional. Controls forge (GitHub/GitLab) webhook integration, GitHub App comment
 | `app_private_key_path` | string | -- | Path to the GitHub App private key (PEM). |
 | `repos` | string or list | `[]` | GitHub `"owner/repo"` repositories to reconcile periodically via the Pulls REST API (accepts a TOML array or a comma-separated string via `SASHIKO__FORGE__REPOS`). When empty and `forge.enabled = true`, auto-detects the GitHub repository from the `origin` remote of `git.repository_path`. |
 | `poll_interval_secs` | integer | `120` | Interval in seconds between periodic GitHub Pulls REST API reconciliation passes (`0` disables polling while keeping webhook ingestion active). |
+| `bot_login` | string | unset | Forge login Sashiko posts reviews as. Fetched PR comments that start with the Sashiko review header are ignored as Sashiko's own output only when posted by this login; when unset, only when posted by a GitHub App account (login ending in `[bot]`). |
 
 > **Security:** When `Settings.toml` contains secrets, restrict file
 > permissions: `chmod 600 Settings.toml`.
