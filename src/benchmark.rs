@@ -6203,4 +6203,240 @@ mod tests {
         assert_eq!(count_row.get::<i64>(0)?, 1);
         Ok(())
     }
+
+    /// Checks that every Message-ID in `ids` names a message in the bundled
+    /// mbox of `version` whose From address is one of `reviewers`. For
+    /// Sashiko, the ID must be the patch a seeded prior finding is attached to.
+    fn resolve_credit_ids(
+        entry: &BenchmarkEntry,
+        archive: &HashMap<String, String>,
+        version: u32,
+        reviewers: &[&str],
+        ids: &[String],
+        failures: &mut Vec<String>,
+    ) -> Result<()> {
+        let cid = entry.label();
+        let Some(ancestor) = entry.ancestor_mboxes.iter().find(|a| a.version == version) else {
+            failures.push(format!("case {cid}: no v{version} ancestor"));
+            return Ok(());
+        };
+        let Some(mbox) = archive.get(&ancestor.mbox_path) else {
+            failures.push(format!("case {cid}: {} missing", ancestor.mbox_path));
+            return Ok(());
+        };
+        let mut authors: HashMap<String, String> = HashMap::new();
+        for raw_msg in crate::ingestor::split_mbox(mbox.as_bytes()) {
+            let (meta, _) = crate::patch::parse_email(&raw_msg)?;
+            authors.insert(
+                normalize_message_id(&meta.message_id).to_string(),
+                meta.author,
+            );
+        }
+        let accepted: BTreeSet<String> = reviewers
+            .iter()
+            .filter_map(|r| canonical_reviewer_identity(r))
+            .collect();
+        let seeded: BTreeSet<&str> = ancestor
+            .prior_findings
+            .iter()
+            .filter_map(|pf| pf.patch_message_id.as_deref())
+            .collect();
+        for mid in ids {
+            let Some(author) = authors.get(mid.as_str()) else {
+                failures.push(format!("case {cid}: {mid} not in v{version} mbox"));
+                continue;
+            };
+            if accepted.contains("sashiko") && seeded.contains(mid.as_str()) {
+                continue;
+            }
+            let from = canonical_identity(author).unwrap_or_default();
+            if !accepted.contains(&from) {
+                failures.push(format!(
+                    "case {cid}: {mid} is from {author:?}, not an expected reviewer"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every required (`expected_prior_message_ids`) and optional
+    /// (`acceptable_attributions`) credit must resolve to real messages by
+    /// the credited reviewer in the bundled mboxes.
+    #[test]
+    fn test_benchmark_versioned_attribution_labels_resolve_to_mbox_messages() -> Result<()> {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let suite_dir = manifest_dir.join("projects/linux/benchmarks");
+        let raw = std::fs::read_to_string(suite_dir.join("benchmark_versioned.json"))?;
+        let entries: Vec<BenchmarkEntry> = serde_json::from_str(&raw)?;
+        let archive = load_mbox_archive(&suite_dir.join("versioned_mboxes.jsonl.gz"))?;
+
+        let mut failures = Vec::new();
+        for entry in &entries {
+            if entry.expected_behavior.expects_attribution() {
+                let reviewers: Vec<&str> = entry
+                    .expected_reviewer
+                    .iter()
+                    .chain(entry.expected_co_reviewers.iter())
+                    .map(String::as_str)
+                    .collect();
+                resolve_credit_ids(
+                    entry,
+                    &archive,
+                    entry.expected_prior_version.unwrap_or_default(),
+                    &reviewers,
+                    &entry.expected_prior_message_ids,
+                    &mut failures,
+                )?;
+            }
+            for acc in &entry.acceptable_attributions {
+                resolve_credit_ids(
+                    entry,
+                    &archive,
+                    acc.version,
+                    &[acc.reviewer.as_str()],
+                    &acc.message_ids,
+                    &mut failures,
+                )?;
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "Attribution ground truth does not resolve:\n{}",
+            failures.join("\n")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_benchmark_versioned_suite_ingests_and_links_ancestors() -> Result<()> {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let bench_file = manifest_dir.join("projects/linux/benchmarks/benchmark_versioned.json");
+        let raw = std::fs::read_to_string(&bench_file)?;
+        let entries: Vec<BenchmarkEntry> = serde_json::from_str(&raw)?;
+        assert_eq!(entries.len(), 53, "Expected 53 multi-version LKML entries");
+        validate_benchmark_entries(&entries)?;
+
+        let mut cat_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for entry in &entries {
+            let cat = entry
+                .category
+                .as_deref()
+                .expect("every entry must declare category");
+            *cat_counts.entry(cat.to_string()).or_default() += 1;
+            assert!(
+                !entry.ancestor_mboxes.is_empty(),
+                "case {:?} must have ancestor_mboxes",
+                entry.case_id
+            );
+            assert!(
+                entry.target_mbox.is_some(),
+                "case {:?} must have target_mbox",
+                entry.case_id
+            );
+            assert!(
+                entry
+                    .baseline_commit
+                    .as_deref()
+                    .is_some_and(|s| s.len() == 40),
+                "case {:?} must have 40-char baseline_commit",
+                entry.case_id
+            );
+        }
+        assert_eq!(cat_counts.get("ignored_prior_bug").copied(), Some(15));
+        assert_eq!(cat_counts.get("bad_advice_regression").copied(), Some(8));
+        assert_eq!(cat_counts.get("wrong_claim_rejected").copied(), Some(11));
+        assert_eq!(cat_counts.get("authority_unverifiable").copied(), Some(10));
+        assert_eq!(cat_counts.get("multihop_or_routing").copied(), Some(9));
+
+        let linux_repo = manifest_dir.join("third_party/linux");
+        if linux_repo.join(".git").exists() || linux_repo.join("HEAD").exists() {
+            for entry in &entries {
+                let shas = std::iter::once(entry.baseline_commit.as_deref()).chain(
+                    entry
+                        .ancestor_mboxes
+                        .iter()
+                        .map(|a| a.baseline_commit.as_deref()),
+                );
+                for sha in shas.flatten() {
+                    let rev = format!("{sha}^{{commit}}");
+                    let out = crate::git_cmd::in_dir(&linux_repo)
+                        .args(["cat-file", "-t", &rev])
+                        .output()?;
+                    assert!(
+                        out.status.success(),
+                        "case {:?} baseline_commit {sha} missing in third_party/linux",
+                        entry.case_id
+                    );
+                }
+            }
+        }
+
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await?;
+        db.migrate().await?;
+        ingest_versioned_benchmark_entries(&db, &bench_file, &entries).await?;
+
+        let mut failures = Vec::new();
+        for entry in &entries {
+            let cid = entry.case_id.as_deref().unwrap_or(&entry.commit);
+            let Some((patch_id, ps_id, patch_status, ps_status, _)) =
+                lookup_benchmark_patch_row(&db, &entry.commit).await?
+            else {
+                failures.push(format!(
+                    "case {cid}: target Commit {} not found",
+                    entry.commit
+                ));
+                continue;
+            };
+            if patch_status.as_deref() != Some("Pending") {
+                failures.push(format!("case {cid}: patch_status={patch_status:?}"));
+            }
+            if ps_status.as_deref() != Some("Pending") {
+                failures.push(format!("case {cid}: ps_status={ps_status:?}"));
+            }
+
+            let prev_ps = db.get_previous_patchset_id(ps_id).await?;
+            let Some(prev_ps_id) = prev_ps else {
+                failures.push(format!(
+                    "case {cid}: target patchset {ps_id} failed to link previous_patchset_id"
+                ));
+                continue;
+            };
+
+            let contexts = db.build_prior_version_contexts(ps_id, None, None).await?;
+            let Some(ctx) = contexts.get(&patch_id) else {
+                failures.push(format!(
+                    "case {cid}: target patch {patch_id} (ps {ps_id}, prev_ps {prev_ps_id}) missing from contexts {:?}",
+                    contexts.keys().collect::<Vec<_>>()
+                ));
+                continue;
+            };
+            if ctx.is_empty_for_audit() {
+                let mut mcount_rows = db
+                    .conn
+                    .query(
+                        "SELECT COUNT(*), (SELECT subject FROM patchsets WHERE id = ?) FROM messages WHERE thread_id IN (SELECT thread_id FROM patchsets WHERE id = ?)",
+                        libsql::params![prev_ps_id, prev_ps_id],
+                    )
+                    .await?;
+                let mrow = mcount_rows.next().await?.unwrap();
+                let msg_cnt: i64 = mrow.get(0)?;
+                let prev_subj: Option<String> = mrow.get(1)?;
+                failures.push(format!(
+                    "case {cid}: patch {patch_id} (ps {ps_id} -> prev_ps {prev_ps_id} {:?}, prev_thread_msgs={msg_cnt}, anc_vers={:?}) has zero auditable items",
+                    prev_subj, ctx.ancestor_versions
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "Benchmark suite validation failed ({} cases):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+        Ok(())
+    }
 }
