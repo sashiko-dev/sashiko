@@ -2992,6 +2992,28 @@ fn write_benchmark_report(
             sum.total_detection_rate_pct
         ),
     )?;
+    if sum.attribution_expected_entries > 0 {
+        write!(out, "  Attribution Acc:    ")?;
+        write_bold(
+            out,
+            &format!(
+                "{}/{} ({:.1}%)\n",
+                sum.attributed, sum.attribution_scored_entries, sum.attribution_rate_pct
+            ),
+        )?;
+    }
+    if sum.suppression_evaluated_entries > 0 {
+        write!(out, "  FP Suppression:     ")?;
+        write_bold(
+            out,
+            &format!(
+                "{}/{} ({:.1}%)\n",
+                sum.suppressed,
+                sum.suppression_evaluated_entries,
+                sum.false_positive_suppression_rate_pct
+            ),
+        )?;
+    }
 
     if sum.missed > 0 {
         writeln!(out, "\nMiss Diagnosis:")?;

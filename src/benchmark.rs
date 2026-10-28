@@ -14,7 +14,7 @@
 
 use crate::ai::{AiProvider, LlmSession, SessionRunner, ValidationError, create_provider};
 use crate::baseline::CommitId;
-use crate::db::{AttributedSubsystem, Database, Severity};
+use crate::db::{AttributedSubsystem, Database, Finding, Severity};
 use crate::events::Event;
 use crate::fetcher::FetchAgent;
 use crate::project::ProjectId;
@@ -22,16 +22,17 @@ use crate::reviewer::{Reviewer, WorkerSubprocessOverrides};
 use crate::settings::Settings;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use flate2::read::GzDecoder;
 use futures_util::stream::StreamExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
-use std::io::{BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
@@ -39,6 +40,96 @@ use tracing::{error, info, warn};
 
 const DEFAULT_KERNEL_REPO_URL: &str =
     "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git";
+const MAX_MBOX_ARCHIVE_DECOMPRESSED_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_INLINE_REVIEW_PROMPT_CHARS: usize = 8_192;
+
+// The two patterns below are constant literals using only basic RE2 syntax,
+// so Regex::new cannot fail on them; test_judge_regexes_compile forces both
+// to compile in the test suite to keep that invariant checked.
+static JUDGE_STATUS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(DETECTED|PARTIALLY_DETECTED|MISSED)\b").expect("valid regex")
+});
+static FINDING_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[F(\d+)\]").expect("valid regex"));
+
+fn default_part_index() -> u32 {
+    1
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkExpectedBehavior {
+    #[default]
+    DetectBug,
+    DetectWithAttribution,
+    DetectRegression,
+    SuppressFalsePositive,
+}
+
+impl BenchmarkExpectedBehavior {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::DetectBug => "detect_bug",
+            Self::DetectWithAttribution => "detect_with_attribution",
+            Self::DetectRegression => "detect_regression",
+            Self::SuppressFalsePositive => "suppress_false_positive",
+        }
+    }
+
+    pub fn is_suppression(&self) -> bool {
+        matches!(self, Self::SuppressFalsePositive)
+    }
+
+    pub fn expects_attribution(&self) -> bool {
+        matches!(self, Self::DetectWithAttribution)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "PascalCase")]
+pub enum BenchmarkAncestorStatus {
+    #[default]
+    #[serde(alias = "reviewed")]
+    Reviewed,
+    #[serde(alias = "cancelled", alias = "canceled")]
+    Cancelled,
+}
+
+impl BenchmarkAncestorStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Reviewed => "Reviewed",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct BenchmarkSeededFinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_message_id: Option<String>,
+    #[serde(default = "default_part_index")]
+    pub part_index: u32,
+    #[serde(default)]
+    pub severity: Severity,
+    pub problem: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity_explanation: Option<String>,
+    #[serde(default)]
+    pub preexisting: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct BenchmarkAncestorMbox {
+    pub version: u32,
+    pub mbox_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_commit: Option<String>,
+    #[serde(default)]
+    pub patchset_status: BenchmarkAncestorStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_findings: Vec<BenchmarkSeededFinding>,
+}
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkOptions {
@@ -54,7 +145,7 @@ pub struct BenchmarkOptions {
     pub settings_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct BenchmarkEntry {
     #[serde(rename = "Commit")]
     pub commit: String,
@@ -68,6 +159,410 @@ pub struct BenchmarkEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub problem_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mbox_archive: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ancestor_mboxes: Vec<BenchmarkAncestorMbox>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_mbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_commit: Option<String>,
+    #[serde(default)]
+    pub expected_behavior: BenchmarkExpectedBehavior,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_reviewer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_prior_version: Option<u32>,
+    /// Every acceptable Message-ID (without angle brackets) of a message in
+    /// `expected_prior_version` where `expected_reviewer` raised the issue.
+    /// For a seeded Sashiko finding this is the Message-ID of the ancestor
+    /// patch email the seeded review is attached to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_prior_message_ids: Vec<String>,
+    /// Other reviewers ("Name <email>") who independently raised the same
+    /// issue in `expected_prior_version`. Crediting any of them is correct;
+    /// their messages belong in `expected_prior_message_ids` too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_co_reviewers: Vec<String>,
+    /// Credit that is acceptable but not required: earlier messages that
+    /// arguably raised the issue. An attribution matching one of these is
+    /// scored `acceptable`, which is neither correct nor wrong.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptable_attributions: Vec<AcceptableAttribution>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lore_urls: Vec<String>,
+}
+
+/// One optional credit on a benchmark entry: a reviewer, the version in
+/// which their messages arguably raised the issue, and those Message-IDs.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct AcceptableAttribution {
+    pub reviewer: String,
+    pub version: u32,
+    pub message_ids: Vec<String>,
+}
+
+impl BenchmarkEntry {
+    pub fn is_versioned(&self) -> bool {
+        self.target_mbox.is_some() || !self.ancestor_mboxes.is_empty()
+    }
+
+    fn label(&self) -> &str {
+        self.case_id.as_deref().unwrap_or(&self.commit)
+    }
+
+    /// Checks that the attribution ground truth is internally consistent.
+    ///
+    /// `detect_with_attribution` entries must name the reviewer, the earliest
+    /// version, and the Message-IDs that the strict scorer accepts. Entries
+    /// that expect a fresh detection (`detect_bug`) must not name a prior
+    /// reviewer or version, because any attribution on them is scored wrong.
+    pub fn validate_attribution_labels(&self) -> Result<()> {
+        let label = self.label();
+        let has_reviewer = self
+            .expected_reviewer
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        for mid in &self.expected_prior_message_ids {
+            let trimmed = mid.trim();
+            if trimmed.is_empty() || trimmed.starts_with('<') || trimmed.ends_with('>') {
+                bail!(
+                    "case {label}: expected_prior_message_ids entry {mid:?} must be a non-empty Message-ID without angle brackets"
+                );
+            }
+        }
+        let unique: BTreeSet<&str> = self
+            .expected_prior_message_ids
+            .iter()
+            .map(|s| s.trim())
+            .collect();
+        if unique.len() != self.expected_prior_message_ids.len() {
+            bail!("case {label}: expected_prior_message_ids contains duplicates");
+        }
+
+        match self.expected_behavior {
+            BenchmarkExpectedBehavior::DetectWithAttribution => {
+                let Some(reviewer) = self.expected_reviewer.as_deref().filter(|_| has_reviewer)
+                else {
+                    bail!("case {label}: detect_with_attribution requires expected_reviewer");
+                };
+                if canonical_reviewer_identity(reviewer).is_none() {
+                    bail!(
+                        "case {label}: expected_reviewer {reviewer:?} must be \"Name <email>\" or \"Sashiko\""
+                    );
+                }
+                let Some(version) = self.expected_prior_version else {
+                    bail!("case {label}: detect_with_attribution requires expected_prior_version");
+                };
+                if self.expected_prior_message_ids.is_empty() {
+                    bail!(
+                        "case {label}: detect_with_attribution requires expected_prior_message_ids"
+                    );
+                }
+                if let Some(bad) = self
+                    .expected_co_reviewers
+                    .iter()
+                    .find(|r| canonical_reviewer_identity(r).is_none())
+                {
+                    bail!(
+                        "case {label}: expected_co_reviewers entry {bad:?} must be \"Name <email>\" or \"Sashiko\""
+                    );
+                }
+                if self.is_versioned() && !self.ancestor_mboxes.iter().any(|a| a.version == version)
+                {
+                    bail!(
+                        "case {label}: expected_prior_version {version} is not one of the ancestor_mboxes versions"
+                    );
+                }
+            }
+            BenchmarkExpectedBehavior::DetectBug => {
+                if has_reviewer
+                    || self.expected_prior_version.is_some()
+                    || !self.expected_prior_message_ids.is_empty()
+                {
+                    bail!(
+                        "case {label}: detect_bug expects no prior credit; expected_reviewer, expected_prior_version and expected_prior_message_ids must be empty"
+                    );
+                }
+            }
+            BenchmarkExpectedBehavior::DetectRegression
+            | BenchmarkExpectedBehavior::SuppressFalsePositive => {
+                if !self.expected_prior_message_ids.is_empty() {
+                    bail!(
+                        "case {label}: expected_prior_message_ids is only valid for detect_with_attribution"
+                    );
+                }
+            }
+        }
+        if !self.expected_behavior.expects_attribution() && !self.expected_co_reviewers.is_empty() {
+            bail!("case {label}: expected_co_reviewers is only valid for detect_with_attribution");
+        }
+        self.validate_acceptable_attributions()
+    }
+
+    fn validate_acceptable_attributions(&self) -> Result<()> {
+        let label = self.label();
+        if self.acceptable_attributions.is_empty() {
+            return Ok(());
+        }
+        if !matches!(
+            self.expected_behavior,
+            BenchmarkExpectedBehavior::DetectBug | BenchmarkExpectedBehavior::DetectWithAttribution
+        ) {
+            bail!(
+                "case {label}: acceptable_attributions is only valid for detect_bug and detect_with_attribution"
+            );
+        }
+        for acc in &self.acceptable_attributions {
+            if canonical_reviewer_identity(&acc.reviewer).is_none() {
+                bail!(
+                    "case {label}: acceptable_attributions reviewer {:?} must be \"Name <email>\" or \"Sashiko\"",
+                    acc.reviewer
+                );
+            }
+            if acc.message_ids.is_empty() {
+                bail!(
+                    "case {label}: acceptable_attributions entry for {:?} needs message_ids",
+                    acc.reviewer
+                );
+            }
+            if let Some(bad) = acc.message_ids.iter().find(|m| {
+                let t = m.trim();
+                t.is_empty() || t.starts_with('<') || t.ends_with('>')
+            }) {
+                bail!(
+                    "case {label}: acceptable_attributions message id {bad:?} must be non-empty and without angle brackets"
+                );
+            }
+            if self.is_versioned()
+                && !self
+                    .ancestor_mboxes
+                    .iter()
+                    .any(|a| a.version == acc.version)
+            {
+                bail!(
+                    "case {label}: acceptable_attributions version {} is not one of the ancestor_mboxes versions",
+                    acc.version
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validates the attribution ground truth of every entry in a suite.
+pub fn validate_benchmark_entries(entries: &[BenchmarkEntry]) -> Result<()> {
+    let errors: Vec<String> = entries
+        .iter()
+        .filter_map(|e| e.validate_attribution_labels().err())
+        .map(|e| e.to_string())
+        .collect();
+    if !errors.is_empty() {
+        bail!(
+            "Benchmark ground truth is invalid ({} entries):\n{}",
+            errors.len(),
+            errors.join("\n")
+        );
+    }
+    Ok(())
+}
+
+/// Canonical identity for an expected reviewer, compared exactly against the
+/// `raised_by_identities` of a finding's structured prior attribution.
+///
+/// "Sashiko" maps to `sashiko`; "Name <email>" maps to the lowercased email.
+fn canonical_reviewer_identity(reviewer: &str) -> Option<String> {
+    let trimmed = reviewer.trim();
+    if trimmed.eq_ignore_ascii_case("sashiko") {
+        return Some("sashiko".to_string());
+    }
+    canonical_identity(trimmed)
+}
+
+/// Lowercased email of an identity given as "Name <email>", "<email>", or a
+/// bare email; `sashiko` stays `sashiko`. Anything else has no identity.
+fn canonical_identity(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("sashiko") {
+        return Some("sashiko".to_string());
+    }
+    let email = match (trimmed.rfind('<'), trimmed.rfind('>')) {
+        (Some(start), Some(end)) if end > start => trimmed[start + 1..end].trim(),
+        (None, None) => trimmed,
+        _ => return None,
+    };
+    let valid = !email.is_empty()
+        && !email.chars().any(char::is_whitespace)
+        && email.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty() && !domain.is_empty() && !domain.contains('@')
+        });
+    valid.then(|| email.to_ascii_lowercase())
+}
+
+fn normalize_message_id(raw: &str) -> &str {
+    raw.trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+}
+
+/// Outcome of strictly scoring the prior attribution of the matched finding.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionOutcome {
+    /// Expected identity, earliest version and an accepted Message-ID.
+    Correct,
+    /// Attribution is present but not correct, or present on an entry that
+    /// expects no prior credit.
+    Wrong,
+    /// Attribution was expected but the matched finding carries none (this
+    /// includes entries whose bug was not matched at all).
+    Missing,
+    /// Attribution matches one of the entry's `acceptable_attributions`:
+    /// defensible but not required credit, neither correct nor wrong.
+    Acceptable,
+}
+
+/// The fields of a finding's `prior_attribution` that the strict scorer
+/// reads. Every field defaults so that older review outputs still parse;
+/// such outputs lack identities and evidence and therefore score as wrong.
+#[derive(Debug, Deserialize, Default)]
+struct ScoredPriorAttribution {
+    #[serde(default)]
+    originally_raised_in_version: Option<u32>,
+    #[serde(default)]
+    raised_by_identities: Vec<String>,
+    #[serde(default)]
+    evidence: Vec<ScoredAttributionEvidence>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ScoredAttributionEvidence {
+    #[serde(default)]
+    message_id: Option<String>,
+}
+
+/// Strictly scores the structured prior attribution of the matched finding.
+///
+/// Returns `None` for suppression entries, and for entries that expect no
+/// prior credit when the matched finding carries none. No free-text, name
+/// token, or judge opinion is consulted.
+pub(crate) fn score_attribution(
+    entry: &BenchmarkEntry,
+    matched_finding: Option<&BenchmarkFindingRecord>,
+) -> Option<AttributionOutcome> {
+    if entry.expected_behavior.is_suppression() {
+        return None;
+    }
+    let attribution = matched_finding
+        .and_then(|f| f.prior_attribution.as_ref())
+        .filter(|v| !v.is_null());
+    let Some(raw) = attribution else {
+        return entry
+            .expected_behavior
+            .expects_attribution()
+            .then_some(AttributionOutcome::Missing);
+    };
+    if entry.expected_behavior.expects_attribution() && attribution_matches_ground_truth(entry, raw)
+    {
+        return Some(AttributionOutcome::Correct);
+    }
+    if attribution_is_acceptable(entry, raw) {
+        return Some(AttributionOutcome::Acceptable);
+    }
+    Some(AttributionOutcome::Wrong)
+}
+
+/// An attribution is acceptable when every credited identity is covered by
+/// an `acceptable_attributions` item with the same version as
+/// `originally_raised_in_version`, and, when evidence is present, at least
+/// one evidence Message-ID belongs to one of those covering items.
+fn attribution_is_acceptable(entry: &BenchmarkEntry, raw: &Value) -> bool {
+    if entry.acceptable_attributions.is_empty() {
+        return false;
+    }
+    let Ok(parsed) = serde_json::from_value::<ScoredPriorAttribution>(raw.clone()) else {
+        return false;
+    };
+    let Some(version) = parsed.originally_raised_in_version else {
+        return false;
+    };
+    if parsed.raised_by_identities.is_empty() {
+        return false;
+    }
+    let mut covering: Vec<&AcceptableAttribution> = Vec::new();
+    for raw_id in &parsed.raised_by_identities {
+        let Some(id) = canonical_identity(raw_id) else {
+            return false;
+        };
+        let matches: Vec<&AcceptableAttribution> = entry
+            .acceptable_attributions
+            .iter()
+            .filter(|acc| {
+                acc.version == version
+                    && canonical_reviewer_identity(&acc.reviewer).as_deref() == Some(id.as_str())
+            })
+            .collect();
+        if matches.is_empty() {
+            return false;
+        }
+        covering.extend(matches);
+    }
+    if parsed.evidence.is_empty() {
+        return true;
+    }
+    let accepted: BTreeSet<&str> = covering
+        .iter()
+        .flat_map(|acc| acc.message_ids.iter())
+        .map(|m| normalize_message_id(m))
+        .collect();
+    parsed.evidence.iter().any(|ev| {
+        ev.message_id
+            .as_deref()
+            .map(normalize_message_id)
+            .is_some_and(|mid| accepted.contains(mid))
+    })
+}
+
+fn attribution_matches_ground_truth(entry: &BenchmarkEntry, raw: &Value) -> bool {
+    let Ok(parsed) = serde_json::from_value::<ScoredPriorAttribution>(raw.clone()) else {
+        return false;
+    };
+    let accepted_identities: BTreeSet<String> = entry
+        .expected_reviewer
+        .iter()
+        .chain(entry.expected_co_reviewers.iter())
+        .filter_map(|r| canonical_reviewer_identity(r))
+        .collect();
+    if accepted_identities.is_empty() {
+        return false;
+    }
+    let Some(expected_version) = entry.expected_prior_version else {
+        return false;
+    };
+    let identity_ok = parsed
+        .raised_by_identities
+        .iter()
+        .filter_map(|id| canonical_identity(id))
+        .any(|id| accepted_identities.contains(&id));
+    let version_ok = parsed.originally_raised_in_version == Some(expected_version);
+    let accepted: BTreeSet<&str> = entry
+        .expected_prior_message_ids
+        .iter()
+        .map(|s| normalize_message_id(s))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let evidence_ok = parsed.evidence.iter().any(|ev| {
+        ev.message_id
+            .as_deref()
+            .map(normalize_message_id)
+            .is_some_and(|mid| accepted.contains(mid))
+    });
+    identity_ok && version_ok && evidence_ok
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +628,34 @@ pub struct SubsystemBenchmarkSummary {
     pub detection_rate_pct: f64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct CategoryBenchmarkSummary {
+    pub category: String,
+    pub total: usize,
+    pub passed: usize,
+    pub detected: usize,
+    pub partially_detected: usize,
+    pub missed: usize,
+    pub suppressed: usize,
+    pub false_positives: usize,
+    pub attribution_expected: usize,
+    /// Entries whose matched finding carries a strictly correct attribution.
+    pub attributed: usize,
+    #[serde(default)]
+    pub attribution_wrong: usize,
+    #[serde(default)]
+    pub attribution_missing: usize,
+    /// Attributions matching an entry's optional `acceptable_attributions`.
+    #[serde(default)]
+    pub attribution_acceptable: usize,
+    /// Entries without a completed review or judge verdict, scored as failures.
+    #[serde(default)]
+    pub failed: usize,
+    /// Strict passes: exact detection (never partial), correct or absent
+    /// attribution as the entry expects, or suppression.
+    pub pass_rate_pct: f64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BenchmarkSummaryStats {
     pub total_entries: usize,
@@ -143,9 +666,54 @@ pub struct BenchmarkSummaryStats {
     pub partially_detected: usize,
     pub missed: usize,
     pub not_reviewed: usize,
+    /// Entries whose judge evaluation failed (`UNKNOWN`), scored as failures.
+    #[serde(default)]
+    pub evaluation_failed: usize,
     pub skipped: usize,
+    /// Detection rates use every non-skipped detection entry as the
+    /// denominator, so unreviewed and unevaluated entries count as failures.
     pub exact_detection_rate_pct: f64,
     pub total_detection_rate_pct: f64,
+    #[serde(default)]
+    pub suppression_evaluated_entries: usize,
+    #[serde(default)]
+    pub suppressed: usize,
+    #[serde(default)]
+    pub false_positives: usize,
+    #[serde(default)]
+    pub false_positive_suppression_rate_pct: f64,
+    /// Suppression passes where the review reported no findings at all; such
+    /// passes do not show that the false claim was examined and rejected.
+    #[serde(default)]
+    pub suppressed_with_no_findings: usize,
+    #[serde(default)]
+    pub attribution_expected_entries: usize,
+    /// Strictly correct attributions on `detect_with_attribution` entries.
+    #[serde(default)]
+    pub attributed: usize,
+    #[serde(default)]
+    pub attribution_wrong: usize,
+    #[serde(default)]
+    pub attribution_missing: usize,
+    /// Attributions matching an entry's optional `acceptable_attributions`.
+    /// They are neither correct nor wrong and are left out of the
+    /// attribution rate and precision denominators.
+    #[serde(default)]
+    pub attribution_acceptable: usize,
+    /// Denominator of `attribution_rate_pct`: attribution-expected entries
+    /// minus those whose attribution was scored acceptable.
+    #[serde(default)]
+    pub attribution_scored_entries: usize,
+    /// Attributions on matched findings of entries that expect no prior
+    /// credit (`detect_bug`, `detect_regression`); all of them are wrong.
+    #[serde(default)]
+    pub unexpected_attributions: usize,
+    #[serde(default)]
+    pub attribution_rate_pct: f64,
+    /// Correct attributions over all attributions the reviewer emitted on
+    /// matched findings.
+    #[serde(default)]
+    pub attribution_precision_pct: f64,
     pub missed_not_raised: usize,
     pub missed_wrongly_dismissed: usize,
     pub missed_preexisting_filtered: usize,
@@ -163,6 +731,8 @@ pub struct BenchmarkSummaryStats {
     pub detections_by_stage: BTreeMap<String, usize>,
     pub false_dismissals_by_stage: BTreeMap<String, usize>,
     pub by_subsystem: Vec<SubsystemBenchmarkSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_category: Vec<CategoryBenchmarkSummary>,
     pub tokens_in: MetricDistribution,
     pub tokens_out: MetricDistribution,
     pub tokens_cached: MetricDistribution,
@@ -183,7 +753,7 @@ pub struct MatchedFindingSummary {
     pub prompts: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct BenchmarkFindingRecord {
     pub index: usize,
     pub severity: String,
@@ -193,6 +763,8 @@ pub struct BenchmarkFindingRecord {
     pub preexisting: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_attribution: Option<Value>,
     pub stages: Vec<String>,
     pub prompts: Vec<String>,
 }
@@ -217,9 +789,15 @@ pub struct BenchmarkStageMetric {
     pub dismissed_count: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct BenchmarkEntryResult {
     pub commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub expected_behavior: BenchmarkExpectedBehavior,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -229,6 +807,16 @@ pub struct BenchmarkEntryResult {
     pub problem_description: String,
     pub found: bool,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<AttributionOutcome>,
+    #[serde(default)]
+    pub suppressed_with_no_findings: bool,
+    /// Versioned (mbox-chain) entries use the strict summary semantics;
+    /// classic commit entries keep the original metric definitions.
+    #[serde(default)]
+    pub versioned: bool,
     pub explanation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_finding: Option<MatchedFindingSummary>,
@@ -275,6 +863,7 @@ pub(crate) struct CommitReviewData {
     pub review_id: Option<i64>,
     pub review_status: Option<String>,
     pub summary_text: String,
+    pub inline_review: String,
     pub tokens_in: u32,
     pub tokens_out: u32,
     pub tokens_cached: u32,
@@ -521,6 +1110,8 @@ pub async fn run_benchmark(
             options.file.display()
         );
     }
+    validate_benchmark_entries(&entries)
+        .with_context(|| format!("Invalid benchmark file {}", options.file.display()))?;
 
     let unique_commits = deduplicate_benchmark_commits(&entries);
     let paths = prepare_benchmark_run_paths(
@@ -565,7 +1156,14 @@ pub async fn run_benchmark(
     }
 
     if !options.analyze_only {
-        ingest_benchmark_commits(&db, &settings, options.repo.as_deref(), &unique_commits).await?;
+        let classic_commits = deduplicate_classic_benchmark_commits(&entries);
+        if !classic_commits.is_empty() {
+            ingest_benchmark_commits(&db, &settings, options.repo.as_deref(), &classic_commits)
+                .await?;
+        }
+        if entries.iter().any(BenchmarkEntry::is_versioned) {
+            ingest_versioned_benchmark_entries(&db, &options.file, &entries).await?;
+        }
         run_benchmark_reviews(
             &db,
             &settings,
@@ -669,8 +1267,28 @@ fn configure_benchmark_settings(
     Ok(())
 }
 
+fn normalize_commit_or_msgid(raw: &str) -> (&str, String) {
+    let trimmed = raw.trim().trim_matches(['<', '>']);
+    (trimmed, format!("<{trimmed}>"))
+}
+
+fn deduplicate_classic_benchmark_commits(entries: &[BenchmarkEntry]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut unique = Vec::new();
+    for entry in entries {
+        if entry.is_versioned() {
+            continue;
+        }
+        let trimmed = entry.commit.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            unique.push(trimmed.to_string());
+        }
+    }
+    unique
+}
+
 async fn commit_has_completed_review(db: &Database, commit: &str) -> Result<bool> {
-    let bracketed = format!("<{commit}>");
+    let (trimmed, bracketed) = normalize_commit_or_msgid(commit);
     let mut rows = db
         .conn
         .query(
@@ -682,14 +1300,14 @@ async fn commit_has_completed_review(db: &Database, commit: &str) -> Result<bool
                AND ps.status = 'Reviewed'
                AND r.status = 'Reviewed'
              LIMIT 1",
-            libsql::params![commit.to_string(), bracketed],
+            libsql::params![trimmed.to_string(), bracketed],
         )
         .await?;
     if rows.next().await?.is_some() {
         return Ok(true);
     }
-    if commit.len() < 40 {
-        let root_msg_id = format!("{commit}@sashiko.local");
+    if trimmed.len() < 40 && !trimmed.contains('@') {
+        let root_msg_id = format!("{trimmed}@sashiko.local");
         let mut fallback_rows = db
             .conn
             .query(
@@ -961,6 +1579,25 @@ impl Drop for AbortTaskOnDrop {
     }
 }
 
+async fn load_benchmark_skipped_patch_ids(db: &Database) -> Result<std::collections::HashSet<i64>> {
+    let mut rows = db
+        .conn
+        .query(
+            "SELECT p.id
+             FROM patches p
+             JOIN patchsets ps ON ps.id = p.patchset_id
+             WHERE p.status = 'Skipped' AND ps.status = 'Pending'
+             LIMIT 10000",
+            (),
+        )
+        .await?;
+    let mut ids = std::collections::HashSet::new();
+    while let Some(row) = rows.next().await? {
+        ids.insert(row.get::<i64>(0)?);
+    }
+    Ok(ids)
+}
+
 async fn run_benchmark_reviews(
     db: &Arc<Database>,
     settings: &Settings,
@@ -974,10 +1611,12 @@ async fn run_benchmark_reviews(
         unique_commits.len(),
         settings.review.concurrency
     );
+    let skip_patch_ids = load_benchmark_skipped_patch_ids(db).await?;
     let worker_overrides = WorkerSubprocessOverrides {
         prompts: Some(options.prompts.clone()),
         settings_path: options.settings_path.clone(),
         report_preexisting,
+        skip_patch_ids,
     };
     let reviewer = Arc::new(
         Reviewer::new(db.clone(), settings.clone())
@@ -1025,11 +1664,698 @@ async fn run_benchmark_reviews(
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct MboxArchiveRecord {
+    #[serde(alias = "path")]
+    key: String,
+    #[serde(alias = "content")]
+    mbox: String,
+}
+
+fn resolve_benchmark_relative_path(suite_dir: &Path, rel: &str) -> Result<PathBuf> {
+    let trimmed = rel.trim();
+    if trimmed.is_empty() {
+        bail!("Empty relative fixture path in benchmark entry");
+    }
+    let rel_path = Path::new(trimmed);
+    for comp in rel_path.components() {
+        match comp {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "Fixture path '{}' must be a safe relative path under {}",
+                    trimmed,
+                    suite_dir.display()
+                );
+            }
+        }
+    }
+    Ok(suite_dir.join(rel_path))
+}
+
+pub fn load_mbox_archive(archive_path: &Path) -> Result<HashMap<String, String>> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("Failed to open mbox archive {}", archive_path.display()))?;
+    let is_gzip = archive_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("gz"));
+
+    let mut raw_text = String::new();
+    if is_gzip {
+        let mut bounded = GzDecoder::new(file).take(MAX_MBOX_ARCHIVE_DECOMPRESSED_BYTES + 1);
+        bounded.read_to_string(&mut raw_text).with_context(|| {
+            format!(
+                "Failed to decompress gzip mbox archive {}",
+                archive_path.display()
+            )
+        })?;
+    } else {
+        let mut bounded = file.take(MAX_MBOX_ARCHIVE_DECOMPRESSED_BYTES + 1);
+        bounded
+            .read_to_string(&mut raw_text)
+            .with_context(|| format!("Failed to read mbox archive {}", archive_path.display()))?;
+    }
+    if raw_text.len() as u64 > MAX_MBOX_ARCHIVE_DECOMPRESSED_BYTES {
+        bail!(
+            "Mbox archive {} exceeds {} byte safety cap",
+            archive_path.display(),
+            MAX_MBOX_ARCHIVE_DECOMPRESSED_BYTES
+        );
+    }
+
+    let mut entries = HashMap::new();
+    for (idx, line_res) in BufReader::new(raw_text.as_bytes()).lines().enumerate() {
+        let line = line_res?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let record: MboxArchiveRecord = serde_json::from_str(trimmed).with_context(|| {
+            format!(
+                "Invalid JSONL record on line {} of {}",
+                idx + 1,
+                archive_path.display()
+            )
+        })?;
+        let norm_key = record.key.trim().trim_start_matches("./").to_string();
+        entries.insert(norm_key, record.mbox);
+    }
+    Ok(entries)
+}
+
+fn read_benchmark_mbox_source(
+    suite_dir: &Path,
+    archive_cache: &mut HashMap<PathBuf, Arc<HashMap<String, String>>>,
+    mbox_archive: Option<&str>,
+    mbox_key: &str,
+) -> Result<String> {
+    if let Some(arch_rel) = mbox_archive.map(str::trim).filter(|s| !s.is_empty()) {
+        let arch_path = resolve_benchmark_relative_path(suite_dir, arch_rel)?;
+        let archive = if let Some(cached) = archive_cache.get(&arch_path) {
+            cached.clone()
+        } else {
+            let loaded = Arc::new(load_mbox_archive(&arch_path)?);
+            archive_cache.insert(arch_path.clone(), loaded.clone());
+            loaded
+        };
+        let norm_key = mbox_key.trim().trim_start_matches("./");
+        return archive.get(norm_key).cloned().ok_or_else(|| {
+            anyhow!(
+                "Mbox key '{}' not found in archive {}",
+                norm_key,
+                arch_path.display()
+            )
+        });
+    }
+
+    let mbox_file = resolve_benchmark_relative_path(suite_dir, mbox_key)?;
+    std::fs::read_to_string(&mbox_file)
+        .with_context(|| format!("Failed to read benchmark mbox {}", mbox_file.display()))
+}
+
+pub async fn ingest_versioned_benchmark_entries(
+    db: &Database,
+    benchmark_file: &Path,
+    entries: &[BenchmarkEntry],
+) -> Result<()> {
+    let suite_dir = benchmark_file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let mut target_msg_ids = BTreeSet::new();
+    for entry in entries {
+        if entry.is_versioned() {
+            let (trimmed, _) = normalize_commit_or_msgid(&entry.commit);
+            if !trimmed.is_empty() {
+                target_msg_ids.insert(trimmed.to_string());
+            }
+        }
+    }
+
+    let mut archive_cache: HashMap<PathBuf, Arc<HashMap<String, String>>> = HashMap::new();
+    let mut seen_targets = BTreeSet::new();
+    let mut ingested_count = 0usize;
+
+    for entry in entries {
+        if !entry.is_versioned() {
+            continue;
+        }
+        let (target_key, _) = normalize_commit_or_msgid(&entry.commit);
+        if target_key.is_empty() || !seen_targets.insert(target_key.to_string()) {
+            continue;
+        }
+        if commit_has_completed_review(db, &entry.commit)
+            .await
+            .unwrap_or(false)
+        {
+            info!(
+                "Versioned benchmark target {} already has a completed review, skipping ingestion",
+                entry.commit
+            );
+            continue;
+        }
+
+        ingest_single_versioned_entry(db, suite_dir, &mut archive_cache, entry, &target_msg_ids)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to ingest versioned benchmark entry '{}' ({})",
+                    entry.case_id.as_deref().unwrap_or("unnamed"),
+                    entry.commit
+                )
+            })?;
+        ingested_count += 1;
+    }
+
+    if ingested_count > 0 {
+        info!(
+            "Successfully ingested {} versioned benchmark patchset chains.",
+            ingested_count
+        );
+    }
+    Ok(())
+}
+
+async fn ingest_single_versioned_entry(
+    db: &Database,
+    suite_dir: &Path,
+    archive_cache: &mut HashMap<PathBuf, Arc<HashMap<String, String>>>,
+    entry: &BenchmarkEntry,
+    target_msg_ids: &BTreeSet<String>,
+) -> Result<()> {
+    let mut sorted_ancestors = entry.ancestor_mboxes.clone();
+    sorted_ancestors.sort_by_key(|a| a.version);
+
+    for ancestor in &sorted_ancestors {
+        let raw_mbox = read_benchmark_mbox_source(
+            suite_dir,
+            archive_cache,
+            entry.mbox_archive.as_deref(),
+            &ancestor.mbox_path,
+        )?;
+        let ps_ids = ingest_raw_mbox_messages(
+            db,
+            &raw_mbox,
+            ancestor.baseline_commit.as_deref(),
+            "lore-benchmark",
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to ingest ancestor v{} ({})",
+                ancestor.version, ancestor.mbox_path
+            )
+        })?;
+
+        for ps_id in ps_ids {
+            finalize_ancestor_patchset_state(db, ps_id, ancestor).await?;
+        }
+    }
+
+    let target_mbox_key = entry
+        .target_mbox
+        .as_deref()
+        .ok_or_else(|| anyhow!("Versioned benchmark entry missing target_mbox"))?;
+    let target_raw = read_benchmark_mbox_source(
+        suite_dir,
+        archive_cache,
+        entry.mbox_archive.as_deref(),
+        target_mbox_key,
+    )?;
+    let target_ps_ids = ingest_raw_mbox_messages(
+        db,
+        &target_raw,
+        entry.baseline_commit.as_deref(),
+        "lore-benchmark",
+    )
+    .await
+    .with_context(|| format!("Failed to ingest target_mbox '{}'", target_mbox_key))?;
+
+    for ps_id in &target_ps_ids {
+        db.reconcile_version_lineage(*ps_id).await?;
+    }
+
+    let Some((_target_patch_id, resolved_ps_id, _, _, _)) =
+        lookup_benchmark_patch_row(db, &entry.commit).await?
+    else {
+        bail!(
+            "Target patch message_id '{}' was not created from target_mbox '{}'",
+            entry.commit,
+            target_mbox_key
+        );
+    };
+
+    prepare_target_patchset_review_state(db, resolved_ps_id, target_msg_ids).await?;
+    Ok(())
+}
+
+async fn ingest_raw_mbox_messages(
+    db: &Database,
+    raw_mbox: &str,
+    baseline_commit: Option<&str>,
+    group: &str,
+) -> Result<Vec<i64>> {
+    let raw_messages = crate::ingestor::split_mbox(raw_mbox.as_bytes());
+    if raw_messages.is_empty() {
+        bail!("Mbox fixture contains zero messages");
+    }
+
+    let baseline_id = match baseline_commit.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw_sha) => {
+            let parsed = CommitId::parse(raw_sha).ok_or_else(|| {
+                anyhow!("Invalid baseline_commit '{}' (expected hex SHA)", raw_sha)
+            })?;
+            Some(
+                db.create_baseline(None, None, Some(parsed.as_str()))
+                    .await?,
+            )
+        }
+        None => None,
+    };
+
+    let mut parsed_items = Vec::with_capacity(raw_messages.len());
+    for msg_raw in raw_messages {
+        let parsed = tokio::task::spawn_blocking(move || crate::patch::parse_email(&msg_raw))
+            .await
+            .context("Mbox parser task panicked")??;
+        parsed_items.push(parsed);
+    }
+
+    // Order cover letters first, then numbered patches in index order, then
+    // discussion replies, preserving relative arrival order within each bucket.
+    parsed_items.sort_by_key(|(meta, _)| {
+        if meta.is_patch_or_cover && meta.index == 0 {
+            (0u8, 0u32)
+        } else if meta.is_patch_or_cover {
+            (1u8, meta.index)
+        } else {
+            (2u8, 0u32)
+        }
+    });
+
+    let sid = db.ensure_subsystem("lore-benchmark", group).await?;
+    let mut created_patchset_ids = BTreeSet::new();
+
+    for (mut metadata, patch_opt) in parsed_items {
+        let thread_id = resolve_mbox_message_thread_id(db, &metadata).await?;
+        let refs_hdr = if metadata.references.is_empty() {
+            None
+        } else {
+            let cleaned: Vec<String> = metadata
+                .references
+                .iter()
+                .map(|r| r.trim_matches(['<', '>']).to_string())
+                .collect();
+            Some(cleaned.join(" "))
+        };
+
+        db.create_message_with_references(
+            &metadata.message_id,
+            thread_id,
+            metadata.in_reply_to.as_deref(),
+            &metadata.author,
+            &metadata.subject,
+            metadata.date,
+            &metadata.body,
+            &metadata.to,
+            &metadata.cc,
+            None,
+            Some(group),
+            refs_hdr.as_deref(),
+        )
+        .await?;
+
+        let git_patch_id = match patch_opt.as_ref() {
+            Some(p) => crate::prerequisites::calculate_git_patch_id(&p.diff)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+
+        if !metadata.is_patch_or_cover
+            && let Some(ref patch) = patch_opt
+            && metadata.index == 1
+            && metadata.total == 1
+            && crate::patch::is_promotable_reply_patch_subject(&metadata.subject)
+            && let Some(next_version) = db
+                .find_in_thread_followup_version(
+                    thread_id,
+                    &metadata.message_id,
+                    &metadata.author,
+                    &metadata.subject,
+                    git_patch_id.as_deref(),
+                    &patch.diff,
+                )
+                .await?
+        {
+            metadata.is_patch_or_cover = true;
+            metadata.version = Some(next_version);
+            metadata.subject =
+                crate::patch::promote_reply_patch_subject(&metadata.subject, next_version);
+        }
+
+        if !metadata.is_patch_or_cover {
+            continue;
+        }
+
+        let cover_letter_id = if metadata.index == 0 || metadata.total == 1 {
+            Some(metadata.message_id.clone())
+        } else {
+            let parent_is_cover = match metadata.in_reply_to.as_deref() {
+                Some(parent) => db
+                    .message_is_cover_letter_for(
+                        parent,
+                        &metadata.author,
+                        metadata.total,
+                        metadata.version,
+                    )
+                    .await
+                    .unwrap_or(false),
+                None => false,
+            };
+            if parent_is_cover {
+                metadata.in_reply_to.clone()
+            } else {
+                Some(metadata.message_id.clone())
+            }
+        };
+
+        let maintainer_sections: Vec<AttributedSubsystem> = patch_opt
+            .as_ref()
+            .map(|p| crate::maintainers::sections_for_diff(&p.diff))
+            .unwrap_or_default()
+            .into_iter()
+            .map(AttributedSubsystem::from_maintainers)
+            .collect();
+
+        if let Some(patchset_id) = db
+            .create_patchset(
+                thread_id,
+                cover_letter_id.as_deref(),
+                &metadata.message_id,
+                &metadata.subject,
+                &metadata.author,
+                metadata.date,
+                metadata.total,
+                2,
+                &metadata.to,
+                &metadata.cc,
+                metadata.version,
+                metadata.index,
+                baseline_id,
+                false,
+                None,
+                None,
+            )
+            .await?
+        {
+            created_patchset_ids.insert(patchset_id);
+            if let Some(cid) = crate::patch::parse_b4_change_id(&metadata.body) {
+                let _ = db.set_patchset_change_id_if_unset(patchset_id, &cid).await;
+            }
+            let _ = db.add_subsystem_to_patchset(patchset_id, sid).await;
+            let _ = db
+                .add_patchset_maintainer_sections(patchset_id, &maintainer_sections)
+                .await;
+
+            if let Some(patch) = patch_opt {
+                let patch_id = db
+                    .create_patch_with_git_patch_id(
+                        patchset_id,
+                        &patch.message_id,
+                        patch.part_index,
+                        &patch.diff,
+                        git_patch_id.as_deref(),
+                    )
+                    .await?;
+                let _ = db.add_subsystem_to_patch(patch_id, sid).await;
+            }
+        }
+    }
+
+    Ok(created_patchset_ids.into_iter().collect())
+}
+
+async fn resolve_mbox_message_thread_id(
+    db: &Database,
+    metadata: &crate::patch::PatchsetMetadata,
+) -> Result<i64> {
+    if let Some(ref reply_to) = metadata.in_reply_to {
+        if let Some(tid) = db.get_thread_id_for_message(reply_to).await? {
+            return Ok(tid);
+        }
+        for r in metadata.references.iter().rev() {
+            let cleaned = r.trim_matches(['<', '>']);
+            if !cleaned.is_empty()
+                && let Some(tid) = db.get_thread_id_for_message(cleaned).await?
+            {
+                return Ok(tid);
+            }
+        }
+        return db.ensure_thread_for_message(reply_to, metadata.date).await;
+    }
+    db.ensure_thread_for_message(&metadata.message_id, metadata.date)
+        .await
+}
+
+async fn finalize_ancestor_patchset_state(
+    db: &Database,
+    patchset_id: i64,
+    ancestor: &BenchmarkAncestorMbox,
+) -> Result<()> {
+    db.reconcile_version_lineage(patchset_id).await?;
+
+    match ancestor.patchset_status {
+        BenchmarkAncestorStatus::Reviewed => {
+            db.execute(
+                "UPDATE patchsets SET status = 'Reviewed', failed_reason = NULL WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+            db.execute(
+                "UPDATE patches SET status = 'Reviewed', apply_error = NULL WHERE patchset_id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT id, COALESCE(part_index, 1), message_id
+                     FROM patches
+                     WHERE patchset_id = ?
+                     ORDER BY part_index ASC, id ASC
+                     LIMIT 256",
+                    libsql::params![patchset_id],
+                )
+                .await?;
+            let mut patches = Vec::new();
+            while let Some(row) = rows.next().await? {
+                patches.push((
+                    row.get::<i64>(0)?,
+                    row.get::<i64>(1)? as u32,
+                    row.get::<String>(2)?,
+                ));
+            }
+            drop(rows);
+
+            for (patch_id, part_index, patch_msg_id) in patches {
+                let mut existing_rev = db
+                    .conn
+                    .query(
+                        "SELECT id, provider FROM reviews WHERE patch_id = ? AND status = 'Reviewed' LIMIT 1",
+                        libsql::params![patch_id],
+                    )
+                    .await?;
+                let existing_rev_info = existing_rev
+                    .next()
+                    .await?
+                    .map(|rrow| {
+                        Ok::<_, libsql::Error>((
+                            rrow.get::<i64>(0)?,
+                            rrow.get::<String>(1).unwrap_or_default(),
+                        ))
+                    })
+                    .transpose()?;
+                drop(existing_rev);
+
+                let (norm_patch_msg, _) = normalize_commit_or_msgid(&patch_msg_id);
+                let matching_seeded: Vec<&BenchmarkSeededFinding> = ancestor
+                    .prior_findings
+                    .iter()
+                    .filter(|seeded| match seeded.patch_message_id.as_deref() {
+                        Some(seed_mid) => {
+                            let (norm_seed, _) = normalize_commit_or_msgid(seed_mid);
+                            norm_seed == norm_patch_msg
+                        }
+                        None => seeded.part_index == part_index,
+                    })
+                    .collect();
+
+                let review_id = if let Some((rev_id, provider)) = existing_rev_info {
+                    if provider != "benchmark-seed" || matching_seeded.is_empty() {
+                        continue;
+                    }
+                    db.execute(
+                        "DELETE FROM findings WHERE review_id = ?",
+                        libsql::params![rev_id],
+                    )
+                    .await?;
+                    rev_id
+                } else {
+                    let rev_id = db
+                        .create_review(
+                            patchset_id,
+                            Some(patch_id),
+                            "benchmark-seed",
+                            "seed",
+                            None,
+                            None,
+                        )
+                        .await?;
+                    db.complete_review(
+                        rev_id,
+                        "Reviewed",
+                        "Benchmark placeholder: no Sashiko review was run on this version.",
+                        Some("Benchmark placeholder: no Sashiko review was run on this version."),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                    rev_id
+                };
+
+                for seeded in matching_seeded {
+                    db.create_finding(Finding {
+                        review_id,
+                        severity: if seeded.severity == Severity::Unknown {
+                            Severity::Medium
+                        } else {
+                            seeded.severity
+                        },
+                        severity_explanation: seeded.severity_explanation.clone(),
+                        problem: seeded.problem.clone(),
+                        preexisting: Some(seeded.preexisting),
+                        locations: None,
+                    })
+                    .await?;
+                }
+            }
+        }
+        BenchmarkAncestorStatus::Cancelled => {
+            db.execute(
+                "UPDATE patchsets SET status = 'Cancelled' WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+            db.execute(
+                "UPDATE patches SET status = 'Cancelled' WHERE patchset_id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn prepare_target_patchset_review_state(
+    db: &Database,
+    patchset_id: i64,
+    target_msg_ids: &BTreeSet<String>,
+) -> Result<()> {
+    let mut rows = db
+        .conn
+        .query(
+            "SELECT id, message_id FROM patches WHERE patchset_id = ? ORDER BY part_index ASC LIMIT 256",
+            libsql::params![patchset_id],
+        )
+        .await?;
+    let mut patches = Vec::new();
+    while let Some(row) = rows.next().await? {
+        patches.push((row.get::<i64>(0)?, row.get::<String>(1)?));
+    }
+    drop(rows);
+
+    let mut any_pending = false;
+    for (patch_id, msg_id) in patches {
+        let (norm_mid, _) = normalize_commit_or_msgid(&msg_id);
+        if !target_msg_ids.contains(norm_mid) {
+            db.execute(
+                "UPDATE patches SET status = 'Skipped', apply_error = NULL WHERE id = ? AND COALESCE(status, '') != 'Reviewed'",
+                libsql::params![patch_id],
+            )
+            .await?;
+            continue;
+        }
+
+        let mut rev_rows = db
+            .conn
+            .query(
+                "SELECT 1 FROM reviews WHERE patch_id = ? AND status = 'Reviewed' LIMIT 1",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let has_completed_review = rev_rows.next().await?.is_some();
+        drop(rev_rows);
+
+        db.execute(
+            "DELETE FROM findings WHERE review_id IN (SELECT id FROM reviews WHERE patch_id = ? AND status != 'Reviewed')",
+            libsql::params![patch_id],
+        )
+        .await?;
+        db.execute(
+            "DELETE FROM tool_usages WHERE review_id IN (SELECT id FROM reviews WHERE patch_id = ? AND status != 'Reviewed')",
+            libsql::params![patch_id],
+        )
+        .await?;
+        db.execute(
+            "DELETE FROM reviews WHERE patch_id = ? AND status != 'Reviewed'",
+            libsql::params![patch_id],
+        )
+        .await?;
+
+        if has_completed_review {
+            db.execute(
+                "UPDATE patches SET status = 'Reviewed', apply_error = NULL WHERE id = ? AND COALESCE(status, '') != 'Reviewed'",
+                libsql::params![patch_id],
+            )
+            .await?;
+        } else {
+            any_pending = true;
+            db.execute(
+                "UPDATE patches SET status = 'Pending', apply_error = NULL WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        }
+    }
+
+    if any_pending {
+        db.execute(
+            "UPDATE patchsets SET status = 'Pending', failed_reason = NULL WHERE id = ?",
+            libsql::params![patchset_id],
+        )
+        .await?;
+    } else {
+        db.execute(
+            "UPDATE patchsets SET status = 'Reviewed', failed_reason = NULL WHERE id = ? AND COALESCE(status, '') != 'Reviewed'",
+            libsql::params![patchset_id],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn lookup_benchmark_patch_row(
     db: &Database,
     commit: &str,
 ) -> Result<Option<(i64, i64, Option<String>, Option<String>, Option<String>)>> {
-    let bracketed = format!("<{commit}>");
+    let (trimmed, bracketed) = normalize_commit_or_msgid(commit);
     let mut rows = db
         .conn
         .query(
@@ -1039,7 +2365,7 @@ async fn lookup_benchmark_patch_row(
              LEFT JOIN messages m ON m.message_id = p.message_id
              WHERE p.message_id IN (?1, ?2)
              ORDER BY p.id DESC LIMIT 1",
-            libsql::params![commit.to_string(), bracketed],
+            libsql::params![trimmed.to_string(), bracketed],
         )
         .await?;
     if let Some(row) = rows.next().await? {
@@ -1053,8 +2379,8 @@ async fn lookup_benchmark_patch_row(
     }
     drop(rows);
 
-    if commit.len() < 40 {
-        let root_msg_id = format!("{commit}@sashiko.local");
+    if trimmed.len() < 40 && !trimmed.contains('@') {
+        let root_msg_id = format!("{trimmed}@sashiko.local");
         let mut fallback_rows = db
             .conn
             .query(
@@ -1177,7 +2503,7 @@ pub(crate) async fn load_commit_review_data(
     let mut rev_rows = db
         .conn
         .query(
-            "SELECT id, status, summary, result_description, interaction_id, created_at
+            "SELECT id, status, summary, result_description, interaction_id, created_at, inline_review
              FROM reviews
              WHERE patch_id = ?
              ORDER BY CASE WHEN status = 'Reviewed' THEN 0 ELSE 1 END ASC, id DESC LIMIT 1",
@@ -1195,6 +2521,9 @@ pub(crate) async fn load_commit_review_data(
     let result_desc: Option<String> = rev_row.get(3).ok();
     let interaction_id: Option<String> = rev_row.get(4).ok();
     let review_created_at: Option<i64> = rev_row.get(5).ok();
+    if let Ok(Some(inline_str)) = crate::compression::get_compressed_string_opt(&rev_row, 6) {
+        data.inline_review = inline_str.trim().to_string();
+    }
 
     data.review_id = Some(review_id);
     if !matches!(review_status.as_str(), "" | "Pending" | "In Review")
@@ -1280,6 +2609,11 @@ pub(crate) async fn load_commit_review_data(
 }
 
 fn populate_findings_and_stages_from_output(data: &mut CommitReviewData, output: &Value) {
+    if data.inline_review.is_empty()
+        && let Some(inline_str) = output.get("inline_review").and_then(Value::as_str)
+    {
+        data.inline_review = inline_str.trim().to_string();
+    }
     if let Some(c) = output.get("concerns_count").and_then(Value::as_u64) {
         data.concerns_count = c as usize;
     }
@@ -1326,8 +2660,14 @@ fn populate_findings_and_stages_from_output(data: &mut CommitReviewData, output:
                 if !skipped
                     && !matches!(
                         name.as_str(),
-                        "pre-screen" | "planning" | "verification" | "report" | "summary"
+                        "pre-screen"
+                            | "planning"
+                            | "deduplication"
+                            | "verification"
+                            | "report"
+                            | "summary"
                     )
+                    && !name.starts_with("verification-")
                     && !name.starts_with("post-verification")
                 {
                     data.planned_stages.push(name.clone());
@@ -1381,6 +2721,7 @@ fn populate_findings_and_stages_from_output(data: &mut CommitReviewData, output:
                 .or_else(|| f.get("post_verification_stage"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let prior_attribution = f.get("prior_attribution").filter(|v| !v.is_null()).cloned();
             let stages = extract_str_vec(f.get("stages"));
             let prompts = extract_str_vec(f.get("prompts"));
 
@@ -1392,6 +2733,7 @@ fn populate_findings_and_stages_from_output(data: &mut CommitReviewData, output:
                 explanation,
                 preexisting,
                 origin,
+                prior_attribution,
                 stages,
                 prompts,
             });
@@ -1542,6 +2884,7 @@ async fn load_findings_table_fallback(
             explanation,
             preexisting,
             origin: None,
+            prior_attribution: None,
             stages: Vec::new(),
             prompts: Vec::new(),
         });
@@ -1574,6 +2917,7 @@ async fn load_bugs_for_review(
                 explanation: bug.severity_explanation(),
                 preexisting: true,
                 origin: Some("bug_repository".to_string()),
+                prior_attribution: None,
                 stages: Vec::new(),
                 prompts: Vec::new(),
             });
@@ -1665,6 +3009,7 @@ pub(crate) async fn evaluate_single_entry(
             &problem_description,
             &data,
             "NOT_REVIEWED".to_string(),
+            None,
             format!(
                 "Patch has no completed review (status: {}).",
                 data.review_status.as_deref().unwrap_or("None")
@@ -1675,15 +3020,32 @@ pub(crate) async fn evaluate_single_entry(
         );
     }
 
-    let prompt = build_judge_prompt(&problem_description, &data);
+    if entry.expected_behavior.is_suppression() && data.findings.is_empty() {
+        let mut result = build_entry_result_from_data(
+            &entry,
+            &problem_description,
+            &data,
+            "SUPPRESSED".to_string(),
+            None,
+            "No findings reported; false-positive claim remained suppressed.".to_string(),
+            None,
+            None,
+            None,
+        );
+        result.suppressed_with_no_findings = true;
+        return result;
+    }
+
+    let prompt = build_judge_prompt_for_entry(&entry, &problem_description, &data);
     let mut session = BenchmarkEvalSession::new(prompt);
     let runner = SessionRunner::new(client.as_ref());
 
     match runner.run(&mut session).await {
         Ok(run_res) => {
             let verdict = run_res.output;
-            let found = verdict.status == "DETECTED" || verdict.status == "PARTIALLY_DETECTED";
-            let matched_finding = if found {
+            let judge_matched =
+                verdict.status == "DETECTED" || verdict.status == "PARTIALLY_DETECTED";
+            let matched_record = if judge_matched {
                 verdict
                     .matched_finding_index
                     .and_then(|idx| data.findings.iter().find(|f| f.index == idx))
@@ -1694,18 +3056,45 @@ pub(crate) async fn evaluate_single_entry(
                             None
                         }
                     })
-                    .map(|f| MatchedFindingSummary {
-                        index: f.index,
-                        severity: f.severity.clone(),
-                        problem: f.problem.clone(),
-                        preexisting: f.preexisting,
-                        origin: f.origin.clone(),
-                        stages: f.stages.clone(),
-                        prompts: f.prompts.clone(),
-                    })
             } else {
                 None
             };
+            let matched_finding = matched_record.map(|f| MatchedFindingSummary {
+                index: f.index,
+                severity: f.severity.clone(),
+                problem: f.problem.clone(),
+                preexisting: f.preexisting,
+                origin: f.origin.clone(),
+                stages: f.stages.clone(),
+                prompts: f.prompts.clone(),
+            });
+
+            if entry.expected_behavior.is_suppression() {
+                let (status, explanation) = if judge_matched {
+                    ("FALSE_POSITIVE".to_string(), verdict.explanation)
+                } else {
+                    (
+                        "SUPPRESSED".to_string(),
+                        format!(
+                            "False-positive claim remained suppressed ({})",
+                            verdict.explanation
+                        ),
+                    )
+                };
+                return build_entry_result_from_data(
+                    &entry,
+                    &problem_description,
+                    &data,
+                    status,
+                    None,
+                    explanation,
+                    matched_finding,
+                    None,
+                    None,
+                );
+            }
+
+            let attribution = score_attribution(&entry, matched_record);
 
             let (miss_reason, dismissed_by_stage) = if verdict.status == "MISSED" {
                 let reason = verdict
@@ -1721,6 +3110,7 @@ pub(crate) async fn evaluate_single_entry(
                 &problem_description,
                 &data,
                 verdict.status,
+                attribution,
                 verdict.explanation,
                 matched_finding,
                 miss_reason,
@@ -1732,6 +3122,7 @@ pub(crate) async fn evaluate_single_entry(
             &problem_description,
             &data,
             "UNKNOWN".to_string(),
+            None,
             format!("Evaluation failed: {e}"),
             None,
             None,
@@ -1749,12 +3140,25 @@ fn empty_entry_result(
 ) -> BenchmarkEntryResult {
     BenchmarkEntryResult {
         commit: entry.commit.clone(),
+        case_id: entry.case_id.clone(),
+        category: entry.category.clone(),
+        expected_behavior: entry.expected_behavior,
         subject: None,
         fixed_by: entry.fixed_by.clone(),
         subsystem: entry.subsystem.clone(),
         problem_description: problem_description.to_string(),
         found: false,
         status: status.to_string(),
+        attributed: entry
+            .expected_behavior
+            .expects_attribution()
+            .then_some(false),
+        attribution: entry
+            .expected_behavior
+            .expects_attribution()
+            .then_some(AttributionOutcome::Missing),
+        suppressed_with_no_findings: false,
+        versioned: entry.is_versioned(),
         explanation: explanation.to_string(),
         matched_finding: None,
         miss_reason: miss_reason.map(str::to_string),
@@ -1787,16 +3191,32 @@ fn build_entry_result_from_data(
     problem_description: &str,
     data: &CommitReviewData,
     status: String,
+    attribution: Option<AttributionOutcome>,
     explanation: String,
     matched_finding: Option<MatchedFindingSummary>,
     miss_reason: Option<String>,
     dismissed_by_stage: Option<String>,
 ) -> BenchmarkEntryResult {
-    let found = status == "DETECTED" || status == "PARTIALLY_DETECTED";
+    // Every path that produced no scored attribution (unreviewed, judge
+    // failure, no match) leaves an expected attribution missing.
+    let attribution = attribution.or_else(|| {
+        entry
+            .expected_behavior
+            .expects_attribution()
+            .then_some(AttributionOutcome::Missing)
+    });
+    let attributed = entry
+        .expected_behavior
+        .expects_attribution()
+        .then(|| attribution == Some(AttributionOutcome::Correct));
+    let found = matches!(
+        status.as_str(),
+        "DETECTED" | "PARTIALLY_DETECTED" | "SUPPRESSED"
+    );
     let patch_findings_count = data.patch_findings_count();
     let preexisting_findings_count = data.preexisting_findings_count();
     let findings_count = data.findings.len();
-    let matched_patch_finding = matched_finding.as_ref().is_some_and(|mf| !mf.preexisting);
+    let matched_patch_finding = found && matched_finding.as_ref().is_some_and(|mf| !mf.preexisting);
     let extra_findings_count = if matched_patch_finding {
         patch_findings_count.saturating_sub(1)
     } else {
@@ -1805,12 +3225,19 @@ fn build_entry_result_from_data(
 
     BenchmarkEntryResult {
         commit: entry.commit.clone(),
+        case_id: entry.case_id.clone(),
+        category: entry.category.clone(),
+        expected_behavior: entry.expected_behavior,
         subject: data.subject.clone(),
         fixed_by: entry.fixed_by.clone(),
         subsystem: entry.subsystem.clone(),
         problem_description: problem_description.to_string(),
         found,
         status,
+        attributed,
+        attribution,
+        suppressed_with_no_findings: false,
+        versioned: entry.is_versioned(),
         explanation,
         matched_finding,
         miss_reason,
@@ -1837,7 +3264,11 @@ fn build_entry_result_from_data(
     }
 }
 
-pub(crate) fn build_judge_prompt(problem_description: &str, data: &CommitReviewData) -> String {
+pub(crate) fn build_judge_prompt_for_entry(
+    entry: &BenchmarkEntry,
+    problem_description: &str,
+    data: &CommitReviewData,
+) -> String {
     let mut findings_block = String::new();
     if data.findings.is_empty() {
         findings_block.push_str("(No findings reported)\n");
@@ -1858,6 +3289,18 @@ pub(crate) fn build_judge_prompt(problem_description: &str, data: &CommitReviewD
         }
     }
 
+    let mut inline_block = String::new();
+    if !data.inline_review.is_empty() {
+        let truncated: String = data
+            .inline_review
+            .chars()
+            .take(MAX_INLINE_REVIEW_PROMPT_CHARS)
+            .collect();
+        inline_block.push_str("\nInline Review Report:\n");
+        inline_block.push_str(&truncated);
+        inline_block.push('\n');
+    }
+
     let mut dismissed_block = String::new();
     if data.dismissed_concerns.is_empty() {
         dismissed_block.push_str("(No dismissed concerns recorded)\n");
@@ -1870,26 +3313,46 @@ pub(crate) fn build_judge_prompt(problem_description: &str, data: &CommitReviewD
         }
     }
 
+    // Attribution is scored deterministically from structured fields
+    // (`score_attribution`); the judge only decides whether a finding matches.
+    // For suppression entries the description is a refuted claim, so the judge
+    // is told explicitly that matching it means a false positive.
+    let (claim_heading, claim_preamble, task_target) = if entry.expected_behavior.is_suppression() {
+        (
+            "Refuted Claim (FALSE; must NOT be reported):",
+            "The description below is a claim that an earlier reviewer made about a previous version of this patch and that has been refuted: it is NOT a real defect in the reviewed code. A correct review does not report it. Your task is to detect whether the tool nevertheless reported this false claim. Use `\"DETECTED\"` or `\"PARTIALLY_DETECTED\"` only when a finding asserts this same refuted claim as an active defect; findings about unrelated issues do not count.\n\n",
+            "the Refuted Claim (asserting it as an active defect)",
+        )
+    } else {
+        (
+            "Ground Truth Defect:",
+            "",
+            "the Ground Truth Defect as an active defect",
+        )
+    };
+
     format!(
-        "You are evaluating an automated Linux kernel code review tool against a known ground-truth bug.\n\n\
-        Ground Truth Bug Description:\n\
+        "You are evaluating an automated Linux kernel code review tool against a target claim or ground-truth bug.\n\n\
+        {claim_preamble}\
+        {claim_heading}\n\
         {problem_description}\n\n\
         Reported Findings:\n\
         {findings_block}\n\
         Review Summary:\n\
-        {}\n\n\
+        {}\n\
+        {inline_block}\n\
         Dismissed / Filtered Candidate Concerns:\n\
         {dismissed_block}\n\
         Task:\n\
-        1. Determine whether ANY of the Reported Findings (`[F1]`, `[F2]`, ...) or the Review Summary describes the Ground Truth Bug:\n\
+        1. Determine whether ANY of the Reported Findings (`[F1]`, `[F2]`, ...) or the Review Summary reports {task_target}:\n\
            - `\"DETECTED\"`: A reported finding accurately identifies the specific root cause and location/mechanism.\n\
            - `\"PARTIALLY_DETECTED\"`: A reported finding identifies the general defect or symptom in the right area with minor inaccuracy.\n\
-           - `\"MISSED\"`: None of the reported findings match the ground truth bug.\n\
+           - `\"MISSED\"`: None of the reported findings report it as a defect.\n\
         2. When `status` is `\"DETECTED\"` or `\"PARTIALLY_DETECTED\"`, set `matched_finding_index` to the integer `1..=N` of the best matching `[F<index>]` finding (or `null` if matched only in the summary).\n\
-        3. When `status` is `\"MISSED\"`, inspect the Dismissed / Filtered Candidate Concerns (`[D1]`, `[D2]`, ...) to diagnose why it was missed:\n\
-           - Set `miss_reason` to `\"wrongly_dismissed\"` if a dismissed concern in `[D1..]` raised the ground truth bug and was later dismissed as a false positive, and set `dismissed_by_stage` to that `[D<index>]`'s `Stage`.\n\
-           - Set `miss_reason` to `\"preexisting_filtered\"` if a concern with `Stage: preexisting-filtered` matched the ground truth bug.\n\
-           - Set `miss_reason` to `\"not_raised\"` if no specialist stage or dismissed concern ever mentioned the ground truth bug.\n\n\
+        3. When `status` is `\"MISSED\"`, inspect the Dismissed / Filtered Candidate Concerns (`[D1]`, `[D2]`, ...) to diagnose why it was not reported:\n\
+           - Set `miss_reason` to `\"wrongly_dismissed\"` if a dismissed concern in `[D1..]` raised the claim and was later dismissed, and set `dismissed_by_stage` to that `[D<index>]`'s `Stage`.\n\
+           - Set `miss_reason` to `\"preexisting_filtered\"` if a concern with `Stage: preexisting-filtered` matched the claim.\n\
+           - Set `miss_reason` to `\"not_raised\"` if no specialist stage or dismissed concern ever mentioned the claim.\n\
         Respond ONLY with a valid JSON object matching this schema:\n\
         {{\n\
           \"status\": \"DETECTED\" | \"PARTIALLY_DETECTED\" | \"MISSED\",\n\
@@ -1930,7 +3393,7 @@ pub(crate) fn parse_judge_verdict(raw: &str) -> Result<BenchmarkJudgeVerdict, Va
     }
 
     // Fallback for plain-text responses `[DETECTED | PARTIALLY_DETECTED | MISSED]: explanation`
-    let re_status = Regex::new(r"(?i)\b(DETECTED|PARTIALLY_DETECTED|MISSED)\b").unwrap();
+    let re_status = &*JUDGE_STATUS_RE;
     if let Some(cap) = re_status.captures(trimmed) {
         let status = cap[1].to_ascii_uppercase();
         let remaining = re_status.replace(trimmed, "").to_string();
@@ -1961,8 +3424,7 @@ fn extract_json_object(text: &str) -> Option<&str> {
 }
 
 fn extract_finding_tag_index(text: &str) -> Option<usize> {
-    let re = Regex::new(r"\[F(\d+)\]").ok()?;
-    let caps = re.captures(text)?;
+    let caps = FINDING_TAG_RE.captures(text)?;
     caps.get(1)?.as_str().parse::<usize>().ok()
 }
 
@@ -2061,6 +3523,41 @@ fn round_one_decimal(val: f64) -> f64 {
     (val * 10.0).round() / 10.0
 }
 
+/// Statuses for entries that were never judged: the review did not complete
+/// or the judge evaluation failed. They count as failures in every rate.
+fn is_failure_status(status: &str) -> bool {
+    matches!(status, "NOT_REVIEWED" | "NOT_FOUND_IN_DB" | "UNKNOWN")
+}
+
+/// Strict per-entry pass: suppression entries must stay suppressed; detection
+/// entries need an exact `DETECTED` verdict (partial matches never pass) and
+/// an attribution outcome matching the expectation: correct when prior credit
+/// is expected, absent otherwise.
+fn entry_passes_strictly(res: &BenchmarkEntryResult) -> bool {
+    if res.expected_behavior.is_suppression() {
+        return res.status == "SUPPRESSED";
+    }
+    if res.status != "DETECTED" {
+        return false;
+    }
+    if res.expected_behavior.expects_attribution() {
+        res.attribution == Some(AttributionOutcome::Correct)
+    } else {
+        matches!(res.attribution, None | Some(AttributionOutcome::Acceptable))
+    }
+}
+
+/// Original per-entry pass used for classic (non-versioned) entries.
+fn entry_passes_legacy(res: &BenchmarkEntryResult) -> bool {
+    if res.expected_behavior.is_suppression() {
+        res.status == "SUPPRESSED"
+    } else if res.expected_behavior.expects_attribution() {
+        res.found && res.attributed == Some(true)
+    } else {
+        res.found
+    }
+}
+
 pub(crate) fn build_benchmark_summary(
     entries: &[BenchmarkEntry],
     results: &[BenchmarkEntryResult],
@@ -2073,7 +3570,20 @@ pub(crate) fn build_benchmark_summary(
     let mut detected = 0usize;
     let mut partially_detected = 0usize;
     let mut missed = 0usize;
+    let mut suppressed = 0usize;
+    let mut false_positives = 0usize;
+    let mut suppression_failed = 0usize;
+    let mut suppressed_with_no_findings = 0usize;
+    let mut attribution_expected_entries = 0usize;
+    let mut attributed = 0usize;
+    let mut attribution_wrong = 0usize;
+    let mut attribution_missing = 0usize;
+    let mut unexpected_attributions = 0usize;
+    let mut attribution_acceptable = 0usize;
+    let mut acceptable_on_expected = 0usize;
     let mut not_reviewed = 0usize;
+    let mut evaluation_failed = 0usize;
+    let mut detection_failed = 0usize;
     let mut skipped = 0usize;
 
     let mut missed_not_raised = 0usize;
@@ -2084,6 +3594,7 @@ pub(crate) fn build_benchmark_summary(
     let mut detections_by_stage: BTreeMap<String, usize> = BTreeMap::new();
     let mut false_dismissals_by_stage: BTreeMap<String, usize> = BTreeMap::new();
     let mut subsystem_buckets: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
+    let mut category_buckets: BTreeMap<String, CategoryBenchmarkSummary> = BTreeMap::new();
     let mut matched_findings_by_commit: HashMap<String, BTreeSet<usize>> = HashMap::new();
     let mut matched_patch_findings_by_commit: HashMap<String, BTreeSet<usize>> = HashMap::new();
 
@@ -2095,20 +3606,121 @@ pub(crate) fn build_benchmark_summary(
             .filter(|s| !s.is_empty())
             .unwrap_or("unspecified")
             .to_string();
-        let bucket = subsystem_buckets.entry(subsys).or_insert((0, 0, 0, 0));
+
+        // Versioned entries: every entry that was not skipped for lacking a
+        // description is scored, and unreviewed entries and failed judge
+        // evaluations count as failures. Classic entries keep the original
+        // semantics, which only score judged outcomes.
+        let strict = res.versioned;
+        let is_scored = if strict {
+            res.status != "SKIPPED"
+        } else {
+            matches!(
+                res.status.as_str(),
+                "DETECTED" | "PARTIALLY_DETECTED" | "MISSED" | "SUPPRESSED" | "FALSE_POSITIVE"
+            )
+        };
+        let is_failure = strict && is_failure_status(&res.status);
+
+        if is_scored {
+            if res.expected_behavior.expects_attribution() {
+                attribution_expected_entries += 1;
+            }
+            match (res.expected_behavior.expects_attribution(), res.attribution) {
+                (true, Some(AttributionOutcome::Correct)) => attributed += 1,
+                (true, Some(AttributionOutcome::Wrong)) => attribution_wrong += 1,
+                (true, Some(AttributionOutcome::Acceptable)) => {
+                    attribution_acceptable += 1;
+                    acceptable_on_expected += 1;
+                }
+                (false, Some(AttributionOutcome::Acceptable)) => attribution_acceptable += 1,
+                (true, _) => attribution_missing += 1,
+                (false, Some(AttributionOutcome::Wrong)) => unexpected_attributions += 1,
+                (false, _) => {}
+            }
+            if res.expected_behavior.is_suppression() {
+                if is_failure {
+                    suppression_failed += 1;
+                }
+                if res.suppressed_with_no_findings {
+                    suppressed_with_no_findings += 1;
+                }
+            } else if is_failure {
+                detection_failed += 1;
+            }
+        }
+
+        if let Some(cat_name) = res
+            .category
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            && is_scored
+        {
+            let cat = category_buckets
+                .entry(cat_name.to_string())
+                .or_insert_with(|| CategoryBenchmarkSummary {
+                    category: cat_name.to_string(),
+                    total: 0,
+                    passed: 0,
+                    detected: 0,
+                    partially_detected: 0,
+                    missed: 0,
+                    suppressed: 0,
+                    false_positives: 0,
+                    attribution_expected: 0,
+                    attributed: 0,
+                    attribution_wrong: 0,
+                    attribution_missing: 0,
+                    attribution_acceptable: 0,
+                    failed: 0,
+                    pass_rate_pct: 0.0,
+                });
+            cat.total += 1;
+            if res.expected_behavior.expects_attribution() {
+                cat.attribution_expected += 1;
+            }
+            match res.attribution {
+                Some(AttributionOutcome::Correct) => cat.attributed += 1,
+                Some(AttributionOutcome::Wrong) => cat.attribution_wrong += 1,
+                Some(AttributionOutcome::Missing) => cat.attribution_missing += 1,
+                Some(AttributionOutcome::Acceptable) => cat.attribution_acceptable += 1,
+                None => {}
+            }
+            match res.status.as_str() {
+                "DETECTED" => cat.detected += 1,
+                "PARTIALLY_DETECTED" => cat.partially_detected += 1,
+                "MISSED" => cat.missed += 1,
+                "SUPPRESSED" => cat.suppressed += 1,
+                "FALSE_POSITIVE" => cat.false_positives += 1,
+                _ if is_failure => cat.failed += 1,
+                _ => {}
+            }
+            let passed = if strict {
+                entry_passes_strictly(res)
+            } else {
+                entry_passes_legacy(res)
+            };
+            if passed {
+                cat.passed += 1;
+            }
+        }
 
         match res.status.as_str() {
             "DETECTED" => {
+                let bucket = subsystem_buckets.entry(subsys).or_insert((0, 0, 0, 0));
                 detected += 1;
                 bucket.0 += 1;
                 bucket.1 += 1;
             }
             "PARTIALLY_DETECTED" => {
+                let bucket = subsystem_buckets.entry(subsys).or_insert((0, 0, 0, 0));
                 partially_detected += 1;
                 bucket.0 += 1;
                 bucket.2 += 1;
             }
             "MISSED" => {
+                let bucket = subsystem_buckets.entry(subsys).or_insert((0, 0, 0, 0));
                 missed += 1;
                 bucket.0 += 1;
                 bucket.3 += 1;
@@ -2127,9 +3739,18 @@ pub(crate) fn build_benchmark_summary(
                     _ => missed_not_raised += 1,
                 }
             }
+            "SUPPRESSED" => {
+                suppressed += 1;
+            }
+            "FALSE_POSITIVE" => {
+                false_positives += 1;
+            }
             "NOT_REVIEWED" | "NOT_FOUND_IN_DB" => {
                 not_reviewed += 1;
                 missed_review_failed += 1;
+            }
+            "UNKNOWN" => {
+                evaluation_failed += 1;
             }
             "SKIPPED" => {
                 skipped += 1;
@@ -2137,7 +3758,9 @@ pub(crate) fn build_benchmark_summary(
             _ => {}
         }
 
-        if let Some(ref mf) = res.matched_finding {
+        if res.found
+            && let Some(ref mf) = res.matched_finding
+        {
             let commit_key = res.commit.trim().to_string();
             matched_findings_by_commit
                 .entry(commit_key.clone())
@@ -2165,7 +3788,7 @@ pub(crate) fn build_benchmark_summary(
         }
     }
 
-    let evaluated_entries = detected + partially_detected + missed;
+    let evaluated_entries = detected + partially_detected + missed + detection_failed;
     let exact_detection_rate_pct = if evaluated_entries > 0 {
         round_one_decimal((detected as f64 * 100.0) / evaluated_entries as f64)
     } else {
@@ -2175,6 +3798,24 @@ pub(crate) fn build_benchmark_summary(
         round_one_decimal(
             ((detected + partially_detected) as f64 * 100.0) / evaluated_entries as f64,
         )
+    } else {
+        0.0
+    };
+    let suppression_evaluated_entries = suppressed + false_positives + suppression_failed;
+    let false_positive_suppression_rate_pct = if suppression_evaluated_entries > 0 {
+        round_one_decimal((suppressed as f64 * 100.0) / suppression_evaluated_entries as f64)
+    } else {
+        0.0
+    };
+    let attribution_rate_denominator = attribution_expected_entries - acceptable_on_expected;
+    let attribution_rate_pct = if attribution_rate_denominator > 0 {
+        round_one_decimal((attributed as f64 * 100.0) / attribution_rate_denominator as f64)
+    } else {
+        0.0
+    };
+    let emitted_attributions = attributed + attribution_wrong + unexpected_attributions;
+    let attribution_precision_pct = if emitted_attributions > 0 {
+        round_one_decimal((attributed as f64 * 100.0) / emitted_attributions as f64)
     } else {
         0.0
     };
@@ -2284,6 +3925,18 @@ pub(crate) fn build_benchmark_summary(
         })
         .collect();
 
+    let by_category: Vec<CategoryBenchmarkSummary> = category_buckets
+        .into_values()
+        .map(|mut cat| {
+            cat.pass_rate_pct = if cat.total > 0 {
+                round_one_decimal((cat.passed as f64 * 100.0) / cat.total as f64)
+            } else {
+                0.0
+            };
+            cat
+        })
+        .collect();
+
     BenchmarkSummaryStats {
         total_entries,
         evaluated_entries,
@@ -2293,9 +3946,24 @@ pub(crate) fn build_benchmark_summary(
         partially_detected,
         missed,
         not_reviewed,
+        evaluation_failed,
         skipped,
         exact_detection_rate_pct,
         total_detection_rate_pct,
+        suppression_evaluated_entries,
+        suppressed,
+        false_positives,
+        false_positive_suppression_rate_pct,
+        suppressed_with_no_findings,
+        attribution_expected_entries,
+        attributed,
+        attribution_wrong,
+        attribution_missing,
+        attribution_acceptable,
+        attribution_scored_entries: attribution_rate_denominator,
+        unexpected_attributions,
+        attribution_rate_pct,
+        attribution_precision_pct,
         missed_not_raised,
         missed_wrongly_dismissed,
         missed_preexisting_filtered,
@@ -2313,6 +3981,7 @@ pub(crate) fn build_benchmark_summary(
         detections_by_stage,
         false_dismissals_by_stage,
         by_subsystem,
+        by_category,
         tokens_in,
         tokens_out,
         tokens_cached,
@@ -2386,14 +4055,114 @@ pub fn format_benchmark_summary_markdown(report: &BenchmarkRunReport) -> String 
             0.0
         }
     ));
-    out.push_str(&format!(
-        "| Not Reviewed / Failed | {} | - |\n",
-        s.not_reviewed
-    ));
+    let any_versioned = report.results.iter().any(|r| r.versioned);
+    if any_versioned {
+        out.push_str(&format!(
+            "| Not Reviewed / Failed (scored as failures) | {} | - |\n",
+            s.not_reviewed
+        ));
+        out.push_str(&format!(
+            "| Judge Evaluation Failed (scored as failures) | {} | - |\n",
+            s.evaluation_failed
+        ));
+    } else {
+        out.push_str(&format!(
+            "| Not Reviewed / Failed | {} | - |\n",
+            s.not_reviewed
+        ));
+    }
     out.push_str(&format!(
         "| Skipped (No Description) | {} | - |\n\n",
         s.skipped
     ));
+
+    if s.suppression_evaluated_entries > 0 || s.attribution_expected_entries > 0 {
+        out.push_str("## Versioned Feedback Metrics\n\n");
+        out.push_str("| Metric | Count | Rate |\n|---|---:|---:|\n");
+        if s.attribution_expected_entries > 0 {
+            let pct = |n: usize| (n as f64 * 100.0) / s.attribution_expected_entries as f64;
+            out.push_str(&format!(
+                "| **Prior-Reviewer Attribution (correct)** | **{} / {}** | **{:.1}%** |\n",
+                s.attributed, s.attribution_scored_entries, s.attribution_rate_pct
+            ));
+            out.push_str(&format!(
+                "| Attribution Wrong | {} | {:.1}% |\n",
+                s.attribution_wrong,
+                pct(s.attribution_wrong)
+            ));
+            out.push_str(&format!(
+                "| Attribution Missing | {} | {:.1}% |\n",
+                s.attribution_missing,
+                pct(s.attribution_missing)
+            ));
+        }
+        out.push_str(&format!(
+            "| Unexpected Attributions (no prior credit expected) | {} | - |\n",
+            s.unexpected_attributions
+        ));
+        out.push_str(&format!(
+            "| Acceptable Attributions (optional credit, not scored) | {} | - |\n",
+            s.attribution_acceptable
+        ));
+        out.push_str(&format!(
+            "| Attribution Precision (correct / emitted) | {} / {} | {:.1}% |\n",
+            s.attributed,
+            s.attributed + s.attribution_wrong + s.unexpected_attributions,
+            s.attribution_precision_pct
+        ));
+        if s.suppression_evaluated_entries > 0 {
+            out.push_str(&format!(
+                "| **False-Positive Suppression** | **{} / {}** | **{:.1}%** |\n",
+                s.suppressed,
+                s.suppression_evaluated_entries,
+                s.false_positive_suppression_rate_pct
+            ));
+            out.push_str(&format!(
+                "| False Positives Reported | {} | {:.1}% |\n",
+                s.false_positives,
+                (s.false_positives as f64 * 100.0) / s.suppression_evaluated_entries as f64
+            ));
+            out.push_str(&format!(
+                "| Suppressed With Zero Findings (vacuous pass) | {} | - |\n",
+                s.suppressed_with_no_findings
+            ));
+        }
+        out.push('\n');
+    }
+
+    if !s.by_category.is_empty() {
+        out.push_str("## Category Breakdown\n\n");
+        out.push_str("Passed is strict: exact detection only (partial matches never pass), correct attribution where prior credit is expected and none otherwise, or suppression. Failed entries (no completed review or judge failure) count in Total.\n\n");
+        out.push_str("| Category | Passed | Detected | Partial | Attributed (ok/wrong/missing) | Suppressed | False Pos | Missed | Failed | Total | Pass Rate |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        for cat in &s.by_category {
+            let attr_cell = if cat.attribution_expected > 0 || cat.attribution_wrong > 0 {
+                format!(
+                    "{}/{}/{} of {}",
+                    cat.attributed,
+                    cat.attribution_wrong,
+                    cat.attribution_missing,
+                    cat.attribution_expected
+                )
+            } else {
+                "-".to_string()
+            };
+            out.push_str(&format!(
+                "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1}% |\n",
+                cat.category,
+                cat.passed,
+                cat.detected,
+                cat.partially_detected,
+                attr_cell,
+                cat.suppressed,
+                cat.false_positives,
+                cat.missed,
+                cat.failed,
+                cat.total,
+                cat.pass_rate_pct
+            ));
+        }
+        out.push('\n');
+    }
 
     out.push_str("## Miss Diagnosis & Precision\n\n");
     out.push_str(&format!(
@@ -2501,11 +4270,21 @@ pub fn format_benchmark_summary_markdown(report: &BenchmarkRunReport) -> String 
             "-".to_string()
         };
         let clean_expl = r.explanation.replace(['\n', '|'], " ");
+        let status = match r.attribution.filter(|_| r.versioned) {
+            Some(AttributionOutcome::Correct) => format!("{} (attribution: correct)", r.status),
+            Some(AttributionOutcome::Wrong) => format!("{} (attribution: wrong)", r.status),
+            Some(AttributionOutcome::Missing) => format!("{} (attribution: missing)", r.status),
+            Some(AttributionOutcome::Acceptable) => {
+                format!("{} (attribution: acceptable)", r.status)
+            }
+            None if r.suppressed_with_no_findings => format!("{} (no findings)", r.status),
+            None => r.status.clone(),
+        };
         out.push_str(&format!(
             "| `{}` | `{}` | **{}** | `{}` | {}/{} | {} | {} | {} |\n",
             short_commit,
             subsys,
-            r.status,
+            status,
             detail,
             r.patch_findings_count,
             r.extra_findings_count,
@@ -2558,18 +4337,21 @@ mod tests {
                 fixed_by: None,
                 subsystem: Some("net".to_string()),
                 problem_description: Some("bug 1".to_string()),
+                ..Default::default()
             },
             BenchmarkEntry {
                 commit: "bbb222".to_string(),
                 fixed_by: None,
                 subsystem: Some("mm".to_string()),
                 problem_description: Some("bug 2".to_string()),
+                ..Default::default()
             },
             BenchmarkEntry {
                 commit: "aaa111".to_string(),
                 fixed_by: None,
                 subsystem: Some("net".to_string()),
                 problem_description: Some("bug 3 on same commit".to_string()),
+                ..Default::default()
             },
         ];
 
@@ -2695,12 +4477,14 @@ mod tests {
                 fixed_by: None,
                 subsystem: Some("net".to_string()),
                 problem_description: Some("First bug in commit".to_string()),
+                ..Default::default()
             },
             BenchmarkEntry {
                 commit: "b168ed458dde".to_string(),
                 fixed_by: None,
                 subsystem: Some("net".to_string()),
                 problem_description: Some("Second bug in same commit".to_string()),
+                ..Default::default()
             },
         ];
 
@@ -2711,6 +4495,7 @@ mod tests {
             explanation: None,
             preexisting: false,
             origin: Some("verification".to_string()),
+            prior_attribution: None,
             stages: vec!["resources".to_string()],
             prompts: vec![],
         };
@@ -2721,6 +4506,7 @@ mod tests {
             explanation: None,
             preexisting: false,
             origin: Some("verification".to_string()),
+            prior_attribution: None,
             stages: vec!["implementation".to_string()],
             prompts: vec![],
         };
@@ -2735,6 +4521,7 @@ mod tests {
                 review_id: Some(1),
                 review_status: Some("Reviewed".to_string()),
                 summary_text: "Summary".to_string(),
+                inline_review: String::new(),
                 tokens_in: 50_000,
                 tokens_out: 5_000,
                 tokens_cached: 25_000,
@@ -2795,6 +4582,7 @@ mod tests {
                 stages: vec![],
                 findings: vec![],
                 dismissed_concerns: vec![],
+                ..Default::default()
             },
             BenchmarkEntryResult {
                 commit: "b168ed458dde".to_string(),
@@ -2827,6 +4615,7 @@ mod tests {
                 stages: vec![],
                 findings: vec![],
                 dismissed_concerns: vec![],
+                ..Default::default()
             },
         ];
 
@@ -2877,6 +4666,7 @@ mod tests {
             explanation: None,
             preexisting: true,
             origin: Some("bug_repository".to_string()),
+            prior_attribution: None,
             stages: vec![],
             prompts: vec![],
         });
@@ -2893,6 +4683,7 @@ mod tests {
             fixed_by: None,
             subsystem: Some("mm".to_string()),
             problem_description: Some("bug".to_string()),
+            ..Default::default()
         }];
         let mut commit_map = HashMap::new();
         commit_map.insert(
@@ -3061,5 +4852,1355 @@ mod tests {
         assert_eq!(row.get::<i64>(0).unwrap(), reviewed_id);
         assert_eq!(row.get::<String>(1).unwrap(), "Reviewed");
         assert!(remaining.next().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_load_mbox_archive_gzip_and_path_traversal_guard() -> Result<()> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let temp = tempdir()?;
+        let suite_dir = temp.path();
+
+        assert!(resolve_benchmark_relative_path(suite_dir, "").is_err());
+        assert!(resolve_benchmark_relative_path(suite_dir, "../escape.mbox").is_err());
+        assert!(resolve_benchmark_relative_path(suite_dir, "/etc/passwd").is_err());
+        assert_eq!(
+            resolve_benchmark_relative_path(suite_dir, "fixtures/v1.mbox")?,
+            suite_dir.join("fixtures/v1.mbox")
+        );
+
+        let archive_path = suite_dir.join("versioned_mboxes.jsonl.gz");
+        let file = File::create(&archive_path)?;
+        let mut gz = GzEncoder::new(file, Compression::default());
+        writeln!(
+            gz,
+            "{}",
+            serde_json::json!({
+                "key": "./case01/v1.mbox",
+                "mbox": "From mboxrd@z Thu Jan  1 00:00:00 1970\nSubject: [PATCH] foo\n"
+            })
+        )?;
+        writeln!(
+            gz,
+            "{}",
+            serde_json::json!({
+                "path": "case01/v2.mbox",
+                "content": "From mboxrd@z Thu Jan  1 00:00:00 1970\nSubject: [PATCH v2] foo\n"
+            })
+        )?;
+        gz.finish()?;
+
+        let map = load_mbox_archive(&archive_path)?;
+        assert_eq!(map.len(), 2);
+        assert!(map.get("case01/v1.mbox").unwrap().contains("[PATCH] foo"));
+        assert!(
+            map.get("case01/v2.mbox")
+                .unwrap()
+                .contains("[PATCH v2] foo")
+        );
+        Ok(())
+    }
+
+    fn test_run_metadata(total_entries: usize) -> BenchmarkRunMetadata {
+        BenchmarkRunMetadata {
+            run_id: "r".to_string(),
+            started_at: String::new(),
+            finished_at: String::new(),
+            wall_clock_secs: 0,
+            sashiko_version: String::new(),
+            sashiko_git_sha: String::new(),
+            sashiko_git_dirty: false,
+            prompts_git_hash: String::new(),
+            benchmark_file: String::new(),
+            total_entries,
+            unique_commits: total_entries,
+            project: "linux".to_string(),
+            ai_provider: String::new(),
+            model: String::new(),
+            effort: None,
+            concurrency: 1,
+            report_preexisting: false,
+            analyze_only: true,
+            database_path: String::new(),
+            results_json_path: String::new(),
+            summary_md_path: String::new(),
+        }
+    }
+
+    fn attribution_entry(reviewer: &str, version: u32, message_ids: &[&str]) -> BenchmarkEntry {
+        BenchmarkEntry {
+            commit: "v3-target@example.com".to_string(),
+            case_id: Some("attr_case".to_string()),
+            category: Some("ignored_prior_bug".to_string()),
+            problem_description: Some("Leak on error path".to_string()),
+            expected_behavior: BenchmarkExpectedBehavior::DetectWithAttribution,
+            expected_reviewer: Some(reviewer.to_string()),
+            expected_prior_version: Some(version),
+            expected_prior_message_ids: message_ids.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn finding_with_attribution(attribution: Option<Value>) -> BenchmarkFindingRecord {
+        BenchmarkFindingRecord {
+            index: 1,
+            severity: "High".to_string(),
+            problem: "skb leak on foo_init() error".to_string(),
+            prior_attribution: attribution,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_judge_regexes_compile() {
+        assert!(JUDGE_STATUS_RE.is_match("detected"));
+        assert!(FINDING_TAG_RE.is_match("[F12]"));
+        assert_eq!(extract_finding_tag_index("see [F3] and [F4]"), Some(3));
+    }
+
+    #[test]
+    fn test_score_attribution_correct_requires_identity_version_and_message_id() {
+        let entry = attribution_entry(
+            "Eric Dumazet <edumazet@google.com>",
+            1,
+            &["20250101.abc@google.com", "20250102.def@google.com"],
+        );
+        let correct = serde_json::json!({
+            "originally_raised_by": "Eric Dumazet",
+            "originally_raised_in_version": 1,
+            "origin_kind": "human",
+            "raised_by_identities": ["EDumazet@Google.com"],
+            "evidence": [
+                { "source_ref": "HM1.2", "version": 1, "message_id": "<20250102.def@google.com>", "quote": "this leaks the skb when foo_init() fails" }
+            ]
+        });
+        let f = finding_with_attribution(Some(correct.clone()));
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Correct)
+        );
+
+        // Wrong version.
+        let mut v2 = correct.clone();
+        v2["originally_raised_in_version"] = serde_json::json!(2);
+        let f = finding_with_attribution(Some(v2));
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Wrong)
+        );
+
+        // Wrong person (same domain, different mailbox).
+        let mut other = correct.clone();
+        other["raised_by_identities"] = serde_json::json!(["kuba@google.com"]);
+        let f = finding_with_attribution(Some(other));
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Wrong)
+        );
+
+        // Evidence cites a message outside the accepted set.
+        let mut wrong_msg = correct.clone();
+        wrong_msg["evidence"][0]["message_id"] = serde_json::json!("20250103.xyz@google.com");
+        let f = finding_with_attribution(Some(wrong_msg));
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Wrong)
+        );
+
+        // Evidence without any message id cannot be verified.
+        let mut no_msg = correct;
+        no_msg["evidence"][0]
+            .as_object_mut()
+            .map(|o| o.remove("message_id"));
+        let f = finding_with_attribution(Some(no_msg));
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Wrong)
+        );
+    }
+
+    #[test]
+    fn test_score_attribution_ignores_names_and_free_text() {
+        // "Eric" is a substring of "generic", and the old scorer accepted any
+        // 4+ character name token anywhere in the review text.
+        let entry = attribution_entry(
+            "Eric Dumazet <edumazet@google.com>",
+            1,
+            &["20250101.abc@google.com"],
+        );
+        let mut f = finding_with_attribution(None);
+        f.problem = "generic error path leaks the skb; Eric Dumazet noted this on v1".to_string();
+        f.explanation = Some("edumazet@google.com raised this in version 1".to_string());
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Missing)
+        );
+
+        // Display name only, without structured identities, is not credit.
+        let legacy = serde_json::json!({
+            "originally_raised_by": "Eric Dumazet <edumazet@google.com>",
+            "originally_raised_in_version": 1,
+            "origin_kind": "human",
+            "reference_url": "https://lore.kernel.org/all/20250101.abc@google.com/"
+        });
+        let f = finding_with_attribution(Some(legacy));
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Wrong)
+        );
+
+        // Unparseable attribution (version as a string) is wrong, not correct.
+        let garbage = serde_json::json!({
+            "originally_raised_in_version": "v1",
+            "raised_by_identities": ["edumazet@google.com"],
+            "evidence": [{ "message_id": "20250101.abc@google.com" }]
+        });
+        let f = finding_with_attribution(Some(garbage));
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Wrong)
+        );
+    }
+
+    #[test]
+    fn test_score_attribution_version_is_exact_not_substring() {
+        // "v1" is a substring of "v10"; versions compare as integers.
+        let entry = attribution_entry("Jan Kara <jack@suse.cz>", 1, &["m1@suse.cz"]);
+        let v10 = serde_json::json!({
+            "originally_raised_in_version": 10,
+            "raised_by_identities": ["jack@suse.cz"],
+            "evidence": [{ "source_ref": "HM1.1", "version": 10, "message_id": "m1@suse.cz", "quote": "q" }]
+        });
+        let f = finding_with_attribution(Some(v10));
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Wrong)
+        );
+
+        let entry10 = attribution_entry("Jan Kara <jack@suse.cz>", 10, &["m1@suse.cz"]);
+        let v1 = serde_json::json!({
+            "originally_raised_in_version": 1,
+            "raised_by_identities": ["jack@suse.cz"],
+            "evidence": [{ "source_ref": "HM1.1", "version": 1, "message_id": "m1@suse.cz", "quote": "q" }]
+        });
+        let f = finding_with_attribution(Some(v1));
+        assert_eq!(
+            score_attribution(&entry10, Some(&f)),
+            Some(AttributionOutcome::Wrong)
+        );
+    }
+
+    #[test]
+    fn test_score_attribution_lkp_and_sashiko_identities() {
+        // The old scorer credited lkp whenever "kernel" or "test" appeared.
+        let entry = attribution_entry(
+            "kernel test robot <lkp@intel.com>",
+            1,
+            &["202501010101.AbCdEf-lkp@intel.com"],
+        );
+        let tokens_only = serde_json::json!({
+            "originally_raised_by": "kernel test robot",
+            "originally_raised_in_version": 1,
+            "raised_by_identities": ["kernel test robot"],
+            "evidence": [{ "message_id": "202501010101.AbCdEf-lkp@intel.com" }]
+        });
+        let f = finding_with_attribution(Some(tokens_only));
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Wrong)
+        );
+
+        let exact = serde_json::json!({
+            "originally_raised_in_version": 1,
+            "raised_by_identities": ["lkp@intel.com"],
+            "evidence": [{ "source_ref": "HM1.3", "version": 1, "message_id": "202501010101.AbCdEf-lkp@intel.com", "quote": "q" }]
+        });
+        let f = finding_with_attribution(Some(exact));
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Correct)
+        );
+
+        // Message-IDs compare case-sensitively in their local part.
+        let lowered = serde_json::json!({
+            "originally_raised_in_version": 1,
+            "raised_by_identities": ["lkp@intel.com"],
+            "evidence": [{ "message_id": "202501010101.abcdef-lkp@intel.com" }]
+        });
+        let f = finding_with_attribution(Some(lowered));
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Wrong)
+        );
+
+        let sashiko = attribution_entry("Sashiko", 1, &["v1-p1@example.com"]);
+        let pf = serde_json::json!({
+            "originally_raised_by": "Sashiko",
+            "originally_raised_in_version": 1,
+            "origin_kind": "sashiko_review",
+            "raised_by_identities": ["sashiko"],
+            "evidence": [{ "source_ref": "PF1", "version": 1, "message_id": "v1-p1@example.com", "quote": "q" }]
+        });
+        let f = finding_with_attribution(Some(pf));
+        assert_eq!(
+            score_attribution(&sashiko, Some(&f)),
+            Some(AttributionOutcome::Correct)
+        );
+    }
+
+    #[test]
+    fn test_score_attribution_accepts_co_reviewers_only_when_listed() {
+        let mut entry = attribution_entry(
+            "Gary Guo <gary@garyguo.net>",
+            1,
+            &["g1@garyguo.net", "b1@tardis.local"],
+        );
+        let boqun = serde_json::json!({
+            "originally_raised_in_version": 1,
+            "raised_by_identities": ["boqun@kernel.org"],
+            "evidence": [{ "source_ref": "HM1.4", "version": 1, "message_id": "b1@tardis.local", "quote": "q" }]
+        });
+        let f = finding_with_attribution(Some(boqun));
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Wrong)
+        );
+        entry.expected_co_reviewers = vec!["Boqun Feng <boqun@kernel.org>".to_string()];
+        assert!(entry.validate_attribution_labels().is_ok());
+        assert_eq!(
+            score_attribution(&entry, Some(&f)),
+            Some(AttributionOutcome::Correct)
+        );
+
+        let bad = BenchmarkEntry {
+            expected_co_reviewers: vec!["Boqun".to_string()],
+            ..entry.clone()
+        };
+        assert!(bad.validate_attribution_labels().is_err());
+        let not_attr = BenchmarkEntry {
+            expected_behavior: BenchmarkExpectedBehavior::DetectRegression,
+            expected_prior_message_ids: vec![],
+            ..entry
+        };
+        assert!(not_attr.validate_attribution_labels().is_err());
+    }
+
+    fn acceptable(reviewer: &str, version: u32, ids: &[&str]) -> AcceptableAttribution {
+        AcceptableAttribution {
+            reviewer: reviewer.to_string(),
+            version,
+            message_ids: ids.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn versioned_detect_bug(acceptable: Vec<AcceptableAttribution>) -> BenchmarkEntry {
+        BenchmarkEntry {
+            commit: "v3-target@example.com".to_string(),
+            case_id: Some("acc_case".to_string()),
+            expected_behavior: BenchmarkExpectedBehavior::DetectBug,
+            ancestor_mboxes: [1, 2]
+                .into_iter()
+                .map(|v| BenchmarkAncestorMbox {
+                    version: v,
+                    mbox_path: format!("acc_case/v{v}.mbox"),
+                    baseline_commit: None,
+                    patchset_status: BenchmarkAncestorStatus::Reviewed,
+                    prior_findings: vec![],
+                })
+                .collect(),
+            target_mbox: Some("acc_case/target.mbox".to_string()),
+            acceptable_attributions: acceptable,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_score_attribution_acceptable_paths() {
+        let entry = versioned_detect_bug(vec![acceptable(
+            "Jan Kara <jack@suse.cz>",
+            1,
+            &["jan-v1@suse.cz"],
+        )]);
+        assert!(entry.validate_attribution_labels().is_ok());
+        let score = |v: Value| score_attribution(&entry, Some(&finding_with_attribution(Some(v))));
+
+        // No attribution on a detect_bug match is fine.
+        assert_eq!(
+            score_attribution(&entry, Some(&finding_with_attribution(None))),
+            None
+        );
+
+        // Identity, version and evidence all match the acceptable item.
+        let ok = serde_json::json!({
+            "originally_raised_in_version": 1,
+            "raised_by_identities": ["Jack@SUSE.cz"],
+            "evidence": [{ "source_ref": "HM1.6", "version": 1, "message_id": "<jan-v1@suse.cz>", "quote": "q" }]
+        });
+        assert_eq!(score(ok.clone()), Some(AttributionOutcome::Acceptable));
+
+        // Without evidence, identity and version suffice.
+        let mut no_ev = ok.clone();
+        no_ev["evidence"] = serde_json::json!([]);
+        assert_eq!(score(no_ev), Some(AttributionOutcome::Acceptable));
+
+        // Wrong version.
+        let mut v2 = ok.clone();
+        v2["originally_raised_in_version"] = serde_json::json!(2);
+        assert_eq!(score(v2), Some(AttributionOutcome::Wrong));
+
+        // Evidence present but outside the acceptable message ids.
+        let mut other_msg = ok.clone();
+        other_msg["evidence"][0]["message_id"] = serde_json::json!("other@suse.cz");
+        assert_eq!(score(other_msg), Some(AttributionOutcome::Wrong));
+
+        // An extra identity that no acceptable item covers.
+        let mut extra = ok.clone();
+        extra["raised_by_identities"] = serde_json::json!(["jack@suse.cz", "tytso@mit.edu"]);
+        assert_eq!(score(extra), Some(AttributionOutcome::Wrong));
+
+        // No identities at all is never acceptable.
+        let mut none = ok;
+        none["raised_by_identities"] = serde_json::json!([]);
+        assert_eq!(score(none), Some(AttributionOutcome::Wrong));
+
+        // On a detect_with_attribution entry, the required credit stays
+        // correct, an acceptable alternative is acceptable, anything else wrong.
+        let mut required = attribution_entry("Gary Guo <gary@garyguo.net>", 1, &["g1@garyguo.net"]);
+        required.acceptable_attributions = vec![acceptable(
+            "Boqun Feng <boqun@kernel.org>",
+            2,
+            &["b2@tardis.local"],
+        )];
+        let gary = serde_json::json!({
+            "originally_raised_in_version": 1,
+            "raised_by_identities": ["gary@garyguo.net"],
+            "evidence": [{ "message_id": "g1@garyguo.net" }]
+        });
+        let boqun = serde_json::json!({
+            "originally_raised_in_version": 2,
+            "raised_by_identities": ["boqun@kernel.org"],
+            "evidence": [{ "message_id": "b2@tardis.local" }]
+        });
+        let f = |v: Value| finding_with_attribution(Some(v));
+        assert_eq!(
+            score_attribution(&required, Some(&f(gary))),
+            Some(AttributionOutcome::Correct)
+        );
+        assert_eq!(
+            score_attribution(&required, Some(&f(boqun))),
+            Some(AttributionOutcome::Acceptable)
+        );
+    }
+
+    #[test]
+    fn test_validate_acceptable_attributions() {
+        let ok = versioned_detect_bug(vec![acceptable(
+            "Jan Kara <jack@suse.cz>",
+            1,
+            &["m@suse.cz"],
+        )]);
+        assert!(ok.validate_attribution_labels().is_ok());
+
+        let bad_version = versioned_detect_bug(vec![acceptable(
+            "Jan Kara <jack@suse.cz>",
+            3,
+            &["m@suse.cz"],
+        )]);
+        assert!(bad_version.validate_attribution_labels().is_err());
+
+        let no_ids = versioned_detect_bug(vec![acceptable("Jan Kara <jack@suse.cz>", 1, &[])]);
+        assert!(no_ids.validate_attribution_labels().is_err());
+
+        let brackets = versioned_detect_bug(vec![acceptable(
+            "Jan Kara <jack@suse.cz>",
+            1,
+            &["<m@suse.cz>"],
+        )]);
+        assert!(brackets.validate_attribution_labels().is_err());
+
+        let name_only = versioned_detect_bug(vec![acceptable("Jan Kara", 1, &["m@suse.cz"])]);
+        assert!(name_only.validate_attribution_labels().is_err());
+
+        for behavior in [
+            BenchmarkExpectedBehavior::DetectRegression,
+            BenchmarkExpectedBehavior::SuppressFalsePositive,
+        ] {
+            let e = BenchmarkEntry {
+                expected_behavior: behavior,
+                ..ok.clone()
+            };
+            assert!(e.validate_attribution_labels().is_err());
+        }
+    }
+
+    #[test]
+    fn test_acceptable_attribution_summary_is_neutral() {
+        let mk = |commit: &str, behavior, attribution| {
+            let entry = BenchmarkEntry {
+                commit: commit.to_string(),
+                category: Some("ignored_prior_bug".to_string()),
+                problem_description: Some("bug".to_string()),
+                expected_behavior: behavior,
+                expected_reviewer: (behavior == BenchmarkExpectedBehavior::DetectWithAttribution)
+                    .then(|| "Jan Kara <jack@suse.cz>".to_string()),
+                expected_prior_version: (behavior
+                    == BenchmarkExpectedBehavior::DetectWithAttribution)
+                    .then_some(1),
+                target_mbox: Some("c/target.mbox".to_string()),
+                ..Default::default()
+            };
+            let data = CommitReviewData {
+                review_id: Some(1),
+                review_status: Some("Reviewed".to_string()),
+                findings: vec![finding_with_attribution(None)],
+                ..Default::default()
+            };
+            let res = build_entry_result_from_data(
+                &entry,
+                "bug",
+                &data,
+                "DETECTED".to_string(),
+                attribution,
+                String::new(),
+                None,
+                None,
+                None,
+            );
+            (entry, data, res)
+        };
+        let cases = [
+            mk(
+                "a",
+                BenchmarkExpectedBehavior::DetectBug,
+                Some(AttributionOutcome::Acceptable),
+            ),
+            mk("b", BenchmarkExpectedBehavior::DetectBug, None),
+            mk(
+                "c",
+                BenchmarkExpectedBehavior::DetectWithAttribution,
+                Some(AttributionOutcome::Correct),
+            ),
+            mk(
+                "d",
+                BenchmarkExpectedBehavior::DetectWithAttribution,
+                Some(AttributionOutcome::Acceptable),
+            ),
+        ];
+        let entries: Vec<BenchmarkEntry> = cases.iter().map(|c| c.0.clone()).collect();
+        let results: Vec<BenchmarkEntryResult> = cases.iter().map(|c| c.2.clone()).collect();
+        let commit_map: HashMap<String, CommitReviewData> = cases
+            .iter()
+            .map(|c| (c.0.commit.clone(), c.1.clone()))
+            .collect();
+        let s = build_benchmark_summary(&entries, &results, &commit_map);
+        assert_eq!(s.attribution_acceptable, 2);
+        assert_eq!(s.attribution_expected_entries, 2);
+        assert_eq!(s.attribution_scored_entries, 1);
+        assert_eq!(s.attributed, 1);
+        assert_eq!(s.attribution_rate_pct, 100.0);
+        assert_eq!(s.attribution_wrong, 0);
+        assert_eq!(s.attribution_missing, 0);
+        assert_eq!(s.unexpected_attributions, 0);
+        assert_eq!(s.attribution_precision_pct, 100.0);
+        let cat = &s.by_category[0];
+        assert_eq!(cat.attribution_acceptable, 2);
+        // Both detect_bug entries pass; the required-credit entry with only
+        // acceptable credit does not.
+        assert_eq!(cat.passed, 3);
+    }
+
+    #[test]
+    fn test_score_attribution_on_entries_without_expected_credit() {
+        let detect_bug = BenchmarkEntry {
+            commit: "c@example.com".to_string(),
+            expected_behavior: BenchmarkExpectedBehavior::DetectBug,
+            ..Default::default()
+        };
+        let any = serde_json::json!({
+            "originally_raised_in_version": 1,
+            "raised_by_identities": ["someone@example.com"],
+            "evidence": [{ "message_id": "x@example.com" }]
+        });
+        let f = finding_with_attribution(Some(any.clone()));
+        assert_eq!(
+            score_attribution(&detect_bug, Some(&f)),
+            Some(AttributionOutcome::Wrong)
+        );
+        let plain = finding_with_attribution(None);
+        assert_eq!(score_attribution(&detect_bug, Some(&plain)), None);
+        assert_eq!(score_attribution(&detect_bug, None), None);
+
+        let regression = BenchmarkEntry {
+            expected_behavior: BenchmarkExpectedBehavior::DetectRegression,
+            ..detect_bug.clone()
+        };
+        assert_eq!(
+            score_attribution(&regression, Some(&f)),
+            Some(AttributionOutcome::Wrong)
+        );
+
+        let suppression = BenchmarkEntry {
+            expected_behavior: BenchmarkExpectedBehavior::SuppressFalsePositive,
+            ..detect_bug
+        };
+        assert_eq!(score_attribution(&suppression, Some(&f)), None);
+
+        // No matched finding on an attribution entry means missing credit.
+        let entry = attribution_entry("Sashiko", 1, &["v1-p1@example.com"]);
+        assert_eq!(
+            score_attribution(&entry, None),
+            Some(AttributionOutcome::Missing)
+        );
+    }
+
+    #[test]
+    fn test_validate_attribution_labels() {
+        let ok = attribution_entry("Jan Kara <jack@suse.cz>", 1, &["m1@suse.cz"]);
+        assert!(ok.validate_attribution_labels().is_ok());
+
+        let no_ids = attribution_entry("Jan Kara <jack@suse.cz>", 1, &[]);
+        assert!(no_ids.validate_attribution_labels().is_err());
+
+        let brackets = attribution_entry("Jan Kara <jack@suse.cz>", 1, &["<m1@suse.cz>"]);
+        assert!(brackets.validate_attribution_labels().is_err());
+
+        let dupes = attribution_entry("Jan Kara <jack@suse.cz>", 1, &["m1@suse.cz", "m1@suse.cz"]);
+        assert!(dupes.validate_attribution_labels().is_err());
+
+        let name_only = attribution_entry("Jan Kara", 1, &["m1@suse.cz"]);
+        assert!(name_only.validate_attribution_labels().is_err());
+
+        let mut no_version = ok.clone();
+        no_version.expected_prior_version = None;
+        assert!(no_version.validate_attribution_labels().is_err());
+
+        let mut not_an_ancestor = ok.clone();
+        not_an_ancestor.ancestor_mboxes = vec![BenchmarkAncestorMbox {
+            version: 2,
+            mbox_path: "c/v2.mbox".to_string(),
+            baseline_commit: None,
+            patchset_status: BenchmarkAncestorStatus::Reviewed,
+            prior_findings: vec![],
+        }];
+        assert!(not_an_ancestor.validate_attribution_labels().is_err());
+
+        let detect_bug_with_reviewer = BenchmarkEntry {
+            expected_behavior: BenchmarkExpectedBehavior::DetectBug,
+            expected_prior_message_ids: vec![],
+            ..ok.clone()
+        };
+        assert!(
+            detect_bug_with_reviewer
+                .validate_attribution_labels()
+                .is_err()
+        );
+
+        let suppression_with_ids = BenchmarkEntry {
+            expected_behavior: BenchmarkExpectedBehavior::SuppressFalsePositive,
+            ..ok
+        };
+        assert!(suppression_with_ids.validate_attribution_labels().is_err());
+
+        let classic = BenchmarkEntry {
+            commit: "abc".to_string(),
+            ..Default::default()
+        };
+        assert!(validate_benchmark_entries(&[classic]).is_ok());
+    }
+
+    #[test]
+    fn test_attribution_and_suppression_summary_metrics() {
+        let entry_attr_ok = BenchmarkEntry {
+            commit: "v2-msg-1@example.com".to_string(),
+            case_id: Some("cat1_01".to_string()),
+            category: Some("ignored_prior_bug".to_string()),
+            subsystem: Some("net".to_string()),
+            problem_description: Some("Leak on error path".to_string()),
+            expected_behavior: BenchmarkExpectedBehavior::DetectWithAttribution,
+            expected_reviewer: Some("Jakub Kicinski <kuba@kernel.org>".to_string()),
+            expected_prior_version: Some(1),
+            expected_prior_message_ids: vec!["v1-reply@kernel.org".to_string()],
+            target_mbox: Some("case/target.mbox".to_string()),
+            ..Default::default()
+        };
+        let entry_attr_missing = BenchmarkEntry {
+            commit: "v2-msg-2@example.com".to_string(),
+            case_id: Some("cat1_02".to_string()),
+            category: Some("ignored_prior_bug".to_string()),
+            subsystem: Some("net".to_string()),
+            problem_description: Some("Missing unlock".to_string()),
+            expected_behavior: BenchmarkExpectedBehavior::DetectWithAttribution,
+            expected_reviewer: Some("Eric Dumazet <edumazet@google.com>".to_string()),
+            expected_prior_version: Some(2),
+            expected_prior_message_ids: vec!["v2-reply@google.com".to_string()],
+            target_mbox: Some("case/target.mbox".to_string()),
+            ..Default::default()
+        };
+        let entry_attr_unreviewed = BenchmarkEntry {
+            commit: "v2-msg-5@example.com".to_string(),
+            case_id: Some("cat1_03".to_string()),
+            category: Some("ignored_prior_bug".to_string()),
+            problem_description: Some("Double free".to_string()),
+            ..entry_attr_missing.clone()
+        };
+        let entry_bug_partial = BenchmarkEntry {
+            commit: "v2-msg-6@example.com".to_string(),
+            case_id: Some("cat1_04".to_string()),
+            category: Some("ignored_prior_bug".to_string()),
+            problem_description: Some("Refcount leak".to_string()),
+            expected_behavior: BenchmarkExpectedBehavior::DetectBug,
+            target_mbox: Some("case/target.mbox".to_string()),
+            ..Default::default()
+        };
+        let entry_suppressed = BenchmarkEntry {
+            commit: "v2-msg-3@example.com".to_string(),
+            case_id: Some("cat3_01".to_string()),
+            category: Some("wrong_claim_rejected".to_string()),
+            subsystem: Some("mm".to_string()),
+            problem_description: Some("False claim about folio refcount".to_string()),
+            expected_behavior: BenchmarkExpectedBehavior::SuppressFalsePositive,
+            target_mbox: Some("case/target.mbox".to_string()),
+            ..Default::default()
+        };
+        let entry_fp = BenchmarkEntry {
+            commit: "v2-msg-4@example.com".to_string(),
+            case_id: Some("cat3_02".to_string()),
+            category: Some("wrong_claim_rejected".to_string()),
+            subsystem: Some("mm".to_string()),
+            problem_description: Some("False claim about page lock".to_string()),
+            expected_behavior: BenchmarkExpectedBehavior::SuppressFalsePositive,
+            target_mbox: Some("case/target.mbox".to_string()),
+            ..Default::default()
+        };
+        let entry_supp_unknown = BenchmarkEntry {
+            commit: "v2-msg-7@example.com".to_string(),
+            case_id: Some("cat3_03".to_string()),
+            ..entry_fp.clone()
+        };
+
+        let matched = |problem: &str| MatchedFindingSummary {
+            index: 1,
+            severity: "High".to_string(),
+            problem: problem.to_string(),
+            preexisting: false,
+            origin: None,
+            stages: vec!["prior-feedback".to_string()],
+            prompts: vec![],
+        };
+        let reviewed = |id: i64, findings: Vec<BenchmarkFindingRecord>| CommitReviewData {
+            review_id: Some(id),
+            review_status: Some("Reviewed".to_string()),
+            findings,
+            ..Default::default()
+        };
+
+        let data_attr_ok = reviewed(1, vec![finding_with_attribution(None)]);
+        let data_attr_missing = reviewed(2, vec![finding_with_attribution(None)]);
+        let data_suppressed = reviewed(3, vec![]);
+        let data_fp = reviewed(4, vec![finding_with_attribution(None)]);
+        let data_unreviewed = CommitReviewData {
+            review_id: Some(5),
+            review_status: Some("Failed".to_string()),
+            ..Default::default()
+        };
+        let data_partial = reviewed(6, vec![finding_with_attribution(None)]);
+        let data_supp_unknown = reviewed(7, vec![finding_with_attribution(None)]);
+
+        let entries = vec![
+            entry_attr_ok.clone(),
+            entry_attr_missing.clone(),
+            entry_attr_unreviewed.clone(),
+            entry_bug_partial.clone(),
+            entry_suppressed.clone(),
+            entry_fp.clone(),
+            entry_supp_unknown.clone(),
+        ];
+        let mut commit_map = HashMap::new();
+        for (e, d) in [
+            (&entry_attr_ok, &data_attr_ok),
+            (&entry_attr_missing, &data_attr_missing),
+            (&entry_attr_unreviewed, &data_unreviewed),
+            (&entry_bug_partial, &data_partial),
+            (&entry_suppressed, &data_suppressed),
+            (&entry_fp, &data_fp),
+            (&entry_supp_unknown, &data_supp_unknown),
+        ] {
+            commit_map.insert(e.commit.clone(), d.clone());
+        }
+
+        let mut suppressed_result = build_entry_result_from_data(
+            &entry_suppressed,
+            "False claim about folio refcount",
+            &data_suppressed,
+            "SUPPRESSED".to_string(),
+            None,
+            "Zero findings reported".to_string(),
+            None,
+            None,
+            None,
+        );
+        suppressed_result.suppressed_with_no_findings = true;
+
+        let results = vec![
+            build_entry_result_from_data(
+                &entry_attr_ok,
+                "Leak on error path",
+                &data_attr_ok,
+                "DETECTED".to_string(),
+                Some(AttributionOutcome::Correct),
+                "Detected with v1 attribution".to_string(),
+                Some(matched("skb leak on foo_init() error")),
+                None,
+                None,
+            ),
+            build_entry_result_from_data(
+                &entry_attr_missing,
+                "Missing unlock",
+                &data_attr_missing,
+                "DETECTED".to_string(),
+                Some(AttributionOutcome::Wrong),
+                "Detected but credited the wrong reviewer".to_string(),
+                Some(matched("Missing spin_unlock()")),
+                None,
+                None,
+            ),
+            build_entry_result_from_data(
+                &entry_attr_unreviewed,
+                "Double free",
+                &data_unreviewed,
+                "NOT_REVIEWED".to_string(),
+                None,
+                "Failed".to_string(),
+                None,
+                Some("review_failed".to_string()),
+                None,
+            ),
+            build_entry_result_from_data(
+                &entry_bug_partial,
+                "Refcount leak",
+                &data_partial,
+                "PARTIALLY_DETECTED".to_string(),
+                Some(AttributionOutcome::Wrong),
+                "Partial match with spurious credit".to_string(),
+                Some(matched("refcount issue")),
+                None,
+                None,
+            ),
+            suppressed_result,
+            build_entry_result_from_data(
+                &entry_fp,
+                "False claim about page lock",
+                &data_fp,
+                "FALSE_POSITIVE".to_string(),
+                None,
+                "False positive [F1] matched safe claim".to_string(),
+                Some(matched("Bogus page lock warning")),
+                None,
+                None,
+            ),
+            build_entry_result_from_data(
+                &entry_supp_unknown,
+                "False claim about page lock",
+                &data_supp_unknown,
+                "UNKNOWN".to_string(),
+                None,
+                "Evaluation failed".to_string(),
+                None,
+                None,
+                None,
+            ),
+        ];
+        assert_eq!(results[2].attribution, Some(AttributionOutcome::Missing));
+        assert_eq!(results[2].attributed, Some(false));
+
+        let summary = build_benchmark_summary(&entries, &results, &commit_map);
+        // Unreviewed detection entries stay in the denominator as failures.
+        assert_eq!(summary.evaluated_entries, 4);
+        assert_eq!(summary.detected, 2);
+        assert_eq!(summary.partially_detected, 1);
+        assert_eq!(summary.exact_detection_rate_pct, 50.0);
+        assert_eq!(summary.total_detection_rate_pct, 75.0);
+        assert_eq!(summary.not_reviewed, 1);
+        assert_eq!(summary.evaluation_failed, 1);
+        assert_eq!(summary.attribution_expected_entries, 3);
+        assert_eq!(summary.attributed, 1);
+        assert_eq!(summary.attribution_wrong, 1);
+        assert_eq!(summary.attribution_missing, 1);
+        assert_eq!(summary.unexpected_attributions, 1);
+        assert_eq!(summary.attribution_rate_pct, 33.3);
+        assert_eq!(summary.attribution_precision_pct, 33.3);
+        // The judge failure on a suppression entry is a failure, not a pass.
+        assert_eq!(summary.suppression_evaluated_entries, 3);
+        assert_eq!(summary.suppressed, 1);
+        assert_eq!(summary.suppressed_with_no_findings, 1);
+        assert_eq!(summary.false_positives, 1);
+        assert_eq!(summary.false_positive_suppression_rate_pct, 33.3);
+
+        assert_eq!(summary.by_category.len(), 2);
+        let cat1 = &summary.by_category[0];
+        assert_eq!(cat1.category, "ignored_prior_bug");
+        assert_eq!(cat1.total, 4);
+        // Only the exact detection with correct credit passes; the partial
+        // match and the wrongly credited detection do not.
+        assert_eq!(cat1.passed, 1);
+        assert_eq!(cat1.failed, 1);
+        assert_eq!(cat1.attribution_wrong, 2);
+        assert_eq!(cat1.attribution_missing, 1);
+        let cat3 = &summary.by_category[1];
+        assert_eq!(cat3.total, 3);
+        assert_eq!(cat3.passed, 1);
+        assert_eq!(cat3.failed, 1);
+
+        let report = BenchmarkRunReport {
+            metadata: test_run_metadata(entries.len()),
+            summary,
+            results,
+        };
+        let md = format_benchmark_summary_markdown(&report);
+        assert!(md.contains("| Attribution Wrong | 1 |"));
+        assert!(md.contains("| Attribution Missing | 1 |"));
+        assert!(md.contains("| Suppressed With Zero Findings (vacuous pass) | 1 |"));
+        assert!(md.contains("DETECTED (attribution: wrong)"));
+    }
+
+    /// Classic (non-versioned) suites keep the original metric semantics:
+    /// unreviewed and unevaluated entries stay out of the detection
+    /// denominator, and partial matches count toward the total rate.
+    #[test]
+    fn test_classic_summary_semantics_unchanged() {
+        let mk = |commit: &str| BenchmarkEntry {
+            commit: commit.to_string(),
+            subsystem: Some("mm".to_string()),
+            problem_description: Some("bug".to_string()),
+            ..Default::default()
+        };
+        let entries: Vec<BenchmarkEntry> = ["c1", "c2", "c3", "c4", "c5", "c6", "c7"]
+            .iter()
+            .map(|c| mk(c))
+            .collect();
+        let reviewed = |id: i64| CommitReviewData {
+            review_id: Some(id),
+            review_status: Some("Reviewed".to_string()),
+            findings: vec![finding_with_attribution(None)],
+            ..Default::default()
+        };
+        let mut commit_map = HashMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            commit_map.insert(e.commit.clone(), reviewed(i as i64 + 1));
+        }
+        let matched = MatchedFindingSummary {
+            index: 1,
+            severity: "High".to_string(),
+            problem: "p".to_string(),
+            preexisting: false,
+            origin: None,
+            stages: vec!["s".to_string()],
+            prompts: vec![],
+        };
+        let statuses = [
+            ("DETECTED", true),
+            ("DETECTED", true),
+            ("PARTIALLY_DETECTED", true),
+            ("MISSED", false),
+            ("UNKNOWN", false),
+            ("NOT_REVIEWED", false),
+            ("SKIPPED", false),
+        ];
+        let results: Vec<BenchmarkEntryResult> = entries
+            .iter()
+            .zip(statuses)
+            .map(|(e, (status, matched_f))| {
+                let data = commit_map.get(&e.commit).cloned().unwrap_or_default();
+                build_entry_result_from_data(
+                    e,
+                    "bug",
+                    &data,
+                    status.to_string(),
+                    None,
+                    String::new(),
+                    matched_f.then(|| matched.clone()),
+                    (status == "NOT_REVIEWED").then(|| "review_failed".to_string()),
+                    None,
+                )
+            })
+            .collect();
+        assert!(results.iter().all(|r| !r.versioned));
+
+        let s = build_benchmark_summary(&entries, &results, &commit_map);
+        assert_eq!(s.evaluated_entries, 4);
+        assert_eq!(s.detected, 2);
+        assert_eq!(s.partially_detected, 1);
+        assert_eq!(s.missed, 1);
+        assert_eq!(s.not_reviewed, 1);
+        assert_eq!(s.skipped, 1);
+        assert_eq!(s.exact_detection_rate_pct, 50.0);
+        assert_eq!(s.total_detection_rate_pct, 75.0);
+        assert_eq!(s.missed_review_failed, 1);
+        assert_eq!(s.missed_not_raised, 1);
+        assert_eq!(s.suppression_evaluated_entries, 0);
+        assert_eq!(s.attribution_expected_entries, 0);
+        assert!(s.by_category.is_empty());
+
+        let report = BenchmarkRunReport {
+            metadata: test_run_metadata(entries.len()),
+            summary: s,
+            results,
+        };
+        let md = format_benchmark_summary_markdown(&report);
+        assert!(md.contains("| **Total Detected** | **3 / 4** | **75.0%** |"));
+        assert!(md.contains("| Not Reviewed / Failed | 1 | - |"));
+        assert!(!md.contains("scored as failures"));
+        assert!(!md.contains("Versioned Feedback Metrics"));
+    }
+
+    #[test]
+    fn test_judge_prompt_marks_suppression_claim_as_refuted() {
+        let entry = BenchmarkEntry {
+            commit: "c@example.com".to_string(),
+            expected_behavior: BenchmarkExpectedBehavior::SuppressFalsePositive,
+            ..Default::default()
+        };
+        let data = CommitReviewData::default();
+        let prompt = build_judge_prompt_for_entry(&entry, "Bogus lock claim", &data);
+        assert!(prompt.contains("Refuted Claim (FALSE; must NOT be reported):"));
+        assert!(prompt.contains("NOT a real defect"));
+        assert!(!prompt.contains("attributed"));
+
+        let detect = BenchmarkEntry {
+            expected_behavior: BenchmarkExpectedBehavior::DetectWithAttribution,
+            expected_reviewer: Some("Jan Kara <jack@suse.cz>".to_string()),
+            ..entry
+        };
+        let prompt = build_judge_prompt_for_entry(&detect, "Real bug", &data);
+        assert!(prompt.contains("Ground Truth Defect:"));
+        assert!(!prompt.contains("Refuted Claim"));
+        assert!(!prompt.contains("jack@suse.cz"));
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_ingest_versioned_benchmark_entries_links_multihop_chain_and_skips_nontarget_parts()
+    -> Result<()> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await?;
+        db.migrate().await?;
+
+        let temp = tempdir()?;
+        let suite_dir = temp.path();
+        let bench_file = suite_dir.join("benchmark_versioned.json");
+        let archive_path = suite_dir.join("versioned_mboxes.jsonl.gz");
+
+        let v1_mbox = concat!(
+            "From mboxrd@z Thu Jan  1 00:00:00 1970\n",
+            "From: Alice Author <alice@example.com>\n",
+            "To: netdev@vger.kernel.org\n",
+            "Subject: [PATCH 0/2] net: add foo driver\n",
+            "Date: Mon, 1 Jan 2024 10:00:00 +0000\n",
+            "Message-ID: <v1-cover@example.com>\n\n",
+            "Cover letter for v1.\n\n",
+            "From mboxrd@z Thu Jan  1 00:00:00 1970\n",
+            "From: Alice Author <alice@example.com>\n",
+            "To: netdev@vger.kernel.org\n",
+            "Subject: [PATCH 1/2] net: foo: add header\n",
+            "Date: Mon, 1 Jan 2024 10:00:01 +0000\n",
+            "Message-ID: <v1-p1@example.com>\n",
+            "In-Reply-To: <v1-cover@example.com>\n",
+            "References: <v1-cover@example.com>\n\n",
+            "Add foo header.\n\n",
+            "---\n",
+            "diff --git a/drivers/net/foo.h b/drivers/net/foo.h\n",
+            "new file mode 100644\n",
+            "index 0000000..1111111\n",
+            "--- /dev/null\n",
+            "+++ b/drivers/net/foo.h\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+int foo_init(void);\n",
+            "+void foo_exit(void);\n",
+            "-- \n2.45.0\n\n",
+            "From mboxrd@z Thu Jan  1 00:00:00 1970\n",
+            "From: Alice Author <alice@example.com>\n",
+            "To: netdev@vger.kernel.org\n",
+            "Subject: [PATCH 2/2] net: foo: add core probe\n",
+            "Date: Mon, 1 Jan 2024 10:00:02 +0000\n",
+            "Message-ID: <v1-p2@example.com>\n",
+            "In-Reply-To: <v1-cover@example.com>\n",
+            "References: <v1-cover@example.com>\n\n",
+            "Add core probe.\n\n",
+            "---\n",
+            "diff --git a/drivers/net/foo.c b/drivers/net/foo.c\n",
+            "new file mode 100644\n",
+            "index 0000000..2222222\n",
+            "--- /dev/null\n",
+            "+++ b/drivers/net/foo.c\n",
+            "@@ -0,0 +1,5 @@\n",
+            "+int foo_init(void)\n",
+            "+{\n",
+            "+\treturn 0;\n",
+            "+}\n",
+            "+void foo_exit(void) {}\n",
+            "-- \n2.45.0\n\n",
+            "From mboxrd@z Thu Jan  1 00:00:00 1970\n",
+            "From: Bob Maintainer <bob@kernel.org>\n",
+            "To: Alice Author <alice@example.com>\n",
+            "Cc: netdev@vger.kernel.org\n",
+            "Subject: Re: [PATCH 2/2] net: foo: add core probe\n",
+            "Date: Mon, 1 Jan 2024 12:00:00 +0000\n",
+            "Message-ID: <v1-reply-bob@kernel.org>\n",
+            "In-Reply-To: <v1-p2@example.com>\n",
+            "References: <v1-cover@example.com> <v1-p2@example.com>\n\n",
+            "foo_init() leaks clk_prepare_enable() when register_netdev() fails.\n\n",
+        );
+
+        let v2_mbox = concat!(
+            "From mboxrd@z Thu Jan  1 00:00:00 1970\n",
+            "From: Alice Author <alice@example.com>\n",
+            "To: netdev@vger.kernel.org\n",
+            "Subject: [PATCH v2 0/2] net: add foo driver\n",
+            "Date: Tue, 2 Jan 2024 10:00:00 +0000\n",
+            "Message-ID: <v2-cover@example.com>\n\n",
+            "v2: fix build warning.\n\n",
+            "From mboxrd@z Thu Jan  1 00:00:00 1970\n",
+            "From: Alice Author <alice@example.com>\n",
+            "To: netdev@vger.kernel.org\n",
+            "Subject: [PATCH v2 1/2] net: foo: add header\n",
+            "Date: Tue, 2 Jan 2024 10:00:01 +0000\n",
+            "Message-ID: <v2-p1@example.com>\n",
+            "In-Reply-To: <v2-cover@example.com>\n",
+            "References: <v2-cover@example.com>\n\n",
+            "Add foo header.\n\n",
+            "---\n",
+            "diff --git a/drivers/net/foo.h b/drivers/net/foo.h\n",
+            "new file mode 100644\n",
+            "index 0000000..1111111\n",
+            "--- /dev/null\n",
+            "+++ b/drivers/net/foo.h\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+int foo_init(void);\n",
+            "+void foo_exit(void);\n",
+            "-- \n2.45.0\n\n",
+            "From mboxrd@z Thu Jan  1 00:00:00 1970\n",
+            "From: Alice Author <alice@example.com>\n",
+            "To: netdev@vger.kernel.org\n",
+            "Subject: [PATCH v2 2/2] net: foo: add core probe\n",
+            "Date: Tue, 2 Jan 2024 10:00:02 +0000\n",
+            "Message-ID: <v2-p2@example.com>\n",
+            "In-Reply-To: <v2-cover@example.com>\n",
+            "References: <v2-cover@example.com>\n\n",
+            "Add core probe.\n\n",
+            "---\n",
+            "diff --git a/drivers/net/foo.c b/drivers/net/foo.c\n",
+            "new file mode 100644\n",
+            "index 0000000..2222223\n",
+            "--- /dev/null\n",
+            "+++ b/drivers/net/foo.c\n",
+            "@@ -0,0 +1,6 @@\n",
+            "+int foo_init(void)\n",
+            "+{\n",
+            "+\t/* build fix */\n",
+            "+\treturn 0;\n",
+            "+}\n",
+            "+void foo_exit(void) {}\n",
+            "-- \n2.45.0\n\n",
+        );
+
+        let v3_mbox = concat!(
+            "From mboxrd@z Thu Jan  1 00:00:00 1970\n",
+            "From: Alice Author <alice@example.com>\n",
+            "To: netdev@vger.kernel.org\n",
+            "Subject: [PATCH v3 0/2] net: add foo driver\n",
+            "Date: Wed, 3 Jan 2024 10:00:00 +0000\n",
+            "Message-ID: <v3-cover@example.com>\n\n",
+            "v3: addressed review comments.\n\n",
+            "From mboxrd@z Thu Jan  1 00:00:00 1970\n",
+            "From: Alice Author <alice@example.com>\n",
+            "To: netdev@vger.kernel.org\n",
+            "Subject: [PATCH v3 1/2] net: foo: add header\n",
+            "Date: Wed, 3 Jan 2024 10:00:01 +0000\n",
+            "Message-ID: <v3-p1@example.com>\n",
+            "In-Reply-To: <v3-cover@example.com>\n",
+            "References: <v3-cover@example.com>\n\n",
+            "Add foo header.\n\n",
+            "---\n",
+            "diff --git a/drivers/net/foo.h b/drivers/net/foo.h\n",
+            "new file mode 100644\n",
+            "index 0000000..1111111\n",
+            "--- /dev/null\n",
+            "+++ b/drivers/net/foo.h\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+int foo_init(void);\n",
+            "+void foo_exit(void);\n",
+            "-- \n2.45.0\n\n",
+            "From mboxrd@z Thu Jan  1 00:00:00 1970\n",
+            "From: Alice Author <alice@example.com>\n",
+            "To: netdev@vger.kernel.org\n",
+            "Subject: [PATCH v3 2/2] net: foo: add core probe\n",
+            "Date: Wed, 3 Jan 2024 10:00:02 +0000\n",
+            "Message-ID: <v3-p2@example.com>\n",
+            "In-Reply-To: <v3-cover@example.com>\n",
+            "References: <v3-cover@example.com>\n\n",
+            "Add core probe.\n\n",
+            "---\n",
+            "diff --git a/drivers/net/foo.c b/drivers/net/foo.c\n",
+            "new file mode 100644\n",
+            "index 0000000..2222224\n",
+            "--- /dev/null\n",
+            "+++ b/drivers/net/foo.c\n",
+            "@@ -0,0 +1,6 @@\n",
+            "+int foo_init(void)\n",
+            "+{\n",
+            "+\t/* still leaks clk on register_netdev error */\n",
+            "+\treturn 0;\n",
+            "+}\n",
+            "+void foo_exit(void) {}\n",
+            "-- \n2.45.0\n\n",
+        );
+
+        let archive_file = File::create(&archive_path)?;
+        let mut gz = GzEncoder::new(archive_file, Compression::default());
+        for (key, mbox) in [
+            ("foo/v1.mbox", v1_mbox),
+            ("foo/v2.mbox", v2_mbox),
+            ("foo/v3.mbox", v3_mbox),
+        ] {
+            writeln!(gz, "{}", serde_json::json!({ "key": key, "mbox": mbox }))?;
+        }
+        gz.finish()?;
+
+        let baseline_sha = "1111111111111111111111111111111111111111";
+        let entry = BenchmarkEntry {
+            commit: "v3-p2@example.com".to_string(),
+            case_id: Some("multihop_01".to_string()),
+            category: Some("multihop_or_routing".to_string()),
+            subsystem: Some("net".to_string()),
+            problem_description: Some("clk leak on register_netdev failure".to_string()),
+            mbox_archive: Some("versioned_mboxes.jsonl.gz".to_string()),
+            ancestor_mboxes: vec![
+                BenchmarkAncestorMbox {
+                    version: 1,
+                    mbox_path: "foo/v1.mbox".to_string(),
+                    baseline_commit: Some(baseline_sha.to_string()),
+                    patchset_status: BenchmarkAncestorStatus::Reviewed,
+                    prior_findings: vec![BenchmarkSeededFinding {
+                        patch_message_id: Some("v1-p2@example.com".to_string()),
+                        part_index: 2,
+                        severity: Severity::High,
+                        problem: "Seeded v1 Sashiko finding: clk leak".to_string(),
+                        severity_explanation: Some("Resource leak on probe failure".to_string()),
+                        preexisting: false,
+                    }],
+                },
+                BenchmarkAncestorMbox {
+                    version: 2,
+                    mbox_path: "foo/v2.mbox".to_string(),
+                    baseline_commit: Some(baseline_sha.to_string()),
+                    patchset_status: BenchmarkAncestorStatus::Cancelled,
+                    prior_findings: vec![],
+                },
+            ],
+            target_mbox: Some("foo/v3.mbox".to_string()),
+            baseline_commit: Some(baseline_sha.to_string()),
+            expected_behavior: BenchmarkExpectedBehavior::DetectWithAttribution,
+            expected_reviewer: Some("Bob Maintainer <bob@kernel.org>".to_string()),
+            expected_prior_version: Some(1),
+            ..Default::default()
+        };
+
+        ingest_versioned_benchmark_entries(&db, &bench_file, std::slice::from_ref(&entry)).await?;
+
+        let (v1_p2_id, v1_ps_id, v1_p2_status, v1_ps_status, _) =
+            lookup_benchmark_patch_row(&db, "v1-p2@example.com")
+                .await?
+                .expect("v1 patch 2 should exist");
+        let (v2_p2_id, v2_ps_id, v2_p2_status, v2_ps_status, _) =
+            lookup_benchmark_patch_row(&db, "v2-p2@example.com")
+                .await?
+                .expect("v2 patch 2 should exist");
+        let (v3_p1_id, v3_ps_id, v3_p1_status, v3_ps_status, _) =
+            lookup_benchmark_patch_row(&db, "v3-p1@example.com")
+                .await?
+                .expect("v3 patch 1 should exist");
+        let (v3_p2_id, v3_ps_id_2, v3_p2_status, _, _) =
+            lookup_benchmark_patch_row(&db, "v3-p2@example.com")
+                .await?
+                .expect("v3 patch 2 should exist");
+
+        assert_eq!(v3_ps_id, v3_ps_id_2);
+        assert_eq!(v1_ps_status.as_deref(), Some("Reviewed"));
+        assert_eq!(v1_p2_status.as_deref(), Some("Reviewed"));
+        assert_eq!(v2_ps_status.as_deref(), Some("Cancelled"));
+        assert_eq!(v2_p2_status.as_deref(), Some("Cancelled"));
+        assert_eq!(v3_ps_status.as_deref(), Some("Pending"));
+        // Non-target patch 1/2 in v3 is marked Skipped so only target patch 2/2 runs LLM stages.
+        assert_eq!(v3_p1_status.as_deref(), Some("Skipped"));
+        assert_eq!(v3_p2_status.as_deref(), Some("Pending"));
+        assert_ne!(v3_p1_id, v3_p2_id);
+
+        // Verify v1 <- v2 <- v3 patchset lineage and patch lineage links.
+        let mut ps_lineage = db
+            .conn
+            .query(
+                "SELECT id, previous_patchset_id FROM patchsets WHERE id IN (?, ?, ?) ORDER BY id ASC",
+                libsql::params![v1_ps_id, v2_ps_id, v3_ps_id],
+            )
+            .await?;
+        let r1 = ps_lineage.next().await?.unwrap();
+        assert_eq!(r1.get::<Option<i64>>(1)?, None);
+        let r2 = ps_lineage.next().await?.unwrap();
+        assert_eq!(r2.get::<Option<i64>>(1)?, Some(v1_ps_id));
+        let r3 = ps_lineage.next().await?.unwrap();
+        assert_eq!(r3.get::<Option<i64>>(1)?, Some(v2_ps_id));
+        drop(ps_lineage);
+
+        let mut p_lineage = db
+            .conn
+            .query(
+                "SELECT previous_patch_id FROM patches WHERE id = ?",
+                libsql::params![v3_p2_id],
+            )
+            .await?;
+        let p_row = p_lineage.next().await?.unwrap();
+        assert_eq!(p_row.get::<Option<i64>>(0)?, Some(v2_p2_id));
+        drop(p_lineage);
+
+        // Verify seeded Sashiko finding on v1 patch 2.
+        let mut seeded_rows = db
+            .conn
+            .query(
+                "SELECT f.problem FROM findings f JOIN reviews r ON f.review_id = r.id WHERE r.patch_id = ?",
+                libsql::params![v1_p2_id],
+            )
+            .await?;
+        let s_row = seeded_rows.next().await?.expect("seeded finding row");
+        assert!(
+            s_row
+                .get::<String>(0)?
+                .contains("Seeded v1 Sashiko finding")
+        );
+        assert!(seeded_rows.next().await?.is_none());
+        drop(seeded_rows);
+
+        let skipped_ids = load_benchmark_skipped_patch_ids(&db).await?;
+        assert!(skipped_ids.contains(&v3_p1_id));
+        assert!(!skipped_ids.contains(&v3_p2_id));
+
+        // Re-ingesting against an existing DB (or shared ancestor) must not duplicate seeded findings.
+        ingest_versioned_benchmark_entries(&db, &bench_file, std::slice::from_ref(&entry)).await?;
+        let mut count_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM findings f JOIN reviews r ON f.review_id = r.id WHERE r.patch_id = ?",
+                libsql::params![v1_p2_id],
+            )
+            .await?;
+        let count_row = count_rows.next().await?.expect("count row");
+        assert_eq!(count_row.get::<i64>(0)?, 1);
+        Ok(())
     }
 }
