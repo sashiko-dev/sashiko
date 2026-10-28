@@ -58,6 +58,7 @@ pub mod prompt_namespaces;
 pub mod repo_sync;
 #[cfg(feature = "server")]
 pub mod reviewer;
+pub mod scan;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod settings;
