@@ -313,7 +313,7 @@ Your task is to (1) deduplicate overlapping items across both lists while preser
 Classify every consolidated item using these strict signal rules. **Repetition is NOT justification: multiple overlapping items are never enough for Category 1 (1a or 1b) unless their reasoning is backed by specific, concrete code proof.**
 
 1. **Category 1a — Well-Justified Concern (`findings` array):**
-   - **Mandatory prerequisite & strong signals:** Concrete, self-contained code proof directly visible in the target diff, prefetched context, and cited `locations`, with **no** competing `dismissed_concern`, **no** reliance on unverified assumptions about unseen code, and **no** potential resolution by a follow-up patch in `=== Follow-Up Patches in Series ===`. Multiple deduplicated `concerns` with no attempts to dismiss is a strong signal for 1a **only when grounded in concrete code proof** (if multiple stages repeat an unproven assumption or vague claim without specific code proof, classify into `hard_cases` instead).
+   - **Mandatory prerequisite & strong signals:** Concrete, self-contained code proof directly visible in the target diff, prefetched context, and cited `locations`, with **no** competing `dismissed_concern`, **no** reliance on unverified assumptions about unseen code, and **no** potential resolution by a follow-up patch listed in `=== Patch Series Context ===`. Multiple deduplicated `concerns` with no attempts to dismiss is a strong signal for 1a **only when grounded in concrete code proof** (if multiple stages repeat an unproven assumption or vague claim without specific code proof, classify into `hard_cases` instead).
    - **Action:** Validate it directly and emit it in `findings`. Assign a calibrated `severity` (`Low`, `Medium`, `High`, or `Critical`) following `severity.md`, state all consequences (both immediate and downstream), triggering paths, and reachability at the start of `severity_explanation` (preserving every distinct function, callback, racing resource, and mechanism), set `"preexisting"`, and include `locations`.
 
 2. **Category 1b — Well-Justified Dismissal (`dismissed_concerns` array):**
@@ -331,7 +331,7 @@ Classify every consolidated item using these strict signal rules. **Repetition i
      - **Mixed signals (`"mixed_signals"`):** Similar or overlapping `concerns` and `dismissed_concerns` exist for the same root cause, function, or code path.
      - **Speculative or assumption-based dismissal (`"speculative_dismissal"`):** Even when NO stage raised a `concern` (and especially when multiple stages emitted overlapping `dismissed_concerns`), inspect every standalone dismissal critically! Multiple overlapping dismissals are NOT enough if they are not justified by specific local disproving code. If one or more `dismissed_concerns` identified a plausible bug (such as a missing cleanup on an error path, NULL dereference when a field is unmapped on resume/rebuild, unlocked shared state access, race with teardown or truncation, unpaired init/patch call, cleared error field before event reporting, sleeping/rescheduling under a lock, unintended state or range advancement, missing software array bounds check in a loop, parser/validator branch mismatch, or type/width/config/build mismatch) and dismissed it using a single-caller proof, an upstream validator without proving all flag branches, an assumption that hardware init/MTU settings bound a software array, an unstated "simplicity trade-off" or "partial improvement over old code", a rationalization that an unpatched `0` or cleared error is "harmless" or "intentional", a claim that a compile-time assertion/build failure prevents runtime corruption, or an indirect predicate check that fails under `PREEMPT_RT` or other valid configurations, you MUST classify the item into `hard_cases` with `"signal_reason": "speculative_dismissal"`.
      - **Speculative or incomplete concern (`"speculative_concern"`):** One or more overlapping `concerns` whose argument is vague, relies on assumptions not based on specific code in the diff/locations (requiring tool inspection of callers, callees, struct definitions, or lock contexts — even if multiple stages repeated the concern), or mixes a partially inaccurate premise with a potentially real underlying bug in the same code path.
-     - **Series interaction (`"series_interaction"`):** Any concern that could plausibly be resolved, wired up, or rewritten by a subsequent patch listed in `=== Follow-Up Patches in Series ===`.
+     - **Series interaction (`"series_interaction"`):** Any concern that could plausibly be resolved, wired up, or rewritten by a subsequent patch listed in `=== Patch Series Context ===`.
    - **Action:** Emit into `hard_cases` with `"estimated_severity"` (`Critical`, `High`, `Medium`, or `Low`), `"signal_reason"`, `"concern_arguments"`, `"dismissal_arguments"`, a concrete `"verification_question"` specifying what code `post-verification` must inspect with tools, `"preexisting"`, and `"locations"`."#;
 
 const STAGE_POST_VERIFICATION_INSTRUCTION: &str = r#"# Per-finding post-verification and conflict resolution
@@ -579,6 +579,14 @@ fn validate_finding_object(finding: &Value, idx: usize) -> Result<(), String> {
         ));
     }
     validate_locations_side(locations.unwrap(), "findings", idx)?;
+    if finding
+        .get("introduced_in_patch")
+        .is_some_and(|v| !(v.is_null() || v.is_i64()))
+    {
+        return Err(format!(
+            "findings[{idx}].introduced_in_patch must be an integer patch number or null."
+        ));
+    }
     Ok(())
 }
 
@@ -2315,7 +2323,7 @@ Aggregated Dismissed Concerns:
 
 Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns' arrays.
 - LINEAGE REQUIREMENT ('source_ids'): Every input item in Aggregated Concerns has an "id" ("C1", "C2", ...) and every input item in Aggregated Dismissed Concerns has an "id" ("D1", "D2", ...). Every output object across 'findings', 'hard_cases', and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the exact input "id" string(s) merged into that item (e.g. ["C1", "D2"]). Every input "id" (all C* and D* IDs) MUST appear in at least one output item's "source_ids". Category 1a 'findings' may ONLY reference C* IDs (any contested C* + D* or promoted D* must go to 'hard_cases'), and Category 1b 'dismissed_concerns' may ONLY reference D* IDs (never C* IDs).
-- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of C* input IDs), "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" for deleted/pre-patch code or "REVISION" for added/modified/context code), and may include "stages" (array of stage names that raised the merged concern) and "prompts" (array of prompt files from the merged concern).
+- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of C* input IDs), "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "introduced_in_patch" (an integer or null: the series position, as in "[Patch N of M]", of the patch whose change first made the problem present, chosen from the series block (the patch under review on its header line, the preceding and subsequent lists below it): an earlier patch when the problem was already present in the tree this patch was applied to, the one whose change made it so, not merely the last to touch the code; the patch under review when its own diff introduces the problem; a subsequent patch when only that patch's change makes it a problem; null when "preexisting" is true, that is, the code came from before the series, or you cannot tell), and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" for deleted/pre-patch code or "REVISION" for added/modified/context code), and may include "stages" (array of stage names that raised the merged concern) and "prompts" (array of prompt files from the merged concern).
 - Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION"), and may include "stages" and "prompts".
 - Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of D* input IDs), "type", "description", "reasoning", and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION"), and may include "stages" and "prompts".
 
@@ -2329,6 +2337,7 @@ Example Output:
       "severity": "High",
       "severity_explanation": "1. Condition Y is met.\n2. The buffer is allocated but not freed before return.",
       "preexisting": false,
+      "introduced_in_patch": 1,
       "locations": [
         {{
           "file": "path/to/file.c",
@@ -2446,7 +2455,7 @@ Candidate Hard Case(s) to Verify:
 
 Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every candidate in this batch MUST be accounted for in either 'findings' (if validated) or 'dismissed_concerns' (ONLY if concrete code disproves the candidate; never return both empty arrays).
 - LINEAGE REQUIREMENT ('source_ids'): Each candidate hard case in this batch has an "id" (e.g. "H1"). Every object in 'findings' and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the candidate "id"(s) from this batch that it resolves (e.g. ["H1"]), and every candidate "id" in this batch must be accounted for.
-- Each object in 'findings' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, Critical, or Unknown), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: false whenever the patch introduces the bug or newly exposes, triggers, or makes reachable a latent defect that could not be triggered before the patch; true when the bug already existed at Baseline SHA before the patch series and was already triggerable before the patch, even if it lives in the same function, caller/callee, or cleanup path modified by the patch), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" for deleted/pre-patch code or "REVISION" for added/modified/context code). Carry forward the locations from the validated candidate; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
+- Each object in 'findings' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, Critical, or Unknown), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: false whenever the patch introduces the bug or newly exposes, triggers, or makes reachable a latent defect that could not be triggered before the patch; true when the bug already existed at Baseline SHA before the patch series and was already triggerable before the patch, even if it lives in the same function, caller/callee, or cleanup path modified by the patch), "introduced_in_patch" (an integer or null: the series position, as in "[Patch N of M]", of the patch whose change first made the problem present, chosen from the series block (the patch under review on its header line, the preceding and subsequent lists below it): an earlier patch when the problem was already present in the tree this patch was applied to, the one whose change made it so, not merely the last to touch the code; the patch under review when its own diff introduces the problem; a subsequent patch when only that patch's change makes it a problem; null when "preexisting" is true, that is, the code came from before the series, or you cannot tell), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" for deleted/pre-patch code or "REVISION" for added/modified/context code). Carry forward the locations from the validated candidate; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
 - Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION", quoting the verbatim disproving guard, lock, cleanup path, or caller/callee implementation).
 
 Example Output:
@@ -2459,6 +2468,7 @@ Example Output:
       "severity": "High",
       "severity_explanation": "1. Condition Y is met.\n2. The buffer is allocated but not freed before return.",
       "preexisting": false,
+      "introduced_in_patch": 1,
       "locations": [
         {{
           "file": "path/to/file.c",
@@ -2667,6 +2677,26 @@ pub fn build_linux_patch_review_workflow_with_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_finding_introduced_in_patch_is_an_integer_or_null() {
+        let finding = |named: Value| {
+            json!({"problem": "p", "severity": "High", "severity_explanation": "e",
+                   "preexisting": false, "locations": [], "introduced_in_patch": named})
+        };
+        assert!(validate_finding_object(&finding(json!(3)), 0).is_ok());
+        assert!(validate_finding_object(&finding(Value::Null), 0).is_ok());
+        let mut absent = finding(Value::Null);
+        absent
+            .as_object_mut()
+            .unwrap()
+            .remove("introduced_in_patch");
+        assert!(validate_finding_object(&absent, 0).is_ok());
+        assert_eq!(
+            validate_finding_object(&finding(json!("abc123")), 0).unwrap_err(),
+            "findings[0].introduced_in_patch must be an integer patch number or null."
+        );
+    }
 
     #[test]
     fn test_each_stage_declares_whether_it_needs_the_commit_message() {
