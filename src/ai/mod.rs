@@ -411,6 +411,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
     if let Some(e) = error.downcast_ref::<gemini::GeminiError>() {
         return e.ai_error_class();
     }
+    if let Some(e) = error.downcast_ref::<mistral::MistralError>() {
+        return e.ai_error_class();
+    }
     if let Some(e) = error.downcast_ref::<crate::worker::prompts::ReviewError>() {
         return e.ai_error_class();
     }
@@ -831,6 +834,14 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
 
             Ok(Arc::new(provider))
         }
+        "mistral" => {
+            let model = ai.model.clone();
+            Ok(Arc::new(mistral::MistralClient::new(
+                model,
+                ai.mistral.as_ref(),
+                ai.api_timeout_secs,
+            )?))
+        }
         "ollama" => {
             let model = ai.model.clone();
             let base_url = ai
@@ -1002,6 +1013,7 @@ pub mod gemini;
 pub mod goose_cli;
 pub mod kiro_cli;
 pub mod logging_provider;
+pub mod mistral;
 pub mod ollama;
 pub mod openai;
 #[cfg(feature = "server")]

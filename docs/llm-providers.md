@@ -636,3 +636,50 @@ extraData = { clientName = "sashiko", sessionId = "review" }
 
 Unlike header values, body fields are read from the settings file, so
 do not put credentials in them.
+
+## Mistral AI
+
+Sashiko has a native Mistral provider (`provider = "mistral"`) for
+`https://api.mistral.ai` and Mistral-shaped gateways. The Mistral chat
+completions API is close to the OpenAI one but not close enough for the
+generic compatible client: replies carry the assistant text as an array of
+typed content blocks, where the chain of thought arrives as `thinking`
+blocks next to `text` blocks instead of a `reasoning_content` string. The
+provider speaks that shape natively, so a reasoning model's thinking is
+kept in the conversation across tool calls without extra settings.
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.mistral.toml Settings.toml
+```
+
+Export the API key as `MISTRAL_API_KEY` (or `LLM_API_KEY`):
+
+```bash
+export MISTRAL_API_KEY=...
+```
+
+Third-party models hosted on Mistral, such as the `zai-glm-*` series, work
+the same way; their 1M-token context is picked up from the model name, so
+`max_input_tokens` in `[ai]` can be raised accordingly.
+
+```toml
+[ai]
+provider = "mistral"
+model = "zai-glm-5-3-flash"
+max_input_tokens = 400000
+
+[ai.mistral]
+# Sent when a stage does not ask for an effort level itself. The API also
+# accepts "none", "minimal", "xhigh" and "max".
+# effort = "medium"
+# max_tokens = 32768
+```
+
+`base_url` accepts the API host (`https://api.mistral.ai`), any `…/v1`
+root (the `/chat/completions` suffix is appended, which covers gateways
+behind a path prefix), or the full chat completions URL. Any other path is
+rejected at startup. Tool calling, JSON mode, and `reasoning_effort` are
+supported; an effort level the model rejects comes back as a 400, which
+ends the run as a fatal error.

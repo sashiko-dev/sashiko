@@ -142,7 +142,7 @@ Core AI settings that apply to all providers.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `devin-cli`, `kiro-cli`, `goose` (alias `goose-cli`), `openai`, `openai-compatible`, `ollama`, `vllm`, `bedrock`, `vertex`. `bedrock` and `vertex` need a build with `--features bedrock` / `--features vertex`; without it their `[ai.bedrock]` / `[ai.vertex]` table is rejected as an unknown field. |
+| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `devin-cli`, `kiro-cli`, `goose` (alias `goose-cli`), `openai`, `openai-compatible`, `mistral`, `ollama`, `vllm`, `bedrock`, `vertex`. `bedrock` and `vertex` need a build with `--features bedrock` / `--features vertex`; without it their `[ai.bedrock]` / `[ai.vertex]` table is rejected as an unknown field. |
 | `model` | string | -- | Model identifier (provider-specific). |
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
@@ -209,6 +209,18 @@ Settings for the OpenAI providers (`provider = "openai"` or `provider = "openai-
 | `send_empty_tool_call_content` | bool | `false` | Send `content: ""` in messages that carry only tool calls instead of omitting the field. Enable it for endpoints that reject such messages or whose chat templates render the missing field as `None`. |
 | `extra_headers` | table | empty | HTTP headers added to every request, as `"Header-Name" = "ENV_VAR"` pairs: each value is read from the named environment variable, never from the settings file, since these can be extra authorization headers. A header named here replaces the one Sashiko would send, `Authorization` included. An unset or empty variable, an invalid name or value, or the same header named twice in different case fails at startup. Header names, never values, join the response cache identity, so a header must not change the reply. |
 | `extra_body` | table | empty | Top-level JSON fields added to every request body. Fields Sashiko sets itself (`model`, `messages`, `tools`, `temperature`, `max_tokens`, `max_completion_tokens`, `response_format`, `reasoning_effort`) are rejected at startup; set reasoning effort with `effort` instead. |
+
+#### `[ai.mistral]`
+
+Settings for the Mistral AI provider (`provider = "mistral"`). The API key
+comes from `MISTRAL_API_KEY` (or `LLM_API_KEY`).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `base_url` | string | `https://api.mistral.ai/v1/chat/completions` | Chat completions endpoint: the API host, any `…/v1` root (the `/chat/completions` suffix is appended), or the full URL. Any other path is rejected at startup. |
+| `max_tokens` | integer | `32768` | Max output tokens per response, reasoning tokens included. The prompt plus `max_tokens` may not exceed the model's context length. |
+| `context_window_size` | integer | model-derived | Context window override; `1048576` for the hosted `zai-glm-*`/`glm-*` models, `131072` for everything else. |
+| `effort` | string | -- | Reasoning effort sent as the `reasoning_effort` request field when a review stage does not ask for one itself: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"`. Leave unset for the model default. |
 
 #### `[ai.ollama]`
 

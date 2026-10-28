@@ -1,0 +1,27 @@
+# Mistral AI (https://api.mistral.ai) and Mistral-shaped gateways.
+# Export MISTRAL_API_KEY (or LLM_API_KEY).
+# Setup: docs/llm-providers.md, section "Mistral AI".
+
+[ai]
+provider = "mistral"
+model = "zai-glm-5-3-flash"
+# The hosted zai-glm models take a 1M-token context; leave room below it
+# for the reply.
+max_input_tokens = 400000
+
+[ai.mistral]
+# Chat completions endpoint: the API host, any .../v1 root (the
+# /chat/completions suffix is appended), or the full URL.
+# base_url = "https://api.mistral.ai"
+# Completion token cap, thinking included. The prompt plus max_tokens may
+# not exceed the model's context length.
+# max_tokens = 32768
+# Reasoning effort sent when a review stage does not ask for one itself:
+# "none", "minimal", "low", "medium", "high", "xhigh", or "max".
+# effort = "medium"
+# Context window override; defaults to 1M for the zai-glm-*/glm-* models
+# and 131072 for everything else.
+# context_window_size = 1048576
+
+[review]
+concurrency = 4
