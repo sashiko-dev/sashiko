@@ -452,12 +452,13 @@ impl MaintainersIndex {
     pub fn from_top_of_trunk<P: AsRef<Path>>(repo_path: P) -> Result<Self> {
         let repo = repo_path.as_ref();
         for git_ref in [
+            "linus/master:MAINTAINERS",
             "origin/master:MAINTAINERS",
             "master:MAINTAINERS",
             "HEAD:MAINTAINERS",
         ] {
             let output = crate::git_cmd::in_dir(repo)
-                .args(["show", git_ref])
+                .args(["-c", "safe.bareRepository=all", "show", git_ref])
                 .output();
             if let Ok(out) = output
                 && out.status.success()
