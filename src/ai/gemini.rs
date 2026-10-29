@@ -334,6 +334,14 @@ fn reason_suffix(error_text: &str) -> String {
         .unwrap_or_default()
 }
 
+fn is_transient_proxy_error(status: reqwest::StatusCode, error_text: &str) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST
+        && (error_text.contains("HTTP connection failed")
+            || error_text.contains("Pony address resolution failed")
+            || error_text.contains("BaMM2/Void RPC returned an error")
+            || error_text.contains("Max retry duration reached"))
+}
+
 fn classify_generate_content_failure(
     status: reqwest::StatusCode,
     retry_after_secs: Option<f64>,
@@ -372,10 +380,18 @@ fn classify_generate_content_failure(
         return GeminiError::PermissionDenied(error_text.to_string());
     }
 
-    if status.is_server_error() || status.as_u16() == 499 {
+    if status.is_server_error()
+        || status.as_u16() == 499
+        || is_transient_proxy_error(status, error_text)
+    {
+        let default_delay = if is_transient_proxy_error(status, error_text) {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_secs(0)
+        };
         let retry_after = retry_after_secs
             .and_then(valid_retry_after_secs)
-            .unwrap_or(Duration::from_secs(0));
+            .unwrap_or(default_delay);
         tracing::debug!(
             "Gemini API Transient Error: status={}, body={}",
             status,
@@ -3006,5 +3022,27 @@ mod tests {
                 "tool-call failure error {msg:?} must not trigger recitation/block handling"
             );
         }
+    }
+
+    #[test]
+    fn test_classify_generate_content_failure_retries_transient_proxy_400() {
+        let proxy_body = r#"{"error":{"code":400,"message":"Failed to generate content: HTTP connection failed: Max retry duration reached (3.000280346s) Status: UNAVAILABLE: Pony address resolution failed","status":"INVALID_ARGUMENT"}}"#;
+        let err =
+            classify_generate_content_failure(reqwest::StatusCode::BAD_REQUEST, None, proxy_body);
+        assert!(
+            matches!(err, GeminiError::TransientError(delay, _) if delay == Duration::from_secs(2)),
+            "transient proxy 400 must be classified as TransientError, got {err:?}"
+        );
+
+        let genuine_400 = r#"{"error":{"code":400,"message":"Invalid JSON payload received.","status":"INVALID_ARGUMENT"}}"#;
+        let err2 =
+            classify_generate_content_failure(reqwest::StatusCode::BAD_REQUEST, None, genuine_400);
+        assert!(
+            matches!(
+                err2,
+                GeminiError::ApiError(reqwest::StatusCode::BAD_REQUEST, _)
+            ),
+            "genuine 400 must remain ApiError, got {err2:?}"
+        );
     }
 }
