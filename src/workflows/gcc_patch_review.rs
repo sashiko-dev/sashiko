@@ -38,11 +38,11 @@ use crate::workflows::linux_patch_review::{
     append_stage_items_with_prompts, apply_planning_stage_output,
     apply_post_verification_stage_output, apply_verification_stage_output,
     batch_inconclusive_concerns_by_severity, build_stage_efforts_schema, collect_stage_prompts,
-    extra_prompt_paths_for_items, extra_prompt_paths_for_state, format_planning_feedback,
-    format_post_verification_feedback, format_verification_stage_feedback,
-    has_valid_proof_location, resolve_stage_effort, validate_locations_side,
-    validate_planning_stage_efforts, validate_post_verification_batch_items,
-    validate_verification_stage_output,
+    dismissed_concern_has_content, extra_prompt_paths_for_items, extra_prompt_paths_for_state,
+    format_planning_feedback, format_post_verification_feedback,
+    format_verification_stage_feedback, has_valid_proof_location, resolve_stage_effort,
+    validate_locations_side, validate_planning_stage_efforts,
+    validate_post_verification_batch_items, validate_verification_stage_output,
 };
 
 /// State container for a GCC patch review run.
@@ -569,17 +569,15 @@ fn validate_concerns_output(
             .get("type")
             .and_then(Value::as_str)
             .is_some_and(|s| !s.trim().is_empty());
-        let has_desc = obj
-            .get("description")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_reasoning = obj
-            .get("reasoning")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        if !has_type || !has_desc || !has_reasoning {
+        if !dismissed_concern_has_content(dismissed) {
+            // A dismissal without description or reasoning asserts nothing
+            // about why the candidate concern fails to apply; dropping it is
+            // lossless while failing the stage would lose every real concern.
+            continue;
+        }
+        if !has_type {
             return Err(format!(
-                "dismissed_concerns[{idx}] must have non-empty 'type', 'description', and 'reasoning' strings."
+                "dismissed_concerns[{idx}] must have a non-empty 'type' string."
             ));
         }
         if let Some(locations) = obj.get("locations").and_then(Value::as_array) {
@@ -1180,6 +1178,27 @@ pub fn build_gcc_patch_review_workflow_with_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_concerns_output_drops_contentless_dismissals() {
+        let output = StageConcernsOutput {
+            concerns: Vec::new(),
+            dismissed_concerns: vec![serde_json::json!({"type": "stub"})],
+        };
+        assert!(validate_concerns_output(&output, &LinuxPatchReviewState::default()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_concerns_output_requires_type_on_content_dismissals() {
+        let output = StageConcernsOutput {
+            concerns: Vec::new(),
+            dismissed_concerns: vec![serde_json::json!({
+                "description": "d", "reasoning": "r"
+            })],
+        };
+        let err = validate_concerns_output(&output, &LinuxPatchReviewState::default()).unwrap_err();
+        assert!(err.contains("'type'"), "{err}");
+    }
 
     #[test]
     fn test_gcc_analysis_stages_table() {

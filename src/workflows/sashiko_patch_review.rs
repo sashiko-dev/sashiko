@@ -33,11 +33,11 @@ use crate::workflows::linux_patch_review::{
     append_stage_items_with_prompts, apply_planning_stage_output,
     apply_post_verification_stage_output, apply_verification_stage_output,
     batch_inconclusive_concerns_by_severity, build_stage_efforts_schema, collect_stage_prompts,
-    extra_prompt_paths_for_items, extra_prompt_paths_for_state, format_planning_feedback,
-    format_post_verification_feedback, format_verification_stage_feedback,
-    has_valid_proof_location, resolve_stage_effort, validate_locations_side,
-    validate_planning_stage_efforts, validate_post_verification_batch_items,
-    validate_verification_stage_output,
+    dismissed_concern_has_content, extra_prompt_paths_for_items, extra_prompt_paths_for_state,
+    format_planning_feedback, format_post_verification_feedback,
+    format_verification_stage_feedback, has_valid_proof_location, resolve_stage_effort,
+    validate_locations_side, validate_planning_stage_efforts,
+    validate_post_verification_batch_items, validate_verification_stage_output,
 };
 
 /// State container for a Sashiko patch review run.
@@ -586,23 +586,11 @@ fn validate_concerns_output(
         let Some(obj) = dismissed.as_object() else {
             return Err(format!("dismissed_concerns[{idx}] must be a JSON object."));
         };
-        let has_desc = obj
-            .get("description")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        if !has_desc {
-            return Err(format!(
-                "dismissed_concerns[{idx}] must have a non-empty 'description' string."
-            ));
-        }
-        let has_reasoning = obj
-            .get("reasoning")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        if !has_reasoning {
-            return Err(format!(
-                "dismissed_concerns[{idx}] must have a non-empty 'reasoning' string."
-            ));
+        if !dismissed_concern_has_content(dismissed) {
+            // A dismissal without description or reasoning asserts nothing
+            // about why the candidate concern fails to apply; dropping it is
+            // lossless while failing the stage would lose every real concern.
+            continue;
         }
         if let Some(locations) = obj.get("locations").and_then(Value::as_array) {
             validate_locations_side(locations, "dismissed_concerns", idx)?;
@@ -1293,6 +1281,15 @@ pub fn build_sashiko_patch_review_workflow_with_effort(
 mod tests {
     use super::*;
     use crate::workflows::linux_patch_review::validate_post_verification_batch_output;
+
+    #[test]
+    fn test_validate_concerns_output_drops_contentless_dismissals() {
+        let output = StageConcernsOutput {
+            concerns: Vec::new(),
+            dismissed_concerns: vec![serde_json::json!({"type": "stub"})],
+        };
+        assert!(validate_concerns_output(&output, &LinuxPatchReviewState::default()).is_ok());
+    }
 
     #[test]
     fn test_sashiko_analysis_stages_table() {

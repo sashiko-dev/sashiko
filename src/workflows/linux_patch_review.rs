@@ -493,6 +493,16 @@ pub(crate) fn validate_locations_side(
     Ok(())
 }
 
+/// Whether a dismissed concern carries the content the validators require:
+/// non-empty `description` and `reasoning` strings.
+pub fn dismissed_concern_has_content(item: &Value) -> bool {
+    ["description", "reasoning"].iter().all(|key| {
+        item.get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    })
+}
+
 fn validate_concerns_output(
     output: &StageConcernsOutput,
     _state: &LinuxPatchReviewState,
@@ -519,18 +529,16 @@ fn validate_concerns_output(
     }
 
     for (idx, dismissed) in output.dismissed_concerns.iter().enumerate() {
-        let has_desc = dismissed
-            .get("description")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_reasoning = dismissed
-            .get("reasoning")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        if !has_desc || !has_reasoning {
-            return Err(format!(
-                "dismissed_concerns[{idx}] must have non-empty 'description' and 'reasoning' strings proving why the candidate concern does not apply."
-            ));
+        if !dismissed.is_object() {
+            return Err(format!("dismissed_concerns[{idx}] must be a JSON object."));
+        }
+        if !dismissed_concern_has_content(dismissed) {
+            // A dismissal without description or reasoning asserts nothing
+            // about why the candidate concern fails to apply. Dropping it is
+            // lossless - downstream stages keep treating the candidate as
+            // unresolved - while failing the stage under BestEffort would
+            // discard every real concern it reported.
+            continue;
         }
         if let Some(locations) = dismissed.get("locations").and_then(Value::as_array) {
             validate_locations_side(locations, "dismissed_concerns", idx)?;
@@ -1055,6 +1063,12 @@ pub fn append_stage_dismissed_concerns_with_prompts(
     prompts: &[String],
 ) {
     for item in src {
+        // Mirrors the stage validators: a dismissal without description and
+        // reasoning is never recorded, so review threads do not carry
+        // entries that assert nothing about the candidate they dismiss.
+        if !dismissed_concern_has_content(item) {
+            continue;
+        }
         let next_id = format!("D{}", dest.len().saturating_add(1));
         let mut obj = item.clone();
         if let Some(map) = obj.as_object_mut() {
@@ -2680,6 +2694,67 @@ pub fn build_linux_patch_review_workflow_with_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_concerns_output_drops_contentless_dismissals() {
+        let proof_location = json!({
+            "file": "drivers/hid/hid-asus.c",
+            "function_or_symbol": "asus_probe",
+            "side": "REVISION",
+            "code_snippet": "return 0;"
+        });
+        let state = LinuxPatchReviewState::default();
+        let output = StageConcernsOutput {
+            concerns: Vec::new(),
+            dismissed_concerns: vec![
+                json!({"description": "", "reasoning": "because"}),
+                json!({"description": "desc", "reasoning": "   "}),
+                json!({"type": "skeleton", "locations": [proof_location.clone()]}),
+                json!({
+                    "description": "lock already held by the caller",
+                    "reasoning": "the caller holds it across the call",
+                    "locations": [proof_location]
+                }),
+            ],
+        };
+        assert!(validate_concerns_output(&output, &state).is_ok());
+    }
+
+    #[test]
+    fn test_validate_concerns_output_still_requires_dismissal_proof() {
+        let state = LinuxPatchReviewState::default();
+        let output = StageConcernsOutput {
+            concerns: Vec::new(),
+            dismissed_concerns: vec![json!({
+                "description": "lock already held by the caller",
+                "reasoning": "the caller holds it across the call"
+            })],
+        };
+        let err = validate_concerns_output(&output, &state).unwrap_err();
+        assert!(
+            err.contains("must include at least one entry in 'locations'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_append_stage_dismissed_concerns_drops_contentless_entries() {
+        let mut dest = Vec::new();
+        let src = vec![
+            json!({"description": "real", "reasoning": "why"}),
+            json!({"description": "", "reasoning": "why"}),
+            json!({"type": "stub"}),
+        ];
+        append_stage_dismissed_concerns_with_prompts(
+            &mut dest,
+            &src,
+            "hardware",
+            &["g".to_string()],
+        );
+        assert_eq!(dest.len(), 1);
+        assert_eq!(dest[0]["id"], json!("D1"));
+        assert_eq!(dest[0]["stage"], json!("hardware"));
+    }
 
     #[test]
     fn test_each_stage_declares_whether_it_needs_the_commit_message() {
