@@ -555,7 +555,7 @@ impl MistralClient {
         let res = match self.client.post(&self.base_url).json(body).send().await {
             Ok(res) => res,
             Err(e) => {
-                let err_str = redact_secret(&e.to_string());
+                let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
                 tracing::error!(
                     "{}Mistral request failed (transport): {}",
                     crate::ai::get_log_prefix(),
@@ -571,7 +571,7 @@ impl MistralClient {
         if res.status().is_success() {
             let status = res.status();
             let body_text = res.text().await.map_err(|e| {
-                let err_str = redact_secret(&e.to_string());
+                let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
                 tracing::error!(
                     "{}Failed to read Mistral response body: {}",
                     crate::ai::get_log_prefix(),
@@ -1356,6 +1356,46 @@ mod tests {
         assert_eq!(response.thought.as_deref(), Some("hmm"));
         let usage = response.usage.unwrap();
         assert_eq!((usage.prompt_tokens, usage.total_tokens), (3, 5));
+
+        // A kept chain of thought re-emits on the next assistant turn as
+        // content blocks shaped exactly like the blocks the API itself
+        // emits in replies, so the wire form stays symmetric end to end.
+        let follow_up = AiRequest {
+            messages: vec![
+                AiMessage {
+                    role: AiRole::Assistant,
+                    content: response.content.clone(),
+                    thought: response.thought.clone(),
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                AiMessage {
+                    role: AiRole::User,
+                    content: Some("go on".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+            ..empty_request()
+        };
+        client.generate_content(follow_up).await?;
+
+        let (_, second) = captured
+            .lock()
+            .await
+            .last()
+            .expect("the follow-up reached the stub")
+            .clone();
+        assert_eq!(
+            second["messages"][0]["content"],
+            json!([
+                {"type": "thinking", "thinking": [{"type": "text", "text": "hmm"}]},
+                {"type": "text", "text": "answer"}
+            ])
+        );
         Ok(())
     }
 
