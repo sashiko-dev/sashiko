@@ -5683,6 +5683,11 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const threads = [];
             stampedFindings.forEach((f, idx) => {
                 const preexisting = !!f.preexisting;
+                const combinedSourceIds = [
+                    ...(Array.isArray(f.raw_source_ids) ? f.raw_source_ids : []),
+                    ...(Array.isArray(f.source_ids) ? f.source_ids : [])
+                ].map(s => String(s || '').trim()).filter(Boolean);
+                const uniqueSourceIds = [...new Set(combinedSourceIds)];
                 threads.push({
                     thread_id: `T${threads.length + 1}`,
                     outcome: preexisting ? 'preexisting_concern' : 'finding',
@@ -5693,8 +5698,11 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     locations: Array.isArray(f.locations) ? f.locations : [],
                     stages: Array.isArray(f.stages) ? f.stages : (f.stage ? [f.stage] : []),
                     prompts: Array.isArray(f.prompts) ? f.prompts : [],
-                    raw_concern_ids: Array.isArray(f.source_ids) ? f.source_ids.filter(s => String(s).startsWith('C')) : [],
-                    raw_dismissed_ids: Array.isArray(f.source_ids) ? f.source_ids.filter(s => String(s).startsWith('D')) : [],
+                    raw_concern_ids: uniqueSourceIds.filter(s => s.startsWith('C') || s.startsWith('PC')),
+                    raw_dismissed_ids: uniqueSourceIds.filter(s => s.startsWith('D') || s.startsWith('PD')),
+                    prior_source_ids: Array.isArray(f.prior_source_ids) ? f.prior_source_ids : [],
+                    prior_attribution: f.prior_attribution || null,
+                    prior_attribution_cleared: Boolean(f.prior_attribution_cleared),
                     verification_kind: 'finding_1a',
                     verification_id: f.stage_item_id || `VF${idx + 1}`,
                     verification_ids: [f.stage_item_id || `VF${idx + 1}`],
@@ -5717,6 +5725,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         prompts: Array.isArray(c.prompts) ? c.prompts : [],
                         raw_concern_ids: [c.id],
                         raw_dismissed_ids: [],
+                        prior_source_ids: Array.isArray(c.prior_source_ids) ? c.prior_source_ids : [],
+                        prior_attribution: c.prior_attribution || null,
+                        prior_attribution_cleared: Boolean(c.prior_attribution_cleared),
                         verification_kind: 'none',
                         verification_id: null,
                         verification_ids: [],
@@ -5739,6 +5750,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     prompts: Array.isArray(d.prompts) ? d.prompts : [],
                     raw_concern_ids: [],
                     raw_dismissed_ids: [d.id],
+                    prior_source_ids: Array.isArray(d.prior_source_ids) ? d.prior_source_ids : [],
+                    prior_attribution: d.prior_attribution || null,
+                    prior_attribution_cleared: Boolean(d.prior_attribution_cleared),
                     verification_kind: 'dismissed_1b',
                     verification_id: `VD${idx + 1}`,
                     verification_ids: [`VD${idx + 1}`],
@@ -5754,6 +5768,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 stages: [],
                 raw_concerns: stampedConcerns,
                 raw_dismissed_concerns: stampedDismissed,
+                prior_resolutions: Array.isArray(outputObj.prior_resolutions) ? outputObj.prior_resolutions : [],
                 verification: {
                     findings: stampedFindings,
                     inconclusive_concerns: [],
@@ -5931,6 +5946,47 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             btn.textContent = allOpen ? '▼ Collapse All' : '▶ Expand All';
         }
 
+        function toggleReviewMapPrior(idx) {
+            const row = document.getElementById(`rm-prior-row-${idx}`);
+            const detail = document.getElementById(`rm-prior-detail-${idx}`);
+            const chevron = document.getElementById(`rm-prior-chevron-${idx}`);
+            if (!row || !detail) return;
+
+            if (currentReviewMapState.expandedPriors.has(idx)) {
+                currentReviewMapState.expandedPriors.delete(idx);
+                row.classList.remove('selected');
+                detail.style.display = 'none';
+                if (chevron) chevron.textContent = '▶';
+            } else {
+                currentReviewMapState.expandedPriors.add(idx);
+                row.classList.add('selected');
+                detail.style.display = 'table-row';
+                if (chevron) chevron.textContent = '▼';
+            }
+            updateReviewMapExpandAllPriorBtn();
+        }
+
+        function toggleAllReviewMapPriors() {
+            const total = currentReviewMapState.totalPriors || 0;
+            const expandAll = currentReviewMapState.expandedPriors.size < total;
+            for (let i = 0; i < total; i++) {
+                const isExpanded = currentReviewMapState.expandedPriors.has(i);
+                if (expandAll && !isExpanded) {
+                    toggleReviewMapPrior(i);
+                } else if (!expandAll && isExpanded) {
+                    toggleReviewMapPrior(i);
+                }
+            }
+        }
+
+        function updateReviewMapExpandAllPriorBtn() {
+            const btn = document.getElementById('rm-expand-all-prior-btn');
+            if (!btn) return;
+            const total = currentReviewMapState.totalPriors || 0;
+            const allOpen = total > 0 && currentReviewMapState.expandedPriors.size >= total;
+            btn.textContent = allOpen ? '▼ Collapse All' : '▶ Expand All';
+        }
+
         async function renderReviewMapView(id) {
             const res = await fetch(`/api/review?id=${encodeURIComponent(id)}`);
             if (!res.ok) throw new Error('Review not found');
@@ -5958,13 +6014,18 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             const stages = Array.isArray(reviewMap.stages) ? reviewMap.stages : [];
             const threads = Array.isArray(reviewMap.threads) ? reviewMap.threads : [];
+            const priorResolutions = Array.isArray(reviewMap.prior_resolutions)
+                ? reviewMap.prior_resolutions
+                : (outputObj && Array.isArray(outputObj.prior_resolutions) ? outputObj.prior_resolutions : []);
 
             currentReviewMapState = {
                 logs,
                 stages,
                 expandedStages: new Set(),
                 expandedThreads: new Set(),
-                totalThreads: threads.length
+                totalThreads: threads.length,
+                expandedPriors: new Set(),
+                totalPriors: priorResolutions.length
             };
 
             const stageIdxByName = new Map();
@@ -6026,6 +6087,30 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 if (!stageName || !stageIdxByName.has(String(stageName))) return '';
                 const sIdx = stageIdxByName.get(String(stageName));
                 return `<a href="javascript:void(0)" onclick="event.stopPropagation(); openReviewMapStageLog(${sIdx})" style="font-weight:600; color:var(--text-dim); font-size:0.9em; text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${escapeHtml(label)}</a>`;
+            };
+
+            const isFreshStageName = s => {
+                const st = String(s || '');
+                return Boolean(
+                    st
+                    && !st.startsWith('prior-feedback')
+                    && !st.startsWith('verification')
+                    && !st.startsWith('post-verification')
+                    && st !== 'deduplication'
+                    && !st.startsWith('prior-attribution')
+                );
+            };
+            const isThreadAlsoFoundBySashiko = (t, stagesFallback) => {
+                const fb = t?.prior_attribution?.found_by;
+                if (fb === 'both' || fb === 'fresh') return true;
+                if (fb === 'prior_feedback') return false;
+                const rawConcerns = Array.isArray(t?.raw_concern_ids) ? t.raw_concern_ids.map(c => String(c || '')) : [];
+                if (rawConcerns.some(cid => /^C\d+$/.test(cid))) return true;
+                if (rawConcerns.some(cid => /^PC\d+$/.test(cid))) return false;
+                const rawDismissed = Array.isArray(t?.raw_dismissed_ids) ? t.raw_dismissed_ids.map(d => String(d || '')) : [];
+                if (rawDismissed.some(did => /^D\d+$/.test(did))) return true;
+                const stArr = Array.isArray(stagesFallback) ? stagesFallback : (Array.isArray(t?.stages) ? t.stages : []);
+                return stArr.some(isFreshStageName);
             };
 
             // 1. Findings & Dismissed Concerns Table
@@ -6246,15 +6331,60 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         : '';
                     const codeTraceHtml = renderReviewMapCodeSnippets(primaryLocations);
 
+                    const pattr = (t.prior_attribution && typeof t.prior_attribution === 'object') ? t.prior_attribution : null;
+                    let priorBadgeHtml = '';
+                    let priorDetailHtml = '';
+                    if (pattr && pattr.originally_raised_by) {
+                        const pVer = pattr.originally_raised_in_version ? `v${escapeHtml(String(pattr.originally_raised_in_version))}` : 'prior';
+                        const rawFirstAuthor = String(pattr.originally_raised_by).split(',')[0].replace(/\s*\[[^\]]*\]/g, '').trim();
+                        const parsedWho = parseAuthor(rawFirstAuthor);
+                        const cleanName = (parsedWho.name || parsedWho.email || rawFirstAuthor).replace(/^["']+|["']+$/g, '').trim();
+                        const pWho = escapeHtml(cleanName || String(pattr.originally_raised_by));
+                        const pUrl = typeof pattr.reference_url === 'string' && pattr.reference_url.startsWith('https://')
+                            ? pattr.reference_url
+                            : '';
+                        const firstEvidence = Array.isArray(pattr.evidence) && pattr.evidence.length > 0 ? pattr.evidence[0] : null;
+                        const isPriorSashiko = pattr.origin_kind === 'sashiko_review'
+                            || String(pattr.originally_raised_by).trim() === 'Sashiko';
+                        const alsoFoundBySashiko = !isPriorSashiko && isThreadAlsoFoundBySashiko(t, stageList);
+                        const reportPrefix = alsoFoundBySashiko ? 'Also reported by' : 'Reported by';
+                        const pBadge = `${reportPrefix} ${pWho} on ${pVer}`;
+                        const foundByLabel = pattr.found_by === 'prior_feedback'
+                            ? ' <span class="text-muted-sm" style="margin-left:8px;">(found via: prior-feedback only)</span>'
+                            : pattr.found_by === 'both'
+                                ? ' <span class="text-muted-sm" style="margin-left:8px;">(found via: fresh review + prior-feedback)</span>'
+                                : pattr.found_by === 'fresh'
+                                    ? ' <span class="text-muted-sm" style="margin-left:8px;">(found via: fresh review)</span>'
+                                    : '';
+                        priorBadgeHtml = pUrl
+                            ? `<div class="text-muted-sm" style="margin-left:12px; margin-top:2px;">${reportPrefix} <a href="${escapeHtml(pUrl)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();" title="Raised in an earlier version">${pWho} on ${pVer}</a></div>`
+                            : `<div class="text-muted-sm" style="margin-left:12px; margin-top:2px;">${pBadge}</div>`;
+                        if (firstEvidence && firstEvidence.quote) {
+                            const linkHtml = pUrl
+                                ? ` <a href="${escapeHtml(pUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(pUrl)}</a>`
+                                : '';
+                            priorDetailHtml = `
+                                <div style="margin-top:8px;">
+                                    <div><strong>${pBadge}</strong>${linkHtml}${foundByLabel}</div>
+                                    <details style="margin-top:4px;">
+                                        <summary class="text-muted-sm" style="cursor:pointer;">Quote from that message</summary>
+                                        <div class="log-inline-block">${escapeHtml(String(firstEvidence.quote))}</div>
+                                    </details>
+                                </div>
+                            `;
+                        }
+                    }
+
                     return `
                         <tr id="rm-row-${idx}" onclick="toggleReviewMapThread(${idx})">
-                            <td><span id="rm-chevron-${idx}" style="color:var(--text-dim); font-size:0.85em; width:12px; display:inline-block;">▶</span><span style="font-weight:600; color:var(--text);">${escapeHtml(String(t.title || 'Candidate issue').trim())}</span></td>
+                            <td><span id="rm-chevron-${idx}" style="color:var(--text-dim); font-size:0.85em; width:12px; display:inline-block;">▶</span><span style="font-weight:600; color:var(--text);">${escapeHtml(String(t.title || 'Candidate issue').trim())}</span>${priorBadgeHtml}</td>
                             <td>${stageCellHtml}</td>
                             <td>${outcomeCellHtml}</td>
                         </tr>
                         <tr id="rm-detail-${idx}" class="rm-detail-row" style="display:none;">
                             <td colspan="3">
                                 <div class="review-card" style="margin-bottom:0;">
+                                    ${priorDetailHtml}
                                     ${pipelineHistoryHtml}
                                     ${codeTraceHtml}
                                 </div>
@@ -6308,6 +6438,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         } else {
                             const cCount = s.concerns_count || 0;
                             const dCount = s.dismissed_count || 0;
+                            if (String(s.name || '').startsWith('prior-feedback')) {
+                                const rCount = priorResolutions.filter(r => r && String(r.stage || '') === String(s.name)).length;
+                                if (rCount > 0) outputParts.push(`${rCount} audited`);
+                            }
                             if (cCount > 0) outputParts.push(`${cCount} ${cCount === 1 ? 'concern' : 'concerns'}`);
                             if (dCount > 0) outputParts.push(`${dCount} dismissed`);
                         }
@@ -6316,12 +6450,16 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         }
                     }
 
-                    const stageDisplayName = s.label || s.name;
-                    const showCodeName = s.label && s.label !== s.name;
+                    let rawStageLabel = String(s.label || s.name || '');
+                    if (rawStageLabel === 'planning') rawStageLabel = 'Planning';
+                    else if (rawStageLabel === 'summary') rawStageLabel = 'Change Summary';
+                    else if (rawStageLabel === 'pre-screen') rawStageLabel = 'Pre-Screen';
+                    else if (rawStageLabel === 'Resource Mgmt') rawStageLabel = 'Resource Management';
+                    const stageDisplayName = rawStageLabel;
 
                     return `
                         <tr id="rm-stage-row-${idx}" onclick="toggleReviewMapStageLog(${idx})">
-                            <td><span id="rm-stage-chevron-${idx}" style="color:var(--text-dim); font-size:0.85em; width:12px; display:inline-block;">▶</span><strong>${escapeHtml(String(stageDisplayName))}</strong>${showCodeName ? `<span class="text-muted-sm"> (<code>${escapeHtml(String(s.name))}</code>)</span>` : ''}</td>
+                            <td><span id="rm-stage-chevron-${idx}" style="color:var(--text-dim); font-size:0.85em; width:12px; display:inline-block;">▶</span><strong>${escapeHtml(String(stageDisplayName))}</strong></td>
                             <td>${s.turns || 0}</td>
                             <td class="text-muted-sm">${formatTokenCount(tokensIn)} / ${formatTokenCount(tokensCached)} / ${formatTokenCount(tokensOut)}</td>
                             <td>${promptsCellHtml}</td>
@@ -6359,6 +6497,155 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             </tbody>
                         </table>
                         ${skippedFooterHtml}
+                    </div>
+                `;
+            }
+
+            let priorResolutionsSectionHtml = '';
+            if (priorResolutions.length > 0) {
+                const resRowsHtml = priorResolutions.map((r, idx) => {
+                    const pid = String(r?.prior_id || '').trim();
+                    const matchedConcern = [...rawConcernsById.values(), ...rawDismissedById.values()].find(item => {
+                        const sids = Array.isArray(item?.prior_source_ids) ? item.prior_source_ids : [];
+                        return sids.some(s => String(s || '').trim() === pid);
+                    });
+                    const rawSummary = String(
+                        r?.summary
+                        || matchedConcern?.description
+                        || matchedConcern?.problem
+                        || r?.reasoning
+                        || 'Prior comment'
+                    ).trim();
+                    const summaryText = rawSummary.replace(/`/g, '');
+                    const verText = r?.version ? `v${escapeHtml(String(r.version))}` : 'prior version';
+                    const refUrl = (typeof r?.reference_url === 'string' && r.reference_url.startsWith('https://'))
+                        ? r.reference_url
+                        : '';
+                    const matchedThreads = threads.filter(t => {
+                        if (!pid) return false;
+                        const attrCleared = Boolean(t?.prior_attribution_cleared);
+                        const pSids = Array.isArray(t?.prior_source_ids) ? t.prior_source_ids : [];
+                        if (!attrCleared && pSids.some(s => String(s || '').trim() === pid)) return true;
+                        const evArr = Array.isArray(t?.prior_attribution?.evidence) ? t.prior_attribution.evidence : [];
+                        return evArr.some(ev => {
+                            const ref = String(ev?.source_ref || '').trim();
+                            return ref === pid || ref.startsWith(`${pid}.`);
+                        });
+                    });
+                    const isPfResolution = pid.startsWith('PF') || r?.origin_kind === 'sashiko_review';
+                    const alsoFoundBySashiko = !isPfResolution && (
+                        Boolean(r?.also_found_by_sashiko)
+                        || matchedThreads.some(t => isThreadAlsoFoundBySashiko(t, t?.stages))
+                    );
+                    const priorSubHtml = alsoFoundBySashiko
+                        ? `<div class="text-muted-sm" style="margin-left:12px; margin-top:2px;">Also found by Sashiko</div>`
+                        : '';
+
+                    const firstSpeaker = Array.isArray(r?.thread_participants) && r.thread_participants.length > 0
+                        ? String(r.thread_participants[0])
+                        : '';
+                    const author = parseAuthor(firstSpeaker);
+                    const nameToDisplay = (author.name || author.email || '—').replace(/^["']+|["']+$/g, '').trim();
+                    const emailToDisplay = author.name ? author.email : '';
+                    const authorLabel = `${escapeHtml(nameToDisplay)}${r?.version ? ` on v${escapeHtml(String(r.version))}` : ''}`;
+                    const authorLineHtml = refUrl
+                        ? `<a href="${escapeHtml(refUrl)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();">${authorLabel}</a>`
+                        : authorLabel;
+                    const speakerHtml = `
+                        <div>${authorLineHtml}</div>
+                        ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
+                    `;
+
+                    const rawVerdict = String(r?.verdict || '').trim();
+                    const vNOutcome = String(r?.v_n_outcome || '').trim();
+                    let outcomeHtml = '';
+                    let verdictDetailLabel = 'Evaluated';
+                    if (rawVerdict === 'still_unaddressed' && vNOutcome === 'dismissed_in_verification') {
+                        outcomeHtml = `<span style="color:var(--text-muted);">Dismissed</span>`;
+                        verdictDetailLabel = 'Dismissed in verification';
+                    } else if (rawVerdict === 'still_unaddressed') {
+                        const medColor = getSeverityColor('Medium');
+                        outcomeHtml = `<span class="tag" style="border:1px solid ${medColor}; color:${medColor}; background:transparent; font-weight:bold;">Unaddressed</span>`;
+                        verdictDetailLabel = 'Still unaddressed in current version';
+                    } else if (rawVerdict === 'addressed_in_vN') {
+                        outcomeHtml = `<span style="color:var(--status-reviewed);">Addressed</span>`;
+                        verdictDetailLabel = 'Addressed in current version';
+                    } else if (rawVerdict === 'disproven_by_code') {
+                        outcomeHtml = `<span style="color:var(--text-muted);">Disproven</span>`;
+                        verdictDetailLabel = 'Disproven by code';
+                    } else if (rawVerdict === 'settled_by_authority') {
+                        outcomeHtml = `<span style="color:var(--text-muted);">Settled</span>`;
+                        verdictDetailLabel = 'Settled by maintainer';
+                    } else if (rawVerdict === 'nit_or_untrusted_unverifiable') {
+                        outcomeHtml = `<span style="color:var(--text-muted);">Dismissed</span>`;
+                        verdictDetailLabel = 'Dismissed';
+                    } else {
+                        outcomeHtml = `<span style="color:var(--text-muted);">${escapeHtml(rawVerdict || '—')}</span>`;
+                    }
+
+                    const reasoning = escapeHtml(String(r?.reasoning || '').replace(/`/g, ''));
+                    const pStage = String(r?.stage || 'prior-feedback');
+                    const quoteText = String(
+                        r?.quote
+                        || r?.authority_evidence?.quote
+                        || ''
+                    ).trim();
+                    const quoteHtml = quoteText
+                        ? `
+                            <div style="margin-top:8px;">
+                                <details open>
+                                    <summary class="text-muted-sm" style="cursor:pointer;">Original comment on ${verText}${refUrl ? ` (<a href="${escapeHtml(refUrl)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();">view message</a>)` : ''}</summary>
+                                    <div class="log-inline-block" style="margin-top:4px;">${escapeHtml(quoteText)}</div>
+                                </details>
+                            </div>
+                        `
+                        : '';
+
+                    return `
+                        <tr id="rm-prior-row-${idx}" onclick="toggleReviewMapPrior(${idx})">
+                            <td><span id="rm-prior-chevron-${idx}" style="color:var(--text-dim); font-size:0.85em; width:12px; display:inline-block;">▶</span><span style="font-weight:600; color:var(--text);">${escapeHtml(summaryText)}</span>${priorSubHtml}</td>
+                            <td>${speakerHtml}</td>
+                            <td>${reasoning}</td>
+                            <td>${outcomeHtml}</td>
+                        </tr>
+                        <tr id="rm-prior-detail-${idx}" class="rm-detail-row" style="display:none;">
+                            <td colspan="4">
+                                <div class="review-card" style="margin-bottom:0;">
+                                    <div>
+                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                                            <span>
+                                                <span class="tag">${escapeHtml(pStage)}</span>
+                                                <span class="text-muted-sm">${escapeHtml(verdictDetailLabel)}</span>
+                                            </span>
+                                            ${renderStageLogLink(pStage)}
+                                        </div>
+                                        <div class="log-inline-block">${reasoning}</div>
+                                    </div>
+                                    ${quoteHtml}
+                                </div>
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
+                priorResolutionsSectionHtml = `
+                    <div class="section">
+                        <h2 style="display:flex; justify-content:space-between; align-items:center;">
+                            <span>Prior Version Feedback (${priorResolutions.length})</span>
+                            <button type="button" id="rm-expand-all-prior-btn" class="toggle-btn" onclick="toggleAllReviewMapPriors()" style="font-size:0.85em; font-weight:normal;">▶ Expand All</button>
+                        </h2>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Comment</th>
+                                    <th style="width:200px;">Author</th>
+                                    <th>Resolution</th>
+                                    <th style="width:120px;">Outcome</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${resRowsHtml}
+                            </tbody>
+                        </table>
                     </div>
                 `;
             }
@@ -6409,6 +6696,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         </tbody>
                     </table>
                 </div>
+
+                ${priorResolutionsSectionHtml}
 
                 ${stagesSectionHtml}
             `;

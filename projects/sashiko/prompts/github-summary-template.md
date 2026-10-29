@@ -39,7 +39,15 @@ with `- [<SEVERITY>]` and individual findings are separated by an empty line:
 
 Where `<SEVERITY>` is strictly one of `CRITICAL`, `HIGH`, `MEDIUM`, or `LOW` in
 uppercase square brackets. If a finding is pre-existing (not introduced by this
-patch), note `(pre-existing)` at the start of its description.
+patch), note `(pre-existing)` at the start of its description. If a finding
+includes `prior_attribution` with an `attribution_line` (for example
+`As reported by Alice on v1`), begin its description with
+`<attribution_line> [N], ...` integrated naturally into the opening sentence,
+print only the reviewer's display name (never their `<email>` address), number
+footnotes sequentially (`[1]`, `[2]`, ...) across the review, and list all
+`[N] <reference_url>` entries together at the very bottom of the review when
+`reference_url` is present. Never credit earlier reviewers anywhere else, and
+use no backticks or markdown link syntax.
 
 If there are no findings at all, output exactly:
 

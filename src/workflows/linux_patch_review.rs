@@ -392,7 +392,9 @@ Follow the formatting rules strictly. Do not use markdown headers or ALL CAPS sh
 
 SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function name, file, line number when known, and specific triggering condition. Prefer the finding's `locations` field when present. Do not produce vague summaries like 'potential issue in error handling'. State precisely what goes wrong, where, and under what circumstances. Do not invent line numbers; if the exact line is unavailable, anchor the comment to the nearest verified function or symbol and explain the triggering condition.
 
-PRE-EXISTING ISSUES: If any finding has `"preexisting": true`, include it in the report and state explicitly at the start of its comment that the problem was not introduced by this patch (for example: "This problem wasn't introduced by this patch, but...")."#;
+PRE-EXISTING ISSUES: If any finding has `"preexisting": true`, include it in the report and state explicitly at the start of its comment that the problem was not introduced by this patch (for example: "This problem wasn't introduced by this patch, but...").
+
+PRIOR-VERSION ATTRIBUTION: If a finding includes `"prior_attribution"` with an `"attribution_line"` (for example `"As reported by Dan Carpenter on v2"`), begin that finding's comment with `<attribution_line> [N], ...` integrated naturally into the opening sentence (or `<attribution_line>, ...` when `reference_url` is absent). Number footnotes sequentially (`[1]`, `[2]`, ...) across the review and list all `[N] <reference_url>` entries together at the very bottom of the entire review email after all inline comments. Print only the reviewer's display name—never include their email address (`<...>`) in the comment text. Never distinguish between findings raised by fresh analysis vs prior-feedback in the email, never credit anyone else, and use no backticks or markdown."#;
 
 const STAGE_JSON_SCHEMA_EXAMPLE: &str = r#"
 TodoWrite compatibility: vendored prompts may ask you to add tasks or suspected bugs to TodoWrite. Do not call or mention TodoWrite. Treat those instructions as an internal checklist only. If that checklist identifies a concrete suspected bug, carry it forward as a JSON concern with file, function_or_symbol, line when known, triggering condition, and evidence. Do not output generic checklist progress as a concern.
@@ -403,12 +405,12 @@ Once you have gathered sufficient information, return ONLY a JSON object with 'c
 If you find no concerns and no dismissed concerns, return {"concerns": [], "dismissed_concerns": []}.
 Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations".
 - "type": A short category string.
-- "description": A clear description of the problem.
-- "reasoning": A step-by-step explanation.
+- "description": A clear plain-text description of the problem (never use markdown backticks).
+- "reasoning": A step-by-step explanation. Never use markdown backticks.
 - "preexisting": true if this bug already existed in the codebase before these patches were applied, false if the issue was newly introduced by the reviewed patchset.
 - "locations": An array of objects, each containing "file", "function_or_symbol", "line", "code_snippet", "side" and "why_this_location_matters".
 - "side": "PARENT" if commenting on deleted or pre-patch code (e.g., '-' lines in the diff or baseline code), or "REVISION" if commenting on newly added or modified code (e.g., '+' lines in the diff or post-patch code). Default to "REVISION" when commenting on unchanged context lines.
-Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations". They mean the same as above, except that "description" is the candidate concern that was investigated and disproved, "reasoning" is the evidence proving it does not apply, and "locations" MUST cite the concrete disproving code (the exact guard, lock, cleanup path, or caller/callee implementation that proves the issue cannot occur — not merely repeating the suspected line from the diff).
+Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations". They mean the same as above, except that "description" is the candidate concern that was investigated and disproved (plain text, never use markdown backticks), "reasoning" is the plain-text evidence proving it does not apply (never use markdown backticks), and "locations" MUST cite the concrete disproving code (the exact guard, lock, cleanup path, or caller/callee implementation that proves the issue cannot occur — not merely repeating the suspected line from the diff).
 
 Use the 'dismissed_concerns' array ONLY for candidate concerns that you considered plausible, investigated, and disproved with concrete evidence. This is especially important when you first suspect a concern and then follow the evidence chain proving that it does NOT apply.
 
@@ -2355,7 +2357,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
     },
     AnalysisStage {
         name: "resources",
-        short: "Resource Mgmt",
+        short: "Resource Management",
         instruction: STAGE_RESOURCES_INSTRUCTION,
         guides: &[],
         uses_commit_log: false,
@@ -2540,7 +2542,15 @@ pub fn stage_short_label(name: &str) -> Option<&'static str> {
     if crate::workflows::prior_attribution::is_prior_attribution_stage_name(name) {
         return Some(crate::workflows::prior_attribution::PRIOR_ATTRIBUTION_SHORT_LABEL);
     }
-    consolidation_stage_by_name(name).map(|s| s.short)
+    if let Some(s) = consolidation_stage_by_name(name) {
+        return Some(s.short);
+    }
+    match normalize_stage_name(name).as_str() {
+        "planning" => Some("Planning"),
+        "pre-screen" => Some("Pre-Screen"),
+        "summary" => Some("Change Summary"),
+        _ => None,
+    }
 }
 
 /// Whether a guide belongs to one stage rather than to the shared context.
@@ -3325,7 +3335,7 @@ Aggregated Dismissed Concerns:
 
 Return ONLY a JSON object with a "clusters" array. Each cluster object MUST contain:
 - "id": sequential cluster identifier ("G1", "G2", ...)
-- "title": concise neutral summary of the shared root cause and function
+- "title": concise neutral plain-text summary of the shared root cause and function (never use markdown backticks)
 - "source_ids": non-empty array of input IDs ("C*", "D*", "PC*", "PD*") belonging to this cluster. Every input ID MUST appear in exactly one cluster.
 
 Example Output:
@@ -3600,9 +3610,9 @@ Aggregated Dismissed Concerns:
 
 Return ONLY a JSON object with 'findings', 'inconclusive_concerns', and 'dismissed_concerns' arrays.
 - LINEAGE REQUIREMENT ('source_ids'): Every input item in Aggregated Concerns has an "id" ("C1", "C2", ...) and every input item in Aggregated Dismissed Concerns has an "id" ("D1", "D2", ...). Every output object across 'findings', 'inconclusive_concerns', and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the exact input "id" string(s) merged into that item (e.g. ["C1", "D2"]). Every input "id" (all C* and D* IDs) MUST appear in at least one output item's "source_ids". Category 1a 'findings' may ONLY reference C* IDs (any contested C* + D* or promoted D* must go to 'inconclusive_concerns'), and Category 1b 'dismissed_concerns' may ONLY reference D* IDs (never C* IDs).
-- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of C* input IDs), "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" for deleted/pre-patch code or "REVISION" for added/modified/context code), and may include "stages" (array of stage names that raised the merged concern) and "prompts" (array of prompt files from the merged concern).
-- Each object in 'inconclusive_concerns' (Category 2: Inconclusive) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION"), and may include "stages" and "prompts".
-- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of D* input IDs), "type", "description", "reasoning", and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION"), and may include "stages" and "prompts".
+- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of C* input IDs), "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed plain-text reasoning and proof, never using markdown backticks), "preexisting" (boolean), and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" for deleted/pre-patch code or "REVISION" for added/modified/context code), and may include "stages" (array of stage names that raised the merged concern) and "prompts" (array of prompt files from the merged concern).
+- Each object in 'inconclusive_concerns' (Category 2: Inconclusive) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description" (plain text, never use markdown backticks), "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated plain-text arguments for why the bug can occur, no backticks), "dismissal_arguments" (consolidated plain-text arguments/snippets from any competing or standalone dismissal, or "" if none, no backticks), "verification_question" (the specific plain-text code question post-verification must answer with tools, no backticks), "preexisting" (boolean), and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION"), and may include "stages" and "prompts".
+- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of D* input IDs), "type", "description" (plain text, never use markdown backticks), "reasoning" (plain text, never use markdown backticks), and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION"), and may include "stages" and "prompts".
 
 Example Output:
 ```json
@@ -3731,8 +3741,8 @@ Inconclusive Concern(s) to Verify:
 
 Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every candidate in this batch MUST be accounted for in either 'findings' (if validated) or 'dismissed_concerns' (ONLY if concrete code disproves the candidate; never return both empty arrays).
 - LINEAGE REQUIREMENT ('source_ids'): Each inconclusive concern in this batch has an "id" (e.g. "I1"). Every object in 'findings' and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the candidate "id"(s) from this batch that it resolves (e.g. ["I1"]), and every candidate "id" in this batch must be accounted for.
-- Each object in 'findings' MUST use: "source_ids" (non-empty array of candidate I* IDs from this batch), "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, Critical, or Unknown), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: false whenever the patch introduces the bug or newly exposes, triggers, or makes reachable a latent defect that could not be triggered before the patch; true when the bug already existed at Baseline SHA before the patch series and was already triggerable before the patch, even if it lives in the same function, caller/callee, or cleanup path modified by the patch), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" for deleted/pre-patch code or "REVISION" for added/modified/context code). Carry forward the locations from the validated candidate; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
-- Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of candidate I* IDs from this batch), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION", quoting the verbatim disproving guard, lock, cleanup path, or caller/callee implementation).
+- Each object in 'findings' MUST use: "source_ids" (non-empty array of candidate I* IDs from this batch), "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, Critical, or Unknown), "severity_explanation" (a plain-text string detailing the reasoning and proof, never using markdown backticks), "preexisting" (a boolean: false whenever the patch introduces the bug or newly exposes, triggers, or makes reachable a latent defect that could not be triggered before the patch; true when the bug already existed at Baseline SHA before the patch series and was already triggerable before the patch, even if it lives in the same function, caller/callee, or cleanup path modified by the patch), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" for deleted/pre-patch code or "REVISION" for added/modified/context code). Carry forward the locations from the validated candidate; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
+- Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of candidate I* IDs from this batch), "description" (the candidate issue that was disproved, plain text, never use markdown backticks), "reasoning" (step-by-step plain-text explanation of how the inspected code disproves the candidate, never use markdown backticks), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION", quoting the verbatim disproving guard, lock, cleanup path, or caller/callee implementation).
 
 Example Output:
 ```json

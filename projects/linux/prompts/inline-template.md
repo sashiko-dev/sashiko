@@ -44,6 +44,24 @@ the author.
   the bug, or prior discussions upstream.  These MUST be included in the summary,
   but should be reworded to fit the template requirements.
 
+- When a finding includes a prior_attribution object with an attribution_line
+  (for example "As reported by Dan Carpenter on v2"), begin that inline comment
+  with "<attribution_line> [N], ..." integrated naturally into the opening
+  sentence. Print only the reviewer's display name (never include their email
+  address "<...>" in the review body). Number footnotes sequentially ([1], [2],
+  ...) across the review and list all "[N] <reference_url>" entries together at
+  the very bottom of the review email after all inline comments, e.g.:
+
+    As reported by Dan Carpenter on v2 [1], if msm_gem_address_space_create()
+    fails in msm_kms_init_aspace(), ...
+
+    ...
+
+    [1] https://lore.kernel.org/r/e0846cd2-c03f-44a8-9f0b-6d78b241f093@stanley.mountain
+
+  Never credit earlier reviewers unless prior_attribution is present on that
+  finding.
+
 - You MUST include every issue sent, even if the additional details explain the
   issue was fixed in a later commit.  Your job is to format issues, not decide
   which ones are worth including.
