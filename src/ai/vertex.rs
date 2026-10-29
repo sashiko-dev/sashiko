@@ -152,6 +152,7 @@ pub struct VertexClient {
     effort: Option<String>,
     context_window_size: usize,
     credentials: AccessTokenCredentials,
+    request_timeout: Option<Duration>,
 }
 
 impl VertexClient {
@@ -205,7 +206,14 @@ impl VertexClient {
             effort,
             context_window_size,
             credentials,
+            request_timeout: None,
         })
+    }
+
+    /// Bounds each HTTP request, including each Gemini continuation hop.
+    pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
     }
 
     async fn get_access_token(&self) -> Result<String> {
@@ -225,7 +233,7 @@ impl VertexClient {
     async fn post_claude_request(&self, body: &VertexClaudeRequest) -> Result<ClaudeResponse> {
         let token = self.get_access_token().await?;
         let url = self.endpoint_url();
-        Self::send_claude_request(&self.client, &url, &token, body).await
+        Self::send_claude_request(&self.client, &url, &token, body, self.request_timeout).await
     }
 
     async fn send_claude_request(
@@ -233,12 +241,17 @@ impl VertexClient {
         url: &str,
         token: &str,
         body: &VertexClaudeRequest,
+        timeout: Option<Duration>,
     ) -> Result<ClaudeResponse> {
-        let res = client
+        let mut request = client
             .post(url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
-            .json(body)
+            .json(body);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let res = request
             .send()
             .await
             .map_err(|e| claude::transport_error("Vertex AI", e))?;
@@ -305,7 +318,7 @@ impl VertexClient {
     ) -> Result<GenerateContentResponse> {
         let token = self.get_access_token().await?;
         let url = self.endpoint_url();
-        Self::send_gemini_request(&self.client, &url, &token, body).await
+        Self::send_gemini_request(&self.client, &url, &token, body, self.request_timeout).await
     }
 
     async fn send_gemini_request(
@@ -313,12 +326,17 @@ impl VertexClient {
         url: &str,
         token: &str,
         body: &GenerateContentRequest,
+        timeout: Option<Duration>,
     ) -> Result<GenerateContentResponse> {
-        let res = client
+        let mut request = client
             .post(url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
-            .json(body)
+            .json(body);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let res = request
             .send()
             .await
             .map_err(|e| gemini::transport_error("Vertex AI", e))?;
@@ -545,6 +563,7 @@ mod tests {
                 url,
                 "dummy-token",
                 &hello_request(),
+                Some(test_http::TEST_TIMEOUT),
             ),
         )
         .await
@@ -645,10 +664,81 @@ mod tests {
                 url,
                 "dummy-token",
                 &request,
+                Some(test_http::TEST_TIMEOUT),
             ),
         )
         .await
         .expect("request did not complete in time")
+    }
+
+    #[tokio::test]
+    async fn test_api_timeout_bounds_claude_headers_and_body() {
+        for phase in [
+            test_http::ResponseStall::Headers,
+            test_http::ResponseStall::Body,
+        ] {
+            let server = test_http::StalledResponse::start(phase).await;
+            let err = tokio::time::timeout(
+                Duration::from_secs(2),
+                VertexClient::send_claude_request(
+                    &test_http::test_client(),
+                    server.url(),
+                    "dummy-token",
+                    &hello_request(),
+                    Some(Duration::from_millis(200)),
+                ),
+            )
+            .await
+            .expect("configured API timeout was not enforced")
+            .expect_err("stalled response must time out");
+            assert_eq!(
+                crate::ai::classify_ai_error(&err),
+                AiErrorClass::Transient {
+                    retry_after: claude::TRANSPORT_RETRY_AFTER
+                },
+            );
+            assert!(transient_message(&err).contains("timed out"), "{err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_api_timeout_bounds_gemini_headers_and_body() {
+        for phase in [
+            test_http::ResponseStall::Headers,
+            test_http::ResponseStall::Body,
+        ] {
+            let server = test_http::StalledResponse::start(phase).await;
+            let request = GenerateContentRequest {
+                contents: vec![],
+                tools: None,
+                system_instruction: None,
+                generation_config: None,
+                continuation_token: None,
+            };
+            let err = tokio::time::timeout(
+                Duration::from_secs(2),
+                VertexClient::send_gemini_request(
+                    &test_http::test_client(),
+                    server.url(),
+                    "dummy-token",
+                    &request,
+                    Some(Duration::from_millis(200)),
+                ),
+            )
+            .await
+            .expect("configured API timeout was not enforced")
+            .expect_err("stalled response must time out");
+            assert_eq!(
+                crate::ai::classify_ai_error(&err),
+                AiErrorClass::Transient {
+                    retry_after: Duration::from_secs(30)
+                },
+            );
+            assert!(
+                gemini_transient_message(&err).contains("timed out"),
+                "{err:#}"
+            );
+        }
     }
 
     fn gemini_transient_message(err: &anyhow::Error) -> &str {

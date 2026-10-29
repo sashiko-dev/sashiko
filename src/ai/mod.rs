@@ -705,14 +705,17 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 .unwrap_or_else(claude::ClaudeClient::default_base_url);
             let thinking = claude.and_then(|c| c.thinking.clone());
             let effort = claude.and_then(|c| c.effort.clone());
-            Ok(Arc::new(claude::ClaudeClient::new(
-                model,
-                enable_caching,
-                max_tokens,
-                base_url,
-                thinking,
-                effort,
-            )))
+            Ok(Arc::new(
+                claude::ClaudeClient::new(
+                    model,
+                    enable_caching,
+                    max_tokens,
+                    base_url,
+                    thinking,
+                    effort,
+                )
+                .with_timeout(Duration::from_secs(ai.api_timeout_secs)),
+            ))
         }
         "stdio-claude" => Ok(Arc::new(claude::StdioClaudeClient::new())),
         #[cfg(feature = "bedrock")]
@@ -966,15 +969,18 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 }
             });
             let effort = vertex.and_then(|v| v.effort.clone());
-            Ok(Arc::new(vertex::VertexClient::new(
-                model,
-                project_id,
-                region,
-                enable_caching,
-                max_tokens,
-                thinking,
-                effort,
-            )?))
+            Ok(Arc::new(
+                vertex::VertexClient::new(
+                    model,
+                    project_id,
+                    region,
+                    enable_caching,
+                    max_tokens,
+                    thinking,
+                    effort,
+                )?
+                .with_timeout(Duration::from_secs(ai.api_timeout_secs)),
+            ))
         }
         #[cfg(not(feature = "vertex"))]
         "vertex" => bail!("vertex provider requires the 'vertex' feature"),
