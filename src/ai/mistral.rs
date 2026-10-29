@@ -325,15 +325,21 @@ impl MistralClient {
         settings: Option<&MistralSettings>,
         api_timeout_secs: u64,
     ) -> Result<Self> {
-        // A variable set to the empty string is no configuration: falling
-        // through to the shared key keeps a valid LLM_API_KEY from being
-        // silently shadowed.
-        let api_key = std::env::var("MISTRAL_API_KEY")
-            .ok()
-            .filter(|key| !key.is_empty())
-            .or_else(|| std::env::var("LLM_API_KEY").ok())
-            .unwrap_or_default();
+        let api_key = Self::resolve_api_key(
+            std::env::var("MISTRAL_API_KEY").ok(),
+            std::env::var("LLM_API_KEY").ok(),
+        );
         Self::new_with_key(model, settings, &api_key, api_timeout_secs)
+    }
+
+    /// A variable set to the empty string is no configuration: the shared
+    /// key only wins when the dedicated one is missing or blank, so a
+    /// stray blank MISTRAL_API_KEY cannot shadow a valid LLM_API_KEY.
+    fn resolve_api_key(dedicated: Option<String>, shared: Option<String>) -> String {
+        dedicated
+            .filter(|key| !key.is_empty())
+            .or_else(|| shared.filter(|key| !key.is_empty()))
+            .unwrap_or_default()
     }
 
     pub(crate) fn new_with_key(
@@ -783,7 +789,7 @@ fn translate_ai_response(resp: MistralResponse) -> Result<AiResponse> {
 #[async_trait]
 impl AiProvider for MistralClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        tracing::info!("Sending Mistral request...");
+        tracing::info!("{}Sending Mistral request...", crate::ai::get_log_prefix());
 
         let body = self.translate_request(request);
         let resp = self.post_request(&body).await?;
@@ -1547,6 +1553,56 @@ mod tests {
             "{err}"
         );
 
+        Ok(())
+    }
+
+    /// An environment variable set to the empty string is no configuration:
+    /// the shared key must win over a blank MISTRAL_API_KEY.
+    #[test]
+    fn empty_mistral_key_falls_through_to_the_shared_key() {
+        let resolve = |dedicated: Option<&str>, shared: Option<&str>| {
+            MistralClient::resolve_api_key(
+                dedicated.map(str::to_string),
+                shared.map(str::to_string),
+            )
+        };
+        assert_eq!(resolve(Some("ded"), Some("shared")), "ded");
+        assert_eq!(resolve(Some(""), Some("shared")), "shared");
+        assert_eq!(resolve(None, Some("shared")), "shared");
+        assert_eq!(resolve(Some(""), None), "");
+        assert_eq!(resolve(None, None), "");
+        assert_eq!(resolve(Some(" "), Some("shared")), " ");
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn redirect_loop_fails_fast_as_permanent() -> anyhow::Result<()> {
+        // A self-redirecting stub exhausts reqwest's redirect budget, which
+        // surfaces as a redirect transport error: the permanent arm must
+        // return it without logging or climbing the backoff ladder.
+        async fn bounce() -> axum::response::Redirect {
+            axum::response::Redirect::temporary("/v1/chat/completions")
+        }
+        let app = axum::Router::new()
+            .route("/", axum::routing::any(bounce))
+            .route("/v1/chat/completions", axum::routing::any(bounce));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = MistralClient::new_with_key(
+            "m".to_string(),
+            Some(&settings(Some(&base_url), None)),
+            "k",
+            30,
+        )?;
+        let err = client
+            .post_request(&client.translate_request(empty_request()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MistralError::PermanentError(_)), "{err}");
         Ok(())
     }
 
