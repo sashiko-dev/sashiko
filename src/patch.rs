@@ -46,25 +46,26 @@ pub struct Patch {
 }
 
 pub fn extract_received_date(raw_email: &[u8]) -> Option<i64> {
-    let header_end = raw_email
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap_or(raw_email.len());
-    let headers_bytes = &raw_email[..header_end];
-    let headers_str = String::from_utf8_lossy(headers_bytes);
-
     let mut current_header = String::new();
     let mut in_received = false;
 
-    for line in headers_str.lines() {
-        if line.starts_with("Received:") {
+    for raw_line in raw_email.split(|&byte| byte == b'\n') {
+        let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if raw_line.is_empty() {
+            break;
+        }
+        let line = String::from_utf8_lossy(raw_line);
+        if line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("Received"))
+        {
             if in_received {
                 break;
             }
             in_received = true;
-            current_header.push_str(line);
+            current_header.push_str(&line);
         } else if in_received && (line.starts_with(' ') || line.starts_with('\t')) {
-            current_header.push_str(line);
+            current_header.push_str(&line);
         } else if in_received {
             break;
         }
@@ -1215,6 +1216,73 @@ Body";
             \r\n\
             Body";
         assert_eq!(extract_received_date(email_malformed_date), None);
+    }
+
+    #[test]
+    fn test_received_date_stops_at_header_body_boundary() {
+        for newline in ["\n", "\r\n"] {
+            let body = format!(
+                "Received: from body.example; Tue, 12 May 2026 00:12:30 +0000{newline}\
+                 This line belongs to the message body.{newline}"
+            );
+            let email = format!(
+                "From: Author <author@example.org>{newline}\
+                 Message-ID: <body-received@example.org>{newline}\
+                 Subject: [PATCH] Preserve body text{newline}\
+                 {newline}{body}"
+            );
+
+            assert_eq!(extract_received_date(email.as_bytes()), None, "{newline:?}");
+            let (metadata, _) = parse_email(email.as_bytes()).unwrap();
+            assert_eq!(metadata.received_date, None, "{newline:?}");
+            assert_eq!(metadata.body, body, "{newline:?}");
+        }
+    }
+
+    #[test]
+    fn test_received_date_accepts_case_insensitive_folded_header() {
+        for newline in ["\n", "\r\n"] {
+            for name in ["Received", "received", "rEcEiVeD"] {
+                let email = format!(
+                    "From: Author <author@example.org>{newline}\
+                     {name}: from relay.example{newline}\
+                     \t {newline}\
+                     \tby inbox.example;{newline}\
+                     \tTue, 12 May 2026 00:12:30 +0000{newline}\
+                     Received: from older.example; Mon, 11 May 2026 00:12:30 +0000{newline}\
+                     Message-ID: <folded-received@example.org>{newline}\
+                     Subject: [PATCH] Preserve the first Received timestamp{newline}\
+                     {newline}Message body.{newline}"
+                );
+
+                assert_eq!(
+                    extract_received_date(email.as_bytes()),
+                    Some(1_778_544_750),
+                    "{newline:?}, {name}"
+                );
+                let (metadata, _) = parse_email(email.as_bytes()).unwrap();
+                assert_eq!(metadata.received_date, Some(1_778_544_750));
+            }
+        }
+    }
+
+    #[test]
+    fn test_received_date_does_not_fall_back_from_invalid_topmost_header() {
+        for newline in ["\n", "\r\n"] {
+            let email = format!(
+                "Received: from relay.example; Invalid Date{newline}\
+                 Received: from older.example; Tue, 12 May 2026 00:12:30 +0000{newline}\
+                 From: Author <author@example.org>{newline}\
+                 Message-ID: <invalid-received@example.org>{newline}\
+                 Subject: [PATCH] Keep the invalid-topmost fallback{newline}\
+                 {newline}\
+                 Received: from body.example; Tue, 12 May 2026 00:12:30 +0000{newline}"
+            );
+
+            assert_eq!(extract_received_date(email.as_bytes()), None, "{newline:?}");
+            let (metadata, _) = parse_email(email.as_bytes()).unwrap();
+            assert_eq!(metadata.received_date, None, "{newline:?}");
+        }
     }
 
     #[test]
