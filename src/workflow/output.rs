@@ -210,6 +210,25 @@ pub fn parse_json_from_text<T: DeserializeOwned>(raw_text: &str) -> Result<T, St
         }
     }
 
+    // Last resort: repair common LLM malformations (unescaped inner quotes,
+    // trailing commas) and re-parse strictly. The repair runs on the raw
+    // text and control-character escaping runs on each repaired variant:
+    // clean_json_string tracks string state by quote count, so an odd
+    // unescaped quote would flip it and turn the structural newlines
+    // between fields into literal \n sequences outside strings, which no
+    // repair recovers. Variants arrive in preference order and any variant
+    // that still fails the strict parse is skipped, so the original error
+    // surfaces unchanged when no repair parses.
+    for repaired in crate::utils::repair_json_candidates(raw_text) {
+        let repaired = crate::utils::clean_json_string(&repaired);
+        if repaired == cleaned {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<T>(&repaired) {
+            return Ok(val);
+        }
+    }
+
     Err(format!(
         "Failed to parse JSON from output ({primary_err}): {}",
         crate::utils::utf8_prefix(raw_text, 200)
@@ -245,9 +264,21 @@ fn find_json_candidates(text: &str) -> Vec<Value> {
         {
             let candidate: String = chars[i..=end].iter().collect();
             let clean_candidate = crate::utils::clean_json_string(&candidate);
-            if let Ok(v) =
-                serde_json::from_str(&clean_candidate).or_else(|_| serde_json::from_str(&candidate))
-            {
+            let mut parsed = serde_json::from_str::<Value>(&clean_candidate)
+                .or_else(|_| serde_json::from_str::<Value>(&candidate));
+            if parsed.is_err() {
+                // Repair the raw candidate and escape control characters on
+                // each repaired variant: see parse_json_from_text for why
+                // the order matters.
+                for repaired in crate::utils::repair_json_candidates(&candidate) {
+                    let repaired = crate::utils::clean_json_string(&repaired);
+                    if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
+                        parsed = Ok(v);
+                        break;
+                    }
+                }
+            }
+            if let Ok(v) = parsed {
                 candidates.push(v);
                 i = end + 1;
                 continue;
@@ -295,6 +326,63 @@ mod tests {
     struct DummyOutput {
         name: String,
         count: u32,
+    }
+
+    #[test]
+    fn test_parse_recovers_unescaped_inner_quotes() {
+        let raw = r#"{"name": "the driver sets "on" mode", "count": 3}"#;
+        let out: DummyOutput = parse_json_from_text(raw).unwrap();
+        assert_eq!(
+            out,
+            DummyOutput {
+                name: "the driver sets \"on\" mode".to_string(),
+                count: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_recovers_trailing_commas() {
+        let raw = "{\n  \"name\": \"x\",\n  \"count\": 3,\n}\n";
+        let out: DummyOutput = parse_json_from_text(raw).unwrap();
+        assert_eq!(
+            out,
+            DummyOutput {
+                name: "x".to_string(),
+                count: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_repairs_quotes_before_escaping_control_characters() {
+        // One unescaped quote inside the value is an odd count: escaping
+        // control characters first would flip the string state for the rest
+        // of the payload and turn the structural newlines between fields
+        // into literal \n sequences outside strings, which no repair
+        // recovers. Repairing the quotes first keeps every field intact.
+        let raw = "{\n  \"name\": \"a \"b c d\",\n  \"count\": 7\n}";
+        let out: DummyOutput = parse_json_from_text(raw).unwrap();
+        assert_eq!(
+            out,
+            DummyOutput {
+                name: "a \"b c d".to_string(),
+                count: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_repairs_candidate_embedded_in_prose() {
+        let raw = r#"Verdict below.\n{"name": "handles "x" input", "count": 1}\nDone."#;
+        let out: DummyOutput = parse_json_from_text(raw).unwrap();
+        assert_eq!(
+            out,
+            DummyOutput {
+                name: "handles \"x\" input".to_string(),
+                count: 1,
+            }
+        );
     }
 
     #[test]
