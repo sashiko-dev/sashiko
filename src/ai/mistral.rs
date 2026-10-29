@@ -280,6 +280,8 @@ pub enum MistralError {
     RateLimitExceeded(Duration),
     #[error("Transient error: {1}, retry after {0:?}")]
     TransientError(Duration, String),
+    #[error("Permanent transport error: {0}")]
+    PermanentError(String),
     #[error("Authentication error: {0}")]
     AuthenticationError(String),
     #[error("API error {0}: {1}")]
@@ -295,6 +297,8 @@ impl ClassifyAiError for MistralError {
             MistralError::TransientError(retry_after, _) => AiErrorClass::Transient {
                 retry_after: *retry_after,
             },
+            // Retrying cannot fix a builder or redirect failure.
+            MistralError::PermanentError(_) => AiErrorClass::Fatal,
             MistralError::AuthenticationError(_) => AiErrorClass::Fatal,
             MistralError::ApiError(status, _) => {
                 classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
@@ -321,8 +325,13 @@ impl MistralClient {
         settings: Option<&MistralSettings>,
         api_timeout_secs: u64,
     ) -> Result<Self> {
+        // A variable set to the empty string is no configuration: falling
+        // through to the shared key keeps a valid LLM_API_KEY from being
+        // silently shadowed.
         let api_key = std::env::var("MISTRAL_API_KEY")
-            .or_else(|_| std::env::var("LLM_API_KEY"))
+            .ok()
+            .filter(|key| !key.is_empty())
+            .or_else(|| std::env::var("LLM_API_KEY").ok())
             .unwrap_or_default();
         Self::new_with_key(model, settings, &api_key, api_timeout_secs)
     }
@@ -339,7 +348,7 @@ impl MistralClient {
             // hitting a remote 401 must not have to guess why no credentials
             // were sent.
             tracing::warn!(
-                "MISTRAL_API_KEY is not set; requests to the Mistral endpoint will be unauthenticated"
+                "MISTRAL_API_KEY is not set or is empty; requests to the Mistral endpoint will be unauthenticated"
             );
         } else {
             // A key with control characters (a stray newline from a
@@ -555,6 +564,16 @@ impl MistralClient {
         let res = match self.client.post(&self.base_url).json(body).send().await {
             Ok(res) => res,
             Err(e) => {
+                if crate::ai::is_permanent_transport_error(&e) {
+                    // Fail fast like the sibling providers instead of
+                    // climbing the backoff ladder for a failure no retry
+                    // can fix. The error surfaces through the returned
+                    // class, so it is not logged here.
+                    return Err(MistralError::PermanentError(redact_secret(&format!(
+                        "{:#}",
+                        anyhow::Error::from(e)
+                    ))));
+                }
                 let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
                 tracing::error!(
                     "{}Mistral request failed (transport): {}",
@@ -588,7 +607,8 @@ impl MistralClient {
                         .and_then(|d| d.reasoning_tokens)
                         .unwrap_or(0);
                     tracing::info!(
-                        "Mistral response received. Tokens: in={}, out={} (reasoning={})",
+                        "{}Mistral response received. Tokens: in={}, out={} (reasoning={})",
+                        crate::ai::get_log_prefix(),
                         response.usage.prompt_tokens,
                         response.usage.completion_tokens,
                         reasoning
@@ -1078,6 +1098,38 @@ mod tests {
             .messages;
         let wire = serde_json::to_value(&messages).unwrap();
         assert_eq!(wire[0]["content"], json!("answer"));
+
+        // The production tool round keeps the thought AND the tool calls on
+        // the same assistant turn: block-form content travels next to the
+        // calls array, which is the shape verified against the live chat
+        // completions endpoint.
+        let messages = c
+            .translate_request(AiRequest {
+                messages: vec![AiMessage {
+                    role: AiRole::Assistant,
+                    content: Some("checking".to_string()),
+                    thought: Some("hmm".to_string()),
+                    thought_signature: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_1".to_string(),
+                        function_name: "lookup".to_string(),
+                        arguments: json!({"q": "x"}),
+                        thought_signature: None,
+                    }]),
+                    tool_call_id: None,
+                }],
+                ..empty_request()
+            })
+            .messages;
+        assert_eq!(messages[0].tool_calls.as_ref().unwrap().len(), 1);
+        let wire = serde_json::to_value(&messages).unwrap();
+        assert_eq!(
+            wire[0]["content"],
+            json!([
+                {"type": "thinking", "thinking": [{"type": "text", "text": "hmm"}]},
+                {"type": "text", "text": "checking"}
+            ])
+        );
     }
 
     #[test]
@@ -1241,6 +1293,10 @@ mod tests {
         assert!(matches!(
             MistralError::TransientError(Duration::from_secs(9), "e".to_string()).ai_error_class(),
             AiErrorClass::Transient { retry_after } if retry_after == Duration::from_secs(9)
+        ));
+        assert!(matches!(
+            MistralError::PermanentError("e".to_string()).ai_error_class(),
+            AiErrorClass::Fatal
         ));
         assert!(matches!(
             MistralError::ApiError(reqwest::StatusCode::BAD_REQUEST, "e".to_string())
@@ -1497,15 +1553,13 @@ mod tests {
     #[cfg(feature = "server")]
     #[tokio::test]
     async fn transport_failure_maps_to_a_transient_error() -> anyhow::Result<()> {
-        // A bound-then-dropped port refuses connections, exercising the send
-        // failure arm without depending on any outside endpoint.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
-        drop(listener);
-
+        // Port 1 on the loopback interface has no listener and cannot be
+        // bound by an unprivileged test, so the connection is refused
+        // deterministically — unlike a bound-then-dropped ephemeral port,
+        // which a concurrent bind can claim back mid-test.
         let client = MistralClient::new_with_key(
             "m".to_string(),
-            Some(&settings(Some(&format!("http://{addr}")), None)),
+            Some(&settings(Some("http://127.0.0.1:1"), None)),
             "k",
             30,
         )?;
