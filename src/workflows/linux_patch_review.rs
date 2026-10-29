@@ -3563,7 +3563,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stage_outputs_do_not_match_inner_location_on_malformed_outer_json() {
+    fn test_unescaped_quotes_repair_outer_object_not_other_stage_shapes() {
         let malformed_with_inner_location = r#"{
   "concerns": [
     {
@@ -3585,12 +3585,27 @@ mod tests {
   "dismissed_concerns": []
 }"#;
 
-        let err = crate::workflow::output::parse_json_from_text::<StageConcernsOutput>(
+        // The unescaped quotes inside the reasoning prose used to make the
+        // whole object unparseable and kill the stage after three retries;
+        // the repair pass recovers the full object with every field intact.
+        let parsed = crate::workflow::output::parse_json_from_text::<StageConcernsOutput>(
             malformed_with_inner_location,
         )
-        .expect_err("malformed outer JSON must not match inner location as StageConcernsOutput");
-        assert!(err.contains("line 6"));
+        .expect("unescaped inner quotes must be repaired, not rejected");
+        assert_eq!(parsed.concerns.len(), 1);
+        assert_eq!(parsed.concerns[0]["description"], "Missing core dependency");
+        assert_eq!(
+            parsed.concerns[0]["reasoning"],
+            "It omits \"core\" and \"std\" from deps."
+        );
+        assert_eq!(
+            parsed.concerns[0]["locations"][0]["file"],
+            "scripts/generate_rust_analyzer.py"
+        );
+        assert_eq!(parsed.concerns[0]["locations"][0]["line"], json!(149));
 
+        // A parseable outer object must still not masquerade as another
+        // stage's output shape just because it parses.
         assert!(
             crate::workflow::output::parse_json_from_text::<VerificationOutput>(
                 malformed_with_inner_location

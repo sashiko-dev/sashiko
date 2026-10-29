@@ -119,6 +119,116 @@ pub fn clean_json_string(input: &str) -> String {
     out
 }
 
+/// Best-effort repairs for common LLM JSON malformations that strict
+/// parsing rejects: unescaped double quotes inside string literals and
+/// trailing commas before `}` or `]`.
+///
+/// A quote inside a string is treated as the terminator only when the next
+/// non-whitespace character is a structural token (`,` `:` `}` `]`) or the
+/// input ends; any other quote is escaped as content. A quote followed by a
+/// comma is ambiguous: it genuinely separates list elements but also shows
+/// up inside quoted prose, and closing prose early can leave behind valid
+/// but semantically shifted JSON. The first syntax error localizes where
+/// parsing derailed, so comma- or colon-preceded quotes at or after it are
+/// escaped as prose while quotes in the region the parser already accepted
+/// stay terminators; a pairs-only fallback is appended for inputs where the
+/// prose reading does not parse. Callers re-parse each variant with a
+/// strict parser and use the first that parses, keeping the original error
+/// when none does. A quote directly followed by a closing brace or bracket
+/// always terminates, so prose that embeds one right after a quote stays
+/// unrecoverable.
+pub fn repair_json_candidates(input: &str) -> Vec<String> {
+    let error_offset = serde_json::from_str::<serde_json::Value>(input)
+        .err()
+        .map(|e| error_byte_offset(input, e.line(), e.column()));
+    let mixed = repair_json_with(input, error_offset);
+    let pairs = repair_json_with(input, None);
+    if mixed == pairs {
+        vec![mixed]
+    } else {
+        vec![mixed, pairs]
+    }
+}
+
+/// Maps a serde_json 1-based line/column error position onto a byte offset
+/// in `input`, clamped to the line and input lengths.
+fn error_byte_offset(input: &str, line: usize, column: usize) -> usize {
+    let mut offset = 0;
+    for (i, line_text) in input.split('\n').enumerate() {
+        if i + 1 == line {
+            return offset + column.saturating_sub(1).min(line_text.len());
+        }
+        offset += line_text.len() + 1;
+    }
+    offset
+}
+
+/// Renders one repair reading of `input`. A comma-preceded in-string quote
+/// terminates the string only when it lies before `error_offset` (or when
+/// the position is unknown). See [`repair_json_candidates`].
+fn repair_json_with(input: &str, error_offset: Option<usize>) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escape = false;
+    let mut byte_pos = 0;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            if escape {
+                out.push('\\');
+                out.push(c);
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                let terminates = if j >= chars.len() {
+                    true
+                } else {
+                    match chars[j] {
+                        '}' | ']' => true,
+                        ',' | ':' => {
+                            error_offset.is_none() || byte_pos < error_offset.unwrap_or(usize::MAX)
+                        }
+                        _ => false,
+                    }
+                };
+                if terminates {
+                    in_string = false;
+                    out.push(c);
+                } else {
+                    out.push_str("\\\"");
+                }
+            } else {
+                out.push(c);
+            }
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if c == ',' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            // Strict JSON forbids a comma directly before } or ].
+            if !matches!(chars.get(j), Some('}') | Some(']')) {
+                out.push(c);
+            }
+        } else {
+            out.push(c);
+        }
+        byte_pos += c.len_utf8();
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +240,81 @@ mod tests {
         assert_eq!(utf8_prefix("abc🙂def", 6), "abc");
         assert_eq!(utf8_prefix("🙂", 0), "");
         assert_eq!(utf8_prefix("short", 100), "short");
+    }
+
+    #[test]
+    fn test_repair_json_candidates_pairs_reading_is_identity_on_valid_json() {
+        let valid = r#"{"a": "x \"y\" z", "b": [1, 2], "c": {"d": true}}"#;
+        assert_eq!(repair_json_candidates(valid), vec![valid.to_string()]);
+    }
+
+    #[test]
+    fn test_repair_json_candidates_prefers_prose_over_shifted_pairs() {
+        // The early-closed "say " string is where parsing derails, so the
+        // comma- and colon-preceded quotes after the error must be read as
+        // prose: terminating them instead would yield valid but shifted
+        // JSON with a truncated value and a phantom key. The last inner
+        // quote is consumed by the mandatory terminator, which is the best
+        // reading an input missing its real closing quote allows.
+        let broken = r#"{"a": "say "hi", "b": "ok"}"#;
+        let candidates = repair_json_candidates(broken);
+        let parsed = candidates
+            .iter()
+            .find_map(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .unwrap();
+        assert_eq!(parsed["a"], "say \"hi\", \"b\": \"ok");
+    }
+
+    #[test]
+    fn test_repair_json_candidates_escapes_unescaped_inner_quotes() {
+        let broken = r#"{"description": "the flag turns "on" by default", "n": 3}"#;
+        let repaired = repair_json_candidates(broken);
+        let parsed = repaired
+            .iter()
+            .find_map(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .unwrap();
+        assert_eq!(parsed["description"], "the flag turns \"on\" by default");
+        assert_eq!(parsed["n"], 3);
+    }
+
+    #[test]
+    fn test_repair_json_candidates_drops_trailing_commas() {
+        let broken = "{\n  \"a\": [1, 2,],\n  \"b\": \"x\",\n}\n";
+        let repaired = repair_json_candidates(broken);
+        let parsed = repaired
+            .iter()
+            .find_map(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .unwrap();
+        assert_eq!(parsed["a"], serde_json::json!([1, 2]));
+        assert_eq!(parsed["b"], "x");
+    }
+
+    #[test]
+    fn test_repair_json_candidates_terminates_list_elements_before_the_error() {
+        // The trailing comma is the first syntax error, so the quotes the
+        // parser already accepted as element separators stay terminators.
+        let broken = r#"{"a": ["one", "two"], "c": [3,]}"#;
+        let repaired = repair_json_candidates(broken);
+        let parsed = repaired
+            .iter()
+            .find_map(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .unwrap();
+        assert_eq!(parsed["a"], serde_json::json!(["one", "two"]));
+        assert_eq!(parsed["c"], serde_json::json!([3]));
+    }
+
+    #[test]
+    fn test_repair_json_candidates_recovers_embedded_key_colon_pairs() {
+        // In the prose reading, colon-preceded quotes after the first
+        // syntax error are content, so prose that itself embeds key-colon
+        // pairs is recovered instead of truncated at the embedded colon.
+        let broken = r#"{"a": "flag "b": 1"}"#;
+        let candidates = repair_json_candidates(broken);
+        let parsed = candidates
+            .iter()
+            .find_map(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .unwrap();
+        assert_eq!(parsed["a"], "flag \"b\": 1");
     }
 
     #[test]

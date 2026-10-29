@@ -209,6 +209,19 @@ pub fn parse_json_from_text<T: DeserializeOwned>(raw_text: &str) -> Result<T, St
         }
     }
 
+    // Last resort: repair common LLM malformations (unescaped inner quotes,
+    // trailing commas) and re-parse strictly. Variants arrive in preference
+    // order and any variant that still fails the strict parse is skipped,
+    // so the original error surfaces unchanged when no repair parses.
+    for repaired in crate::utils::repair_json_candidates(&cleaned) {
+        if repaired == cleaned {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<T>(&repaired) {
+            return Ok(val);
+        }
+    }
+
     Err(format!(
         "Failed to parse JSON from output ({primary_err}): {}",
         crate::utils::utf8_prefix(raw_text, 200)
@@ -226,9 +239,17 @@ fn find_json_candidates(text: &str) -> Vec<Value> {
         {
             let candidate: String = chars[i..=end].iter().collect();
             let clean_candidate = crate::utils::clean_json_string(&candidate);
-            if let Ok(v) =
-                serde_json::from_str(&clean_candidate).or_else(|_| serde_json::from_str(&candidate))
-            {
+            let mut parsed = serde_json::from_str::<Value>(&clean_candidate)
+                .or_else(|_| serde_json::from_str::<Value>(&candidate));
+            if parsed.is_err() {
+                for repaired in crate::utils::repair_json_candidates(&clean_candidate) {
+                    if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
+                        parsed = Ok(v);
+                        break;
+                    }
+                }
+            }
+            if let Ok(v) = parsed {
                 candidates.push(v);
                 i = end + 1;
                 continue;
@@ -276,6 +297,45 @@ mod tests {
     struct DummyOutput {
         name: String,
         count: u32,
+    }
+
+    #[test]
+    fn test_parse_recovers_unescaped_inner_quotes() {
+        let raw = r#"{"name": "the driver sets "on" mode", "count": 3}"#;
+        let out: DummyOutput = parse_json_from_text(raw).unwrap();
+        assert_eq!(
+            out,
+            DummyOutput {
+                name: "the driver sets \"on\" mode".to_string(),
+                count: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_recovers_trailing_commas() {
+        let raw = "{\n  \"name\": \"x\",\n  \"count\": 3,\n}\n";
+        let out: DummyOutput = parse_json_from_text(raw).unwrap();
+        assert_eq!(
+            out,
+            DummyOutput {
+                name: "x".to_string(),
+                count: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_repairs_candidate_embedded_in_prose() {
+        let raw = r#"Verdict below.\n{"name": "handles "x" input", "count": 1}\nDone."#;
+        let out: DummyOutput = parse_json_from_text(raw).unwrap();
+        assert_eq!(
+            out,
+            DummyOutput {
+                name: "handles \"x\" input".to_string(),
+                count: 1,
+            }
+        );
     }
 
     #[test]
