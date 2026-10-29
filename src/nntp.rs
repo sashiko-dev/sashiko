@@ -49,6 +49,14 @@ pub struct GroupInfo {
     pub name: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to retrieve article {article_id}: {response}")]
+pub(crate) struct ArticleResponseError {
+    pub(crate) code: u16,
+    article_id: String,
+    response: String,
+}
+
 /// The crypto provider backing every NNTPS handshake.
 ///
 /// Optional features (such as `bedrock`) can link `ring` alongside
@@ -182,10 +190,15 @@ impl NntpClient {
             .take()
             .ok_or_else(|| anyhow!("NNTP connection closed after prior I/O error or timeout"))?;
         match timeout(self.timeout, stream.read_until(b'\n', buf)).await {
-            Ok(Ok(n)) => {
+            Ok(Ok(n)) if n > 0 && buf.ends_with(b"\n") => {
                 self.stream = Some(stream);
                 Ok(n)
             }
+            Ok(Ok(_)) => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "NNTP connection closed before a complete response line",
+            )
+            .into()),
             Ok(Err(e)) => Err(e.into()),
             Err(_) => Err(anyhow!("Read timed out")),
         }
@@ -231,10 +244,7 @@ impl NntpClient {
         let mut groups = Vec::new();
         loop {
             let mut buf = Vec::new();
-            let n = self.read_line_with_timeout(&mut buf).await?;
-            if n == 0 {
-                break; // EOF
-            }
+            self.read_line_with_timeout(&mut buf).await?;
 
             let line_raw = String::from_utf8_lossy(&buf);
             let line = line_raw.trim_end_matches(['\r', '\n']);
@@ -288,17 +298,25 @@ impl NntpClient {
         self.send_command(&format!("ARTICLE {}", id)).await?;
         let response = self.read_response().await?;
 
-        if !response.starts_with("220") {
-            return Err(anyhow!("Failed to retrieve article {}: {}", id, response));
+        let code = response
+            .split(' ')
+            .next()
+            .filter(|code| code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|code| code.parse::<u16>().ok())
+            .ok_or_else(|| anyhow!("Invalid ARTICLE response for {}: {}", id, response))?;
+        if code != 220 {
+            return Err(ArticleResponseError {
+                code,
+                article_id: id.to_string(),
+                response,
+            }
+            .into());
         }
 
         let mut lines = Vec::new();
         loop {
             let mut buf = Vec::new();
-            let n = self.read_line_with_timeout(&mut buf).await?;
-            if n == 0 {
-                break; // EOF
-            }
+            self.read_line_with_timeout(&mut buf).await?;
 
             // Convert to string (lossy)
             let line_raw = String::from_utf8_lossy(&buf);
@@ -352,6 +370,81 @@ mod tests {
     use tokio_rustls::TlsAcceptor;
     use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use tokio_rustls::rustls::{RootCertStore, ServerConfig};
+
+    #[tokio::test]
+    async fn incomplete_multiline_responses_are_errors() {
+        for (command, response) in [
+            (
+                "ARTICLE 1",
+                "220 article follows\r\nSubject: [PATCH] partial\r\n\r\nbody\r\n",
+            ),
+            ("ARTICLE 1", "220 article follows\r\nSubject: partial\r\n."),
+            ("LIST", "215 list follows\r\ntest.group 2 1 y\r\n"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                stream.write_all(b"200 ready\r\n").await.unwrap();
+                let mut received = String::new();
+                stream.read_line(&mut received).await.unwrap();
+                assert_eq!(received.trim(), command);
+                stream.write_all(response.as_bytes()).await.unwrap();
+                // EOF without a complete dot terminator cannot finish a reply.
+            });
+            let mut client = NntpClient::connect("127.0.0.1", address.port(), false)
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                if command == "LIST" {
+                    client.list().await
+                } else {
+                    client.article("1").await
+                }
+            })
+            .await
+            .expect("closed fixture must not stall the client");
+            server.await.unwrap();
+            assert!(result.is_err(), "accepted incomplete {command}: {result:?}");
+            assert!(client.stream.is_none(), "EOF must close the connection");
+        }
+    }
+
+    #[tokio::test]
+    async fn article_errors_preserve_the_actual_response_code() {
+        for (id, response, expected_code) in [
+            ("1423", "400 service unavailable\r\n", Some(400)),
+            ("1", "400 unavailable (trace 423)\r\n", Some(400)),
+            ("1", "423 no article with that number\r\n", Some(423)),
+            ("1", "4230 malformed status\r\n", None),
+            ("1", "2200 malformed success\r\n", None),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                stream.write_all(b"200 ready\r\n").await.unwrap();
+                let mut command = String::new();
+                stream.read_line(&mut command).await.unwrap();
+                assert_eq!(command, format!("ARTICLE {id}\r\n"));
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let mut client = NntpClient::connect("127.0.0.1", address.port(), false)
+                .await
+                .unwrap();
+            let error = client.article(id).await.unwrap_err();
+            server.await.unwrap();
+            assert_eq!(
+                error
+                    .downcast_ref::<ArticleResponseError>()
+                    .map(|error| error.code),
+                expected_code,
+                "{response:?} for {id}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn article_preserves_payload_whitespace_and_framing() {
