@@ -74,7 +74,7 @@ fn shard_user_template(profile: &VerificationShardProfile) -> String {
          {CLUSTER_DIRECTIVE}{series_context}\n\n\
          Candidate Clusters to Verify:\n{{{{candidate_clusters}}}}\n\n\
          {LINEAGE_RULES}\n\
-         - Each object in 'findings' MUST use the keys: \"source_ids\" (non-empty array of cluster G* IDs), {problem_rule}, \"severity\" (\"Low\", \"Medium\", \"High\", \"Critical\", or \"Unknown\"), \"severity_explanation\" (detailed reasoning and proof), \"preexisting\" (boolean), and \"locations\" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be \"PARENT\" for deleted/pre-patch code or \"REVISION\" for added/modified/context code).\n\
+         - Each object in 'findings' MUST use the keys: \"source_ids\" (non-empty array of cluster G* IDs), {problem_rule}, \"severity\" (\"Low\", \"Medium\", \"High\", \"Critical\", or \"Unknown\"), \"severity_explanation\" (plain-text detailed reasoning and proof, NEVER using backquotes), \"preexisting\" (boolean), and \"locations\" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be \"PARENT\" for deleted/pre-patch code or \"REVISION\" for added/modified/context code).\n\
          {INCONCLUSIVE_RULE}{example}",
         instruction = profile.instruction,
         problem_rule = profile.problem_rule,

@@ -305,7 +305,7 @@ You are an automated review bot generating a report for `gcc-patches@gcc.gnu.org
 
 Follow the formatting rules strictly. Do not use markdown headers or backticks. Ensure the tone is constructive, technical, and concise.
 
-SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function or pattern name, file, and specific triggering condition (such as input construct, optimization flag, or target mode). Prefer the finding's `locations` field when present. State precisely what goes wrong (e.g., wrong-code miscompilation, ICE in `tree_check_failed`, rejects-valid under SFINAE) and why.
+SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function or pattern name, file, and specific triggering condition (such as input construct, optimization flag, or target mode). Prefer the finding's `locations` field when present. State precisely what goes wrong (e.g., wrong-code miscompilation, ICE in `tree_check_failed`, rejects-valid under SFINAE) and why. If a finding includes `"prior_attribution"` with an `"attribution_line"` (for example `"As reported by Richard Biener on v2"`), begin that finding's comment with `<attribution_line> [N], ...` integrated naturally into the opening sentence (or `<attribution_line>, ...` when `reference_url` is absent), print only the reviewer's display name (never their `<email>` address), number footnotes sequentially (`[1]`, `[2]`, ...) across the review, and list all `[N] <reference_url>` entries together at the very bottom of the review after all inline comments when `reference_url` is present, with no backticks or markdown.
 
 PRE-EXISTING ISSUES: If any finding has `"preexisting": true`, include it in the report and state explicitly at the start of its comment that the problem was not introduced by this patch."#;
 
@@ -520,7 +520,15 @@ pub fn stage_short_label(name: &str) -> Option<&'static str> {
     if crate::workflows::prior_attribution::is_prior_attribution_stage_name(name) {
         return Some(crate::workflows::prior_attribution::PRIOR_ATTRIBUTION_SHORT_LABEL);
     }
-    consolidation_stage_by_name(name).map(|s| s.short)
+    if let Some(s) = consolidation_stage_by_name(name) {
+        return Some(s.short);
+    }
+    match normalize_stage_name(name).as_str() {
+        "planning" => Some("Planning"),
+        "pre-screen" => Some("Pre-Screen"),
+        "summary" => Some("Change Summary"),
+        _ => None,
+    }
 }
 
 pub fn is_stage_exclusive_guide(name: &str) -> bool {

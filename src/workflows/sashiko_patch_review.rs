@@ -284,10 +284,11 @@ For each candidate in `inconclusive_concerns`, use the available Git and file to
 const STAGE_REPORT_INSTRUCTION: &str = r#"# Generate plain-text inline review report
 
 Generate the plain-text inline review report following the exact formatting rules and structure in `github-summary-template.md`.
-- Output ONLY a plain bulleted list of ALL findings ordered from highest severity to lowest (`- [CRITICAL] ...`, `- [HIGH] ...`, `- [MEDIUM] ...`, `- [LOW] ...`), or `No issues found.` if there are no findings.
+- Output ONLY a plain bulleted list of ALL findings ordered from highest severity to lowest (`- [CRITICAL] ...`, `- [HIGH] ...`, `- [MEDIUM] ...`, `- [LOW] ...`), followed at the very bottom by any `[N] <reference_url>` footnote entries, or `No issues found.` if there are no findings.
 - If any finding has `"preexisting": true`, state explicitly in its explanation that the issue was not introduced by this change.
+- If any finding includes `"prior_attribution"` with an `"attribution_line"` (for example `"As reported by Alice on v1"`), begin that bullet's description with `<attribution_line> [N], ...` integrated naturally into the opening sentence (or `<attribution_line>, ...` when `reference_url` is absent), print only the reviewer's display name (never their `<email>` address), number footnotes sequentially (`[1]`, `[2]`, ...) across the review, and list all `[N] <reference_url>` entries together at the very bottom of the review when `reference_url` is present, with no backticks or markdown link syntax.
 - Do NOT include `Summary:` or `Findings:` headers (the summary is generated and displayed separately in the UI).
-- Do NOT use backticks, markdown code blocks, or markdown headings. Wrap all lines at 78 characters or fewer."#;
+- Do NOT use backticks, markdown code blocks, or markdown headings. Wrap prose lines at 78 characters or fewer."#;
 
 const SUMMARY_SYSTEM_PROMPT: &str = r#"You are a principal Rust and distributed systems engineer maintaining Sashiko, an automated AI patch review system.
 Your task in this stage is to write a concise plain-text summary of the proposed change based strictly on the patch or series context provided below.
@@ -545,7 +546,15 @@ pub fn stage_short_label(name: &str) -> Option<&'static str> {
     if crate::workflows::prior_attribution::is_prior_attribution_stage_name(name) {
         return Some(crate::workflows::prior_attribution::PRIOR_ATTRIBUTION_SHORT_LABEL);
     }
-    consolidation_stage_by_name(name).map(|s| s.short)
+    if let Some(s) = consolidation_stage_by_name(name) {
+        return Some(s.short);
+    }
+    match normalize_stage_name(name).as_str() {
+        "planning" => Some("Planning"),
+        "pre-screen" => Some("Pre-Screen"),
+        "summary" => Some("Change Summary"),
+        _ => None,
+    }
 }
 
 pub fn is_stage_exclusive_guide(name: &str) -> bool {
@@ -676,7 +685,13 @@ fn validate_github_summary_format(
                     .to_string(),
             );
         }
-        if !line.starts_with("    ") && !line.starts_with('\t') && line.chars().count() > 84 {
+        if !line.starts_with("    ")
+            && !line.starts_with('\t')
+            && !is_footnote_url_line(l)
+            && !l.contains("https://")
+            && !l.contains("http://")
+            && line.chars().count() > 84
+        {
             return Err(format!(
                 "Line exceeds 78-character terminal width ({} chars): \"{}...\". Wrap all prose lines at 78 characters.",
                 line.chars().count(),
@@ -700,6 +715,21 @@ fn validate_github_summary_format(
         }
     }
     Ok(())
+}
+
+fn is_footnote_url_line(trimmed_line: &str) -> bool {
+    let Some(rest) = trimmed_line.strip_prefix('[') else {
+        return false;
+    };
+    let digits_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits_len == 0 {
+        return false;
+    }
+    let after_bracket = rest[digits_len..].strip_prefix(']').map(str::trim_start);
+    matches!(
+        after_bracket,
+        Some(url) if url.starts_with("https://") || url.starts_with("http://")
+    )
 }
 
 pub fn format_sashiko_inline_findings(text: &str) -> String {
@@ -2014,5 +2044,23 @@ mod tests {
                 .contains(r#"side MUST be "PARENT""#),
             "Sashiko post-verification stage user prompt must define valid side enum values"
         );
+    }
+
+    #[test]
+    fn test_validate_github_summary_format_allows_long_footnote_urls() {
+        let state = SashikoPatchReviewState {
+            findings: vec![serde_json::json!({
+                "problem": "workflow: missing check",
+                "severity": "Medium",
+            })],
+            ..SashikoPatchReviewState::default()
+        };
+        let report = "\
+- [MEDIUM] As reported by Alice on v1 [1], in src/authority.rs
+  (CanonicalMaintainersView::build), name-qualified mailmap entries are
+  skipped during maintainer indexing.
+
+[1] https://github.com/sashiko-dev/sashiko/pull/784#discussion_r123456789012345678901234567890";
+        assert!(validate_github_summary_format(report, &state).is_ok());
     }
 }
