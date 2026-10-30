@@ -3724,10 +3724,7 @@ async fn process_parsed_article(
     let maintainer_sections: Vec<sashiko::db::AttributedSubsystem> = patch_opt
         .as_ref()
         .map(|p| sashiko::maintainers::sections_for_diff(&p.diff))
-        .unwrap_or_default()
-        .into_iter()
-        .map(sashiko::db::AttributedSubsystem::from_maintainers)
-        .collect();
+        .unwrap_or_default();
 
     if group.starts_with("git-import") || group == "git-fetch" {
         let (label, email) = if let Some(url) = &mr_url {

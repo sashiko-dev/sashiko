@@ -111,18 +111,15 @@ pub async fn backfill_patchset_maintainer_sections(db: &Database) -> Result<()> 
 
 /// The union of the sections every part of this patchset touches.
 async fn sections_for_patchset(db: &Database, id: i64) -> Result<Vec<AttributedSubsystem>> {
-    let mut names: Vec<String> = Vec::new();
+    let mut sections: Vec<AttributedSubsystem> = Vec::new();
     for diff in db.patch_diffs_only(id).await? {
-        for name in crate::maintainers::sections_for_diff(&diff) {
-            if !names.contains(&name) {
-                names.push(name);
+        for section in crate::maintainers::sections_for_diff(&diff) {
+            if !sections.contains(&section) {
+                sections.push(section);
             }
         }
     }
-    Ok(names
-        .into_iter()
-        .map(AttributedSubsystem::from_maintainers)
-        .collect())
+    Ok(sections)
 }
 
 #[cfg(test)]

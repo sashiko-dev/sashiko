@@ -926,13 +926,16 @@ pub static GLOBAL_INDEX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::
 /// directory prefix, and a directory prefix names nobody. Attributing a series
 /// to a guess is worse than attributing it to no one, because the guess would
 /// silently hand the series' transcripts to whoever happened to match.
-pub fn sections_for_diff(diff: &str) -> Vec<String> {
+///
+/// The result includes upstream grant sections, marked as such, so that the
+/// maintainers holding a grant over these files get the same access.
+pub fn sections_for_diff(diff: &str) -> Vec<AttributedSubsystem> {
     let files = crate::baseline::extract_files_from_diff(diff);
     if files.is_empty() {
         return Vec::new();
     }
     match get_global_maintainers() {
-        Some(index) => index.match_files(&files),
+        Some(index) => index.attribute_files(&files),
         None => Vec::new(),
     }
 }
@@ -1343,7 +1346,11 @@ F:\t*/
         // init only fills an empty slot, so start from one.
         clear_global_maintainers();
 
-        let index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
+        let mut index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
+        index.set_upstream_grants(vec![RawUpstreamGrant {
+            section: "BTRFS FILE SYSTEM".into(),
+            paths: vec!["net/core/".into()],
+        }]);
         let arc = Arc::new(index);
         init_global_maintainers(arc.clone());
 
@@ -1359,13 +1366,13 @@ F:\t*/
                     @@ -1 +1 @@\n\
                     diff --git a/net/core/dev.c b/net/core/dev.c\n\
                     @@ -1 +1 @@\n";
-        let mut sections = sections_for_diff(diff);
-        sections.sort();
+        // Upstream grant sections follow, marked as such.
         assert_eq!(
-            sections,
+            sections_for_diff(diff),
             vec![
-                "BTRFS FILE SYSTEM".to_string(),
-                "NETWORKING [GENERAL]".to_string()
+                AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM"),
+                AttributedSubsystem::from_maintainers("NETWORKING [GENERAL]"),
+                AttributedSubsystem::from_upstream_grant("BTRFS FILE SYSTEM"),
             ]
         );
 

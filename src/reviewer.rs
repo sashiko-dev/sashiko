@@ -2662,25 +2662,19 @@ impl Reviewer {
                                         let matched_subsystems: Vec<_> = if project
                                             .uses_maintainers()
                                         {
-                                            let names = if let Some(mindex) =
+                                            if let Some(mindex) =
                                                 crate::maintainers::get_global_maintainers()
                                             {
-                                                mindex.match_files(&source_files)
+                                                mindex.attribute_files(&source_files)
                                             } else if let Ok(mindex) =
                                                 crate::maintainers::MaintainersIndex::from_top_of_trunk(
                                                     &ctx.settings.git.repository_path,
                                                 )
                                             {
-                                                mindex.match_files(&source_files)
+                                                mindex.attribute_files(&source_files)
                                             } else {
                                                 Vec::new()
-                                            };
-                                            names
-                                                .into_iter()
-                                                .map(
-                                                    crate::db::AttributedSubsystem::from_maintainers,
-                                                )
-                                                .collect()
+                                            }
                                         } else {
                                             crate::workflows::linux_bug::extract_directory_subsystems_for_project(
                                                 &source_files,
