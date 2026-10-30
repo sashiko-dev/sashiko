@@ -10566,7 +10566,8 @@ impl Database {
         let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until, p.slug, p.mr_url, p.mr_title, p.mr_number
              FROM patchsets p
-             WHERE p.status IN ('Reviewed', 'Failed') AND p.embargo_until IS NOT NULL
+             WHERE (p.status = 'Reviewed' OR (p.status = 'Failed' AND p.mr_url IS NOT NULL))
+             AND p.embargo_until IS NOT NULL
              AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
              AND (
                  p.embargo_until <= ?
@@ -10706,7 +10707,9 @@ impl Database {
     pub async fn claim_patchset_embargo_release(&self, id: i64, now: i64) -> Result<bool> {
         let sql = format!(
             "UPDATE patchsets AS p SET embargo_release_started_at = ?
-             WHERE p.id = ? AND p.status IN ('Reviewed', 'Failed') AND p.embargo_until IS NOT NULL
+             WHERE p.id = ?
+               AND (p.status = 'Reviewed' OR (p.status = 'Failed' AND p.mr_url IS NOT NULL))
+               AND p.embargo_until IS NOT NULL
                AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
                AND (p.embargo_until <= ? OR (p.status = 'Reviewed' AND ({CLEAN_PATCHSET_PREDICATE})))"
         );

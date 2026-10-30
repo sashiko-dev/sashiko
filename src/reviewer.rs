@@ -482,30 +482,32 @@ impl Reviewer {
         ctx: &ReviewContext,
         patchset: &PatchsetRow,
     ) -> Result<()> {
-        let reviews = Self::latest_completed_reviews_by_part(
-            ctx.db
-                .get_completed_reviews_for_release(patchset.id)
-                .await?,
-        );
+        if patchset.status.as_deref() == Some("Reviewed") {
+            let reviews = Self::latest_completed_reviews_by_part(
+                ctx.db
+                    .get_completed_reviews_for_release(patchset.id)
+                    .await?,
+            );
 
-        for review in reviews {
-            let ps_msg_id = patchset
-                .message_id
-                .as_deref()
-                .unwrap_or(&review.patch_message_id);
-            Self::queue_notifications(
-                ctx,
-                patchset.id,
-                Some(review.id),
-                review.patch_id,
-                &review.patch_message_id,
-                ps_msg_id,
-                review.index,
-                &review.inline_review,
-                Some(&review.findings),
-                &review.summary,
-            )
-            .await?;
+            for review in reviews {
+                let ps_msg_id = patchset
+                    .message_id
+                    .as_deref()
+                    .unwrap_or(&review.patch_message_id);
+                Self::queue_notifications(
+                    ctx,
+                    patchset.id,
+                    Some(review.id),
+                    review.patch_id,
+                    &review.patch_message_id,
+                    ps_msg_id,
+                    review.index,
+                    &review.inline_review,
+                    Some(&review.findings),
+                    &review.summary,
+                )
+                .await?;
+            }
         }
 
         ctx.db.release_embargoed_forge_outbox(patchset.id).await?;
