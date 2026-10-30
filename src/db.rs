@@ -9615,7 +9615,11 @@ impl Database {
             }
         }
 
-        nodes.sort_by_key(|n| (n.version, n.date.unwrap_or(0), n.id));
+        // Every email link points to a strictly older patchset, so posting
+        // order is chain order; version tags are not (RFC v2 -> v1 -> v2
+        // must list RFC v2 first). The version only breaks ties between
+        // revisions sharing a timestamp, such as Forge PR revisions.
+        nodes.sort_by_key(|n| (n.date.unwrap_or(0), n.version, n.id));
         Ok(nodes
             .into_iter()
             .map(|n| {
@@ -29595,6 +29599,15 @@ mod tests {
         let v2 = ingest_single(&db, author, d0 + 6 * DAY, "c@x", &subj("PATCH v2")).await;
         assert_linked(&db, v1, rfc2, "subject_author").await;
         assert_linked(&db, v2, v1, "subject_author").await;
+        // The version chain lists postings in chain order, not by tag.
+        let chain: Vec<i64> = db
+            .get_patchset_version_chain(v1, 0)
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(chain, vec![rfc2, v1, v2]);
     }
 
     /// A new version posted without changing the tag (a day later) links
