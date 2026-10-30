@@ -21,7 +21,7 @@ and a patch that violates one is a finding on its own terms.
 
 - Only extensions frozen or ratified by the RISC-V Foundation may be
   upstreamed. Support for a ratified extension must not be silently removed;
-  flag removal or disabling of ratified extension support as a blocker.
+  flag removal or disabling of ratified extension support as High severity.
 - Extension support must show a clear user: links to patches submitted to
   upstream compilers, toolchains or kernels (for example posted GCC patches).
   A series adding an extension without evidence the feature is tested and
