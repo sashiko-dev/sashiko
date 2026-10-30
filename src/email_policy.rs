@@ -1,3 +1,4 @@
+use crate::db::SeverityFloor;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -106,6 +107,40 @@ fn default_true() -> bool {
     true
 }
 
+/// Whether reviews mention pre-existing bugs that relate to the patch, and
+/// how severe such a bug must be. See
+/// designs/DESIGN_RELATED_PREEXISTING_BUGS.md.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelatedPreexistingPolicy {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_related_preexisting_min_severity")]
+    pub min_severity: SeverityFloor,
+}
+
+fn default_related_preexisting_min_severity() -> SeverityFloor {
+    SeverityFloor::High
+}
+
+impl Default for RelatedPreexistingPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_severity: default_related_preexisting_min_severity(),
+        }
+    }
+}
+
+/// Per-list override of [`RelatedPreexistingPolicy`]; unset fields fall back
+/// to `[defaults.related_preexisting]`.
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelatedPreexistingOverride {
+    pub enabled: Option<bool>,
+    pub min_severity: Option<SeverityFloor>,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct DefaultListPolicy {
@@ -125,6 +160,8 @@ pub struct DefaultListPolicy {
     pub patchwork: PatchworkPolicy,
     #[serde(default)]
     pub embargo_hours: u32,
+    #[serde(default)]
+    pub related_preexisting: RelatedPreexistingPolicy,
 }
 
 impl Default for DefaultListPolicy {
@@ -138,6 +175,7 @@ impl Default for DefaultListPolicy {
             ignored_emails: Vec::new(),
             patchwork: PatchworkPolicy::default(),
             embargo_hours: 0,
+            related_preexisting: RelatedPreexistingPolicy::default(),
         }
     }
 }
@@ -159,6 +197,8 @@ pub struct MailingListPolicy {
     #[serde(default)]
     pub patchwork: PatchworkPolicy,
     pub embargo_hours: Option<u32>,
+    #[serde(default)]
+    pub related_preexisting: RelatedPreexistingOverride,
 }
 
 pub type SubsystemPolicy = MailingListPolicy;
@@ -301,6 +341,42 @@ impl EmailPolicyConfig {
             .collect();
         groups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         groups
+    }
+
+    /// Resolves the related pre-existing bug policy for a patch addressed to
+    /// `addresses` (its To and Cc entries, bare or display-name form).
+    ///
+    /// When no configured list matches, the defaults apply. Otherwise each
+    /// matched list contributes its override (falling back to the defaults
+    /// field by field): any list that disables the feature disables it, and
+    /// the strictest severity floor wins.
+    pub fn related_preexisting_for<'a>(
+        &self,
+        addresses: impl IntoIterator<Item = &'a str>,
+    ) -> RelatedPreexistingPolicy {
+        let defaults = self.defaults.related_preexisting;
+        let addresses: Vec<String> = addresses.into_iter().map(extract_bare_email).collect();
+        let mut resolved: Option<RelatedPreexistingPolicy> = None;
+        for (list_key, list_policy) in &self.lists {
+            let list_bare = extract_bare_email(list_key);
+            if !addresses.contains(&list_bare) {
+                continue;
+            }
+            let over = list_policy.related_preexisting;
+            let enabled = over.enabled.unwrap_or(defaults.enabled);
+            let min_severity = over.min_severity.unwrap_or(defaults.min_severity);
+            resolved = Some(match resolved {
+                None => RelatedPreexistingPolicy {
+                    enabled,
+                    min_severity,
+                },
+                Some(acc) => RelatedPreexistingPolicy {
+                    enabled: acc.enabled && enabled,
+                    min_severity: acc.min_severity.max(min_severity),
+                },
+            });
+        }
+        resolved.unwrap_or(defaults)
     }
 
     /// Apply a fallback patchwork token to any enabled patchwork policy
@@ -455,6 +531,79 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("repeats its own address in `cc`"), "{err}");
+    }
+
+    #[test]
+    fn test_related_preexisting_defaults_when_unconfigured() {
+        let config = EmailPolicyConfig::parse_content("").unwrap();
+        let resolved = config.related_preexisting_for(["Dev <dev@example.org>"]);
+        assert_eq!(resolved, RelatedPreexistingPolicy::default());
+        assert!(resolved.enabled);
+        assert_eq!(resolved.min_severity, SeverityFloor::High);
+    }
+
+    #[test]
+    fn test_related_preexisting_resolution_across_lists() {
+        let config = EmailPolicyConfig::parse_content(
+            r#"
+            [defaults.related_preexisting]
+            min_severity = "Medium"
+
+            ["linux-mm@kvack.org".related_preexisting]
+            min_severity = "critical"
+
+            ["bpf@vger.kernel.org"]
+            reply_to = ["author"]
+
+            ["netdev@vger.kernel.org".related_preexisting]
+            enabled = false
+            "#,
+        )
+        .unwrap();
+
+        // No configured list matches: defaults.
+        let none = config.related_preexisting_for(["other@example.org"]);
+        assert!(none.enabled);
+        assert_eq!(none.min_severity, SeverityFloor::Medium);
+
+        // A list without an override inherits the defaults field by field.
+        let bpf = config.related_preexisting_for(["bpf@vger.kernel.org"]);
+        assert!(bpf.enabled);
+        assert_eq!(bpf.min_severity, SeverityFloor::Medium);
+
+        // The strictest floor wins, matched in display-name form.
+        let mm_bpf =
+            config.related_preexisting_for(["<bpf@vger.kernel.org>", "MM <LINUX-MM@kvack.org>"]);
+        assert!(mm_bpf.enabled);
+        assert_eq!(mm_bpf.min_severity, SeverityFloor::Critical);
+
+        // Any matched list that disables the feature disables it.
+        let net_bpf =
+            config.related_preexisting_for(["bpf@vger.kernel.org", "netdev@vger.kernel.org"]);
+        assert!(!net_bpf.enabled);
+    }
+
+    #[test]
+    fn test_related_preexisting_rejects_invalid_config() {
+        let err = EmailPolicyConfig::parse_content(
+            r#"
+            [defaults.related_preexisting]
+            min_severity = "unknown"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid severity"), "{err}");
+
+        let err = EmailPolicyConfig::parse_content(
+            r#"
+            ["bpf@vger.kernel.org".related_preexisting]
+            enable = false
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field"), "{err}");
     }
 
     #[test]
