@@ -697,6 +697,42 @@ pub(crate) fn subject_prefix_tokens(subject: &str) -> impl Iterator<Item = &str>
         .filter(|token| !token.is_empty())
 }
 
+/// Whether a subject marks its series as a request for comments.
+///
+/// Inside the leading bracketed groups, where submitters spell the tag many
+/// ways, a token counts when it is `RFC` optionally followed by a version
+/// (`[RFC PATCH v2 1/3]`, `[PATCH RFC]`, `[RFCv2 PATCH]`, `[RFC2]`). Outside
+/// them only an exact leading `RFC` word counts (`RFC: mm: ...`). Brackets
+/// after the first non-bracketed text are ignored, so a title that merely
+/// mentions an RFC document is not an RFC, and words that only start with the
+/// letters (`RFCOMM:`, `[PATCH RFCOMM]`) do not match. Matching ignores case.
+pub fn is_rfc_subject(subject: &str) -> bool {
+    let is_tag_token = |token: &str| {
+        let lower = token.to_ascii_lowercase();
+        let Some(rest) = lower.strip_prefix("rfc") else {
+            return false;
+        };
+        let digits = rest.strip_prefix('v').unwrap_or(rest);
+        rest.is_empty() || (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let mut rest = subject.trim_start();
+    while let Some(after_open) = rest.strip_prefix('[') {
+        let Some((group, after_close)) = after_open.split_once(']') else {
+            break;
+        };
+        if group
+            .split(|c: char| !c.is_alphanumeric())
+            .any(is_tag_token)
+        {
+            return true;
+        }
+        rest = after_close.trim_start();
+    }
+    rest.split(|c: char| !c.is_alphanumeric())
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("rfc"))
+}
+
 pub fn get_subject_prefixes(subject: &str) -> Vec<String> {
     let mut prefixes = Vec::new();
 
@@ -1459,6 +1495,47 @@ Body";
         let (index, total) = parse_subject_index(subject);
         assert_eq!(index, 1);
         assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn test_is_rfc_subject() {
+        for subject in [
+            "[RFC] mm: add a knob",
+            "[RFC PATCH 1/3] mm: add a knob",
+            "[PATCH RFC v2 8/8] mm: add a knob",
+            "[rfc patch] mm: add a knob",
+            "[RFC] [PATCH v3] mm: add a knob",
+            "[PATCH] [RFC] mm: add a knob",
+            "[RFC v4] mm: add a knob",
+            "  [PATCH RFC net-next] net: add a knob",
+            "[RFC-PATCH] mm: add a knob",
+            "[RFC_v2] mm: add a knob",
+            "[RFCv2 PATCH 0/4] mm: add a knob",
+            "[PATCH RFCv3 1/4] mm: add a knob",
+            "[rfcV10] mm: add a knob",
+            "[RFC2] mm: add a knob",
+            "RFC: mm: add a knob",
+            "RFC PATCH mm: add a knob",
+        ] {
+            assert!(is_rfc_subject(subject), "{subject:?} should be an RFC");
+        }
+        for subject in [
+            "[PATCH] mm: add a knob",
+            "[PATCH v1] mm: add a knob",
+            "[PATCH v5 2/3] mm: add a knob",
+            "[PATCH] Bluetooth: RFCOMM: fix a leak",
+            "[PATCH RFCOMM] fix a leak",
+            "[RFCv] mm: add a knob",
+            "RFCOMM: fix a leak",
+            "RFCv2: mm: add a knob",
+            "[PATCH] doc: describe [RFC 1234] compliance",
+            "[PATCH] net: follow RFC 9000 on retries",
+            "[PATCH-RFCish] mm: add a knob",
+            "[RFC unterminated mm: add a knob",
+            "",
+        ] {
+            assert!(!is_rfc_subject(subject), "{subject:?} should not be an RFC");
+        }
     }
 
     #[test]
