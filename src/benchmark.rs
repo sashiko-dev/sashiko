@@ -1614,6 +1614,8 @@ async fn run_benchmark_reviews(
         settings_path: options.settings_path.clone(),
         report_preexisting,
         skip_patch_ids,
+        // Each patchset's review sets this from the gate.
+        related_preexisting: Default::default(),
     };
     let reviewer = Arc::new(
         Reviewer::new(db.clone(), settings.clone())

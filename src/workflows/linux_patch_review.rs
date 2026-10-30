@@ -67,6 +67,9 @@ pub struct LinuxPatchReviewState {
     pub skip_report: bool,
     /// Retain pre-existing concerns through verification and inline report generation.
     pub report_preexisting: bool,
+    /// Look for pre-existing bugs related to the patch and report the few
+    /// that pass the selection and disclosure checks.
+    pub related_preexisting: crate::related_preexisting::RelatedPreexistingMode,
 
     /// Target project identifier (e.g. "linux" or "sashiko") used for finding UUID prefixes.
     pub project: String,

@@ -27,6 +27,7 @@ use sashiko::local_review::{
 };
 use sashiko::project::ProjectId;
 use sashiko::prompt_bundle;
+use sashiko::related_preexisting::RelatedPreexistingMode;
 #[cfg(feature = "server")]
 use sashiko::reviewer::Reviewer;
 use sashiko::settings::{EffortMode, Overrides, Settings};
@@ -259,6 +260,10 @@ enum Commands {
         /// Include pre-existing bugs in verification and report generation
         #[arg(long, hide = true)]
         report_preexisting: bool,
+
+        /// Look for related pre-existing bugs at or above this severity
+        #[arg(long, hide = true, conflicts_with = "report_preexisting")]
+        related_preexisting_min_severity: Option<sashiko::db::SeverityFloor>,
     },
 
     /// Clone or refresh the tree the daemon reviews
@@ -599,6 +604,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 custom_prompt,
                 agent,
                 report_preexisting,
+                related_preexisting_min_severity,
                 ..
             } => {
                 std::panic::set_hook(Box::new(|info| {
@@ -626,6 +632,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         current_tree: false,
                         agent: *agent,
                         report_preexisting: *report_preexisting,
+                        related_preexisting: RelatedPreexistingMode::from_min_severity(
+                            *related_preexisting_min_severity,
+                        ),
                     },
                     &settings,
                 )
@@ -5253,6 +5262,49 @@ mod tests {
     #[test]
     fn test_unknown_project_is_rejected_by_the_parser() {
         assert!(Cli::try_parse_from(["sashiko", "--project", "freebsd"]).is_err());
+    }
+
+    #[test]
+    fn test_worker_parses_the_related_preexisting_floor() {
+        let cli = Cli::try_parse_from([
+            "sashiko",
+            "worker",
+            "--related-preexisting-min-severity",
+            "High",
+        ])
+        .unwrap();
+        let Some(Commands::Worker {
+            related_preexisting_min_severity,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected the worker subcommand");
+        };
+        assert_eq!(
+            related_preexisting_min_severity,
+            Some(sashiko::db::SeverityFloor::High)
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "sashiko",
+                "worker",
+                "--related-preexisting-min-severity",
+                "unknown",
+            ])
+            .is_err()
+        );
+        // Reporting every pre-existing bug and only related ones are exclusive.
+        assert!(
+            Cli::try_parse_from([
+                "sashiko",
+                "worker",
+                "--report-preexisting",
+                "--related-preexisting-min-severity",
+                "high",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
