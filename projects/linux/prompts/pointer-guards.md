@@ -13,7 +13,7 @@ in one guard does not mean you can skip analyzing remaining guards or steps.
 NEVER skip analyzing a guard because it seems "obviously irrelevant" to the
 target pointer. Analyze every guard before concluding it provides no protection.
 
-Place each step defined below into TodoWrite.
+Place each step defined below on a checklist.
 
 **Background knowledge:**
 
@@ -50,7 +50,7 @@ Misunderstanding what constitutes a dereference causes false positives.
    - `if (foo)` protects dereferencing `foo`
    - `if (foo && foo->bar)` protects dereferencing both `foo` and `foo->bar`
 
-## TodoWrite Template
+## Checklist Template
 
 For each guard, create entries tracking:
 - Variables accessed by guard
@@ -72,7 +72,7 @@ For EACH guard in order (never skip):
 - Load full definition if it's a helper function
 - Identify what state the guard checks (variable/field names)
 - Output guard name, location, line of code describing the guard
-- Add to TodoWrite per template above
+- Add to the checklist per template above
 
 You've reached the end of step one.  At this point you're going to want to
 jump to conclusions and skip the entire rest of this prompt.  You don't have
@@ -110,16 +110,16 @@ Process guards in order starting with Guard 1.
             guard coupling often happens higher up in the callchain.
 
 For EACH guard in order (do not skip to later guards):
-- Add to TodoWrite: every variable accessed by the guard
+- Add to the checklist: every variable accessed by the guard
   - Output: each variable found
 
-- Add to TodoWrite: EVERY function that writes to those variables
+- Add to the checklist: EVERY function that writes to those variables
   - Load the definition of these functions
   - Output: function name, random line of code inside the function
-- Add to TodoWrite: The callers of EVERY function that writes to those variables
+- Add to the checklist: The callers of EVERY function that writes to those variables
   - Read the definition of these functions
   - Output: each function name, random line of code from each function
-- Add to TodoWrite: The callees of EVERY function that writes to those variables
+- Add to the checklist: The callees of EVERY function that writes to those variables
   - Read the definition of these functions
   - Output: each function name, random line of code from each function
 - Document the full meaning of the guard based on setter analysis
@@ -144,7 +144,7 @@ For each guard in numbered order, determine coupling:
 
 2. **Check NULL assignment paths**:
    - Find where target pointer is set to NULL
-   - Add each location to TodoWrite
+   - Add each location to the checklist
      - Output: location, line of code
    - Is guard state cleared before/when pointer set NULL?
    - If guard cleared first (or same time under locks): Coupling maintained
@@ -159,7 +159,7 @@ For each guard in numbered order, determine coupling:
    - Does it use the same guard?
    - REQUIRED: Verify context is identical (locks, calling context, subsystem state)
      - Output: guard being compared, context evaluation
-   - If contexts differ: Guard may still be valid (add to TodoWrite)
+   - If contexts differ: Guard may still be valid (add to the checklist)
    - If same context + same guard + NULL check exists: Coupling likely broken
    - Output: analysis for this guard (1 sentence conclusion)
 
