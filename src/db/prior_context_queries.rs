@@ -505,14 +505,14 @@ impl Database {
             let Some(mut anc_row) = self.fetch_chain_patchset_row(anc_id).await? else {
                 break;
             };
-            if anc_row.previous_patchset_id.is_none()
-                && anc_row.stored_version.is_none()
-                && anc_row.mr_number.is_none()
-                && crate::patch::parse_subject_version(&anc_row.subject).unwrap_or(1) > 1
-                && self
-                    .reconcile_ancestor_version_lineage(anc_id)
-                    .await
-                    .is_ok()
+            if super::needs_lazy_lineage(
+                anc_row.previous_patchset_id,
+                anc_row.stored_version.is_some(),
+                anc_row.mr_number,
+            ) && self
+                .reconcile_ancestor_version_lineage(anc_id)
+                .await
+                .is_ok()
             {
                 anc_row.previous_patchset_id =
                     self.get_previous_patchset_id(anc_id).await.unwrap_or(None);
