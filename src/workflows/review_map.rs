@@ -309,6 +309,44 @@ fn static_stage_guides(project: ProjectId, stage_name: &str) -> Vec<String> {
     guides
 }
 
+fn extract_xml_attr<'a>(line: &'a str, tag_prefix: &str, attr: &str) -> Option<&'a str> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with(tag_prefix) {
+        return None;
+    }
+    let needle = format!("{attr}=\"");
+    let start = trimmed.find(&needle)? + needle.len();
+    let rest = &trimmed[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].trim()).filter(|s| !s.is_empty())
+}
+
+fn extract_maintainer_notes(block: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    for line in block.lines() {
+        if let Some(sub) = extract_xml_attr(line, "<maintainer_note ", "subsystem") {
+            push_unique(&mut notes, sub);
+        }
+    }
+    notes
+}
+
+fn extract_code_notes(block: &str) -> (Option<String>, Vec<String>) {
+    let mut set_name = None;
+    let mut units = Vec::new();
+    for line in block.lines() {
+        if set_name.is_none()
+            && let Some(s) = extract_xml_attr(line, "<code_notes ", "set")
+        {
+            set_name = Some(s.to_string());
+        }
+        if let Some(unit) = extract_xml_attr(line, "<unit_note ", "unit") {
+            push_unique(&mut units, unit);
+        }
+    }
+    (set_name, units)
+}
+
 fn build_prompts_manifest(
     project: ProjectId,
     state: &LinuxPatchReviewState,
@@ -338,6 +376,8 @@ fn build_prompts_manifest(
             push_unique(&mut pre_screen, trimmed);
         }
     }
+    let maintainer_notes = extract_maintainer_notes(&state.maintainer_notes);
+    let (code_notes_set, code_notes) = extract_code_notes(&state.code_notes);
 
     let mut stage_guides_map = serde_json::Map::new();
     let mut tool_read_by_path: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -367,6 +407,9 @@ fn build_prompts_manifest(
     json!({
         "base": base,
         "pre_screen": pre_screen,
+        "maintainer_notes": maintainer_notes,
+        "code_notes": code_notes,
+        "code_notes_set": code_notes_set,
         "stage_guides": stage_guides_map,
         "tool_read": tool_read,
     })
@@ -1625,6 +1668,26 @@ mod tests {
         assert_eq!(
             state.prior_resolutions[0]["also_found_by_sashiko"], false,
             "A PC1 concern contested only by a fresh stage's D1 dismissal was not found by a fresh Sashiko stage"
+        );
+    }
+
+    #[test]
+    fn test_build_prompts_manifest_extracts_maintainer_and_code_notes() {
+        let state = LinuxPatchReviewState {
+            project: "linux".to_string(),
+            maintainer_notes: "\n\n<maintainer_notes>\n<maintainer_note subsystem=\"General\">\n- rule\n</maintainer_note>\n<maintainer_note subsystem=\"Networking Drivers\">\n- net rule\n</maintainer_note>\n</maintainer_notes>".to_string(),
+            code_notes: "\n\n<code_notes set=\"7.3\" revision=\"v6.18\">\n<unit_note unit=\"NETWORKING DRIVERS — drivers/net (part 3)\" reason=\"touched_files\">\n- note\n</unit_note>\n</code_notes>".to_string(),
+            ..Default::default()
+        };
+        let map = build_review_map(ProjectId::Linux, &state, &[], 0);
+        assert_eq!(
+            map["prompts"]["maintainer_notes"],
+            json!(["General", "Networking Drivers"])
+        );
+        assert_eq!(map["prompts"]["code_notes_set"], json!("7.3"));
+        assert_eq!(
+            map["prompts"]["code_notes"],
+            json!(["NETWORKING DRIVERS — drivers/net (part 3)"])
         );
     }
 }

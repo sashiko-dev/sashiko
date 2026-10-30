@@ -6074,6 +6074,23 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const prompts = reviewMap.prompts || {};
             const preScreenPrompts = Array.isArray(prompts.pre_screen) ? prompts.pre_screen : [];
             const stageGuidesObj = (prompts.stage_guides && typeof prompts.stage_guides === 'object') ? prompts.stage_guides : {};
+            let maintainerNotes = Array.isArray(prompts.maintainer_notes) ? prompts.maintainer_notes.filter(Boolean).map(String) : [];
+            let codeNotes = Array.isArray(prompts.code_notes) ? prompts.code_notes.filter(Boolean).map(String) : [];
+            let codeNotesSet = typeof prompts.code_notes_set === 'string' && prompts.code_notes_set.trim() ? prompts.code_notes_set.trim() : '';
+            if (maintainerNotes.length === 0 && codeNotes.length === 0 && logs.length > 0) {
+                const sysEntry = logs.find(l => l && String(l.role || '').toLowerCase() === 'system' && typeof l.content === 'string');
+                if (sysEntry) {
+                    const sysText = sysEntry.content;
+                    for (const m of sysText.matchAll(/<maintainer_note\s+subsystem="([^"]+)"/g)) {
+                        if (m[1] && !maintainerNotes.includes(m[1])) maintainerNotes.push(m[1]);
+                    }
+                    const setMatch = sysText.match(/<code_notes\s+set="([^"]+)"/);
+                    if (setMatch && setMatch[1]) codeNotesSet = setMatch[1];
+                    for (const m of sysText.matchAll(/<unit_note\s+unit="([^"]+)"/g)) {
+                        if (m[1] && !codeNotes.includes(m[1])) codeNotes.push(m[1]);
+                    }
+                }
+            }
 
             const renderStageLogLink = (stageName, label = 'View stage log') => {
                 if (!stageName || !stageIdxByName.has(String(stageName))) return '';
@@ -6668,6 +6685,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <div class="kv"><div class="label">Model:</div><div>${escapeHtml(providerModel)}</div></div>
                     <div class="kv"><div class="label">Tokens:</div><div>In: ${formatTokenCount(tokensIn)} &middot; Cached: ${formatTokenCount(tokensCached)} &middot; Out: ${formatTokenCount(tokensOut)}</div></div>
                     ${promptsHash ? `<div class="kv"><div class="label">Sashiko ver.:</div><div>${escapeHtml(promptsHash)}</div></div>` : ''}
+                    ${maintainerNotes.length > 0 ? `<div class="kv"><div class="label">Maintainer notes:</div><div>${maintainerNotes.map(n => `<span class="tag">${escapeHtml(n)}</span>`).join('')}</div></div>` : ''}
+                    ${codeNotes.length > 0 ? `<div class="kv"><div class="label">Code notes${codeNotesSet ? ` (${escapeHtml(codeNotesSet)})` : ''}:</div><div>${codeNotes.map(n => `<span class="tag">${escapeHtml(n)}</span>`).join('')}</div></div>` : ''}
                 </div>
 
                 <div class="section">
