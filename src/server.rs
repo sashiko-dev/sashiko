@@ -1812,18 +1812,15 @@ async fn analyze_bug(
     if payload.subsystems.is_empty() && !payload.source_files.is_empty() {
         if project.uses_maintainers() {
             let matched = if let Some(mindex) = crate::maintainers::get_global_maintainers() {
-                mindex.match_files(&payload.source_files)
+                mindex.attribute_files(&payload.source_files)
             } else if let Ok(mindex) = crate::maintainers::MaintainersIndex::from_top_of_trunk(
                 &state.settings.git.repository_path,
             ) {
-                mindex.match_files(&payload.source_files)
+                mindex.attribute_files(&payload.source_files)
             } else {
                 Vec::new()
             };
-            payload.subsystems = matched
-                .into_iter()
-                .map(crate::db::AttributedSubsystem::from_maintainers)
-                .collect();
+            payload.subsystems = matched;
         } else {
             payload.subsystems =
                 crate::workflows::linux_bug::extract_directory_subsystems_for_project(

@@ -1470,10 +1470,7 @@ async fn persist_benchmark_patch(
     .await?;
 
     let sid = db.ensure_subsystem("from git", "git-import").await?;
-    let maintainer_sections: Vec<AttributedSubsystem> = crate::maintainers::sections_for_diff(diff)
-        .into_iter()
-        .map(AttributedSubsystem::from_maintainers)
-        .collect();
+    let maintainer_sections: Vec<AttributedSubsystem> = crate::maintainers::sections_for_diff(diff);
 
     let patchset_id = db
         .create_patchset(
@@ -2046,10 +2043,7 @@ async fn ingest_raw_mbox_messages(
         let maintainer_sections: Vec<AttributedSubsystem> = patch_opt
             .as_ref()
             .map(|p| crate::maintainers::sections_for_diff(&p.diff))
-            .unwrap_or_default()
-            .into_iter()
-            .map(AttributedSubsystem::from_maintainers)
-            .collect();
+            .unwrap_or_default();
 
         if let Some(patchset_id) = db
             .create_patchset(

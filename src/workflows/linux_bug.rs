@@ -716,6 +716,24 @@ pub fn extract_directory_subsystems_for_project(
     }
 }
 
+/// The subsystem names that describe a bug for similarity search and the
+/// deduplication prompt.
+///
+/// Upstream grant sections are left out: they only widen who may see the bug
+/// and are never part of its hydrated subsystems, so including them would
+/// skew the query vector against the stored ones and show the dedup model
+/// sections the bug does not belong to. A grant section that also matched
+/// through MAINTAINERS is still kept, once, through that match.
+fn similarity_subsystem_names(subsystems: &[AttributedSubsystem]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for sub in subsystems {
+        if sub.source != crate::db::SubsystemSource::UpstreamGrant && !names.contains(&sub.name) {
+            names.push(sub.name.clone());
+        }
+    }
+    names
+}
+
 /// Resolves the subsystems to record against a bug, retaining where each name
 /// came from.
 ///
@@ -744,29 +762,34 @@ fn resolve_official_subsystems_for_project(
     verified_files: &[String],
     project: ProjectId,
 ) -> Vec<AttributedSubsystem> {
-    let from_index = |index: &crate::maintainers::MaintainersIndex| {
-        let matched = index.match_files(verified_files);
-        (!matched.is_empty()).then(|| {
-            matched
-                .into_iter()
-                .map(AttributedSubsystem::from_maintainers)
-                .collect::<Vec<_>>()
-        })
-    };
     let from_paths = || {
         extract_directory_subsystems_for_project(verified_files, project)
             .into_iter()
             .map(AttributedSubsystem::from_path_prefix)
             .collect::<Vec<_>>()
     };
+    // MAINTAINERS matches plus upstream grant sections. Without a single
+    // MAINTAINERS match the directory prefixes are added for display, as
+    // before; grant sections are kept either way, since they are what lets
+    // an upstream maintainer see the bug at all.
+    let from_index = |index: &crate::maintainers::MaintainersIndex| {
+        let mut attributed = index.attribute_files(verified_files);
+        if !attributed
+            .iter()
+            .any(|s| s.source == crate::db::SubsystemSource::MaintainersSection)
+        {
+            attributed.splice(0..0, from_paths());
+        }
+        attributed
+    };
 
     if project.uses_maintainers() {
         if let Some(tb) = tools {
             return match crate::maintainers::get_global_maintainers() {
-                Some(index) => from_index(&index).unwrap_or_else(from_paths),
+                Some(index) => from_index(&index),
                 None => {
                     match crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path()) {
-                        Ok(index) => from_index(&index).unwrap_or_else(from_paths),
+                        Ok(index) => from_index(&index),
                         Err(_) => from_paths(),
                     }
                 }
@@ -778,7 +801,7 @@ fn resolve_official_subsystems_for_project(
         }
 
         return match crate::maintainers::get_global_maintainers() {
-            Some(index) => from_index(&index).unwrap_or_else(from_paths),
+            Some(index) => from_index(&index),
             None => from_paths(),
         };
     }
@@ -2588,8 +2611,7 @@ pub async fn process_issue_worker_for_project(
         &verified_files,
         project,
     );
-    let official_subsystem_names: Vec<String> =
-        official_subsystems.iter().map(|s| s.name.clone()).collect();
+    let official_subsystem_names = similarity_subsystem_names(&official_subsystems);
 
     let title_prefix = extract_title_prefix(&norm.canonical_title);
 
@@ -5439,6 +5461,21 @@ Call Trace:
         let resolved = resolve_official_subsystems(None, &caller, &files);
         assert_eq!(resolved, caller);
         assert!(resolved.iter().all(|s| !s.source.confers_authority()));
+    }
+
+    #[test]
+    fn test_similarity_subsystem_names_skip_upstream_grants() {
+        let attributed = vec![
+            AttributedSubsystem::from_maintainers("ARM/QUALCOMM SUPPORT"),
+            AttributedSubsystem::from_maintainers("ARM/QUALCOMM SUPPORT"),
+            AttributedSubsystem::from_path_prefix("arch/arm64"),
+            AttributedSubsystem::from_upstream_grant("ARM/SOC SUPPORT"),
+            AttributedSubsystem::from_upstream_grant("ARM/QUALCOMM SUPPORT"),
+        ];
+        assert_eq!(
+            similarity_subsystem_names(&attributed),
+            vec!["ARM/QUALCOMM SUPPORT".to_string(), "arch/arm64".to_string()]
+        );
     }
 
     #[test]
