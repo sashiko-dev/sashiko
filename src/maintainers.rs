@@ -53,8 +53,12 @@ impl CompiledPattern {
         let pattern = raw_pattern.trim().trim_start_matches("./");
         let depth = pattern.matches('/').count();
 
-        if pattern.ends_with("/*") {
-            let dir_prefix = pattern.strip_suffix('*').unwrap().to_string();
+        // The prefix shortcut requires a literal parent directory. Wildcards
+        // in earlier components still need the general glob matcher.
+        if let Some(parent) = pattern.strip_suffix("/*")
+            && !parent.contains(['*', '?'])
+        {
+            let dir_prefix = format!("{parent}/");
             CompiledPattern::DirSingleLevel { dir_prefix, depth }
         } else if pattern.ends_with('/') {
             CompiledPattern::PrefixDir {
@@ -988,6 +992,73 @@ F:	*/
         assert_eq!(
             btrfs.maintainer_addresses().collect::<Vec<_>>(),
             vec!["clm@fb.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_directory_globs_with_wildcard_parents() {
+        // Expected membership comes from MAINTAINERS' path-component rules:
+        // a single '*' or '?' cannot cross '/', whereas '**' can.
+        for (pattern, path, expected) in [
+            ("arch/*/net/*", "arch/arm64/net/bpf_jit_comp.c", true),
+            ("arch/*/net/*", "arch/arm64/net/subdir/helper.c", false),
+            ("arch/*/net/*", "arch/vendor/arm64/net/helper.c", false),
+            ("arch/*/net/*", "drivers/arm64/net/helper.c", false),
+            ("arch/*/events/*/*", "arch/x86/events/intel/core.c", true),
+            ("arch/*/events/*/*", "arch/x86/events/core.c", false),
+            ("arch/arm?/net/*", "arch/arm64/net/jit.c", false),
+            ("arch/arm?/net/*", "arch/arm8/net/jit.c", true),
+            ("arch/**/net/*", "arch/vendor/arm64/net/jit.c", true),
+            ("arch/x86/events/*", "arch/x86/events/core.c", true),
+            ("arch/x86/events/*", "arch/x86/events/intel/core.c", false),
+        ] {
+            assert_eq!(
+                CompiledPattern::compile(pattern).is_match(path),
+                expected,
+                "{pattern:?} against {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wildcard_parents_attribute_subsystems_and_respect_exclusions() {
+        // The F: patterns are used by Linux's BPF and performance sections.
+        // The synthetic X: entry exercises the same matcher for exclusions.
+        let fixture = "Maintainers List\n\n\
+BPF\n\
+L: bpf@example.org\n\
+F: arch/*/net/*\n\n\
+PERFORMANCE EVENTS\n\
+L: perf@example.org\n\
+F: arch/*/events/*\n\
+F: arch/*/events/*/*\n\
+X: arch/*/events/private/*\n";
+        let index = MaintainersIndex::from_reader(fixture.as_bytes()).unwrap();
+
+        for (path, expected) in [
+            ("arch/arm64/net/bpf_jit_comp.c", vec!["BPF"]),
+            ("arch/x86/events/core.c", vec!["PERFORMANCE EVENTS"]),
+            ("arch/x86/events/intel/core.c", vec!["PERFORMANCE EVENTS"]),
+            ("arch/x86/events/private/internal.c", vec![]),
+            ("arch/x86/events/intel/deeper/core.c", vec![]),
+            ("arch/arm64/net/subdir/helper.c", vec![]),
+        ] {
+            assert_eq!(index.match_file(path), expected, "{path}");
+        }
+        assert_eq!(
+            index.match_files([
+                "arch/x86/events/core.c",
+                "arch/x86/events/intel/core.c",
+                "arch/arm64/net/bpf_jit_comp.c",
+            ]),
+            vec!["PERFORMANCE EVENTS", "BPF"]
+        );
+        assert_eq!(
+            index.match_mailing_lists([
+                "arch/x86/events/private/internal.c",
+                "arch/arm64/net/bpf_jit_comp.c",
+            ]),
+            vec!["bpf@example.org"]
         );
     }
 
