@@ -39,6 +39,16 @@ symbols = [
 - **Narrow suppression preconditions:** Any rule instructing reviewers not to
   report a pattern must state the exact preconditions under which the pattern is
   safe so real bugs are not blanket-suppressed.
+- **Consistent severity terms:** When a maintainer note sets, raises, or caps
+  the severity of an issue, it must use exactly the four levels Sashiko
+  reports: Low, Medium, High, and Critical, as defined in the project's
+  `severity.md`. Flag any other priority vocabulary used to rank an issue,
+  such as "nit", "minor", "major", "blocker", "serious", "urgent", "P0"-"P3",
+  or "must fix", and ask for the matching level instead (for example "report
+  it as Low" rather than "it is a nit"). The reviewing model has to map every
+  finding onto one of the four levels, and other terms leave that mapping to
+  guesswork. Rules that only decide whether a pattern is reported at all
+  ("do not report", "report it as a bug") need no severity level.
 
 ## Code Notes (`projects/*/prompts/notes/` and `src/notes/`)
 
