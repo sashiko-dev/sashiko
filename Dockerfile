@@ -63,7 +63,6 @@ COPY --from=builder /app /usr/local/bin
 COPY Settings.toml /app/Settings.toml
 COPY projects /app/projects
 RUN ln -s /app/projects/linux/mailing_lists.toml /app/email_policy.toml
-COPY third_party/prompts /app/third_party/prompts
 COPY static /app/static
 
 # Copy entrypoint script
