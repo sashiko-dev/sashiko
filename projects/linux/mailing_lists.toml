@@ -386,3 +386,6 @@ reply_to = ["author", "list", "recipients"]
 
 ["sparclinux@vger.kernel.org"]
 reply_to = ["author", "list"]
+
+["printk@lists.linux.dev"]
+reply_to = ["author", "list", "recipients"]
