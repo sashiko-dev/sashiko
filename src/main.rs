@@ -1248,7 +1248,12 @@ async fn run_daemon(
     });
 
     // DB Worker (Transactional Batching)
-    let worker_db = db.clone();
+    let worker_db = db.with_auto_review(settings.review.auto_review);
+    if !settings.review.auto_review {
+        info!(
+            "Automatic reviews disabled (review.auto_review = false); completed patchsets wait in Awaiting Review until a manual rerun"
+        );
+    }
     let mapping = settings.subsystems.mapping.clone();
     let email_policy_path = settings.review.email_policy_path.clone();
     let review_settings = settings.review.clone();

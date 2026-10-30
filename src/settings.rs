@@ -1067,6 +1067,9 @@ fn default_batch_window_secs() -> u64 {
 #[allow(unused)]
 pub struct ReviewSettings {
     pub concurrency: usize,
+    /// Whether completed patchsets are queued for review automatically.
+    #[serde(default = "default_true")]
+    pub auto_review: bool,
     /// Parent directory for the worktrees a review worker checks patches out
     /// into, or None for one under the system temporary directory.
     ///
