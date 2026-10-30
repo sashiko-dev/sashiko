@@ -125,7 +125,9 @@ sashiko-cli show [OPTIONS] [ID]
 
 ### rerun
 
-Request a re-review of a completed patchset.
+Request a re-review of a completed patchset. When the daemon runs with
+`review.auto_review = false`, this is also how an operator starts the first
+review of a patchset sitting in the `Awaiting Review` status.
 
 ```
 sashiko-cli rerun <ID>

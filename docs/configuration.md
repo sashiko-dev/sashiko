@@ -401,6 +401,7 @@ pass.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `concurrency` | integer | -- | Number of concurrent reviews. Required: a file without it fails to load. |
+| `auto_review` | bool | `true` | Queue completed patchsets for review automatically. When `false`, a fully ingested patchset waits in the `Awaiting Review` status until an operator starts the review with `sashiko-cli rerun <ID>` (or `POST /api/patchset/rerun`). |
 | `worktree_dir` | string | -- | Directory for git worktrees used during daemon reviews. The daemon empties it on startup, so it must hold nothing else. |
 | `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). Idle wait time spent parked on shared rate limits (RPS/TPM pacing or 429 backoff) while no requests of this review are in flight is credited back to the deadline. |
 | `max_retries` | integer | `3` | Retry count on transient failures. |

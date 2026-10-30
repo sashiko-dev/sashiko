@@ -203,6 +203,7 @@ pub struct Database {
     bug_model: Option<String>,
     bug_claim: Option<BugAnalysisClaim>,
     patchset_claim: Option<PatchsetReviewClaim>,
+    auto_review: bool,
 }
 
 /// Guards an open transaction on the transaction `libsql::Connection` so
@@ -2004,6 +2005,7 @@ impl Database {
             bug_model: model,
             bug_claim: self.bug_claim.clone(),
             patchset_claim: self.patchset_claim,
+            auto_review: self.auto_review,
         }
     }
 
@@ -2019,6 +2021,7 @@ impl Database {
             bug_model: self.bug_model.clone(),
             bug_claim: self.bug_claim.clone(),
             patchset_claim: self.patchset_claim,
+            auto_review: self.auto_review,
         }
     }
 
@@ -2037,6 +2040,7 @@ impl Database {
                 owner: owner.into(),
             }),
             patchset_claim: self.patchset_claim,
+            auto_review: self.auto_review,
         }
     }
 
@@ -2056,6 +2060,33 @@ impl Database {
                 patchset_id,
                 generation,
             }),
+            auto_review: self.auto_review,
+        }
+    }
+
+    /// Scopes whether fully ingested patchsets are queued for review
+    /// automatically or wait in Awaiting Review for a manual rerun.
+    pub fn with_auto_review(&self, auto_review: bool) -> Self {
+        Self {
+            conn: self.conn.clone(),
+            tx_conn: self.tx_conn.clone(),
+            tx_lock: self.tx_lock.clone(),
+            in_transaction: self.in_transaction,
+            bug_actor: self.bug_actor.clone(),
+            bug_tool: self.bug_tool.clone(),
+            bug_model: self.bug_model.clone(),
+            bug_claim: self.bug_claim.clone(),
+            patchset_claim: self.patchset_claim,
+            auto_review,
+        }
+    }
+
+    /// The status a patchset lands in once its last part arrives.
+    fn completion_status(&self) -> &'static str {
+        if self.auto_review {
+            ReviewStatus::Pending.as_str()
+        } else {
+            ReviewStatus::AwaitingReview.as_str()
         }
     }
 
@@ -2599,6 +2630,7 @@ impl Database {
             bug_model: None,
             bug_claim: None,
             patchset_claim: None,
+            auto_review: true,
         })
     }
 
@@ -7971,12 +8003,15 @@ impl Database {
         // Conversely, if unversioned patches arrived first (existing_version is None,
         // existing_subject_index > 0) and an explicit versioned cover letter or patch
         // arrives from the same git send-email batch (or direct reply to the cover letter),
-        // allow them to merge.
+        // allow them to merge. Awaiting Review counts alongside Pending: it is the
+        // same "complete but not yet reviewed" state with review.auto_review off.
         if existing_version.is_none() && new_version.is_some() {
             return existing_subject_index > 0
                 && (existing_status == "Incomplete"
                     || existing_status == "Fetching"
-                    || (new_part_index == 0 && existing_status == "Pending"))
+                    || (new_part_index == 0
+                        && (existing_status == "Pending"
+                            || existing_status == "Awaiting Review")))
                 && same_batch_or_reply;
         }
 
@@ -8573,8 +8608,8 @@ impl Database {
                     .await?;
 
                 self.execute(
-                    "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
-                    libsql::params![id],
+                    "UPDATE patchsets SET status = ? WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
+                    libsql::params![self.completion_status(), id],
                 ).await?;
 
                 return Ok(Some(id));
@@ -9349,8 +9384,8 @@ impl Database {
             .await?;
 
             self.execute(
-                "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
-                libsql::params![target_id],
+                "UPDATE patchsets SET status = ? WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
+                libsql::params![self.completion_status(), target_id],
             ).await?;
 
             return Ok(Some(target_id));
@@ -9467,6 +9502,7 @@ impl Database {
                 part_index,
                 diff_to_write,
                 selected_patch_id,
+                self.completion_status(),
             )
             .await?
             {
@@ -9482,6 +9518,7 @@ impl Database {
         bail!("patch {message_id} changed during {PATCH_WRITE_MAX_ATTEMPTS} write attempts")
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn write_patch_transaction(
         tx: DatabaseTransaction,
         old_patch: Option<StoredPatchState>,
@@ -9490,6 +9527,7 @@ impl Database {
         part_index: u32,
         diff: libsql::Value,
         git_patch_id: Option<String>,
+        completion_status: &'static str,
     ) -> Result<PatchWriteOutcome> {
         if old_patch.is_none() {
             let collision_exists = {
@@ -9556,8 +9594,8 @@ impl Database {
         .await?;
 
         tx.execute(
-            "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
-            libsql::params![patchset_id],
+            "UPDATE patchsets SET status = ? WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
+            libsql::params![completion_status, patchset_id],
         )
         .await?;
 
@@ -12114,9 +12152,9 @@ impl Database {
 
     pub async fn cancel_patchset(&self, id: i64, force: bool) -> Result<bool> {
         let allowed_statuses = if force {
-            "('Fetching', 'Pending', 'Incomplete', 'In Review')"
+            "('Fetching', 'Pending', 'Awaiting Review', 'Incomplete', 'In Review')"
         } else {
-            "('Fetching', 'Pending', 'Incomplete')"
+            "('Fetching', 'Pending', 'Awaiting Review', 'Incomplete')"
         };
         let tx_guard = if self.in_transaction {
             None
@@ -17849,6 +17887,263 @@ mod tests {
         db.create_patch(ps_id, "msg_2", 2, "diff").await.unwrap();
         let list = db.get_patchsets(1, 0, None, None).await.unwrap();
         assert_eq!(list[0].status.as_deref(), Some("Pending"));
+    }
+
+    /// When review.auto_review = false a completed patchset must wait in
+    /// Awaiting Review until it is manually rerun.
+    #[tokio::test]
+    async fn test_manual_review_patchset_awaits_rerun() {
+        let db = setup_db().await;
+        let db = db.with_auto_review(false);
+        let thread_id = db
+            .create_thread("root_manual", "Manual Review Test", 60000)
+            .await
+            .unwrap();
+        let author = "Manual Author <manual@example.com>";
+
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_manual",
+                "Manual Review Test",
+                author,
+                60000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_message(
+            "msg_manual",
+            thread_id,
+            None,
+            author,
+            "Manual Review Test",
+            60000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch(ps_id, "msg_manual", 1, "diff")
+            .await
+            .unwrap();
+
+        // Complete but waiting on an operator: invisible to the Reviewer.
+        let list = db.get_patchsets(1, 0, None, None).await.unwrap();
+        assert_eq!(list[0].status.as_deref(), Some("Awaiting Review"));
+        assert!(db.get_pending_patchsets(10).await.unwrap().is_empty());
+        assert!(!db.claim_patchset_for_review(ps_id).await.unwrap());
+
+        // A rerun is the manual trigger that queues the review; it is the
+        // first review, not a re-review, so the count stays put.
+        db.rerun_patchset(ps_id).await.unwrap();
+        let list = db.get_patchsets(1, 0, None, None).await.unwrap();
+        assert_eq!(list[0].status.as_deref(), Some("Pending"));
+        assert_eq!(db.get_pending_patchsets(10).await.unwrap()[0].id, ps_id);
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT target_review_count FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        let count: Option<u32> = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count.unwrap_or(1), 1);
+
+        // A series that is still waiting can be withdrawn without force.
+        let thread_id = db
+            .create_thread("root_manual_cancel", "Manual Cancel Test", 60001)
+            .await
+            .unwrap();
+        let ps_cancel = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_manual_cancel",
+                "Manual Cancel Test",
+                author,
+                60001,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_message(
+            "msg_manual_cancel",
+            thread_id,
+            None,
+            author,
+            "Manual Cancel Test",
+            60001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch(ps_cancel, "msg_manual_cancel", 1, "diff")
+            .await
+            .unwrap();
+        let list = db
+            .get_patchsets(2, 0, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.id == ps_cancel)
+            .collect::<Vec<_>>();
+        assert_eq!(list[0].status.as_deref(), Some("Awaiting Review"));
+        assert!(db.cancel_patchset(ps_cancel, false).await.unwrap());
+        let list = db
+            .get_patchsets(2, 0, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.id == ps_cancel)
+            .collect::<Vec<_>>();
+        assert_eq!(list[0].status.as_deref(), Some("Cancelled"));
+    }
+
+    /// With review.auto_review = false, unversioned patches that complete a
+    /// series flip it to Awaiting Review. A versioned cover letter from the
+    /// same git send-email batch that arrives afterwards must still attach to
+    /// it, exactly like it would attach to a Pending series.
+    #[tokio::test]
+    async fn test_late_versioned_cover_attaches_to_awaiting_review_series() {
+        let db = setup_db().await;
+        let db = db.with_auto_review(false);
+        let author = "Batch Author <batch@example.com>";
+        // git send-email stamps one timestamp prefix per batch; a prefix
+        // longer than ten characters is the same-batch signal.
+        let prefix = "20261103t0512000001";
+        let msgid = |n: u32| format!("{prefix}-{n}-batch@example.com");
+        let thread_id = db
+            .create_thread(&msgid(1), "Batch Series", 61000)
+            .await
+            .unwrap();
+
+        // Patches 1/2 and 2/2 arrive first, without a version tag.
+        let mut ps_id = None;
+        for (part, subj) in [(1, "[PATCH 1/2] One"), (2, "[PATCH 2/2] Two")] {
+            db.create_message(
+                &msgid(part),
+                thread_id,
+                None,
+                author,
+                subj,
+                61000 + i64::from(part),
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let id = db
+                .create_patchset(
+                    thread_id,
+                    None,
+                    &msgid(part),
+                    subj,
+                    author,
+                    61000 + i64::from(part),
+                    2,
+                    1,
+                    "",
+                    "",
+                    None,
+                    part,
+                    None,
+                    true,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            ps_id = Some(id);
+            db.create_patch(id, &msgid(part), part, "diff")
+                .await
+                .unwrap();
+        }
+        let ps_id = ps_id.unwrap();
+        let list = db.get_patchsets(10, 0, None, None).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].status.as_deref(), Some("Awaiting Review"));
+
+        // The versioned cover letter arrives last, from the same batch.
+        db.create_message(
+            &msgid(0),
+            thread_id,
+            None,
+            author,
+            "[PATCH 0/2 v2] Batch Series",
+            61003,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let cover_id = db
+            .create_patchset(
+                thread_id,
+                Some(&msgid(0)),
+                &msgid(0),
+                "[PATCH 0/2 v2] Batch Series",
+                author,
+                61003,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // It attaches to the existing series rather than orphaning a row.
+        assert_eq!(cover_id, Some(ps_id));
+        let list = db.get_patchsets(10, 0, None, None).await.unwrap();
+        assert_eq!(list.len(), 1, "the late cover must not split the series");
+        assert_eq!(list[0].status.as_deref(), Some("Awaiting Review"));
+        assert_eq!(
+            list[0].subject.as_deref(),
+            Some("[PATCH 0/2 v2] Batch Series")
+        );
     }
 
     #[tokio::test]
