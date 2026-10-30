@@ -12370,10 +12370,20 @@ impl Database {
         let Some(cand) = self.load_lineage_candidate(existing_prev_id).await? else {
             return Ok(false);
         };
-        // A link whose signal is unknown is held to the strictest rules.
+        // A link whose signal is unknown is held to the strictest rules:
+        // body links only accept a tag that moves forward.
         let signal = existing_signal
             .and_then(VersionLinkSignal::from_str)
-            .unwrap_or(VersionLinkSignal::SubjectAuthor);
+            .unwrap_or(VersionLinkSignal::MessageRef);
+        // An unchanged tag is only evidence together with the exact
+        // subject and shape; a later cover letter or row merge can change
+        // either, and the link must then go.
+        if signal == VersionLinkSignal::SubjectAuthor
+            && cand.revision.step_to(ctx.revision) == RevisionStep::SameLabel
+            && !Self::has_same_subject_and_shape(ctx, &cand)
+        {
+            return Ok(false);
+        }
         Ok(!self
             .qualifying_predecessors(ctx, vec![cand], signal)
             .await?
@@ -12420,14 +12430,24 @@ impl Database {
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             let cand = LineageCandidate::from_row(&row)?;
-            if SubjectShape::of(cand.subject_index, cand.total_parts) == shape
-                && crate::patch::clean_subject(&cand.subject) == clean_curr
-                && crate::patch::get_subject_prefixes(&cand.subject) == curr_prefixes
-            {
+            if Self::has_same_subject_and_shape(ctx, &cand) {
                 out.push(cand);
             }
         }
         Ok(out)
+    }
+
+    /// Whether `cand` has the exact cleaned subject, subsystem prefixes and
+    /// like-for-like shape (cover letter or single patch) of the current
+    /// patchset, as the subject signal requires.
+    fn has_same_subject_and_shape(ctx: &LineageContext<'_>, cand: &LineageCandidate) -> bool {
+        let shape = SubjectShape::of(ctx.subject_index, ctx.total_parts);
+        shape != SubjectShape::Other
+            && SubjectShape::of(cand.subject_index, cand.total_parts) == shape
+            && crate::patch::clean_subject(&cand.subject)
+                == crate::patch::clean_subject(ctx.subject)
+            && crate::patch::get_subject_prefixes(&cand.subject)
+                == crate::patch::get_subject_prefixes(ctx.subject)
     }
 
     /// Writes the chosen previous version on the current patchset only (or,
@@ -29615,6 +29635,40 @@ mod tests {
             .map(|v| v["id"].as_i64().unwrap())
             .collect();
         assert_eq!(chain, vec![rfc2, v1, v2]);
+    }
+
+    /// A subject-only link between postings with the same tag is dropped
+    /// once the current patchset's subject no longer matches, and a link
+    /// with an unknown signal is held to the forward-tag-only rule.
+    #[tokio::test]
+    async fn test_version_lineage_stale_same_label_link_is_dropped() {
+        let db = setup_db().await;
+        let author = "Dev <dev@example.org>";
+        let subj = "[PATCH] gpio: foo: fix irq leak on remove";
+        let d0 = 1_790_000_000;
+        let first = ingest_single(&db, author, d0, "t1@x", subj).await;
+        let second = ingest_single(&db, author, d0 + DAY, "t2@x", subj).await;
+        assert_linked(&db, second, first, "subject_author").await;
+
+        db.execute(
+            "UPDATE patchsets SET subject = ? WHERE id = ?",
+            libsql::params!["[PATCH] gpio: bar: rework probe ordering", second],
+        )
+        .await
+        .unwrap();
+        db.reconcile_version_lineage(second).await.unwrap();
+        assert_not_linked(&db, second).await;
+
+        let third = ingest_single(&db, author, d0 + 2 * DAY, "t3@x", subj).await;
+        assert_linked(&db, third, first, "subject_author").await;
+        db.execute(
+            "UPDATE patchsets SET version_link_signal = 'unknown', subject = ? WHERE id = ?",
+            libsql::params!["[PATCH] gpio: baz: unrelated", third],
+        )
+        .await
+        .unwrap();
+        db.reconcile_version_lineage(third).await.unwrap();
+        assert_not_linked(&db, third).await;
     }
 
     /// Pre-migration-14 rows (`version IS NULL`, unlinked) for an RFC and
