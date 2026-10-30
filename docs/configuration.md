@@ -189,7 +189,6 @@ Settings for the Gemini provider (`provider = "gemini"`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `explicit_prompt_caching` | bool | `false` | Use explicit caching hints in requests. |
 | `max_tokens` | integer | model-derived | Max output tokens per response, thinking included (`generationConfig.maxOutputTokens`). Defaults to `131072` on models with Long Decodes v2 (`CONTINUATION` support, such as Argon) and is omitted otherwise (or when set to `0`) so the backend uses the model default. |
 | `thinking_level` | string | -- | Default thinking level sent as `thinkingConfig.thinkingLevel` (`"LOW"`, `"MEDIUM"`, `"HIGH"`) when a stage does not specify a per-request reasoning effort. On Argon models every stage specifies one (see `[review] effort`), so only `"LOW"` has an effect there: it selects `effort = "low"` when `[review] effort` is unset. |
 | `base_url` | string | `https://generativelanguage.googleapis.com` | API base URL. `GOOGLE_GEMINI_BASE_URL` or `GEMINI_BASE_URL` take precedence when set. |

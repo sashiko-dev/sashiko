@@ -358,8 +358,6 @@ pub(crate) fn default_claude_max_tokens() -> u32 {
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct GeminiSettings {
-    #[serde(default)]
-    pub explicit_prompt_caching: bool,
     /// Max output tokens per `generateContent` request, thinking included.
     /// Sent as `generationConfig.maxOutputTokens`. When unset, defaults to
     /// `131_072` on models with Long Decodes v2 (`CONTINUATION` support, such
