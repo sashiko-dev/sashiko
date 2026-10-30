@@ -208,11 +208,15 @@ the dismissal is invalid. Report the race.
 
 ### 8.2. Race reference budget (MANDATORY)
 For any suspected use-after-free where the other side is asynchronous work, an
-RCU callback or a workqueue item, apply "Step 5: Check Object Lifetime" in
-`locking.md`, loading it if it is not already loaded.
+RCU callback or a workqueue item, list what keeps the object alive on each
+side (references, held locks, RCU read-side sections) up to the free. Report
+only if the free can run while the using side still holds a pointer with no
+pin. When `locking.md` is in context, apply its "Step 5: Check Object
+Lifetime".
 
-Required output: the `budget:` line defined there. If analysis already
-produced one, check it against the code again rather than copying it.
+Required output: the `budget:` line defined in `locking.md` when it is in
+context, otherwise the pins held on each side and the free point. If analysis
+already produced one, check it against the code again rather than copying it.
 
 ### 9. Performance Tradeoffs
 **Not a regression if**:
