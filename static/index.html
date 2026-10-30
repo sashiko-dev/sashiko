@@ -5760,7 +5760,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             return {
                 version: 0,
                 legacy: true,
-                prompts: { base: [], pre_screen: [], stage_guides: {}, tool_read: [] },
+                prompts: { base: [], pre_screen: [], stage_guides: {} },
                 stages: [],
                 raw_concerns: stampedConcerns,
                 raw_dismissed_concerns: stampedDismissed,
@@ -6417,11 +6417,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     const tokensCached = s.tokens_cached || 0;
                     const tokensOut = s.tokens_out || 0;
 
-                    const staticGuides = Array.isArray(stageGuidesObj[s.name]) ? stageGuidesObj[s.name] : [];
-                    const readGuides = Array.isArray(s.prompts_read) ? s.prompts_read : [];
-                    const allStageGuides = [...new Set([...staticGuides, ...readGuides])];
-                    const promptsCellHtml = allStageGuides.length > 0
-                        ? allStageGuides.map(g => `<span class="tag">${escapeHtml(String(g))}</span>`).join('')
+                    const stageGuides = Array.isArray(stageGuidesObj[s.name]) ? stageGuidesObj[s.name] : [];
+                    const promptsCellHtml = stageGuides.length > 0
+                        ? stageGuides.map(g => `<span class="tag">${escapeHtml(String(g))}</span>`).join('')
                         : '<span style="color:var(--text-dim);">—</span>';
 
                     let outputCellHtml = '<span style="color:var(--text-dim);">—</span>';

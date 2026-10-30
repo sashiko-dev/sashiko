@@ -1411,20 +1411,13 @@ pub fn push_unique_prompt(prompts: &mut Vec<String>, candidate: &str) {
     }
 }
 
-pub fn collect_stage_prompts(
-    selected_guides: &[String],
-    stage_guides: &[&str],
-    outcome: &crate::workflow::stage::StageOutcome,
-) -> Vec<String> {
+pub fn collect_stage_prompts(selected_guides: &[String], stage_guides: &[&str]) -> Vec<String> {
     let mut prompts = Vec::new();
     for guide in selected_guides {
         push_unique_prompt(&mut prompts, guide);
     }
     for guide in stage_guides {
         push_unique_prompt(&mut prompts, guide);
-    }
-    for prompt in outcome.read_prompts() {
-        push_unique_prompt(&mut prompts, &prompt);
     }
     prompts
 }
@@ -1725,7 +1718,6 @@ fn enrich_item_provenance(
     primary_sources: &[Value],
     secondary_sources: &[Value],
     selected_guides: &[String],
-    stage_read_prompts: &[String],
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
     if let Some(map) = item.as_object_mut() {
@@ -1750,9 +1742,6 @@ fn enrich_item_provenance(
         for p in src_prompts {
             push_unique_prompt(&mut allowed_prompts, &p);
         }
-    }
-    for p in stage_read_prompts {
-        push_unique_prompt(&mut allowed_prompts, p);
     }
     prompts.retain(|p| allowed_prompts.iter().any(|ap| ap == p));
 
@@ -1889,9 +1878,6 @@ fn enrich_item_provenance(
             }
         }
     }
-    for p in stage_read_prompts {
-        push_unique_prompt(&mut prompts, p);
-    }
 
     if let Some(map) = item.as_object_mut() {
         let has_type = map
@@ -1930,20 +1916,17 @@ fn enrich_item_provenance(
 pub fn enrich_verification_output(
     state: &LinuxPatchReviewState,
     out: &mut VerificationOutput,
-    outcome: &crate::workflow::stage::StageOutcome,
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
-    enrich_verification_output_for_stage(state, VERIFICATION.name, out, outcome, stage_lookup);
+    enrich_verification_output_for_stage(state, VERIFICATION.name, out, stage_lookup);
 }
 
 pub fn enrich_verification_output_for_stage(
     state: &LinuxPatchReviewState,
     stage_name: &str,
     out: &mut VerificationOutput,
-    outcome: &crate::workflow::stage::StageOutcome,
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
-    let read_prompts = outcome.read_prompts();
     let vf_base = state.verification_findings.len();
     for (idx, finding) in out.findings.iter_mut().enumerate() {
         // Category 1a findings originate strictly from C* / PC* concerns.
@@ -1952,7 +1935,6 @@ pub fn enrich_verification_output_for_stage(
             &state.all_concerns,
             &[],
             &state.selected_guides,
-            &read_prompts,
             stage_lookup,
         );
         if let Some(map) = finding.as_object_mut() {
@@ -1975,7 +1957,6 @@ pub fn enrich_verification_output_for_stage(
             primary_concerns,
             secondary_dismissals,
             &state.selected_guides,
-            &read_prompts,
             stage_lookup,
         );
         if let Some(map) = inconclusive.as_object_mut() {
@@ -1998,7 +1979,6 @@ pub fn enrich_verification_output_for_stage(
             &state.all_dismissed_concerns,
             &[],
             &state.selected_guides,
-            &read_prompts,
             stage_lookup,
         );
         if let Some(map) = dismissed.as_object_mut() {
@@ -2038,33 +2018,17 @@ pub fn enrich_post_verification_output(
     selected_guides: &[String],
     batch: &[Value],
     out: &mut PostVerificationOutput,
-    outcome: &crate::workflow::stage::StageOutcome,
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
-    let read_prompts = outcome.read_prompts();
     for finding in &mut out.findings {
-        enrich_item_provenance(
-            finding,
-            batch,
-            &[],
-            selected_guides,
-            &read_prompts,
-            stage_lookup,
-        );
+        enrich_item_provenance(finding, batch, &[], selected_guides, stage_lookup);
         if let Some(map) = finding.as_object_mut() {
             map.remove("prior_discussion_context");
             map.remove("authority_evidence");
         }
     }
     for dismissed in &mut out.dismissed_concerns {
-        enrich_item_provenance(
-            dismissed,
-            batch,
-            &[],
-            selected_guides,
-            &read_prompts,
-            stage_lookup,
-        );
+        enrich_item_provenance(dismissed, batch, &[], selected_guides, stage_lookup);
         if let Some(map) = dismissed.as_object_mut() {
             map.remove("prior_discussion_context");
         }
@@ -2616,12 +2580,9 @@ fn analysis_stage(
                 reasoning_effort,
                 ..Default::default()
             })
-            .reduce_with_outcome(
-                move |state: &mut LinuxPatchReviewState,
-                      out: StageConcernsOutput,
-                      outcome: &crate::workflow::stage::StageOutcome| {
-                    let prompts =
-                        collect_stage_prompts(&state.selected_guides, def.guides, outcome);
+            .reduce(
+                move |state: &mut LinuxPatchReviewState, out: StageConcernsOutput| {
+                    let prompts = collect_stage_prompts(&state.selected_guides, def.guides);
                     append_stage_items_with_prompts(
                         &mut state.all_concerns,
                         &out.concerns,
@@ -3209,21 +3170,19 @@ fn expand_direct_dismissed_ids(state: &LinuxPatchReviewState, out: &mut Verifica
 pub fn apply_verification_stage_output(
     state: &mut LinuxPatchReviewState,
     out: VerificationOutput,
-    outcome: &crate::workflow::stage::StageOutcome,
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
-    apply_verification_stage_output_for_stage(state, VERIFICATION.name, out, outcome, stage_lookup);
+    apply_verification_stage_output_for_stage(state, VERIFICATION.name, out, stage_lookup);
 }
 
 pub fn apply_verification_stage_output_for_stage(
     state: &mut LinuxPatchReviewState,
     stage_name: &str,
     mut out: VerificationOutput,
-    outcome: &crate::workflow::stage::StageOutcome,
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
     expand_direct_dismissed_ids(state, &mut out);
-    enrich_verification_output_for_stage(state, stage_name, &mut out, outcome, stage_lookup);
+    enrich_verification_output_for_stage(state, stage_name, &mut out, stage_lookup);
     state.verification_findings.extend(out.findings.clone());
     state
         .verification_dismissed
@@ -3243,11 +3202,10 @@ pub fn apply_verification_shard_output(
     stage_name: &str,
     shard_clusters: &[Value],
     out: VerificationOutput,
-    outcome: &crate::workflow::stage::StageOutcome,
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
     let expanded = expand_verification_shard_output(shard_clusters, out);
-    apply_verification_stage_output_for_stage(state, stage_name, expanded, outcome, stage_lookup);
+    apply_verification_stage_output_for_stage(state, stage_name, expanded, stage_lookup);
 }
 
 pub fn apply_post_verification_stage_output(
@@ -3255,16 +3213,9 @@ pub fn apply_post_verification_stage_output(
     stage_name: &str,
     batch: &[Value],
     mut out: PostVerificationOutput,
-    outcome: &crate::workflow::stage::StageOutcome,
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
-    enrich_post_verification_output(
-        &state.selected_guides,
-        batch,
-        &mut out,
-        outcome,
-        stage_lookup,
-    );
+    enrich_post_verification_output(&state.selected_guides, batch, &mut out, stage_lookup);
     for finding in &mut out.findings {
         let pv_idx = state.post_verification_findings.len().saturating_add(1);
         let pvf_id = format!("PVF{pv_idx}");
@@ -3695,8 +3646,8 @@ Example Output:
             reasoning_effort: effort.map(crate::ai::EffortMode::verification_stage_effort),
             ..Default::default()
         })
-        .reduce_with_outcome(|state, out: VerificationOutput, outcome| {
-            apply_verification_stage_output(state, out, outcome, analysis_stage_by_name);
+        .reduce(|state, out: VerificationOutput| {
+            apply_verification_stage_output(state, out, analysis_stage_by_name);
         })
         .build()
 }
@@ -3814,13 +3765,12 @@ Example Output:
             reasoning_effort: effort.map(crate::ai::EffortMode::verification_stage_effort),
             ..Default::default()
         })
-        .reduce_with_outcome(move |state, out: PostVerificationOutput, outcome| {
+        .reduce(move |state, out: PostVerificationOutput| {
             apply_post_verification_stage_output(
                 state,
                 stage_name,
                 &batch_for_reduce,
                 out,
-                outcome,
                 analysis_stage_by_name,
             );
         })
@@ -5248,81 +5198,12 @@ mod tests {
 
     #[test]
     fn test_collect_stage_prompts_and_provenance_enrichment() {
-        // Use Gemini-style function-name tool call IDs ("read_prompt") across parallel
-        // calls where one call succeeds and another fails, verifying that a failed call
-        // does not drop a sibling successful call sharing the same tool_call_id.
-        let outcome = crate::workflow::stage::StageOutcome {
-            skipped: false,
-            tokens_in: 10,
-            tokens_out: 10,
-            tokens_cached: 0,
-            history: vec![
-                crate::ai::AiMessage {
-                    role: crate::ai::AiRole::Assistant,
-                    content: None,
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: Some(vec![
-                        crate::ai::ToolCall {
-                            id: "read_prompt".to_string(),
-                            function_name: "read_prompt".to_string(),
-                            arguments: json!({"name": "patterns/BPF-001.md"}),
-                            thought_signature: None,
-                        },
-                        crate::ai::ToolCall {
-                            id: "read_prompt".to_string(),
-                            function_name: "read_prompt".to_string(),
-                            arguments: json!({"name": "patterns/missing.md"}),
-                            thought_signature: None,
-                        },
-                        crate::ai::ToolCall {
-                            id: "read_prompt".to_string(),
-                            function_name: "read_prompt".to_string(),
-                            arguments: json!({"name": "../secret.md"}),
-                            thought_signature: None,
-                        },
-                    ]),
-                    tool_call_id: None,
-                },
-                crate::ai::AiMessage {
-                    role: crate::ai::AiRole::Tool,
-                    content: Some(r#"{"content": "BPF pattern guide"}"#.to_string()),
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: None,
-                    tool_call_id: Some("read_prompt".to_string()),
-                },
-                crate::ai::AiMessage {
-                    role: crate::ai::AiRole::Tool,
-                    content: Some(r#"{"error": "File not found"}"#.to_string()),
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: None,
-                    tool_call_id: Some("read_prompt".to_string()),
-                },
-                crate::ai::AiMessage {
-                    role: crate::ai::AiRole::Tool,
-                    content: Some(
-                        r#"{"content": "should be rejected by sanitize_guide_path"}"#.to_string(),
-                    ),
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: None,
-                    tool_call_id: Some("read_prompt".to_string()),
-                },
-            ],
-        };
-
         let selected = vec!["networking.md".to_string()];
         let locking_def = analysis_stage_by_name("locking").unwrap();
-        let prompts = collect_stage_prompts(&selected, locking_def.guides, &outcome);
+        let prompts = collect_stage_prompts(&selected, locking_def.guides);
         assert_eq!(
             prompts,
-            vec![
-                "networking.md".to_string(),
-                "locking.md".to_string(),
-                "patterns/BPF-001.md".to_string(),
-            ]
+            vec!["networking.md".to_string(), "locking.md".to_string()]
         );
 
         let mut state = LinuxPatchReviewState {
@@ -5343,11 +5224,7 @@ mod tests {
             &prompts,
         );
         let exec_def = analysis_stage_by_name("execution-flow").unwrap();
-        let exec_prompts = collect_stage_prompts(
-            &selected,
-            exec_def.guides,
-            &crate::workflow::stage::StageOutcome::default(),
-        );
+        let exec_prompts = collect_stage_prompts(&selected, exec_def.guides);
         append_stage_dismissed_concerns_with_prompts(
             &mut state.all_dismissed_concerns,
             &[json!({
@@ -5365,22 +5242,17 @@ mod tests {
         assert_eq!(state.all_concerns[0]["prompts"], json!(prompts));
 
         // Extra prompt paths for verification exclude networking.md (already in selected_guides)
-        // and include locking.md, patterns/BPF-001.md and callstack.md.
+        // and include locking.md and callstack.md.
         let extra_paths = extra_prompt_paths_for_state(&state, analysis_stage_by_name);
         assert_eq!(
             extra_paths,
-            vec![
-                PathBuf::from("locking.md"),
-                PathBuf::from("patterns/BPF-001.md"),
-                PathBuf::from("callstack.md"),
-            ]
+            vec![PathBuf::from("locking.md"), PathBuf::from("callstack.md")]
         );
 
-        // Verification stage user prompt log includes @locking.md, @patterns/BPF-001.md, etc.
+        // Verification stage user prompt log includes @locking.md and @callstack.md.
         let ver_stage = verification_stage(20, 0.0);
         let rendered_ver_log = ver_stage.user_prompt.render_for_log(&state);
         assert!(rendered_ver_log.contains("@locking.md"));
-        assert!(rendered_ver_log.contains("@patterns/BPF-001.md"));
         assert!(rendered_ver_log.contains("@callstack.md"));
 
         let mut ver_out = VerificationOutput {
@@ -5399,12 +5271,7 @@ mod tests {
             dismissed_ids: vec![],
             dismissed_concerns: vec![],
         };
-        let outcome_ver = ver_stage.outcome_reducer.as_ref().unwrap();
-        outcome_ver(
-            &mut state,
-            ver_out.clone(),
-            &crate::workflow::stage::StageOutcome::default(),
-        );
+        (ver_stage.reducer)(&mut state, ver_out.clone());
         assert_eq!(
             state.inconclusive_concerns[0]["stages"],
             json!(["locking", "execution-flow"])
@@ -5412,12 +5279,7 @@ mod tests {
         assert_eq!(state.inconclusive_concerns[0]["stage"], "locking");
         assert_eq!(
             state.inconclusive_concerns[0]["prompts"],
-            json!([
-                "networking.md",
-                "locking.md",
-                "patterns/BPF-001.md",
-                "callstack.md"
-            ])
+            json!(["networking.md", "locking.md", "callstack.md"])
         );
 
         // Post-verification stage for this inconclusive batch gets the exact same prompts
@@ -5441,7 +5303,6 @@ mod tests {
             &state.selected_guides,
             &batch,
             &mut pv_out,
-            &crate::workflow::stage::StageOutcome::default(),
             analysis_stage_by_name,
         );
         record_verified_findings(&mut state, pv_out.findings);
@@ -5453,12 +5314,7 @@ mod tests {
         );
         assert_eq!(
             state.findings[0]["prompts"],
-            json!([
-                "networking.md",
-                "locking.md",
-                "patterns/BPF-001.md",
-                "callstack.md"
-            ])
+            json!(["networking.md", "locking.md", "callstack.md"])
         );
         let _ = &mut ver_out;
     }
@@ -5605,12 +5461,7 @@ mod tests {
         };
         assert!(validate_verification_stage_output(&valid_ver, &state).is_ok());
 
-        apply_verification_stage_output(
-            &mut state,
-            valid_ver,
-            &crate::workflow::stage::StageOutcome::default(),
-            analysis_stage_by_name,
-        );
+        apply_verification_stage_output(&mut state, valid_ver, analysis_stage_by_name);
         assert_eq!(state.verification_findings[0]["id"], "VF1");
         assert_eq!(state.inconclusive_concerns[0]["id"], "I1");
         assert_eq!(
@@ -5673,7 +5524,6 @@ mod tests {
             "post-verification-1",
             &batch,
             good_pv,
-            &crate::workflow::stage::StageOutcome::default(),
             analysis_stage_by_name,
         );
         assert_eq!(state.post_verification_findings[0]["id"], "PVF1");
@@ -5721,12 +5571,7 @@ mod tests {
             dismissed_concerns: vec![],
         };
 
-        apply_verification_stage_output(
-            &mut state,
-            ver_out,
-            &crate::workflow::stage::StageOutcome::default(),
-            analysis_stage_by_name,
-        );
+        apply_verification_stage_output(&mut state, ver_out, analysis_stage_by_name);
         state.resolve_locations();
 
         assert_eq!(state.findings.len(), 1);
@@ -6009,7 +5854,6 @@ mod tests {
             "verification-1",
             &shards[0],
             out_shard_1,
-            &crate::workflow::stage::StageOutcome::default(),
             analysis_stage_by_name,
         );
 
@@ -6048,7 +5892,6 @@ mod tests {
             "verification-2",
             &shards[1],
             out_shard_2,
-            &crate::workflow::stage::StageOutcome::default(),
             analysis_stage_by_name,
         );
 
@@ -6261,7 +6104,6 @@ mod tests {
         enrich_item_provenance(
             &mut spoofed_finding,
             &state.all_concerns,
-            &[],
             &[],
             &[],
             analysis_stage_by_name,

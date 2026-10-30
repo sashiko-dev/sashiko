@@ -28,7 +28,7 @@ use crate::prior_context::{
 use crate::workflow::output::OutputFormat;
 use crate::workflow::policy::{StagePolicy, ToolScope};
 use crate::workflow::prompt::PromptTemplate;
-use crate::workflow::stage::{ExecutableStage, Stage, StageOutcome};
+use crate::workflow::stage::{ExecutableStage, Stage};
 use crate::workflows::guard::normalize_stage_name;
 use crate::workflows::linux_patch_review::{
     LinuxPatchReviewState, collect_stage_prompts, has_valid_proof_location, push_unique_string,
@@ -806,9 +806,8 @@ pub fn apply_prior_feedback_output(
     state: &mut LinuxPatchReviewState,
     shard: &PriorFeedbackShard,
     out: PriorFeedbackOutput,
-    outcome: &StageOutcome,
 ) {
-    let prompts = collect_stage_prompts(&state.selected_guides, &[], outcome);
+    let prompts = collect_stage_prompts(&state.selected_guides, &[]);
 
     let mut authority_by_id = std::collections::BTreeMap::new();
     for res in &out.resolutions {
@@ -946,11 +945,9 @@ where
                         ..Default::default()
                     })
                     .required()
-                    .reduce_with_outcome(
-                        move |st: &mut LinuxPatchReviewState,
-                              out: PriorFeedbackOutput,
-                              outcome: &StageOutcome| {
-                            apply_prior_feedback_output(st, &shard_for_reduce, out, outcome);
+                    .reduce(
+                        move |st: &mut LinuxPatchReviewState, out: PriorFeedbackOutput| {
+                            apply_prior_feedback_output(st, &shard_for_reduce, out);
                         },
                     )
                     .build(),
@@ -1248,8 +1245,7 @@ mod tests {
         );
 
         let mut state = LinuxPatchReviewState::default();
-        let outcome = StageOutcome::default();
-        apply_prior_feedback_output(&mut state, &shard, valid, &outcome);
+        apply_prior_feedback_output(&mut state, &shard, valid);
 
         assert_eq!(state.prior_resolutions.len(), 2);
         assert_eq!(state.all_concerns.len(), 1);
@@ -1474,7 +1470,6 @@ mod tests {
                     "locations": [{"file": "arch/x86/kvm/svm/nested.c", "function_or_symbol": "nested_svm", "line": 70, "code_snippet": "vmcb->cr2 = x;", "side": "REVISION"}]
                 })],
             },
-            &StageOutcome::default(),
         );
 
         // Even with <= 4 total items (3 items), PC1/PD1 forces deduplication to run!
@@ -1535,7 +1530,6 @@ mod tests {
                 dismissed_ids: vec![],
                 dismissed_concerns: vec![],
             },
-            &StageOutcome::default(),
             analysis_stage_by_name,
         );
 
@@ -1586,7 +1580,6 @@ mod tests {
                 })],
                 dismissed_concerns: vec![],
             },
-            &StageOutcome::default(),
             analysis_stage_by_name,
         );
         apply_post_verification_stage_output(
@@ -1602,7 +1595,6 @@ mod tests {
                     "locations": [{"file": "arch/x86/kvm/svm/nested.c", "function_or_symbol": "nested_svm", "line": 70, "code_snippet": "vmcb->cr2 = x;", "side": "REVISION"}]
                 })],
             },
-            &StageOutcome::default(),
             analysis_stage_by_name,
         );
 
@@ -1698,7 +1690,6 @@ mod tests {
                     "locations": [{"file": "fs/namei.c", "function_or_symbol": "foo_lookup", "line": 42, "code_snippet": "dput(d);", "side": "REVISION"}]
                 })],
             },
-            &StageOutcome::default(),
         );
         assert_eq!(state.all_dismissed_concerns.len(), 1);
         assert!(
@@ -1772,7 +1763,6 @@ mod tests {
                 })],
                 dismissed_concerns: vec![],
             },
-            &StageOutcome::default(),
         );
         // VF1 names only the fresh C1; VF2 names nothing and only overlaps
         // PC1 by location and text.
@@ -1787,7 +1777,6 @@ mod tests {
                 dismissed_ids: vec![],
                 dismissed_concerns: vec![],
             },
-            &StageOutcome::default(),
             analysis_stage_by_name,
         );
         assert_eq!(state.findings.len(), 2);
@@ -1807,7 +1796,6 @@ mod tests {
                 ],
                 dismissed_concerns: vec![],
             },
-            &StageOutcome::default(),
             analysis_stage_by_name,
         );
         assert!(state.findings[2].get("prior_attribution").is_none());

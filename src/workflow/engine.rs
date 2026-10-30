@@ -33,7 +33,6 @@ pub struct StageRunRecord {
     pub tokens_in: u32,
     pub tokens_out: u32,
     pub tokens_cached: u32,
-    pub prompts_read: Vec<String>,
     pub history_start: usize,
     pub history_end: usize,
 }
@@ -93,7 +92,6 @@ fn record_stage_outcome(
     let history_start = outcome.history.len();
     let skipped = stage_outcome.skipped();
     let turns = stage_outcome.turns();
-    let prompts_read = stage_outcome.read_prompts();
     outcome.tokens_in = outcome.tokens_in.saturating_add(stage_outcome.tokens_in);
     outcome.tokens_out = outcome.tokens_out.saturating_add(stage_outcome.tokens_out);
     outcome.tokens_cached = outcome
@@ -108,7 +106,6 @@ fn record_stage_outcome(
         tokens_in: stage_outcome.tokens_in,
         tokens_out: stage_outcome.tokens_out,
         tokens_cached: stage_outcome.tokens_cached,
-        prompts_read,
         history_start,
         history_end,
     });

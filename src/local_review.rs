@@ -2233,7 +2233,7 @@ mod tests {
         let single_map = json!({
             "version": 1,
             "project": "sashiko",
-            "prompts": {"base": ["review-core.md"], "pre_screen": [], "stage_guides": {}, "tool_read": []},
+            "prompts": {"base": ["review-core.md"], "pre_screen": [], "stage_guides": {}},
             "stages": [{"name": "pre-screen", "log_start": 0, "log_end": 2}],
             "raw_concerns": [{"id": "C1"}],
             "raw_dismissed_concerns": [],

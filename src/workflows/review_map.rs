@@ -17,7 +17,7 @@
 //! Assembles the `review_map` JSON payload from [`LinuxPatchReviewState`] and
 //! [`StageRunRecord`] telemetry after workflow execution completes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
 
@@ -380,8 +380,6 @@ fn build_prompts_manifest(
     let (code_notes_set, code_notes) = extract_code_notes(&state.code_notes);
 
     let mut stage_guides_map = serde_json::Map::new();
-    let mut tool_read_by_path: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
     for run in stage_runs {
         if run.skipped {
             continue;
@@ -390,19 +388,7 @@ fn build_prompts_manifest(
         if !guides.is_empty() {
             stage_guides_map.insert(run.name.clone(), json!(guides));
         }
-        for read_path in &run.prompts_read {
-            let trimmed = read_path.trim();
-            if sanitize_prompt_relpath(trimmed) {
-                let entry = tool_read_by_path.entry(trimmed.to_string()).or_default();
-                push_unique(entry, &run.name);
-            }
-        }
     }
-
-    let tool_read: Vec<Value> = tool_read_by_path
-        .into_iter()
-        .map(|(path, stages)| json!({ "path": path, "stages": stages }))
-        .collect();
 
     json!({
         "base": base,
@@ -411,7 +397,6 @@ fn build_prompts_manifest(
         "code_notes": code_notes,
         "code_notes_set": code_notes_set,
         "stage_guides": stage_guides_map,
-        "tool_read": tool_read,
     })
 }
 
@@ -1128,7 +1113,6 @@ pub fn build_review_map(
                 "tokens_in": r.tokens_in,
                 "tokens_out": r.tokens_out,
                 "tokens_cached": r.tokens_cached,
-                "prompts_read": r.prompts_read,
                 "concerns_count": concerns_count,
                 "dismissed_count": dismissed_count,
                 "log_start": r.history_start.saturating_add(history_offset),
@@ -1248,7 +1232,6 @@ mod tests {
                 tokens_in: 100,
                 tokens_out: 50,
                 tokens_cached: 0,
-                prompts_read: vec![],
                 history_start: 0,
                 history_end: 2,
             },
@@ -1259,7 +1242,6 @@ mod tests {
                 tokens_in: 200,
                 tokens_out: 80,
                 tokens_cached: 0,
-                prompts_read: vec!["subsystem/bpf.md".to_string()],
                 history_start: 2,
                 history_end: 6,
             },

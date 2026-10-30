@@ -138,13 +138,12 @@ pub fn verification_shard_stage(
             ..Default::default()
         })
         .skip_if(|s| s.all_concerns.is_empty() && s.all_dismissed_concerns.is_empty())
-        .reduce_with_outcome(move |state, out: VerificationOutput, outcome| {
+        .reduce(move |state, out: VerificationOutput| {
             apply_verification_shard_output(
                 state,
                 stage_name,
                 &clusters_for_reduce,
                 out,
-                outcome,
                 stage_lookup,
             );
         })
