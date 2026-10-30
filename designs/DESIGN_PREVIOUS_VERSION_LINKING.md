@@ -46,10 +46,12 @@ flowchart TD
 1. **Backwards only.** Only $S$ itself is linked: `S.previous_patchset_id` and `S.version_link_signal` are the only lineage columns written (plus `S.version` and `S.change_id`). No other patchset's `previous_patchset_id` is ever written, no version family is expanded or renumbered, and a later run can only change $S$'s own link.
 2. **Strict predecessor.** A candidate $C$ qualifies only if
    * `C.date < S.date` (strictly older),
-   * `C.version < S.version` (strictly lower; an unversioned `[PATCH]` is version 1),
+   * the subject revision hints of $C$ and $S$ allow $C$ to precede $S$ (Section 2.3): the
+     version number grows, an RFC posting is followed by a non-RFC posting, or the label is
+     unchanged and the postings are far enough apart not to be a double send,
    * $C$ and $S$ have the same author email (`extract_email`, exact match or the b4 web relay `devnull+` alias of the same address via `authors_match`). A display name alone never matches, and authors without an email address never match,
    * $C$ is not a placeholder or a reply, is not a Forge PR, and is not a prerequisite of $S$ (or $S$ a prerequisite of $C$) according to `Based-on:` / `prerequisite-message-id:` / `prerequisite-patch-id:` trailers.
-3. **One predecessor or none.** The highest-ranked signal that yields at least one qualifying candidate decides. Within that signal, the candidate with the highest version wins. If two *different* candidates share that highest version and the signal cannot prove they are the same series (Signal 3), nothing is linked and the ambiguity is logged at info level. Lower-ranked signals are not consulted after an ambiguous result.
+3. **One predecessor or none.** The highest-ranked signal that yields at least one qualifying candidate decides. Within that signal, the latest posting in series order wins: a candidate is dropped when a later candidate could itself be its next version (Section 2.3). If several candidates remain, Signals 2 and 4 pick the one with the highest version number (then the latest date); Signal 3 cannot prove they are the same series, so nothing is linked and the ambiguity is logged at info level. Lower-ranked signals are not consulted after an ambiguous result.
 4. **Recomputed on every run.** The predecessor is recomputed from scratch whenever $S$ is reconciled (cover letter, patch 1, final patch, change-id update). A newly chosen predecessor replaces the existing link. When no signal yields a predecessor, an existing link is kept only while it still satisfies invariant 2 (for example a link carried over when two partial rows of the series were merged); otherwise (for example a cover letter arrived later and names the old predecessor as a prerequisite) the link and the per-patch lineage of $S$ are cleared.
 5. **Out-of-order arrival.** If `v1` is ingested after `v2`, `v1` finds no older, lower-versioned predecessor and `v2` is not touched. The `v1 -> v2` link is only made if `v2` is reconciled again later (for example when its last part arrives). This miss is accepted.
 
@@ -61,7 +63,7 @@ flowchart TD
 ### Signal 2: `b4` `change-id:` Trailer & `b4 prep` Tracker Commits
 * **Extraction:** Parse `change-id: <token>` (case-insensitive header/trailer line in the cover letter body or below `---` in patch `1/N`, e.g., `change-id: 20260920-net-foo-teardown-4f2a9c1b`) or `"change-id"` from an un-sent `b4 prep` tracking block (`--- b4-submit-tracking ---`) via `parse_b4_change_id(body: &str) -> Option<String>` in `src/patch.rs`. When reviewing a git branch range containing an empty `b4 prep` tracker commit (`parse_b4_submit_tracking`), filter the tracker commit out of the `1..N` patch list and extract its `change-id`. Store in `patchsets.change_id` (indexed).
 * **Match criteria:** `C.change_id == S.change_id` plus the invariants in 2.1.
-* **Choice:** Highest version; same-version duplicates (resends) are the same series by construction, so the latest one wins.
+* **Choice:** The latest posting in series order; same-label duplicates (resends) are the same series by construction, so the latest one wins.
 * **Confidence:** Exact (`"change_id"`). Survives cover letter subject renames and patch count changes.
 
 ### Signal 3: Explicit Previous-Version Links in the Body
@@ -69,7 +71,10 @@ flowchart TD
   * `v1: <url>`, `- v1: <url>`, `* v1: <url>`, `[v1] <url>`, `v1 link: <url>`, `v1 (<url>)`, `v7 (with test steps): <url>`;
   * b4's `- Link to v1: <url>`, `Link to v1: <url>`, `Link[v1]: <url>`;
   * `Previous version: <url>`, `Previous revision: <url>`, `Version 1: <url>`;
-  * `Changes since v1 (<url>):`, `Changes since v1: <url>`.
+  * `Changes since v1 (<url>):`, `Changes since v1: <url>`;
+  * the same markers naming an RFC posting: `RFC: <url>`, `- RFC v2: <url>`, `RFC-v4: <url>`,
+    `- Link to RFC: <url>`, `Link to RFC v3: <url>`, `Changes since RFC: <url>`. A bare IETF
+    reference such as `RFC 8200:` is not a marker because the number carries no `v`.
 
   The link is a Lore / LKML / Patchwork / `patch.msgid.link` URL or a bare `<message-id>`.
 * **Not counted:**
@@ -78,17 +83,17 @@ flowchart TD
   * Kernel-version prose (`since v6.8`, `in v6.12`, `fixed in v5.4`, `v6.8: <url>`).
   * Quoted lines and dependency or bug-report trailers (`Based-on:`, `prerequisite-message-id:`, `base-commit:`, `Closes:`, `Fixes:`, `Reported-by:`, `BugLink:`).
 * **Match criteria:** Look up the local patchsets whose `cover_letter_message_id` or a `patches.message_id` matches one of the extracted Message-IDs, plus the invariants in 2.1.
-* **Choice:** Highest version. Two different patchsets at that version are ambiguous and produce no link.
+* **Choice:** The latest posting in series order (invariant 3). Two different patchsets left at the top are ambiguous and produce no link.
 * **Confidence:** High (`"message_ref"`).
 
 ### Signal 4: Exact Cleaned Subject + Author, Like-for-Like
-* **Trigger:** `S.version > 1`, the cleaned subject is not empty, and it is not a generic short subject (`fix typo`, `cleanup`, ...) without subsystem prefixes.
+* **Trigger:** The cleaned subject is not empty, and it is not a generic short subject (`fix typo`, `cleanup`, ...) without subsystem prefixes. An unversioned `[PATCH]` is searched too: it may follow an RFC posting, or be a new version whose author forgot the version tag.
 * **Candidates:** Local patchsets by the same normalized author email dated in `[S.date - 120 days, S.date)` (no forward window), via the expression index `idx_patchsets_author_email_date` (`ORDER BY date DESC LIMIT 100`), across all statuses.
 * **Match criteria:**
   1. `clean_subject(C.subject) == clean_subject(S.subject)` **and** `get_subject_prefixes(C.subject) == get_subject_prefixes(S.subject)` (exact match, no fuzzy or per-patch matching).
   2. Like-for-like shape only: a cover letter (`subject_index == 0`) is compared only with a cover letter, and a single patch (`subject_index == 1`, `total_parts == 1`) only with a single patch. Patch 1 of a series is never compared with a cover letter, and a single patch split out of an earlier series is not linked to that series.
-  3. The invariants in 2.1.
-* **Choice:** Highest version; same-version duplicates share the exact subject and are resends of the same series, so the latest one wins.
+  3. The invariants in 2.1, with the stricter unchanged-label rule of Section 2.3 (bracketed `PATCH`/`RFC` tag, at most 30 days apart).
+* **Choice:** The latest posting in series order; same-label duplicates share the exact subject and are resends of the same series, so the latest one wins.
 * **Confidence:** Medium-High (`"subject_author"`).
 
 ### Removed: `git_patch_id` Overlap Across Series
@@ -98,9 +103,66 @@ Sharing one unchanged patch is not evidence that two series are versions of each
 
 When $S$ gets a **new** link to predecessor $P$ (the link did not exist before this run), $P$ is cancelled together with its pending outbox entries if all of the following hold:
 * $P$ is still in flight (`Fetching`, `Incomplete`, `Pending`, `In Review`);
-* the link came from Signal 2 (`change_id`) or Signal 3 (`message_ref`), or from Signal 4 (`subject_author`) with `S.date - P.date <= 30 days` (the window the pre-lineage superseding logic used).
+* the link came from Signal 2 (`change_id`) or Signal 3 (`message_ref`), or from Signal 4 (`subject_author`) with `S.date - P.date <= 30 days` (the window the pre-lineage superseding logic used) and a label that moved forward (Section 2.3). A Signal 4 link between two postings with the same label (most often a new version without a version tag) links the review history but leaves $P$'s review running, because two unrelated series that share an exact subject must never cancel each other.
 
 Nothing else is cancelled: not $P$'s own predecessors, not other members of a chain, not $S$ itself when an older version arrives late, and not $P$ again when a later run of $S$ keeps the same link (so an explicit rerun of $P$ is respected). The Forge PR path keeps its own superseding rules.
+
+### 2.3 Subject Revision Hints, RFC Postings and Chronology
+
+The version tag in a subject is a free-format label chosen by the author, not an identity. In
+production data, authors often:
+
+* post an RFC, then a plain `[PATCH]` or `[PATCH v1]` (RFC → v1 was the most common transition
+  the old "strictly lower version" rule could never link), or restart at v1 after `RFC v2`;
+* keep counting through the RFC tag (`v1 → RFC v2 → v3`);
+* send a new version without changing the tag (`[PATCH]` twice, a day apart, the second one
+  with "Changes in v2:");
+* send the same posting twice within minutes by mistake.
+
+Chronology is therefore the primary order, and the subject only provides a hint.
+`crate::patch::SubjectRevision` parses the hint from a subject: the stage (`Rfc` when a
+bracketed `RFC` token is present, otherwise `Patch`) and the version number (`vN`, 1 when absent).
+`SubjectRevision::step_to(next)` classifies an older posting followed by a newer one:
+
+| Step | Condition | Example |
+|---|---|---|
+| `Advances` | the number grows, or the stage goes from `Rfc` to `Patch` | `v1 → v2`, `RFC v2 → v1`, `RFC → v1`, `v1 → RFC v2` |
+| `SameLabel` | same number, no `Rfc → Patch` step | `v2 → v2`, `[PATCH] → [PATCH]`, `v1 → RFC v1` |
+| `Regresses` | the number shrinks without an `Rfc → Patch` step | `v3 → v2` |
+
+Rules, applied per signal:
+
+| Step | Signal 2 (`change_id`) | Signal 3 (`message_ref`) | Signal 4 (`subject_author`) |
+|---|---|---|---|
+| `Advances` | qualifies | qualifies | qualifies |
+| `SameLabel` | qualifies when at least 1 hour apart | never | qualifies when 1 hour to 30 days apart and the subject carries a bracketed `PATCH`/`RFC` tag; never supersedes |
+| `Regresses` | qualifies (the change-id wins over a mistyped tag) | never | never |
+
+Body links stay strict because one cover letter can list the version links of several related
+series: a QEMU series and its companion kernel series by the same author link each other's
+`v1`..`v5`, and accepting an unchanged or regressing tag there would link the QEMU `v4` to the
+kernel `v5`.
+
+Postings under 1 hour apart with an unchanged label are treated as an accidental double send, not
+as a new version of each other: the repeated posting is not a candidate, so the double send links
+to the same predecessor as the posting it repeats. Ordering among the candidates uses the same steps: a candidate is dropped when a
+later candidate `Advances` from it (or, for Signals 2 and 4, which prove the same series, has the
+same label). This picks the newest posting of the series even when its number is not the
+highest (`RFC v2 → v1 → v2` links the final v2 to v1, not to RFC v2), while a stale resend of an
+old version posted after a newer one (`v1, v2, v1 RESEND`) does not beat v2.
+
+Because every link points to a strictly older patchset, links still cannot form a cycle.
+
+### 2.4 Internal Revision vs. Public Label
+
+Because labels can repeat within one chain (`RFC → v1`, or two `[PATCH]` postings), consumers
+that need an identity use the **revision**: the position in the chain, computed by
+`assign_effective_versions` while walking `previous_patchset_id` (the subject number, raised to
+at least one more than the previous revision). The **label** is derived from the subject for
+display (`RFC`, `RFC v2`, `v3`, the same rule as `versionLabel()` in the Web UI) and is never used
+for ordering. The prior-version context carries both: `ancestor_versions` and every `version`
+field are revisions, and `version_labels` maps each revision to its label, so prompts and the
+public credit line ("As reported by ... on RFC v2") show what the author actually posted.
 
 ---
 
@@ -234,14 +296,14 @@ In email/NNTP ingestion and lore backfills, versions can arrive out of order (e.
    * **Risk:** An author sends many single-patch cleanups with generic subjects (e.g., `[PATCH] treewide: fix typo`), posts a series that depends on another of their series, carries a shared patch in several series, or posts a new series as a reply into an older thread.
    * **Mitigation:**
      * Only explicit signals link: an exact b4 change-id, an explicit previous-version link on the same line, or an exact like-for-like subject. Threading headers, unmarked Lore links, shared `git_patch_id`s, and patch-1-versus-cover subject matches never link.
-     * Require a strictly older, strictly lower-versioned predecessor by the same author email, so a newer series can never become the "previous version" of an older one.
+     * Require a strictly older predecessor by the same author email whose subject revision hint allows it to precede the current one (Section 2.3), so a newer series can never become the "previous version" of an older one. An unchanged label links through Signal 4 only for tagged subjects at most 30 days apart, and such a link never cancels a review.
      * Link nothing when the top signal yields two different candidates.
      * Exclude generic 1-2 word subjects (e.g., `"fix typo"`, `"cleanup"`) from Signal 4 unless accompanied by subsystem prefixes (`get_subject_prefixes`).
      * Exclude any patchset named in the current series' `Based-on:` / `prerequisite-*` trailers (and vice versa) from every signal.
    * **Blast radius:** A wrong link affects only the one patchset being reconciled, and cancellation reaches only its direct predecessor under the stricter conditions of Section 2.2.
 2. **Cycles in `previous_patchset_id`:**
    * **Risk:** Inconsistent version numbers or dates could create a cycle when walking `previous_patchset_id`.
-   * **Mitigation:** Every email link points to a patchset that is strictly older and strictly lower-versioned, so edges cannot form a cycle. Traversal queries additionally track a `HashSet<i64>` of visited IDs with a hard cap of 32 hops.
+   * **Mitigation:** Every email link points to a patchset that is strictly older, so edges cannot form a cycle. Traversal queries additionally track a `HashSet<i64>` of visited IDs with a hard cap of 32 hops.
 3. **Query Scaling on `patchsets` and `patches`:**
    * **Risk:** Scanning `patchsets` or `patches` during ingestion on a large database could slow down message ingestion.
    * **Mitigation:** Every lookup path is backed by a selective index (`idx_patchsets_mr_number`, `idx_patchsets_change_id`, `idx_patchsets_cover_letter_message_id`, `idx_patches_message_id`, and `idx_patchsets_author_email_date` with a 120-day backward window and `LIMIT 100`). Very busy senders may have more than 100 patchsets in the window; older candidates are then missed, which only loses links. We also verify index usage via `EXPLAIN QUERY PLAN` tests in `src/db.rs`.
