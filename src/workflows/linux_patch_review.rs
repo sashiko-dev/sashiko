@@ -397,7 +397,7 @@ PRE-EXISTING ISSUES: If any finding has `"preexisting": true`, include it in the
 PRIOR-VERSION ATTRIBUTION: If a finding includes `"prior_attribution"` with an `"attribution_line"` (for example `"As reported by Dan Carpenter on v2"`), begin that finding's comment with `<attribution_line> [N], ...` integrated naturally into the opening sentence (or `<attribution_line>, ...` when `reference_url` is absent). Number footnotes sequentially (`[1]`, `[2]`, ...) across the review and list all `[N] <reference_url>` entries together at the very bottom of the entire review email after all inline comments. Print only the reviewer's display name—never include their email address (`<...>`) in the comment text. Never distinguish between findings raised by fresh analysis vs prior-feedback in the email, never credit anyone else, and use no backticks or markdown."#;
 
 const STAGE_JSON_SCHEMA_EXAMPLE: &str = r#"
-TodoWrite compatibility: vendored prompts may ask you to add tasks or suspected bugs to TodoWrite. Do not call or mention TodoWrite. Treat those instructions as an internal checklist only. If that checklist identifies a concrete suspected bug, carry it forward as a JSON concern with file, function_or_symbol, line when known, triggering condition, and evidence. Do not output generic checklist progress as a concern.
+Checklists: guides may ask you to add tasks or suspected bugs to a checklist. Keep that checklist internal to your reasoning. If it identifies a concrete suspected bug, carry it forward as a JSON concern with file, function_or_symbol, line when known, triggering condition, and evidence. Do not output generic checklist progress as a concern.
 
 RUNNING CANDIDATE LEDGER: Across tool turns, maintain a short numbered list of every candidate bug you suspect or verify in your thoughts. Before emitting your final JSON, check every item on your numbered list to ensure none were forgotten during later tool calls.
 
@@ -4374,11 +4374,11 @@ mod tests {
 
     #[test]
     fn test_analysis_stages_keep_the_guidance_the_schema_alone_does_not_carry() {
-        // The vendored guides still tell the model to use TodoWrite, which no
-        // longer exists, and the verification stages keep anti-charity and
-        // symmetrical proof directives of their own.
+        // The guides ask the model to keep checklists, and the verification
+        // stages keep anti-charity and symmetrical proof directives of their
+        // own.
         for required in [
-            "Do not call or mention TodoWrite",
+            "Keep that checklist internal to your reasoning",
             "Do not be overly charitable to the existing code",
             "If you find no concerns and no dismissed concerns",
             "investigated, and disproved with concrete evidence",

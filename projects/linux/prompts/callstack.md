@@ -13,8 +13,8 @@ Note: foo->ptr dereferences foo BUT NOT ptr
 
 This callstack analysis is required for all non-trivial changes.
 
-Add each Task from this prompt (Task 1,2,3,4,5,6,7,8,9) into a TodoWrite.
-The TodoWrite must ensure that you complete every task before completing
+Add each Task from this prompt (Task 1,2,3,4,5,6,7,8,9) to a checklist.
+The checklist must ensure that you complete every task before completing
 this prompt.
 
 ---
@@ -240,7 +240,7 @@ complete caller analysis.
 - Identify inner loops that modify these variables
 - Identify conditions that allow the loop to exit normally
 - Identify functions not yet in context that control loop iteration and exit
-  - Add to TodoWrite
+  - Add to the checklist
   - **IMPORTANT** You will want to skip this step.  Skipping this step will
     cause you to miss critical information that is needed to properly judge
     the safety of loop exit criteria.  DO NOT, FOR ANY REASON, SKIP THIS STEP.
@@ -264,7 +264,7 @@ Additional functions identified for context reading [ list ]
 exit conditions
 ```
 
-- Load all functions added into TodoWrite that were not yet in context
+- Load all functions added to the checklist that were not yet in context
 
 ## Task 6b: **Mandatory loop control flow validation**:
 - step loop.1: Track what happens to resource-holding variables across loop iterations
