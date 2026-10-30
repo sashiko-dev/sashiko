@@ -122,6 +122,16 @@ impl ProjectId {
         }
     }
 
+    /// The path to this project's upstream maintainer grants
+    /// ([`crate::upstream_grants`]), for the projects whose access follows
+    /// MAINTAINERS. A missing file means no grants.
+    pub fn upstream_maintainers_path(self) -> Option<&'static str> {
+        match self {
+            ProjectId::Linux => Some("projects/linux/upstream_maintainers.toml"),
+            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu => None,
+        }
+    }
+
     /// Where this project's code comes from: the tree `sashiko repo sync`
     /// clones and the daemon reviews patches against.
     pub fn upstream(self) -> Upstream {

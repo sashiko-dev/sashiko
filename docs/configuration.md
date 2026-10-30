@@ -5,6 +5,10 @@ Sashiko is configured through two files:
 - **Settings.toml** -- application settings (AI, server, git, review)
 - **projects/\<project\>/mailing_lists.toml** -- per-mailing-list tracking, embargo, email delivery, and Patchwork policy
 
+Linux deployments also read
+[projects/linux/upstream_maintainers.toml](#projectslinuxupstream_maintainerstoml),
+which widens bug and embargo access for upstream maintainers.
+
 This page is the complete reference. The files in the repository are
 starting points, each with one job:
 
@@ -581,6 +585,34 @@ context: sashiko
 ```
 
 Downstream tools can parse this format with simple line splitting.
+
+## `projects/linux/upstream_maintainers.toml`
+
+Grants that give the maintainers (`M:` and `R:`) of an existing MAINTAINERS
+section the same access as if the section listed extra paths: they can see
+and manage bugs, and see embargoed review results and review transcripts, for
+changes to those paths. Use it for maintainers who receive pull requests for
+a subtree they do not own in MAINTAINERS, such as the SoC group. Mail routing
+and the subsystems displayed for a bug or patchset still follow MAINTAINERS
+only. Only the Linux project reads this file; a missing file means no grants.
+
+```toml
+[[grant]]
+section = "ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)"
+paths = ["arch/*/boot/dts/", "drivers/soc/", "drivers/firmware/"]
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `section` | string | Title of an existing MAINTAINERS section, matched case insensitively. |
+| `paths` | list | Paths in the MAINTAINERS `F:` syntax. A trailing slash covers the whole subtree. Paths that cover the whole tree (`*`, `*/`, `**`) are rejected. |
+
+The file is read at daemon startup. A grant whose section is missing or is a
+catch-all section (THE REST), or whose paths are invalid, is dropped with an
+error; a file that cannot be parsed grants nothing. When the loaded grants
+differ from the ones the stored access rows were derived from, startup
+re-derives those rows for every bug and patchset, so adding or removing a
+grant takes effect on existing data after a restart.
 
 ## Environment variables
 

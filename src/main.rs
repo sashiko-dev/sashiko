@@ -813,11 +813,25 @@ async fn run_daemon(
     let maintainers_index = if project.uses_maintainers() {
         let linux_repo_path = std::path::PathBuf::from(&settings.git.repository_path);
         match sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&linux_repo_path) {
-            Ok(idx) => {
+            Ok(mut idx) => {
                 info!(
                     "Successfully parsed and indexed {} MAINTAINERS sections from top-of-trunk of Linus's tree",
                     idx.len()
                 );
+                if let Some(path) = project.upstream_maintainers_path() {
+                    // A grant file that cannot be read or parsed grants
+                    // nothing, which is the direction to fail in.
+                    match sashiko::upstream_grants::load(std::path::Path::new(path)) {
+                        Ok(grants) => {
+                            let listed = grants.len();
+                            let kept = idx.set_upstream_grants(grants);
+                            info!(
+                                "Loaded {kept} of {listed} upstream maintainer grants from {path}"
+                            );
+                        }
+                        Err(e) => error!("Ignoring upstream maintainer grants: {e:#}"),
+                    }
+                }
                 Arc::new(idx)
             }
             Err(e) => {

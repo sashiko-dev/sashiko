@@ -17,6 +17,21 @@ To request tracking for a new lore or NNTP mailing list, you can either:
 1.  **Submit a Pull Request:** Add a `["<list-email>"]` section to [`projects/linux/mailing_lists.toml`](mailing_lists.toml). Sashiko automatically derives the Lore NNTP group name by reversing the domain components and appending the list's local part (e.g., `bpf@vger.kernel.org` becomes `org.kernel.vger.bpf`). If the NNTP group name on `nntp.lore.kernel.org` does not follow this convention, set `nntp_group = "..."` explicitly in the section.
 2.  **Send an Email:** Contact the Sashiko development mailing list (`sashiko@lists.linux.dev`) and `Cc: Roman Gushchin <roman.gushchin@linux.dev>` with your request.
 
+## Access for Upstream Maintainers
+
+Sashiko shows bugs, embargoed review results and review transcripts to the
+maintainers of the MAINTAINERS sections that cover the changed files. If you
+receive pull requests for a subtree that MAINTAINERS does not list under your
+section (for example, the SoC group for platform device trees and SoC
+drivers), send a pull request adding a grant to
+[`projects/linux/upstream_maintainers.toml`](upstream_maintainers.toml) that
+names your section and the paths you receive pull requests for. Everyone
+listed on that section with `M:` or `R:` then gets the same access to those
+paths as the platform maintainers, without any change to MAINTAINERS or to
+who is copied on patches. See
+[docs/configuration.md](../../docs/configuration.md#projectslinuxupstream_maintainerstoml)
+for the file format.
+
 ## Adding and Updating Maintainer Notes
 
 Sashiko separates objective codebase facts from human maintainer guidance:
