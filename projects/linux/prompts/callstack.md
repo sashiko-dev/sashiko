@@ -199,9 +199,8 @@ complete caller analysis.
   - Output: list of pointers you found for the same memory
 - step resource.4: Verify resources are properly initialized, locked, and freed
 - step resource.4b: For any suspected race, including a use-after-free where the other side is asynchronous work, an RCU callback or a workqueue item:
-  - Load `locking.md` if not already loaded, and follow its tracing method
-  - For a suspected use-after-free, complete "Step 5: Check Object Lifetime", including the reference budget, before reporting
-  - Output: "locking.md loaded: [ y / n ]", plus the `budget:` line for a suspected use-after-free
+  - For a suspected use-after-free, list what keeps the object alive on each side (references, held locks, RCU read-side sections) up to the free, and report only if the free can run while the using side still holds a pointer with no pin
+  - Output: the pins held on each side, and the free point
 - step resource.5: Continue into Task 5B, even if you think you've found enough details to complete the analysis
 - Output: Category NUMBER [ list of resources checked: line of code where each resource was assigned ]
 
@@ -210,7 +209,7 @@ complete caller analysis.
 **CRITICAL**: This task catches use-after-free bugs in RCU-protected data structures.
 
 - step rcu.1: For any `call_rcu()`, `synchronize_rcu()`, or `kfree_rcu()` in the diff:
-  - Check the code notes for the RCU rules of the structures involved, and the RCU section of `locking.md`
+  - Check the code notes for the RCU rules of the structures involved
 - step rcu.2: Identify what data structures the object is part of (rhashtable, hlist, list, rb-tree, etc.)
   - Output: "Object in data structures: [ list ]"
 - step rcu.3: Verify removal from ALL lookup structures happens BEFORE call_rcu()
