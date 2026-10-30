@@ -65,6 +65,17 @@ symbols = [
   instead, such as a file or document in the tree, a pattern to search for
   with `git_grep`, or history to inspect with `git_log`, or that drops the
   bullet when no such evidence exists.
+- **No conflicts or duplicates:** Use `git_read_files` and `git_grep` to
+  compare a new or changed bullet with the project's review prompts
+  (`severity.md`, the review procedures) and with the other maintainer notes
+  whose `paths` or `symbols` overlap with it. Flag a bullet that contradicts
+  another note or a global rule without saying which one wins, and a bullet
+  that only repeats a rule already stated elsewhere. Subsystem-local
+  overrides are allowed and expected: a note may report a pattern at a higher
+  or lower severity than `severity.md` would, or relax a global rule, within
+  its own subsystem. Such an override is not a conflict as long as it is
+  scoped to the note's subsystem and states the pattern and level it applies
+  to.
 
 ## Code Notes (`projects/*/prompts/notes/` and `src/notes/`)
 
