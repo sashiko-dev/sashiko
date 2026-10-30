@@ -25,7 +25,10 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use tracing::info;
+use tracing::{error, info};
+
+use crate::db::AttributedSubsystem;
+use crate::upstream_grants::{self, RawUpstreamGrant, UpstreamGrant};
 
 /// Represents a compiled file or directory pattern from an `F:` or `X:` line.
 #[derive(Debug, Clone)]
@@ -415,6 +418,9 @@ pub struct MaintainersIndex {
     subsystems_by_address: HashMap<String, BTreeSet<String>>,
     /// Addresses listed on a section that claims the whole tree.
     global_addresses: HashSet<String>,
+    /// Validated upstream grants (`upstream_maintainers.toml`). They widen
+    /// access only; [`MaintainersIndex::match_files`] never consults them.
+    upstream_grants: Vec<UpstreamGrant>,
 }
 
 impl MaintainersIndex {
@@ -442,7 +448,112 @@ impl MaintainersIndex {
             sections,
             subsystems_by_address,
             global_addresses,
+            upstream_grants: Vec::new(),
         }
+    }
+
+    /// Attaches upstream grants, replacing any attached before, and returns
+    /// how many were kept.
+    ///
+    /// A grant is dropped, with an error logged, when its section is not in
+    /// the index, is a catch-all section, or its paths fail validation.
+    /// Dropping keeps the daemon up when upstream renames a section, and the
+    /// error makes the stale grant visible. A dropped grant grants nothing.
+    pub fn set_upstream_grants(&mut self, grants: Vec<RawUpstreamGrant>) -> usize {
+        self.upstream_grants.clear();
+        for grant in grants {
+            let wanted = grant.section.trim();
+            let Some(section) = self
+                .sections
+                .iter()
+                .find(|s| s.name.trim().eq_ignore_ascii_case(wanted))
+            else {
+                error!(
+                    "Dropping upstream grant: no MAINTAINERS section is titled {:?}",
+                    grant.section
+                );
+                continue;
+            };
+            if section.catch_all {
+                error!(
+                    "Dropping upstream grant for {:?}: it is a catch-all section",
+                    section.name
+                );
+                continue;
+            }
+            if let Err(why) = upstream_grants::validate_paths(&grant.paths) {
+                error!("Dropping upstream grant for {:?}: {why}", section.name);
+                continue;
+            }
+            self.upstream_grants
+                .push(UpstreamGrant::new(section.name.clone(), grant.paths));
+        }
+        self.upstream_grants.len()
+    }
+
+    /// Sections whose maintainers hold an upstream grant over any of `files`,
+    /// in grant order and without duplicates.
+    pub fn upstream_grant_sections<I, S>(&self, files: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let files: Vec<S> = files.into_iter().collect();
+        let mut out: Vec<String> = Vec::new();
+        for grant in &self.upstream_grants {
+            if out.contains(&grant.section) {
+                continue;
+            }
+            if files.iter().any(|f| grant.covers(f.as_ref())) {
+                out.push(grant.section.clone());
+            }
+        }
+        out
+    }
+
+    /// The sections that confer access over changes to `files`: every
+    /// MAINTAINERS match, then every upstream grant covering the files. The
+    /// same title may appear with both sources; they are stored apart.
+    pub fn attribute_files<I, S>(&self, files: I) -> Vec<AttributedSubsystem>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let files: Vec<S> = files.into_iter().collect();
+        let mut out: Vec<AttributedSubsystem> = self
+            .match_files(files.iter().map(AsRef::as_ref))
+            .into_iter()
+            .map(AttributedSubsystem::from_maintainers)
+            .collect();
+        out.extend(
+            self.upstream_grant_sections(files.iter().map(AsRef::as_ref))
+                .into_iter()
+                .map(AttributedSubsystem::from_upstream_grant),
+        );
+        out
+    }
+
+    /// A stable description of the attached grants. Stored rows derived from
+    /// grants are stale whenever this changes.
+    pub fn upstream_grants_fingerprint(&self) -> String {
+        let mut grants: Vec<(String, Vec<String>)> = self
+            .upstream_grants
+            .iter()
+            .map(|g| {
+                let mut paths: Vec<String> =
+                    g.raw_paths().iter().map(|p| p.trim().to_string()).collect();
+                paths.sort();
+                paths.dedup();
+                (g.section.clone(), paths)
+            })
+            .collect();
+        grants.sort();
+        serde_json::to_string(&grants).unwrap_or_default()
+    }
+
+    /// Whether any upstream grant is attached.
+    pub fn has_upstream_grants(&self) -> bool {
+        !self.upstream_grants.is_empty()
     }
 
     /// The section titles the given address is listed against.
@@ -1049,6 +1160,84 @@ F:	*/
         // A subsystem maintainer, however senior, is not global.
         assert!(!index.is_global_maintainer("akpm@linux-foundation.org"));
         assert!(!index.is_global_maintainer("nobody@example.org"));
+    }
+
+    #[test]
+    fn test_upstream_grants_widen_access_attribution_only() {
+        let maintainers = "\
+Maintainers List
+----------------
+
+ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)
+M:\tArnd <arnd@example.com>
+F:\tarch/arm64/boot/dts/Makefile
+
+ARM/QUALCOMM SUPPORT
+M:\tBjorn <bjorn@example.com>
+L:\tlinux-arm-msm@example.com
+F:\tdrivers/soc/qcom/
+F:\tdrivers/watchdog/gunyah_wdt.c
+
+THE REST
+M:\tLinus <linus@example.com>
+F:\t*
+F:\t*/
+";
+        let mut index = MaintainersIndex::from_reader(maintainers.as_bytes()).unwrap();
+        let soc = "ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)";
+        let kept = index.set_upstream_grants(vec![
+            // Matched case insensitively, stored as MAINTAINERS spells it.
+            RawUpstreamGrant {
+                section: soc.to_ascii_lowercase(),
+                paths: vec!["arch/*/boot/dts/".into(), "drivers/soc/".into()],
+            },
+            RawUpstreamGrant {
+                section: "NO SUCH SECTION".into(),
+                paths: vec!["drivers/".into()],
+            },
+            RawUpstreamGrant {
+                section: "THE REST".into(),
+                paths: vec!["drivers/".into()],
+            },
+            RawUpstreamGrant {
+                section: soc.into(),
+                paths: vec!["*/".into()],
+            },
+        ]);
+        assert_eq!(kept, 1);
+
+        let smem = ["drivers/soc/qcom/smem.c"];
+        assert_eq!(index.upstream_grant_sections(smem), vec![soc]);
+        assert_eq!(
+            index.attribute_files(smem),
+            vec![
+                AttributedSubsystem::from_maintainers("ARM/QUALCOMM SUPPORT"),
+                AttributedSubsystem::from_upstream_grant(soc),
+            ]
+        );
+        // Path precise: the platform section's other files are not granted.
+        assert!(
+            index
+                .upstream_grant_sections(["drivers/watchdog/gunyah_wdt.c"])
+                .is_empty()
+        );
+        // Ownership, and everything derived from it, is unchanged.
+        assert_eq!(index.match_files(smem), vec!["ARM/QUALCOMM SUPPORT"]);
+        assert_eq!(
+            index.match_mailing_lists(smem),
+            vec!["linux-arm-msm@example.com"]
+        );
+
+        let before = index.upstream_grants_fingerprint();
+        index.set_upstream_grants(vec![RawUpstreamGrant {
+            section: soc.into(),
+            paths: vec!["drivers/soc/".into(), "arch/*/boot/dts/".into()],
+        }]);
+        assert_eq!(index.upstream_grants_fingerprint(), before);
+        index.set_upstream_grants(Vec::new());
+        assert!(!index.has_upstream_grants());
+        assert_ne!(index.upstream_grants_fingerprint(), before);
+        assert!(index.upstream_grant_sections(smem).is_empty());
     }
 
     #[test]

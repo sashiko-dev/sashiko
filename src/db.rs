@@ -995,9 +995,10 @@ pub struct NewBug {
 
 /// Where a subsystem name attached to a bug came from.
 ///
-/// Only [`SubsystemSource::MaintainersSection`] identifies a real kernel
-/// maintainer, so only that variant can confer access to a bug. The other two
-/// are useful for display and filtering and confer nothing.
+/// Only [`SubsystemSource::MaintainersSection`] and
+/// [`SubsystemSource::UpstreamGrant`] name real kernel maintainers, so only
+/// they can confer access to a bug. The other two are useful for display and
+/// filtering and confer nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubsystemSource {
@@ -1006,9 +1007,21 @@ pub enum SubsystemSource {
     /// A directory prefix derived from the touched paths, or the `kernel`
     /// sentinel used when nothing more specific could be determined.
     PathPrefix,
+    /// A MAINTAINERS section title whose maintainers hold an upstream grant
+    /// (`upstream_maintainers.toml`) over the touched files. Confers the same
+    /// access as a MAINTAINERS match. Never deserialized, so no payload or
+    /// stored JSON can claim it: only code holding the index produces it, and
+    /// it is stored in its own tables rather than in a `source` column.
+    #[serde(skip_deserializing)]
+    UpstreamGrant,
     /// Supplied verbatim by whoever filed the bug. The default, because a name
     /// of unknown origin must not be mistaken for a maintainer's jurisdiction.
+    /// Any unrecognised value deserializes to this, including
+    /// `upstream_grant`, so a serialized attribution read back loses its
+    /// authority rather than failing to parse.
     #[default]
+    // Last, because serde requires the catch-all variant to be last.
+    #[serde(other)]
     CallerSupplied,
 }
 
@@ -1018,11 +1031,13 @@ impl SubsystemSource {
             Self::MaintainersSection => "maintainers_section",
             Self::PathPrefix => "path_prefix",
             Self::CallerSupplied => "caller_supplied",
+            Self::UpstreamGrant => "upstream_grant",
         }
     }
 
     /// Parses a stored value, treating anything unrecognised as caller
-    /// supplied so that an unexpected string cannot widen access.
+    /// supplied so that an unexpected string cannot widen access. Grant rows
+    /// live in their own tables and are never read through this.
     pub fn from_stored(value: &str) -> Self {
         match value {
             "maintainers_section" => Self::MaintainersSection,
@@ -1034,7 +1049,7 @@ impl SubsystemSource {
     /// Whether a row with this provenance can grant a maintainer access to the
     /// bug it is attached to.
     pub fn confers_authority(&self) -> bool {
-        matches!(self, Self::MaintainersSection)
+        matches!(self, Self::MaintainersSection | Self::UpstreamGrant)
     }
 }
 
@@ -1081,6 +1096,12 @@ impl AttributedSubsystem {
     /// A directory prefix or sentinel derived from the touched paths.
     pub fn from_path_prefix(name: impl Into<String>) -> Self {
         Self::new(name, SubsystemSource::PathPrefix)
+    }
+
+    /// A section whose maintainers hold an upstream grant over the touched
+    /// paths.
+    pub fn from_upstream_grant(name: impl Into<String>) -> Self {
+        Self::new(name, SubsystemSource::UpstreamGrant)
     }
 }
 
@@ -15128,6 +15149,21 @@ mod tests {
             .count();
         assert_eq!(reattributed, 1);
         Ok(())
+    }
+
+    #[test]
+    fn test_upstream_grant_source_cannot_be_deserialized() {
+        let parsed: AttributedSubsystem =
+            serde_json::from_value(json!({"name": "SOC", "source": "upstream_grant"})).unwrap();
+        assert_eq!(parsed.source, SubsystemSource::CallerSupplied);
+        assert!(!parsed.source.confers_authority());
+        // Serializing still says what it was, for logs and the bug input.
+        assert_eq!(
+            serde_json::to_value(AttributedSubsystem::from_upstream_grant("SOC")).unwrap(),
+            json!({"name": "SOC", "source": "upstream_grant"})
+        );
+        let unknown: SubsystemSource = serde_json::from_value(json!("bogus")).unwrap();
+        assert_eq!(unknown, SubsystemSource::CallerSupplied);
     }
 
     #[tokio::test]

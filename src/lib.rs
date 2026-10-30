@@ -66,6 +66,7 @@ pub mod settings;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod toolbox;
+pub mod upstream_grants;
 pub mod utils;
 pub mod worker;
 pub mod workflow;
