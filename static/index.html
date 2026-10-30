@@ -1923,10 +1923,10 @@
         // their browser until the content is updated.
         // Leave `headline`, `body`, and `items` empty to keep the banner hidden.
         const WHATS_NEW = {
-            id: '2026-10-30-whats-new-v3',
+            id: '2026-10-30-whats-new-v4',
             title: "What's New in Sashiko",
             date: '2026-10-30',
-            headline: "What's new: maintainer notes & auto-generated code notes (67.3% recall), prior-version review tracking, and experimental GCC & QEMU support",
+            headline: "What's new: maintainer notes & code notes (67.3% recall), prior-version review tracking, Gemini 4 Argon as the new default model, and GCC & QEMU support",
             body: '',
             items: [
                 {
@@ -1936,6 +1936,10 @@
                 {
                     title: 'Patchset version history & prior review tracking',
                     description: 'Patchsets and individual patches now link across versions (v1 → v2 → …). When reviewing a new version, Sashiko checks earlier human and AI comments on the series, drops points that were already fixed or pushed back on, and credits the original reviewer when an earlier issue is still unaddressed.'
+                },
+                {
+                    title: 'Gemini 4 Argon is now the default model',
+                    description: 'Gemini 4 Argon (gemini-4-argon) is now the default review model, significantly improving reasoning depth and overall review quality.'
                 },
                 {
                     title: 'Experimental GCC & QEMU support',
