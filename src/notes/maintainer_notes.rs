@@ -263,9 +263,10 @@ mod tests {
         assert_eq!(render_maintainer_notes(&[]), "");
     }
 
-    #[test]
-    fn test_shipped_maintainer_notes_parse() {
+    /// Reads every maintainer note shipped under `projects/*/prompts/`.
+    fn shipped_maintainer_notes() -> Vec<(std::path::PathBuf, String)> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("projects");
+        let mut notes = Vec::new();
         for project in std::fs::read_dir(&root).unwrap().flatten() {
             let dir = project.path().join("prompts").join(MAINTAINER_NOTES_RELDIR);
             let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -273,11 +274,69 @@ mod tests {
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                let name = path.file_stem().unwrap().to_string_lossy().to_string();
                 let text = std::fs::read_to_string(&path).unwrap();
-                MaintainerNote::parse(&name, &text)
-                    .unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+                notes.push((path, text));
             }
+        }
+        notes
+    }
+
+    #[test]
+    fn test_shipped_maintainer_notes_parse() {
+        for (path, text) in shipped_maintainer_notes() {
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            MaintainerNote::parse(&name, &text)
+                .unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+        }
+    }
+
+    /// Priority words that rank an issue outside the Low, Medium, High and
+    /// Critical levels Sashiko reports.
+    const NON_SEVERITY_RANK_WORDS: &[&str] = &[
+        "nit",
+        "nits",
+        "blocker",
+        "blockers",
+        "showstopper",
+        "p0",
+        "p1",
+        "p2",
+        "p3",
+    ];
+
+    /// Returns the non-severity priority words used in `text`. Words inside
+    /// double quotes are mentions rather than rankings (the notes policy
+    /// lists them as examples) and are skipped.
+    fn non_severity_rank_words(text: &str) -> Vec<String> {
+        let unquoted: Vec<&str> = text.split('"').step_by(2).collect();
+        unquoted
+            .join(" ")
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| NON_SEVERITY_RANK_WORDS.contains(&w.to_ascii_lowercase().as_str()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn test_non_severity_rank_words() {
+        assert_eq!(
+            non_severity_rank_words("A missing #[inline] is a nit; P1 at most."),
+            vec!["nit", "P1"]
+        );
+        assert!(non_severity_rank_words("Report it as Low. Do not nitpick.").is_empty());
+        assert!(non_severity_rank_words("Avoid terms such as \"nit\" or \"P0\".").is_empty());
+    }
+
+    #[test]
+    fn test_shipped_maintainer_notes_use_severity_levels() {
+        for (path, text) in shipped_maintainer_notes() {
+            let words = non_severity_rank_words(&text);
+            assert!(
+                words.is_empty(),
+                "{}: uses {words:?} to rank issues; use Low, Medium, High or \
+                 Critical instead",
+                path.display()
+            );
         }
     }
 }
