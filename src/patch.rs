@@ -1101,10 +1101,13 @@ fn version_link_line_regex() -> &'static Regex {
             (?:
                 (?:\[\s*v\d+\s*\]|v\d+)(?:\s+links?)?(?:\s*\([^()]*\))?
               | links?\s*(?:to\s+)?(?:\[\s*v\d+\s*\]|v\d+)
+              | (?:\[\s*)?rfc(?:[\s-]*v\d+)?(?:\s*\])?(?:\s+links?)?(?:\s*\([^()]*\))?
+              | links?\s*(?:to\s+)?(?:the\s+)?rfc(?:[\s-]*v\d+)?
               | (?:previous|prior|earlier|last)\s+(?:version|revision|posting|iteration)
                 (?:\s*\([^()]*\))?
               | version\s+\d+
               | changes\s+(?:since|from)\s+(?:\[\s*v\d+\s*\]|v\d+)
+              | changes\s+(?:since|from)\s+(?:the\s+)?rfc(?:[\s-]*v\d+)?
             )
             (?:
                 (?:\s*[:=]|\s*-+>?|\s+at\b|\s)\s*[(<\[]?\s*
@@ -1936,6 +1939,41 @@ Changes since v6.8: https://lore.kernel.org/r/20260106-changes-since-kver@kernel
         let prose = "v2 of the base series: https://lore.kernel.org/r/20260107-base-v2@kernel.org\n\
 v1 was discussed at https://lore.kernel.org/r/20260108-discussed@kernel.org\n";
         assert!(extract_version_reference_msgids(prose).is_empty());
+    }
+
+    #[test]
+    fn test_extract_version_reference_msgids_rfc_markers() {
+        // Forms observed in production cover letters of the non-RFC
+        // posting that follows an RFC.
+        let body = "RFC: https://lore.kernel.org/linux-wireless/20261003-rfc-a@pobox.sk/\n\
+- RFC: https://lore.kernel.org/20261028051104.154232-1-sj@kernel.org\n\
+RFC v2: https://lore.kernel.org/all/20260914-rfc-v2-0-bf6645bb2f65@oss.qualcomm.com/\n\
+RFC-v4: https://lore.kernel.org/all/20250104101224.873926-1-zengheng4@huawei.com/\n\
+- Link to RFC: https://lore.kernel.org/bpf/20260902070534.2141812-1-tangyazhou@zju.edu.cn/\n\
+- Link to RFC v3: https://lore.kernel.org/all/20261013131309.2790253-1-ridong.chen@linux.dev/\n\
+rfc: https://lore.kernel.org/kexec/20260901180713.4185641-1-dmatlack@google.com/\n\
+[RFC] https://lore.kernel.org/r/20260801-bracketed-rfc@kernel.org\n\
+Changes since RFC: https://lore.kernel.org/r/20260802-changes-since-rfc@kernel.org\n";
+        assert_eq!(
+            extract_version_reference_msgids(body),
+            vec![
+                "20261003-rfc-a@pobox.sk",
+                "20261028051104.154232-1-sj@kernel.org",
+                "20260914-rfc-v2-0-bf6645bb2f65@oss.qualcomm.com",
+                "20250104101224.873926-1-zengheng4@huawei.com",
+                "20260902070534.2141812-1-tangyazhou@zju.edu.cn",
+                "20261013131309.2790253-1-ridong.chen@linux.dev",
+                "20260901180713.4185641-1-dmatlack@google.com",
+                "20260801-bracketed-rfc@kernel.org",
+                "20260802-changes-since-rfc@kernel.org",
+            ]
+        );
+
+        // IETF RFC references and RFC prose are not previous-version markers.
+        let ietf = "RFC 8200: https://lore.kernel.org/r/20260110-ietf@kernel.org\n\
+RFC 9110 https://lore.kernel.org/r/20260111-ietf-space@kernel.org\n\
+The RFC was discussed at https://lore.kernel.org/r/20260112-discussed@kernel.org\n";
+        assert!(extract_version_reference_msgids(ietf).is_empty());
     }
 
     #[test]

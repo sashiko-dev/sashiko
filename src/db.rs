@@ -29649,6 +29649,39 @@ mod tests {
         assert_linked(&db, v3, v2, "subject_author").await;
     }
 
+    /// A renamed non-RFC posting that names its RFC predecessor with an
+    /// "RFC: <url>" line links through the explicit reference.
+    #[tokio::test]
+    async fn test_version_lineage_rfc_link_line_links_renamed_series() {
+        let db = setup_db().await;
+        let author = "Tom <t.tonhauser@pobox.sk>";
+        let d0 = 1_790_000_000;
+        let rfc = ingest_single(
+            &db,
+            author,
+            d0,
+            "20261003192957.761090-1-t.tonhauser@pobox.sk",
+            "[RFC PATCH] wifi: ath9k: keep non-aggregate frames",
+        )
+        .await;
+        let body = "Fix frame loss.\n---\n\
+RFC: https://lore.kernel.org/linux-wireless/20261003192957.761090-1-t.tonhauser@pobox.sk/\n";
+        let v1 = ingest_test_series(
+            &db,
+            author,
+            d0 + 9 * DAY,
+            None,
+            &[TestPart::new(
+                "20261012-ath9k-v1@pobox.sk",
+                "[PATCH] wifi: ath9k: fix loss of non-aggregate frames",
+            )
+            .body(body)],
+            None,
+        )
+        .await;
+        assert_linked(&db, v1, rfc, "message_ref").await;
+    }
+
     #[test]
     fn test_choose_predecessor_newest_posting_of_series() {
         let cand = |id: i64, date: i64, subject: &str| {
