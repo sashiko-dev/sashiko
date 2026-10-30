@@ -226,9 +226,13 @@ pub fn is_promotable_reply_patch_subject(subject: &str) -> bool {
     {
         return false;
     }
-    let has_patch_tag = subject_prefix_tokens(subject)
-        .any(|tok| tok.eq_ignore_ascii_case("patch") || tok.eq_ignore_ascii_case("rfc"));
-    has_patch_tag && !clean_subject(subject).is_empty()
+    has_patch_or_rfc_tag(subject) && !clean_subject(subject).is_empty()
+}
+
+/// Whether a bracketed subject tag contains a `PATCH` or `RFC` token.
+pub fn has_patch_or_rfc_tag(subject: &str) -> bool {
+    subject_prefix_tokens(subject)
+        .any(|tok| tok.eq_ignore_ascii_case("patch") || tok.eq_ignore_ascii_case("rfc"))
 }
 
 pub fn promote_reply_patch_subject(subject: &str, version: u32) -> String {
@@ -602,6 +606,80 @@ pub fn parse_subject_version(subject: &str) -> Option<u32> {
         }
     }
     None
+}
+
+/// Stage of a posting as declared by its subject tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SeriesStage {
+    /// A bracketed `RFC` token is present (`[RFC PATCH]`, `[PATCH RFC v2]`).
+    Rfc,
+    /// Any other posting.
+    Patch,
+}
+
+/// How a newer posting's subject tag relates to an older posting's tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionStep {
+    /// The version number grows, or an RFC posting is followed by a
+    /// non-RFC one (`v1 -> v2`, `RFC v2 -> v1`, `v1 -> RFC v2`).
+    Advances,
+    /// The same number without an RFC to non-RFC step (`v2 -> v2`,
+    /// `[PATCH] -> [PATCH]`, `v1 -> RFC v1`).
+    SameLabel,
+    /// The number shrinks without an RFC to non-RFC step (`v3 -> v2`).
+    Regresses,
+}
+
+/// The revision an author declared in a subject: an ordering hint only.
+/// Authors restart numbering after RFC rounds and forget to bump tags, so
+/// chronology decides the actual order of postings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubjectRevision {
+    pub stage: SeriesStage,
+    /// `vN` from the subject, 1 when the subject carries no version tag.
+    pub number: u32,
+}
+
+impl SubjectRevision {
+    pub fn parse(subject: &str) -> Self {
+        Self::with_number(subject, parse_subject_version(subject).unwrap_or(1))
+    }
+
+    /// The stage parsed from `subject` with an already known version
+    /// number (for example the stored `patchsets.version`).
+    pub fn with_number(subject: &str, number: u32) -> Self {
+        let stage = if subject_prefix_tokens(subject).any(|tok| tok.eq_ignore_ascii_case("rfc")) {
+            SeriesStage::Rfc
+        } else {
+            SeriesStage::Patch
+        };
+        Self {
+            stage,
+            number: number.max(1),
+        }
+    }
+
+    /// Classifies `self` (older posting) followed by `next` (newer posting).
+    pub fn step_to(self, next: Self) -> RevisionStep {
+        if self.stage == SeriesStage::Rfc && next.stage == SeriesStage::Patch {
+            return RevisionStep::Advances;
+        }
+        match next.number.cmp(&self.number) {
+            std::cmp::Ordering::Greater => RevisionStep::Advances,
+            std::cmp::Ordering::Equal => RevisionStep::SameLabel,
+            std::cmp::Ordering::Less => RevisionStep::Regresses,
+        }
+    }
+
+    /// The public label: `vN`, or `RFC` / `RFC vN`, matching
+    /// `versionLabel()` in the web UI.
+    pub fn label(self) -> String {
+        match (self.stage, self.number) {
+            (SeriesStage::Rfc, 1) => "RFC".to_string(),
+            (SeriesStage::Rfc, n) => format!("RFC v{n}"),
+            (SeriesStage::Patch, n) => format!("v{n}"),
+        }
+    }
 }
 
 /// Returns bracketed subject tokens in order, including standard patch tags.
@@ -1402,6 +1480,84 @@ Body";
 
         // Edge case: [PATCH] v3: ...
         assert_eq!(parse_subject_version("[PATCH] v3: subject"), Some(3));
+    }
+
+    #[test]
+    fn test_subject_revision_parses_stage_number_and_label() {
+        let cases = [
+            ("[PATCH] mm: fix", SeriesStage::Patch, 1, "v1"),
+            ("[PATCH v1] mm: fix", SeriesStage::Patch, 1, "v1"),
+            ("[PATCH v3 0/4] mm: fix", SeriesStage::Patch, 3, "v3"),
+            ("[RFC PATCH] mm: fix", SeriesStage::Rfc, 1, "RFC"),
+            ("[PATCH RFC v2 0/3] mm: fix", SeriesStage::Rfc, 2, "RFC v2"),
+            ("[RFC net-next v4] mm: fix", SeriesStage::Rfc, 4, "RFC v4"),
+            (
+                "[uL RFC PATCH v3 0/8] i2c: omap",
+                SeriesStage::Rfc,
+                3,
+                "RFC v3",
+            ),
+            // "rfc" outside the brackets is part of the summary.
+            (
+                "[PATCH] net: document RFC 8200 handling",
+                SeriesStage::Patch,
+                1,
+                "v1",
+            ),
+        ];
+        for (subject, stage, number, label) in cases {
+            let rev = SubjectRevision::parse(subject);
+            assert_eq!(rev, SubjectRevision { stage, number }, "{subject}");
+            assert_eq!(rev.label(), label, "{subject}");
+        }
+        assert_eq!(SubjectRevision::with_number("[RFC] x", 0).number, 1);
+    }
+
+    #[test]
+    fn test_subject_revision_steps() {
+        let step = |a: &str, b: &str| SubjectRevision::parse(a).step_to(SubjectRevision::parse(b));
+        assert_eq!(step("[PATCH] x", "[PATCH v2] x"), RevisionStep::Advances);
+        assert_eq!(step("[RFC PATCH] x", "[PATCH] x"), RevisionStep::Advances);
+        assert_eq!(
+            step("[RFC PATCH v3] x", "[PATCH v1] x"),
+            RevisionStep::Advances
+        );
+        assert_eq!(
+            step("[RFC PATCH v2] x", "[PATCH v2] x"),
+            RevisionStep::Advances
+        );
+        assert_eq!(
+            step("[PATCH] x", "[RFC PATCH v2] x"),
+            RevisionStep::Advances
+        );
+        assert_eq!(step("[RFC] x", "[RFC v2] x"), RevisionStep::Advances);
+        assert_eq!(step("[PATCH] x", "[PATCH] x"), RevisionStep::SameLabel);
+        assert_eq!(
+            step("[PATCH v2] x", "[PATCH v2 RESEND] x"),
+            RevisionStep::SameLabel
+        );
+        assert_eq!(step("[PATCH] x", "[RFC PATCH] x"), RevisionStep::SameLabel);
+        assert_eq!(
+            step("[PATCH v3] x", "[PATCH v2] x"),
+            RevisionStep::Regresses
+        );
+        assert_eq!(
+            step("[PATCH v2] x", "[RFC PATCH] x"),
+            RevisionStep::Regresses
+        );
+    }
+
+    #[test]
+    fn test_has_patch_or_rfc_tag() {
+        assert!(has_patch_or_rfc_tag("[PATCH v2 1/3] x"));
+        assert!(has_patch_or_rfc_tag("[RFC] x"));
+        assert!(has_patch_or_rfc_tag("[net-next,PATCH] x"));
+        assert!(!has_patch_or_rfc_tag(
+            "linux-next: manual merge of the drm tree"
+        ));
+        assert!(!has_patch_or_rfc_tag(
+            "[Openvpn-devel] [S] Change in openvpn[master]: x"
+        ));
     }
 
     #[test]
