@@ -36,6 +36,10 @@ use tracing::{info, warn};
 #[cfg(feature = "server")]
 mod patch_lineage;
 #[cfg(feature = "server")]
+mod preexisting_disclosures;
+#[cfg(feature = "server")]
+pub use preexisting_disclosures::{NewPreexistingDisclosure, PreexistingDisclosure};
+#[cfg(feature = "server")]
 mod prior_context_queries;
 #[cfg(feature = "server")]
 pub use prior_context_queries::PriorContextOptions;
@@ -506,6 +510,39 @@ impl Severity {
             Severity::Low
         } else {
             Severity::Unknown
+        }
+    }
+}
+
+/// How a related pre-existing bug relates to the patch under review.
+///
+/// Serialized in PascalCase where reviews exchange it (`"SameCode"`), and
+/// stored in snake case in `preexisting_disclosures.relation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisclosureRelation {
+    /// The bug sits in code the patch touches.
+    SameCode,
+    /// The bug repeats the defect the patch fixes elsewhere.
+    SamePattern,
+    /// Related in some other way the review explained.
+    Other,
+}
+
+impl DisclosureRelation {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::SameCode => "same_code",
+            Self::SamePattern => "same_pattern",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn from_db_str(raw: &str) -> Result<Self> {
+        match raw {
+            "same_code" => Ok(Self::SameCode),
+            "same_pattern" => Ok(Self::SamePattern),
+            "other" => Ok(Self::Other),
+            _ => bail!("unknown pre-existing disclosure relation {raw:?}"),
         }
     }
 }
@@ -2862,6 +2899,30 @@ impl Database {
             }
         }
 
+        if current_version < 19 {
+            info!("Applying database migration version 19 (pre-existing bug disclosures)...");
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 19 {
+                info!(
+                    "Database already at version {} under the migration lock; skipping version 19.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                tx.execute_batch(include_str!("migrations/019_preexisting_disclosures.sql"))
+                    .await?;
+                tx.execute("PRAGMA user_version = 19", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
         let has_patchwork_outbox = {
             let mut rows = self
                 .conn
@@ -2880,7 +2941,7 @@ impl Database {
             .await?;
         }
 
-        info!("Database schema is up to date at version 18.");
+        info!("Database schema is up to date at version 19.");
 
         Ok(())
     }
@@ -27994,7 +28055,7 @@ mod tests {
         let db = setup_db().await;
         let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
         let version: u32 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
 
         for (table, expected_cols) in [
             (
