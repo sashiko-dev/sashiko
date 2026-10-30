@@ -510,6 +510,94 @@ impl Severity {
     }
 }
 
+/// Lowest severity a finding must have to pass a threshold.
+///
+/// Unlike [`Severity`], it has no `Unknown` variant: a threshold always names
+/// a real level. Text forms are matched case-insensitively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SeverityFloor {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl SeverityFloor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+
+    fn as_severity(self) -> Severity {
+        match self {
+            Self::Low => Severity::Low,
+            Self::Medium => Severity::Medium,
+            Self::High => Severity::High,
+            Self::Critical => Severity::Critical,
+        }
+    }
+
+    /// Whether `severity` is at or above this floor. `Unknown` never passes.
+    pub fn admits(self, severity: Severity) -> bool {
+        severity != Severity::Unknown && severity >= self.as_severity()
+    }
+}
+
+impl std::fmt::Display for SeverityFloor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SeverityFloor {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "critical" => Ok(Self::Critical),
+            _ => Err(format!(
+                "invalid severity {raw:?}: expected one of \"low\", \"medium\", \"high\", \"critical\""
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SeverityFloor {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod severity_floor_tests {
+    use super::*;
+
+    #[test]
+    fn test_severity_floor_admits_and_parses() {
+        assert!(SeverityFloor::High.admits(Severity::High));
+        assert!(SeverityFloor::High.admits(Severity::Critical));
+        assert!(!SeverityFloor::High.admits(Severity::Medium));
+        assert!(SeverityFloor::Low.admits(Severity::Low));
+        assert!(!SeverityFloor::Low.admits(Severity::Unknown));
+        assert_eq!(" High ".parse::<SeverityFloor>(), Ok(SeverityFloor::High));
+        assert_eq!(
+            SeverityFloor::Medium.to_string().parse(),
+            Ok(SeverityFloor::Medium)
+        );
+        assert!("unknown".parse::<SeverityFloor>().is_err());
+    }
+}
+
 /// Triage lifecycle of a Linux kernel bug.
 ///
 /// Owned by humans, the API, and the deduplication stage. Deliberately separate
