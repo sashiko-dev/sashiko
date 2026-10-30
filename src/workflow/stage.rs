@@ -104,9 +104,6 @@ pub trait ExecutableStage<S: Send + Sync>: Send + Sync {
 /// Reducer function applying stage output `T` to mutable workflow state `S`.
 pub type StageReducer<S, T> = Arc<dyn Fn(&mut S, T) + Send + Sync>;
 
-/// Reducer function applying stage output `T` and [`StageOutcome`] to mutable workflow state `S`.
-pub type StageOutcomeReducer<S, T> = Arc<dyn Fn(&mut S, T, &StageOutcome) + Send + Sync>;
-
 /// Conditional predicate determining whether a stage should be evaluated.
 pub type StageCondition<S> = Arc<dyn Fn(&S) -> bool + Send + Sync>;
 
@@ -118,7 +115,6 @@ pub struct Stage<S, T> {
     pub output_format: OutputFormat<S, T>,
     pub policy: StagePolicy,
     pub reducer: StageReducer<S, T>,
-    pub outcome_reducer: Option<StageOutcomeReducer<S, T>>,
     pub skip_if: Option<StageCondition<S>>,
     /// A required stage aborts its parallel batch on failure even under
     /// `ParallelPolicy::BestEffort`, so its output is never silently lost.
@@ -140,7 +136,6 @@ pub struct StageBuilder<S, T> {
     output_format: Option<OutputFormat<S, T>>,
     policy: StagePolicy,
     reducer: Option<StageReducer<S, T>>,
-    outcome_reducer: Option<StageOutcomeReducer<S, T>>,
     skip_if: Option<StageCondition<S>>,
     required: bool,
 }
@@ -154,7 +149,6 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
             output_format: None,
             policy: StagePolicy::default(),
             reducer: None,
-            outcome_reducer: None,
             skip_if: None,
             required: false,
         }
@@ -220,22 +214,6 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
         F: Fn(&mut S, T) + Send + Sync + 'static,
     {
         self.reducer = Some(Arc::new(reducer));
-        self.outcome_reducer = None;
-        self
-    }
-
-    /// Defines how the stage output `T` and [`StageOutcome`] mutate the workflow state `&mut S`.
-    pub fn reduce_with_outcome<F>(mut self, reducer: F) -> Self
-    where
-        F: Fn(&mut S, T, &StageOutcome) + Send + Sync + 'static,
-    {
-        let shared = Arc::new(reducer);
-        let shared_for_plain = shared.clone();
-        self.reducer = Some(Arc::new(move |state, out| {
-            let empty_outcome = StageOutcome::default();
-            shared_for_plain(state, out, &empty_outcome);
-        }));
-        self.outcome_reducer = Some(shared);
         self
     }
 
@@ -272,7 +250,6 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
             output_format,
             policy: self.policy,
             reducer,
-            outcome_reducer: self.outcome_reducer,
             skip_if: self.skip_if,
             required: self.required,
         }
@@ -567,18 +544,10 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             skipped: false,
         };
 
-        let mutation: StateMutation<S> = if let Some(ref outcome_reducer) = self.outcome_reducer {
-            let outcome_reducer = outcome_reducer.clone();
-            let outcome_clone = outcome.clone();
-            Box::new(move |s: &mut S| {
-                outcome_reducer(s, result.output, &outcome_clone);
-            })
-        } else {
-            let reducer = self.reducer.clone();
-            Box::new(move |s: &mut S| {
-                reducer(s, result.output);
-            })
-        };
+        let reducer = self.reducer.clone();
+        let mutation: StateMutation<S> = Box::new(move |s: &mut S| {
+            reducer(s, result.output);
+        });
 
         Ok((outcome, mutation))
     }
@@ -1017,28 +986,6 @@ mod tests {
             .execute_isolated(&env, &EmptyState, None)
             .await
             .expect("recitation fallback should accept non-quoted text response");
-    }
-
-    #[test]
-    fn test_stage_builder_reduce_clears_outcome_reducer() {
-        let stage: Stage<String, String> = Stage::builder("override_reduce")
-            .user_prompt(PromptTemplate::new("go"))
-            .output_format(OutputFormat::text())
-            .reduce_with_outcome(|state: &mut String, out: String, _outcome: &StageOutcome| {
-                *state = format!("outcome:{out}");
-            })
-            .reduce(|state: &mut String, out: String| {
-                *state = format!("plain:{out}");
-            })
-            .build();
-
-        assert!(
-            stage.outcome_reducer.is_none(),
-            "calling .reduce(...) after .reduce_with_outcome(...) must clear outcome_reducer"
-        );
-        let mut state = String::new();
-        (stage.reducer)(&mut state, "ok".to_string());
-        assert_eq!(state, "plain:ok");
     }
 
     struct MalformedToolCallThenTextProvider {
