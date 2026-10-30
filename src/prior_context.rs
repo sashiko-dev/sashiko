@@ -21,7 +21,7 @@
 use crate::authority::{ContributorAuthority, TrustTier};
 use crate::notes::select::diff_identifiers;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Hard per-patch serialized JSON byte budget for `PriorVersionContext`
 /// (512 KiB). Long series carry dozens of versions of discussion, and
@@ -86,6 +86,9 @@ pub struct PriorAttribution {
     /// Display name of the first speaker who raised the issue.
     pub originally_raised_by: String,
     pub originally_raised_in_version: u32,
+    /// The subject label of that revision as posted (`RFC v2`, `v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub originally_raised_in_label: Option<String>,
     pub origin_kind: OriginKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_url: Option<String>,
@@ -189,11 +192,20 @@ pub struct PriorChangelogBlock {
 }
 
 /// Transport-agnostic prior-version context attached to a single `vN` patch.
+///
+/// Every `version` in the context is a revision: the position in the linked
+/// chain, unique and increasing, used for ordering and identity. Authors'
+/// subject tags can repeat within one chain (`RFC` followed by `v1`, or a
+/// new version posted without a new tag), so `version_labels` maps each
+/// revision to the label the author actually posted (`RFC v2`, `v1`) for
+/// display.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriorVersionContext {
     pub current_version: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ancestor_versions: Vec<u32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub version_labels: BTreeMap<u32, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inter_version_diff_base_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1465,6 +1477,7 @@ mod tests {
                 attribution: PriorAttribution {
                     originally_raised_by: "Sashiko".to_string(),
                     originally_raised_in_version: 1,
+                    originally_raised_in_label: None,
                     origin_kind: OriginKind::SashikoReview,
                     reference_url: None,
                     raised_by_identities: Vec::new(),
@@ -1660,6 +1673,7 @@ mod tests {
                 attribution: PriorAttribution {
                     originally_raised_by: "Sashiko".to_string(),
                     originally_raised_in_version: 1,
+                    originally_raised_in_label: None,
                     origin_kind: OriginKind::SashikoReview,
                     reference_url: None,
                     raised_by_identities: Vec::new(),

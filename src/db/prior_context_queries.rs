@@ -403,11 +403,16 @@ impl Database {
         }
 
         let ancestor_versions: Vec<u32> = ancestors.iter().map(|a| a.effective_version).collect();
+        let version_labels: BTreeMap<u32, String> = std::iter::once(&curr_ps)
+            .chain(ancestors.iter())
+            .map(|row| (row.effective_version, row.public_label()))
+            .collect();
         let mut contexts: HashMap<i64, PriorVersionContext> = HashMap::new();
         for vp in &v_n_patches {
             let mut ctx = PriorVersionContext {
                 current_version: curr_ps.effective_version,
                 ancestor_versions: ancestor_versions.clone(),
+                version_labels: version_labels.clone(),
                 ..PriorVersionContext::default()
             };
             populate_interdiff_and_changelogs(
@@ -475,6 +480,7 @@ impl Database {
         }
 
         for ctx in contexts.values_mut() {
+            label_prior_findings(ctx);
             finalize_prior_version_context(ctx);
         }
         Ok(contexts)
@@ -868,6 +874,7 @@ impl Database {
             let attribution = PriorAttribution {
                 originally_raised_by: "Sashiko".to_string(),
                 originally_raised_in_version: reviewed_in_version,
+                originally_raised_in_label: None,
                 origin_kind: OriginKind::SashikoReview,
                 reference_url: default_reference_url.map(str::to_string),
                 raised_by_identities: vec![SASHIKO_IDENTITY.to_string()],
@@ -1213,6 +1220,29 @@ impl Database {
             patches_by_ps,
             opts.forge_bot_login,
         ))
+    }
+}
+
+impl ChainPatchsetRow {
+    /// The label shown to readers for this revision: the author's subject
+    /// tag for an email series, or the revision number for a Forge PR.
+    fn public_label(&self) -> String {
+        if self.mr_number.is_some() {
+            format!("v{}", self.effective_version)
+        } else {
+            crate::patch::SubjectRevision::parse(&self.subject).label()
+        }
+    }
+}
+
+/// Copies the public label of each prior finding's revision onto its
+/// attribution, so the credit shows the tag the author posted.
+fn label_prior_findings(ctx: &mut PriorVersionContext) {
+    for pf in &mut ctx.prior_findings {
+        pf.attribution.originally_raised_in_label = ctx
+            .version_labels
+            .get(&pf.attribution.originally_raised_in_version)
+            .cloned();
     }
 }
 
@@ -3915,6 +3945,83 @@ mod tests {
         assert_eq!(curr.effective_version, u32::MAX);
     }
 
+    /// `RFC -> v1 -> v2`: revisions stay unique and increasing while the
+    /// labels keep the tags the author posted, and prior findings carry
+    /// the label of the revision they were raised in.
+    #[test]
+    fn test_revisions_and_public_labels_for_rfc_chain() {
+        let row = |id: i64, subject: &str, mr_number: Option<i64>| ChainPatchsetRow {
+            id,
+            thread_id: None,
+            cover_letter_message_id: None,
+            subject: subject.to_string(),
+            author: "Author <a@example.com>".to_string(),
+            date: id * 100,
+            mr_url: None,
+            mr_number,
+            slug: None,
+            stored_version: None,
+            previous_patchset_id: None,
+            effective_version: 0,
+        };
+        let mut curr = row(3, "[PATCH v2 0/2] mm: fix", None);
+        let mut ancestors = vec![
+            row(2, "[PATCH 0/2] mm: fix", None),
+            row(1, "[RFC PATCH 0/2] mm: fix", None),
+        ];
+        assign_effective_versions(&mut curr, &mut ancestors);
+        let labelled: Vec<(u32, String)> = std::iter::once(&curr)
+            .chain(ancestors.iter())
+            .map(|r| (r.effective_version, r.public_label()))
+            .collect();
+        assert_eq!(
+            labelled,
+            vec![
+                (3, "v2".to_string()),
+                (2, "v1".to_string()),
+                (1, "RFC".to_string())
+            ]
+        );
+
+        let mut forge = row(4, "Fix the parser", Some(7));
+        forge.effective_version = 3;
+        assert_eq!(forge.public_label(), "v3");
+
+        let mut ctx = PriorVersionContext {
+            version_labels: labelled.into_iter().collect(),
+            prior_findings: vec![PriorFindingItem {
+                id: "PF1".to_string(),
+                reviewed_in_version: 1,
+                scope: PriorItemScope::DirectPatchLineage,
+                severity: "High".to_string(),
+                severity_explanation: None,
+                problem: "leak".to_string(),
+                locations: None,
+                attribution: PriorAttribution {
+                    originally_raised_by: "Sashiko".to_string(),
+                    originally_raised_in_version: 1,
+                    originally_raised_in_label: None,
+                    origin_kind: OriginKind::SashikoReview,
+                    reference_url: None,
+                    raised_by_identities: Vec::new(),
+                    evidence: Vec::new(),
+                    found_by: None,
+                    attribution_line: None,
+                },
+                source_message_id: None,
+            }],
+            ..PriorVersionContext::default()
+        };
+        label_prior_findings(&mut ctx);
+        assert_eq!(
+            ctx.prior_findings[0]
+                .attribution
+                .originally_raised_in_label
+                .as_deref(),
+            Some("RFC")
+        );
+    }
+
     #[tokio::test]
     async fn test_prior_feedback_resolutions_and_finding_provenance_queryable() {
         let db = setup_db().await;
@@ -3978,6 +4085,7 @@ mod tests {
         let attr = crate::prior_context::PriorAttribution {
             originally_raised_by: "Oliver Neukum".to_string(),
             originally_raised_in_version: 1,
+            originally_raised_in_label: None,
             origin_kind: crate::prior_context::OriginKind::HumanReviewer,
             reference_url: Some("https://lore.kernel.org/r/hm1@suse.com".to_string()),
             raised_by_identities: vec!["oneukum@suse.com".to_string()],
