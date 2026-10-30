@@ -26,7 +26,7 @@ contributing process (docs/devel/submitting-a-patch.rst).
   the file already uses them, no C99 declarations after statements when the
   surrounding style forbids them); `scripts/checkpatch.pl` conformance issues
   are at most Low severity.
-- Do not report formatting nits the project's own tooling would not flag.
+- Do not report formatting issues the project's own tooling would not flag.
 
 ## Tests and documentation
 
