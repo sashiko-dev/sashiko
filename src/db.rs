@@ -15,6 +15,8 @@
 #[cfg(feature = "server")]
 use crate::ReviewStatus;
 #[cfg(feature = "server")]
+use crate::patch::{RevisionStep, SubjectRevision};
+#[cfg(feature = "server")]
 use crate::settings::DatabaseSettings;
 #[cfg(feature = "server")]
 use anyhow::Context;
@@ -1504,6 +1506,11 @@ const SUBJECT_SUPERSEDE_MAX_AGE_SECS: i64 = 30 * 86400;
 #[cfg(feature = "server")]
 const SUBJECT_LINK_WINDOW_SECS: i64 = 120 * 86400;
 
+/// Postings with an unchanged version tag sent closer together than this
+/// are an accidental double send, not a new version.
+#[cfg(feature = "server")]
+const SAME_LABEL_MIN_GAP_SECS: i64 = 3600;
+
 #[cfg(feature = "server")]
 const LINEAGE_CANDIDATE_COLUMNS: &str =
     "id, subject, subject_index, author, date, total_parts, cover_letter_message_id, version";
@@ -1544,11 +1551,15 @@ impl VersionLinkSignal {
     /// Whether a link through this signal is strong enough to cancel a
     /// predecessor posted `age_secs` before the new version. An explicit
     /// change-id or body link always is; a subject match only within the
-    /// 30 days the superseding logic used before version lineage.
-    fn supersedes(self, age_secs: i64) -> bool {
+    /// 30 days the superseding logic used before version lineage, and
+    /// only when the subject tag moved forward: two unrelated series that
+    /// share an exact subject and tag must never cancel each other.
+    fn supersedes(self, age_secs: i64, step: RevisionStep) -> bool {
         match self {
             Self::ChangeId | Self::MessageRef => true,
-            Self::SubjectAuthor => age_secs <= SUBJECT_SUPERSEDE_MAX_AGE_SECS,
+            Self::SubjectAuthor => {
+                step == RevisionStep::Advances && age_secs <= SUBJECT_SUPERSEDE_MAX_AGE_SECS
+            }
         }
     }
 
@@ -1560,6 +1571,45 @@ impl VersionLinkSignal {
         match self {
             Self::ChangeId | Self::SubjectAuthor => true,
             Self::MessageRef => false,
+        }
+    }
+
+    /// Whether a candidate posted `gap_secs` before the current patchset,
+    /// whose subject tag steps to the current tag with `step`, may be its
+    /// previous version through this signal. Version tags are author-chosen
+    /// hints, so a tag that moves forward (including RFC to non-RFC) always
+    /// qualifies. A b4 change-id proves the series, so it also accepts an
+    /// unchanged tag (unless the postings look like an accidental double
+    /// send) and a tag that went backwards. Body links can name several
+    /// related series (a kernel series and its QEMU counterpart list each
+    /// other's versions), so they keep requiring a tag that moves forward.
+    /// The subject-only signal trusts an unchanged tag only with a
+    /// bracketed PATCH/RFC tag (`tagged`) within 30 days, because recurring
+    /// subjects (merge notifications, periodic fix collections) repeat
+    /// verbatim.
+    fn admits(self, step: RevisionStep, gap_secs: i64, tagged: bool) -> bool {
+        match (self, step) {
+            (_, RevisionStep::Advances) => true,
+            (Self::ChangeId, RevisionStep::SameLabel) => gap_secs >= SAME_LABEL_MIN_GAP_SECS,
+            (Self::SubjectAuthor, RevisionStep::SameLabel) => {
+                tagged
+                    && (SAME_LABEL_MIN_GAP_SECS..=SUBJECT_SUPERSEDE_MAX_AGE_SECS)
+                        .contains(&gap_secs)
+            }
+            (Self::ChangeId, RevisionStep::Regresses) => true,
+            (Self::MessageRef, RevisionStep::SameLabel | RevisionStep::Regresses)
+            | (Self::SubjectAuthor, RevisionStep::Regresses) => false,
+        }
+    }
+
+    /// Whether a later candidate whose tag follows an earlier candidate's
+    /// tag with `step` replaces the earlier one as the newest posting of
+    /// the series.
+    fn later_candidate_replaces(self, step: RevisionStep) -> bool {
+        match step {
+            RevisionStep::Advances => true,
+            RevisionStep::SameLabel => self.same_version_is_same_series(),
+            RevisionStep::Regresses => false,
         }
     }
 }
@@ -1639,6 +1689,7 @@ struct LineageCandidate {
     total_parts: u32,
     cover_id: Option<String>,
     version: u32,
+    revision: SubjectRevision,
 }
 
 #[cfg(feature = "server")]
@@ -1647,9 +1698,11 @@ impl LineageCandidate {
     fn from_row(row: &libsql::Row) -> Result<Self> {
         let subject: String = row.get::<Option<String>>(1)?.unwrap_or_default();
         let stored_version: Option<u32> = row.get(7)?;
+        let version = effective_version(stored_version, &subject);
         Ok(Self {
             id: row.get(0)?,
-            version: effective_version(stored_version, &subject),
+            version,
+            revision: SubjectRevision::with_number(&subject, version),
             subject,
             subject_index: row.get::<Option<u32>>(2)?.unwrap_or(9999),
             author: row.get::<Option<String>>(3)?.unwrap_or_default(),
@@ -1682,6 +1735,7 @@ struct LineageContext<'a> {
     author: &'a str,
     date: i64,
     version: u32,
+    revision: SubjectRevision,
     change_id: Option<&'a str>,
     refs: &'a LineageReferences,
 }
@@ -12208,6 +12262,7 @@ impl Database {
             author: &curr.author,
             date: curr.date,
             version: curr.version(),
+            revision: SubjectRevision::with_number(&curr.subject, curr.version()),
             change_id: curr.change_id.as_deref().or(new_change_id.as_deref()),
             refs: &refs,
         };
@@ -12420,7 +12475,7 @@ impl Database {
                 VersionLinkSignal::MessageRef => self.message_ref_candidates(ctx).await?,
                 VersionLinkSignal::SubjectAuthor => self.subject_author_candidates(ctx).await?,
             };
-            let qualifying = self.qualifying_predecessors(ctx, raw).await?;
+            let qualifying = self.qualifying_predecessors(ctx, raw, signal).await?;
             match Self::choose_predecessor(qualifying, signal) {
                 PredecessorChoice::NoCandidate => continue,
                 PredecessorChoice::Ambiguous(ids) => {
@@ -12438,39 +12493,70 @@ impl Database {
         Ok(None)
     }
 
+    /// Picks the newest posting of the series among the qualifying
+    /// candidates. A candidate is dropped when a later candidate follows
+    /// it in the series (its tag advances, or keeps the label for a signal
+    /// that proves the same series), so chronology decides even when tags
+    /// restart (`RFC v2 -> v1 -> v2`). Of the remaining candidates the
+    /// highest tag wins, which keeps a stale resend of an old version from
+    /// beating a newer version; ties are broken by date for same-series
+    /// signals and are ambiguous otherwise.
     fn choose_predecessor(
         mut candidates: Vec<LineageCandidate>,
         signal: VersionLinkSignal,
     ) -> PredecessorChoice {
-        let Some(top_version) = candidates.iter().map(|c| c.version).max() else {
-            return PredecessorChoice::NoCandidate;
-        };
-        candidates.retain(|c| c.version == top_version);
         candidates.sort_by_key(|c| (c.date, c.id));
         candidates.dedup_by_key(|c| c.id);
-        if candidates.len() > 1 && !signal.same_version_is_same_series() {
-            return PredecessorChoice::Ambiguous(candidates.iter().map(|c| c.id).collect());
+        let newest: Vec<&LineageCandidate> = candidates
+            .iter()
+            .filter(|older| {
+                !candidates.iter().any(|newer| {
+                    newer.date > older.date
+                        && signal.later_candidate_replaces(older.revision.step_to(newer.revision))
+                })
+            })
+            .collect();
+        let tag_rank = |c: &LineageCandidate| {
+            (
+                c.revision.number,
+                c.revision.stage == crate::patch::SeriesStage::Patch,
+            )
+        };
+        let Some(top) = newest.iter().map(|c| tag_rank(c)).max() else {
+            return PredecessorChoice::NoCandidate;
+        };
+        let mut top_ranked: Vec<&LineageCandidate> =
+            newest.into_iter().filter(|c| tag_rank(c) == top).collect();
+        if top_ranked.len() > 1 && !signal.same_version_is_same_series() {
+            return PredecessorChoice::Ambiguous(top_ranked.iter().map(|c| c.id).collect());
         }
-        match candidates.pop() {
-            Some(latest) => PredecessorChoice::Chosen(latest),
+        match top_ranked.pop() {
+            Some(latest) => PredecessorChoice::Chosen(latest.clone()),
             None => PredecessorChoice::NoCandidate,
         }
     }
 
-    /// Keeps the candidates that are strictly older, strictly lower
-    /// versioned, by the same author email, and not a prerequisite of (or
-    /// dependent on) the current patchset.
+    /// Keeps the candidates that are strictly older, whose subject tag
+    /// may precede the current one through `signal`, by the same author
+    /// email, and not a prerequisite of (or dependent on) the current
+    /// patchset.
     async fn qualifying_predecessors(
         &self,
         ctx: &LineageContext<'_>,
         candidates: Vec<LineageCandidate>,
+        signal: VersionLinkSignal,
     ) -> Result<Vec<LineageCandidate>> {
+        let ctx_tagged = crate::patch::has_patch_or_rfc_tag(ctx.subject);
         let mut out = Vec::new();
         for cand in candidates {
             if cand.id == ctx.patchset_id
                 || is_placeholder_or_reply(&cand.subject, cand.subject_index)
                 || cand.date >= ctx.date
-                || cand.version >= ctx.version
+                || !signal.admits(
+                    cand.revision.step_to(ctx.revision),
+                    ctx.date - cand.date,
+                    ctx_tagged && crate::patch::has_patch_or_rfc_tag(&cand.subject),
+                )
                 || !same_author_email(&cand.author, ctx.author)
             {
                 continue;
@@ -12589,12 +12675,17 @@ impl Database {
         &self,
         ctx: &LineageContext<'_>,
         existing_prev_id: i64,
+        existing_signal: Option<&str>,
     ) -> Result<bool> {
         let Some(cand) = self.load_lineage_candidate(existing_prev_id).await? else {
             return Ok(false);
         };
+        // A link whose signal is unknown is held to the strictest rules.
+        let signal = existing_signal
+            .and_then(VersionLinkSignal::from_str)
+            .unwrap_or(VersionLinkSignal::SubjectAuthor);
         Ok(!self
-            .qualifying_predecessors(ctx, vec![cand])
+            .qualifying_predecessors(ctx, vec![cand], signal)
             .await?
             .is_empty())
     }
@@ -12610,8 +12701,7 @@ impl Database {
         let shape = SubjectShape::of(ctx.subject_index, ctx.total_parts);
         let clean_curr = crate::patch::clean_subject(ctx.subject);
         let curr_prefixes = crate::patch::get_subject_prefixes(ctx.subject);
-        if ctx.version <= 1
-            || shape == SubjectShape::Other
+        if shape == SubjectShape::Other
             || clean_curr.is_empty()
             || Self::is_generic_short_subject(&clean_curr, &curr_prefixes)
         {
@@ -12664,7 +12754,9 @@ impl Database {
     ) -> Result<usize> {
         let Some((pred, signal)) = chosen else {
             if let Some(prev_id) = existing_prev_id
-                && self.existing_link_still_qualifies(ctx, prev_id).await?
+                && self
+                    .existing_link_still_qualifies(ctx, prev_id, existing_signal)
+                    .await?
             {
                 self.reconcile_patch_lineage(prev_id, ctx.patchset_id)
                     .await?;
@@ -12715,11 +12807,12 @@ impl Database {
         // leave the predecessor alone so an explicit rerun is respected.
         // Nothing beyond the direct predecessor is ever cancelled.
         let age_secs = ctx.date.saturating_sub(pred.date);
+        let step = pred.revision.step_to(ctx.revision);
         let previously_superseded = !is_new_link
             && existing_signal
                 .and_then(VersionLinkSignal::from_str)
-                .is_some_and(|prev_sig| prev_sig.supersedes(age_secs));
-        if previously_superseded || !signal.supersedes(age_secs) {
+                .is_some_and(|prev_sig| prev_sig.supersedes(age_secs, step));
+        if previously_superseded || !signal.supersedes(age_secs, step) {
             return Ok(0);
         }
         // cancel_patchset only cancels a patchset (and its pending outbox)
@@ -29860,6 +29953,202 @@ mod tests {
     }
 
     const DAY: i64 = 86400;
+
+    /// Ingests a single-patch series with an empty body.
+    async fn ingest_single(
+        db: &Database,
+        author: &str,
+        date: i64,
+        msgid: &str,
+        subject: &str,
+    ) -> i64 {
+        ingest_test_series(
+            db,
+            author,
+            date,
+            None,
+            &[TestPart::new(msgid, subject)],
+            None,
+        )
+        .await
+    }
+
+    /// A QEMU series whose cover letter lists the version links of its
+    /// companion kernel series (patchsets 39050 and 39053 in the audited
+    /// database) is not linked to the newer-tagged kernel series, while a
+    /// b4 change-id still follows an unchanged or mistyped tag.
+    #[test]
+    fn test_version_link_signal_admits_by_step() {
+        use RevisionStep::{Advances, Regresses, SameLabel};
+        let day = 86_400;
+        assert!(!VersionLinkSignal::MessageRef.admits(Regresses, 600, true));
+        assert!(!VersionLinkSignal::MessageRef.admits(SameLabel, day, true));
+        assert!(VersionLinkSignal::MessageRef.admits(Advances, 600, true));
+        assert!(VersionLinkSignal::ChangeId.admits(Regresses, day, true));
+        assert!(VersionLinkSignal::ChangeId.admits(SameLabel, day, true));
+        assert!(!VersionLinkSignal::ChangeId.admits(SameLabel, 600, true));
+        assert!(VersionLinkSignal::SubjectAuthor.admits(SameLabel, day, true));
+        assert!(!VersionLinkSignal::SubjectAuthor.admits(SameLabel, day, false));
+        assert!(!VersionLinkSignal::SubjectAuthor.admits(SameLabel, 31 * day, true));
+        assert!(!VersionLinkSignal::SubjectAuthor.admits(Regresses, day, true));
+        assert!(VersionLinkSignal::SubjectAuthor.admits(Advances, 100 * day, false));
+    }
+
+    /// An RFC followed by a plain [PATCH] (the most common RFC flow, never
+    /// linked by a strictly-lower-version rule) links through the exact
+    /// subject, and numbering restarted after RFC v2 still links.
+    #[tokio::test]
+    async fn test_version_lineage_rfc_followed_by_unversioned_patch() {
+        let db = setup_db().await;
+        let author = "SJ <sj@kernel.org>";
+        let d0 = 1_790_000_000;
+        let rfc = ingest_single(
+            &db,
+            author,
+            d0,
+            "rfc-1@k.org",
+            "[RFC PATCH] mm/damon/core: fix quota",
+        )
+        .await;
+        let rfc2 = ingest_single(
+            &db,
+            author,
+            d0 + 2 * DAY,
+            "rfc-2@k.org",
+            "[RFC PATCH v2] mm/damon/core: fix quota",
+        )
+        .await;
+        assert_linked(&db, rfc2, rfc, "subject_author").await;
+        let v1 = ingest_single(
+            &db,
+            author,
+            d0 + 5 * DAY,
+            "v1@k.org",
+            "[PATCH] mm/damon/core: fix quota",
+        )
+        .await;
+        assert_linked(&db, v1, rfc2, "subject_author").await;
+        // The RFC to non-RFC step moves the tag forward, so the in-flight
+        // RFC is superseded like any older version.
+        assert_status(&db, rfc2, "Cancelled").await;
+    }
+
+    /// `RFC v2 -> v1 -> v2`: the final v2 follows the newest posting of
+    /// the series (v1), not the highest number (RFC v2).
+    #[tokio::test]
+    async fn test_version_lineage_restarted_numbering_follows_chronology() {
+        let db = setup_db().await;
+        let author = "Dev <dev@example.org>";
+        let subj = |tag: &str| format!("[{tag}] net: foo: fix teardown race");
+        let d0 = 1_790_000_000;
+        let rfc2 = ingest_single(&db, author, d0, "a@x", &subj("RFC PATCH v2")).await;
+        let v1 = ingest_single(&db, author, d0 + 3 * DAY, "b@x", &subj("PATCH")).await;
+        let v2 = ingest_single(&db, author, d0 + 6 * DAY, "c@x", &subj("PATCH v2")).await;
+        assert_linked(&db, v1, rfc2, "subject_author").await;
+        assert_linked(&db, v2, v1, "subject_author").await;
+    }
+
+    /// A new version posted without changing the tag (a day later) links
+    /// through the subject but leaves the predecessor's review running. A
+    /// double send minutes apart is not a new version of the posting it
+    /// repeats, and a subject without a PATCH tag or a repost beyond 30
+    /// days is not linked.
+    #[tokio::test]
+    async fn test_version_lineage_unchanged_tag_links_by_chronology() {
+        let db = setup_db().await;
+        let author = "Krzysztof <krzk@kernel.org>";
+        let d0 = 1_790_000_000;
+        let subj = "[PATCH] wifi: ath10k: drop unused qmi_elem_info arrays";
+        let first = ingest_single(&db, author, d0, "w1@k.org", subj).await;
+        db.update_patchset_status(first, "Pending").await.unwrap();
+        let next_day = ingest_single(&db, author, d0 + DAY, "w2@k.org", subj).await;
+        assert_linked(&db, next_day, first, "subject_author").await;
+        assert_status(&db, first, "Pending").await;
+
+        // A double send of next_day is not its next version; it links to
+        // the same predecessor as the posting it repeats.
+        let double_send = ingest_single(&db, author, d0 + DAY + 300, "w3@k.org", subj).await;
+        assert_linked(&db, double_send, first, "subject_author").await;
+
+        let much_later = ingest_single(&db, author, d0 + 70 * DAY, "w4@k.org", subj).await;
+        assert_not_linked(&db, much_later).await;
+
+        let merge = "linux-next: manual merge of the drm tree with the origin tree";
+        let m1 = ingest_single(&db, author, d0, "m1@k.org", merge).await;
+        let m2 = ingest_single(&db, author, d0 + 2 * DAY, "m2@k.org", merge).await;
+        assert_not_linked(&db, m1).await;
+        assert_not_linked(&db, m2).await;
+    }
+
+    /// A tag that goes backwards is not followed by the subject signal,
+    /// and a stale resend of an old version posted after a newer version
+    /// does not become the predecessor of the next version.
+    #[tokio::test]
+    async fn test_version_lineage_regressing_tag_and_stale_resend() {
+        let db = setup_db().await;
+        let author = "Dev <dev@example.org>";
+        let subj = |tag: &str| format!("[{tag}] spi: fsl: release DMA channels on remove");
+        let d0 = 1_790_000_000;
+        let v1 = ingest_single(&db, author, d0, "s1@x", &subj("PATCH")).await;
+        let v2 = ingest_single(&db, author, d0 + 2 * DAY, "s2@x", &subj("PATCH v2")).await;
+        let resend_v1 = ingest_single(&db, author, d0 + 4 * DAY, "s3@x", &subj("PATCH")).await;
+        let v3 = ingest_single(&db, author, d0 + 6 * DAY, "s4@x", &subj("PATCH v3")).await;
+        assert_linked(&db, v2, v1, "subject_author").await;
+        // [PATCH] after [PATCH v2] regresses; its only same-label
+        // candidate, v1, is still accepted.
+        assert_linked(&db, resend_v1, v1, "subject_author").await;
+        assert_linked(&db, v3, v2, "subject_author").await;
+    }
+
+    #[test]
+    fn test_choose_predecessor_newest_posting_of_series() {
+        let cand = |id: i64, date: i64, subject: &str| {
+            let version = crate::patch::parse_subject_version(subject).unwrap_or(1);
+            LineageCandidate {
+                id,
+                subject: subject.to_string(),
+                subject_index: 1,
+                author: String::new(),
+                date,
+                total_parts: 1,
+                cover_id: None,
+                version,
+                revision: SubjectRevision::with_number(subject, version),
+            }
+        };
+        let chosen = |cands: Vec<LineageCandidate>, signal| match Database::choose_predecessor(
+            cands, signal,
+        ) {
+            PredecessorChoice::Chosen(c) => Some(c.id),
+            PredecessorChoice::Ambiguous(_) | PredecessorChoice::NoCandidate => None,
+        };
+        // RFC, RFC v2 and v1 are all older than v2: v1 is the newest.
+        let rfc_chain = || {
+            vec![
+                cand(1, 10, "[RFC PATCH] x"),
+                cand(2, 20, "[RFC PATCH v2] x"),
+                cand(3, 30, "[PATCH] x"),
+            ]
+        };
+        assert_eq!(
+            chosen(rfc_chain(), VersionLinkSignal::SubjectAuthor),
+            Some(3)
+        );
+        assert_eq!(chosen(rfc_chain(), VersionLinkSignal::MessageRef), Some(3));
+        // v1 -> RFC v2 keeps one counter: RFC v2 is newest.
+        let counted = vec![cand(1, 10, "[PATCH] x"), cand(2, 20, "[RFC PATCH v2] x")];
+        assert_eq!(chosen(counted, VersionLinkSignal::SubjectAuthor), Some(2));
+        // Two explicit references with the same tag stay ambiguous.
+        let two_refs = vec![cand(1, 10, "[PATCH v2] a"), cand(2, 20, "[PATCH v2] b")];
+        assert!(matches!(
+            Database::choose_predecessor(two_refs, VersionLinkSignal::MessageRef),
+            PredecessorChoice::Ambiguous(_)
+        ));
+        assert!(matches!(
+            Database::choose_predecessor(Vec::new(), VersionLinkSignal::ChangeId),
+            PredecessorChoice::NoCandidate
+        ));
+    }
 
     /// Oliver Hartkopp's CAN series (patchsets 87034, 90825 and 91985 in
     /// the audited database) share one patch but are different series. A
