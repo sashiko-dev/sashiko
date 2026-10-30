@@ -49,6 +49,22 @@ symbols = [
   finding onto one of the four levels, and other terms leave that mapping to
   guesswork. Rules that only decide whether a pattern is reported at all
   ("do not report", "report it as a bug") need no severity level.
+- **Every instruction must be doable by the review:** A Sashiko review sees
+  only the patch and its commit message, any series or prior-version context
+  included in the prompt, the prompts and notes loaded into it, and the
+  reviewed git repository through read-only tools (`git_read_files`,
+  `git_grep`, `git_find_files`, `git_ls`, `git_diff`, `git_show`,
+  `git_log`, `git_blame`). It cannot access the internet, mailing list
+  archives, bug trackers, datasheets, specifications, or any tree other than
+  the reviewed one, and it cannot compile code, run tests, linters,
+  checkpatch, scripts, or shell commands, or observe how a patch was sent.
+  Flag any note bullet that asks the reviewer to do one of these things (for
+  example "run checkpatch.pl", "check that it builds with W=1", "look up the
+  earlier discussion on lore", or "verify the register layout against the
+  datasheet"). Ask for a rewrite that names evidence the review can read
+  instead, such as a file or document in the tree, a pattern to search for
+  with `git_grep`, or history to inspect with `git_log`, or that drops the
+  bullet when no such evidence exists.
 
 ## Code Notes (`projects/*/prompts/notes/` and `src/notes/`)
 
