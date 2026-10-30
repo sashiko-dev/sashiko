@@ -842,6 +842,13 @@ async fn run_daemon(
         warn!("Patchset MAINTAINERS attribution backfill failed: {e}");
     }
 
+    // Brings stored upstream grant rows in line with the grants loaded now.
+    // A failure leaves the rows from the last complete walk in place, and the
+    // walk is retried on the next boot.
+    if let Err(e) = sashiko::backfill::reconcile_upstream_grant_sections(&db).await {
+        error!("Upstream grant reconciliation failed: {e:#}");
+    }
+
     // Create internal task queues
     // raw_tx -> Parser -> parsed_tx -> DB Worker
     let (raw_tx, mut raw_rx) = mpsc::channel::<Event>(1000);

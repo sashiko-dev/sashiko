@@ -820,6 +820,23 @@ impl Bug {
         None
     }
 
+    /// The files a bug is attributed by: the latest verification's
+    /// `source_files`, else the ones filed with the candidate. Unlike
+    /// [`Bug::source_files`], this also covers bugs not yet verified.
+    pub fn attributable_files(&self) -> Option<Vec<String>> {
+        self.source_files().or_else(|| {
+            self.enrichments.iter().find_map(|e| {
+                if e.kind != "candidate" && e.kind != "raw_candidate" {
+                    return None;
+                }
+                e.data_json
+                    .as_ref()?
+                    .get("source_files")
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+            })
+        })
+    }
+
     pub fn introduced_in_commit(&self) -> Option<String> {
         for e in self.enrichments.iter().rev() {
             if e.kind == "origin_discovery" {
@@ -4165,6 +4182,71 @@ impl Database {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Replaces the upstream grant rows of a page of bugs in one short
+    /// transaction.
+    pub async fn replace_bug_upstream_sections_batch(
+        &self,
+        rows: &[(i64, Vec<String>)],
+    ) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        for (bug_id, granted) in rows {
+            tx_db.write_bug_upstream_sections(*bug_id, granted).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Replaces the upstream grant rows of a page of patchsets in one short
+    /// transaction.
+    pub async fn replace_patchset_upstream_sections_batch(
+        &self,
+        rows: &[(i64, Vec<String>)],
+    ) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        for (patchset_id, granted) in rows {
+            tx_db
+                .write_patchset_upstream_sections(*patchset_id, granted)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Bug ids greater than `after_id`, ascending, for walks over every bug.
+    pub async fn bug_ids_after(&self, after_id: i64, limit: usize) -> Result<Vec<i64>> {
+        self.ids_after(
+            "SELECT id FROM bugs WHERE id > ? ORDER BY id ASC LIMIT ?",
+            after_id,
+            limit,
+        )
+        .await
+    }
+
+    /// Patchset ids greater than `after_id`, ascending, for walks over every
+    /// patchset.
+    pub async fn patchset_ids_after(&self, after_id: i64, limit: usize) -> Result<Vec<i64>> {
+        self.ids_after(
+            "SELECT id FROM patchsets WHERE id > ? ORDER BY id ASC LIMIT ?",
+            after_id,
+            limit,
+        )
+        .await
+    }
+
+    async fn ids_after(&self, sql: &str, after_id: i64, limit: usize) -> Result<Vec<i64>> {
+        let mut rows = self
+            .conn
+            .query(sql, libsql::params![after_id, limit as i64])
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get(0)?);
+        }
+        Ok(ids)
     }
 
     /// Returns the MAINTAINERS section titles that grant authority over this
