@@ -9497,7 +9497,7 @@ impl Database {
             let message_id: Option<String> = row.get(4)?;
             let slug: Option<String> = row.get(5)?;
             let stored_ver: Option<u32> = row.get(6)?;
-            let prev_id: Option<i64> = row.get(7)?;
+            let mut prev_id: Option<i64> = row.get(7)?;
             let mr_number: Option<i64> = row.get(8)?;
             let embargo_until: Option<i64> = row.get(9)?;
             drop(rows);
@@ -9521,6 +9521,14 @@ impl Database {
                         .and_then(crate::patch::parse_subject_version)
                 })
                 .unwrap_or(1);
+
+            if prev_id.is_none() && stored_ver.is_none() && ver > 1 && mr_number.is_none() {
+                if let Err(e) = self.reconcile_ancestor_version_lineage(id).await {
+                    warn!("Failed to lazily reconcile version lineage for patchset {id}: {e}");
+                } else {
+                    prev_id = self.get_previous_patchset_id(id).await.unwrap_or(None);
+                }
+            }
 
             nodes.push(ChainNode {
                 id,
@@ -9637,8 +9645,8 @@ impl Database {
             // Columns 0..=19 are read above; columns 20..=23 are p.version,
             // p.previous_patchset_id, p.version_link_signal, and p.mr_number (24 columns total).
             let stored_version: Option<u32> = row.get(20)?;
-            let previous_patchset_id: Option<i64> = row.get(21)?;
-            let version_link_signal: Option<String> = row.get(22)?;
+            let mut previous_patchset_id: Option<i64> = row.get(21)?;
+            let mut version_link_signal: Option<String> = row.get(22)?;
             let mr_number: Option<i64> = row.get(23)?;
             drop(rows);
             let baseline = self.get_baseline_json(baseline_id).await?;
@@ -9654,6 +9662,19 @@ impl Database {
                         .and_then(crate::patch::parse_subject_version)
                 })
                 .unwrap_or(1);
+
+            if previous_patchset_id.is_none()
+                && stored_version.is_none()
+                && effective_version > 1
+                && mr_number.is_none()
+            {
+                if let Err(e) = self.reconcile_ancestor_version_lineage(pid).await {
+                    warn!("Failed to lazily reconcile version lineage for patchset {pid}: {e}");
+                } else if let Ok(Some(subj)) = Self::read_lineage_subject(&self.conn, pid).await {
+                    previous_patchset_id = subj.previous_patchset_id;
+                    version_link_signal = subj.version_link_signal;
+                }
+            }
 
             // Calculate pagination
             let limit_val = limit.unwrap_or(50);
@@ -9902,8 +9923,8 @@ impl Database {
             // Columns 0..=19 are read above; columns 20..=23 are p.version,
             // p.previous_patchset_id, p.version_link_signal, and p.mr_number (24 columns total).
             let stored_version: Option<u32> = row.get(20)?;
-            let previous_patchset_id: Option<i64> = row.get(21)?;
-            let version_link_signal: Option<String> = row.get(22)?;
+            let mut previous_patchset_id: Option<i64> = row.get(21)?;
+            let mut version_link_signal: Option<String> = row.get(22)?;
             let mr_number: Option<i64> = row.get(23)?;
             drop(rows);
             let baseline = self.get_baseline_json(baseline_id).await?;
@@ -9919,6 +9940,19 @@ impl Database {
                         .and_then(crate::patch::parse_subject_version)
                 })
                 .unwrap_or(1);
+
+            if previous_patchset_id.is_none()
+                && stored_version.is_none()
+                && effective_version > 1
+                && mr_number.is_none()
+            {
+                if let Err(e) = self.reconcile_ancestor_version_lineage(pid).await {
+                    warn!("Failed to lazily reconcile version lineage for patchset {pid}: {e}");
+                } else if let Ok(Some(subj)) = Self::read_lineage_subject(&self.conn, pid).await {
+                    previous_patchset_id = subj.previous_patchset_id;
+                    version_link_signal = subj.version_link_signal;
+                }
+            }
 
             let limit_val = limit.unwrap_or(50);
             let page_val = page.unwrap_or(1);
@@ -11706,6 +11740,49 @@ impl Database {
         patchset_id: i64,
         skip_intermediate_parts: bool,
     ) -> Result<usize> {
+        let cancelled = self
+            .reconcile_version_lineage_with_options(patchset_id, skip_intermediate_parts, true)
+            .await?;
+        if let Some(prev_id) = self.get_previous_patchset_id(patchset_id).await? {
+            self.reconcile_ancestor_version_lineage(prev_id).await?;
+        }
+        Ok(cancelled)
+    }
+
+    /// Lazily reconciles unlinked pre-migration-14 ancestor patchsets
+    /// (`version IS NULL` and effective version > 1) along the backward chain
+    /// starting at `start_id`, without cancelling any historical patchset.
+    pub(crate) async fn reconcile_ancestor_version_lineage(&self, start_id: i64) -> Result<()> {
+        const MAX_CHAIN_HOPS: usize = 32;
+        let mut curr_id = start_id;
+        let mut visited = std::collections::HashSet::new();
+        while visited.len() < MAX_CHAIN_HOPS && visited.insert(curr_id) {
+            let Some(subj) = Self::read_lineage_subject(&self.conn, curr_id).await? else {
+                break;
+            };
+            if let Some(prev_id) = subj.previous_patchset_id {
+                curr_id = prev_id;
+                continue;
+            }
+            if subj.stored_version.is_some() || subj.version() <= 1 || subj.mr_number.is_some() {
+                break;
+            }
+            self.reconcile_version_lineage_with_options(curr_id, false, false)
+                .await?;
+            let Some(updated_prev_id) = self.get_previous_patchset_id(curr_id).await? else {
+                break;
+            };
+            curr_id = updated_prev_id;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_version_lineage_with_options(
+        &self,
+        patchset_id: i64,
+        skip_intermediate_parts: bool,
+        allow_supersede: bool,
+    ) -> Result<usize> {
         let Some(pre) = Self::read_lineage_subject(&self.conn, patchset_id).await? else {
             return Ok(0);
         };
@@ -11755,7 +11832,12 @@ impl Database {
         };
 
         let cancelled = tx_db
-            .reconcile_version_lineage_locked(patchset_id, skip_intermediate_parts, refs)
+            .reconcile_version_lineage_locked(
+                patchset_id,
+                skip_intermediate_parts,
+                allow_supersede,
+                refs,
+            )
             .await?;
 
         if let Some(tx) = tx_guard {
@@ -11770,6 +11852,7 @@ impl Database {
         &self,
         patchset_id: i64,
         skip_intermediate_parts: bool,
+        allow_supersede: bool,
         refs: LineageReferences,
     ) -> Result<usize> {
         let Some(curr) = Self::read_lineage_subject(&self.conn, patchset_id).await? else {
@@ -11830,6 +11913,7 @@ impl Database {
             curr.previous_patchset_id,
             curr.version_link_signal.as_deref(),
             chosen,
+            allow_supersede,
         )
         .await
     }
@@ -12255,6 +12339,7 @@ impl Database {
         existing_prev_id: Option<i64>,
         existing_signal: Option<&str>,
         chosen: Option<(LineageCandidate, VersionLinkSignal)>,
+        allow_supersede: bool,
     ) -> Result<usize> {
         let Some((pred, signal)) = chosen else {
             if let Some(prev_id) = existing_prev_id
@@ -12297,6 +12382,10 @@ impl Database {
         }
         self.reconcile_patch_lineage(pred.id, ctx.patchset_id)
             .await?;
+
+        if !allow_supersede {
+            return Ok(0);
+        }
 
         // A link supersedes when it is newly established or when its signal
         // upgrades from one that did not supersede at age_secs (for example,
@@ -29941,6 +30030,132 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
         assert_status(&db, ps_v1, "Pending").await;
         db.reconcile_version_lineage(ps_v2).await.unwrap();
         assert_status(&db, ps_v1, "Pending").await;
+    }
+
+    #[tokio::test]
+    async fn test_version_lineage_lazily_links_pre_migration_14_ancestor_chain() {
+        let db = setup_db().await;
+        let author = "Zhan Xusheng <zhanxusheng1024@gmail.com>";
+        let d0 = 1_780_000_000i64;
+
+        let ps_v1 = ingest_test_series(
+            &db,
+            author,
+            d0,
+            None,
+            &[TestPart::new(
+                "20261016032732.2328852-1-zhanxusheng@xiaomi.com",
+                "[PATCH] Input: sysrq - reset the per-device key state when reparsing reset_seq",
+            )],
+            None,
+        )
+        .await;
+        let ps_v2 = ingest_test_series(
+            &db,
+            author,
+            d0 + DAY,
+            None,
+            &[TestPart::new(
+                "20261016070636.2559899-1-zhanxusheng@xiaomi.com",
+                "[PATCH v2] tty: sysrq: reset the per-device key state when reparsing reset_seq",
+            )
+            .body("Fix state.\n---\nv1: https://lore.kernel.org/all/20261016032732.2328852-1-zhanxusheng@xiaomi.com/\n")],
+            None,
+        )
+        .await;
+        let ps_v3 = ingest_test_series(
+            &db,
+            author,
+            d0 + 5 * DAY,
+            Some(
+                TestPart::new(
+                    "20261021022007.1717207-1-zhanxusheng1024@gmail.com",
+                    "[PATCH v3 0/2] tty: sysrq: fix the reset sequence state kept per input device",
+                )
+                .body("Cover v3.\n\nv2: https://lore.kernel.org/all/20261016070636.2559899-1-zhanxusheng@xiaomi.com/\nv1: https://lore.kernel.org/all/20261016032732.2328852-1-zhanxusheng@xiaomi.com/\n"),
+            ),
+            &[
+                TestPart::new(
+                    "20261021022007.1717207-2-zhanxusheng1024@gmail.com",
+                    "[PATCH v3 1/2] tty: sysrq: move reset sequence state to sysrq_state",
+                ),
+                TestPart::new(
+                    "20261021022007.1717207-3-zhanxusheng1024@gmail.com",
+                    "[PATCH v3 2/2] tty: sysrq: reset the per-device key state when reparsing reset_seq",
+                ),
+            ],
+            None,
+        )
+        .await;
+
+        // Simulate pre-migration-14 rows for v1, v2, and v3 (version IS NULL,
+        // previous_patchset_id IS NULL, and Pending status on v2 to verify
+        // lazy ancestor reconciliation never cancels historical predecessors).
+        db.execute(
+            "UPDATE patchsets SET version = NULL, previous_patchset_id = NULL, version_link_signal = NULL WHERE id IN (?, ?, ?)",
+            libsql::params![ps_v1, ps_v2, ps_v3],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
+            libsql::params![ps_v2],
+        )
+        .await
+        .unwrap();
+
+        let ps_v4 = ingest_test_series(
+            &db,
+            author,
+            d0 + 14 * DAY,
+            Some(
+                TestPart::new(
+                    "20261030045854.153556-1-zhanxusheng1024@gmail.com",
+                    "[PATCH v4 0/2] tty: sysrq: fix the reset sequence kept per input device",
+                )
+                .body("Cover v4.\n\nv3: https://lore.kernel.org/all/20261021022007.1717207-1-zhanxusheng1024@gmail.com/\n"),
+            ),
+            &[
+                TestPart::new(
+                    "20261030045854.153556-2-zhanxusheng1024@gmail.com",
+                    "[PATCH v4 1/2] tty: sysrq: move reset sequence state to sysrq_state",
+                ),
+                TestPart::new(
+                    "20261030045854.153556-3-zhanxusheng1024@gmail.com",
+                    "[PATCH v4 2/2] tty: sysrq: reset the per-device key state when reparsing reset_seq",
+                ),
+            ],
+            None,
+        )
+        .await;
+
+        assert_linked(&db, ps_v4, ps_v3, "message_ref").await;
+        assert_linked(&db, ps_v3, ps_v2, "message_ref").await;
+        assert_linked(&db, ps_v2, ps_v1, "message_ref").await;
+        // Historical ancestor ps_v2 must not be cancelled when lazily linked.
+        assert_status(&db, ps_v2, "Pending").await;
+
+        // Also verify lazy on-read reconciliation when v4 was already linked to v3
+        // before v3 and v2 were reconciled.
+        db.execute(
+            "UPDATE patchsets SET version = NULL, previous_patchset_id = NULL, version_link_signal = NULL WHERE id IN (?, ?)",
+            libsql::params![ps_v2, ps_v3],
+        )
+        .await
+        .unwrap();
+
+        let details = db
+            .get_patchset_details(ps_v4, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let versions: Vec<i64> = details["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(versions, vec![ps_v1, ps_v2, ps_v3, ps_v4]);
     }
 
     #[test]
