@@ -215,6 +215,7 @@ pub fn shard_prior_version_context(ctx: &PriorVersionContext) -> Vec<PriorFeedba
         let shard_context = PriorVersionContext {
             current_version: ctx.current_version,
             ancestor_versions: ctx.ancestor_versions.clone(),
+            version_labels: ctx.version_labels.clone(),
             inter_version_diff_base_version: ctx.inter_version_diff_base_version,
             inter_version_diff: ctx.inter_version_diff.clone(),
             changelogs: ctx.changelogs.clone(),
@@ -1010,6 +1011,7 @@ mod tests {
                 origin_kind: OriginKind::SashikoReview,
                 originally_raised_by: "Sashiko".to_string(),
                 originally_raised_in_version: version,
+                originally_raised_in_label: None,
                 reference_url: Some("https://sashiko.sashiko.dev/#/patchset/1".to_string()),
                 raised_by_identities: vec![SASHIKO_IDENTITY.to_string()],
                 evidence: Vec::new(),

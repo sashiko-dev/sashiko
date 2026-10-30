@@ -6348,7 +6348,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     let priorBadgeHtml = '';
                     let priorDetailHtml = '';
                     if (pattr && pattr.originally_raised_by) {
-                        const pVer = pattr.originally_raised_in_version ? `v${escapeHtml(String(pattr.originally_raised_in_version))}` : 'prior';
+                        const pVer = (typeof pattr.originally_raised_in_label === 'string' && pattr.originally_raised_in_label.trim())
+                            ? escapeHtml(pattr.originally_raised_in_label.trim())
+                            : (pattr.originally_raised_in_version ? `v${escapeHtml(String(pattr.originally_raised_in_version))}` : 'prior');
                         const rawFirstAuthor = String(pattr.originally_raised_by).split(',')[0].replace(/\s*\[[^\]]*\]/g, '').trim();
                         const parsedWho = parseAuthor(rawFirstAuthor);
                         const cleanName = (parsedWho.name || parsedWho.email || rawFirstAuthor).replace(/^["']+|["']+$/g, '').trim();

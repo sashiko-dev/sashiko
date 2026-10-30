@@ -493,6 +493,7 @@ pub fn compute_prior_attribution(
     Some(PriorAttribution {
         originally_raised_by: credit_name(earliest.speaker.display()),
         originally_raised_in_version: earliest.version,
+        originally_raised_in_label: None,
         origin_kind: earliest.speaker.origin_kind(),
         reference_url: earliest.reference_url.clone(),
         raised_by_identities: vec![earliest.speaker.identity().to_string()],
@@ -599,11 +600,18 @@ fn extract_string_list(item: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The credit prefix for an attributed finding (`As reported by <Name> on v<K>`).
+/// The credit prefix for an attributed finding (`As reported by <Name> on
+/// <label>`), naming the revision by the label the author posted (`RFC v2`)
+/// and falling back to `v<K>` when no label is known.
 pub fn attribution_line(attr: &PriorAttribution) -> String {
     let who = credit_name(&attr.originally_raised_by);
-    let version = attr.originally_raised_in_version;
-    format!("As reported by {who} on v{version}")
+    match attr.originally_raised_in_label.as_deref() {
+        Some(label) if !label.trim().is_empty() => format!("As reported by {who} on {label}"),
+        _ => format!(
+            "As reported by {who} on v{}",
+            attr.originally_raised_in_version
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -845,6 +853,11 @@ pub(crate) fn stamp_attribution(
             Some(f) if has_prior_stage_or_source(f) => FoundBy::PriorFeedback,
             _ => FoundBy::Fresh,
         };
+        attr.originally_raised_in_label = state.prior_version_context.as_ref().and_then(|ctx| {
+            ctx.version_labels
+                .get(&attr.originally_raised_in_version)
+                .cloned()
+        });
         attr.attribution_line = Some(attribution_line(&attr));
         attr.found_by = Some(found);
         attr
@@ -1047,6 +1060,7 @@ mod tests {
                 attribution: PriorAttribution {
                     originally_raised_by: "Sashiko".to_string(),
                     originally_raised_in_version: 2,
+                    originally_raised_in_label: None,
                     origin_kind: OriginKind::SashikoReview,
                     reference_url: Some("https://sashiko.dev/#/patchset/v2".to_string()),
                     raised_by_identities: vec![SASHIKO_IDENTITY.to_string()],
@@ -1257,6 +1271,17 @@ mod tests {
         assert_eq!(found_by(&prior_only), FoundBy::PriorFeedback);
         assert_eq!(found_by(&fresh_only), FoundBy::Fresh);
         assert_eq!(attribution_line(&attr), "As reported by Jan Kara on v1");
+        // The posted label names the revision when the chain knows it.
+        let rfc = PriorAttribution {
+            originally_raised_in_label: Some("RFC v2".to_string()),
+            ..attr.clone()
+        };
+        assert_eq!(attribution_line(&rfc), "As reported by Jan Kara on RFC v2");
+        let blank = PriorAttribution {
+            originally_raised_in_label: Some("  ".to_string()),
+            ..attr.clone()
+        };
+        assert_eq!(attribution_line(&blank), "As reported by Jan Kara on v1");
 
         // A fresh-stage finding that receives a proven prior_attribution from
         // prior-attribution (even without a PC* source_id) is FoundBy::Both.
