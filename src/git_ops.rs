@@ -67,6 +67,9 @@ impl GitWorktree {
         commit_hash: &str,
         parent_dir: Option<&Path>,
     ) -> Result<Self> {
+        if commit_hash.is_empty() || commit_hash.starts_with('-') {
+            return Err(anyhow!("Invalid commit revision: {}", commit_hash));
+        }
         let parent_owned = parent_dir.map(|p| p.to_path_buf());
         let temp_dir = tokio::task::spawn_blocking(move || -> Result<TempDir> {
             if let Some(parent) = parent_owned {
@@ -141,12 +144,13 @@ impl GitWorktree {
             return Err(err);
         }
 
-        // `--end-of-options` terminates option parsing before `commit_hash`
-        // (`git reset --hard` treats `--` before `<commit>` as a pathspec
-        // separator and rejects hard resets with paths).
+        // `commit_hash` is verified not to start with `-` above, and trailing
+        // `--` prevents it from being interpreted as a pathspec on both
+        // Git 2.39 and newer releases (`git reset` on Git 2.39 rejects
+        // `--end-of-options`).
         let output = match crate::git_cmd::in_dir_async(&path)
             .args(["-c", "safe.bareRepository=all"])
-            .args(["reset", "--hard", "--end-of-options", commit_hash])
+            .args(["reset", "--hard", commit_hash, "--"])
             .output()
             .await
         {
@@ -184,6 +188,9 @@ impl GitWorktree {
         commit_hash: &str,
         parent_dir: Option<&Path>,
     ) -> Result<Self> {
+        if commit_hash.is_empty() || commit_hash.starts_with('-') {
+            return Err(anyhow!("Invalid commit revision: {}", commit_hash));
+        }
         let parent_owned = parent_dir.map(|p| p.to_path_buf());
         let temp_dir = tokio::task::spawn_blocking(move || -> Result<TempDir> {
             if let Some(parent) = parent_owned {
@@ -249,12 +256,13 @@ impl GitWorktree {
             return Err(err);
         }
 
-        // `--end-of-options` terminates option parsing before `commit_hash`
-        // (`git reset --hard` treats `--` before `<commit>` as a pathspec
-        // separator and rejects hard resets with paths).
+        // `commit_hash` is verified not to start with `-` above, and trailing
+        // `--` prevents it from being interpreted as a pathspec on both
+        // Git 2.39 and newer releases (`git reset` on Git 2.39 rejects
+        // `--end-of-options`).
         let output = match crate::git_cmd::in_dir_async(&path)
             .args(["-c", "safe.bareRepository=all"])
-            .args(["reset", "--hard", "--end-of-options", commit_hash])
+            .args(["reset", "--hard", commit_hash, "--"])
             .output()
             .await
         {
