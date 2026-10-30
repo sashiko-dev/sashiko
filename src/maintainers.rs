@@ -52,22 +52,38 @@ impl CompiledPattern {
     pub fn compile(raw_pattern: &str) -> Self {
         let pattern = raw_pattern.trim().trim_start_matches("./");
         let depth = pattern.matches('/').count();
+        let is_wildcard = |s: &str| s.contains(['*', '?']);
 
-        if pattern.ends_with("/*") {
-            let dir_prefix = pattern.strip_suffix('*').unwrap().to_string();
-            CompiledPattern::DirSingleLevel { dir_prefix, depth }
-        } else if pattern.ends_with('/') {
+        // The literal shortcuts below compare the directory part verbatim, so
+        // they only apply when it has no wildcard. "arch/*/boot/dts/" and
+        // "arch/*/net/*" must reach the glob branch, or they would only match
+        // a directory literally named "*".
+        if let Some(dir_prefix) = pattern.strip_suffix('*')
+            && dir_prefix.ends_with('/')
+            && !is_wildcard(dir_prefix)
+        {
+            CompiledPattern::DirSingleLevel {
+                dir_prefix: dir_prefix.to_string(),
+                depth,
+            }
+        } else if pattern.ends_with('/') && !is_wildcard(pattern) {
             CompiledPattern::PrefixDir {
                 prefix: pattern.to_string(),
                 depth,
             }
-        } else if !pattern.contains('*') && !pattern.contains('?') {
+        } else if !is_wildcard(pattern) {
             CompiledPattern::ExactFile {
                 path: pattern.to_string(),
                 depth,
             }
         } else {
-            let re_str = glob_to_regex(pattern);
+            // A trailing slash covers the whole subtree, as it does for the
+            // literal PrefixDir case.
+            let re_str = if pattern.ends_with('/') {
+                glob_to_regex(&format!("{pattern}**"))
+            } else {
+                glob_to_regex(pattern)
+            };
             let regex = Regex::new(&re_str).unwrap_or_else(|_| Regex::new("a^").unwrap());
             let literal_end = pattern.find(['*', '?']).unwrap_or(pattern.len());
             let anchor_end = pattern[..literal_end].rfind('/').map_or(0, |i| i + 1);
@@ -160,9 +176,9 @@ pub struct MaintainerSection {
     /// means `F: *` or `F: */` and only occurs in THE REST.
     ///
     /// This cannot be recovered from the compiled patterns: `*` compiles to a
-    /// glob that matches only top-level files, and `*/` to a prefix that
-    /// matches nothing at all. Both are plainly meant as "everything", so the
-    /// intent is recorded while the raw text is still in hand.
+    /// glob that matches only top-level files, and `*/` is not compiled at
+    /// all. Both are plainly meant as "everything", so the intent is recorded
+    /// while the raw text is still in hand.
     pub catch_all: bool,
 }
 
@@ -580,7 +596,15 @@ impl MaintainersIndex {
                         // A pattern of "*" or "*/" is how the file spells "the
                         // whole tree"; neither survives compilation as such.
                         current_catch_all |= val == "*" || val == "*/";
-                        current_files.push(CompiledPattern::compile(val));
+                        // "*/" would now compile to a glob over every nested
+                        // file. The catch-all flag already carries what it
+                        // means, and matching it would attribute every file
+                        // (and copy the section's list on every patch), so it
+                        // is not compiled, keeping the section's matches to
+                        // the top-level files "*" covers.
+                        if val != "*/" {
+                            current_files.push(CompiledPattern::compile(val));
+                        }
                     }
                     "X" => {
                         current_excludes.push(CompiledPattern::compile(val));
@@ -1025,6 +1049,46 @@ F:	*/
         // A subsystem maintainer, however senior, is not global.
         assert!(!index.is_global_maintainer("akpm@linux-foundation.org"));
         assert!(!index.is_global_maintainer("nobody@example.org"));
+    }
+
+    #[test]
+    fn test_wildcard_directory_patterns_match_their_subtree() {
+        let maintainers = "\
+Maintainers List
+----------------
+
+DT
+M:\tA <a@example.com>
+F:\tarch/*/boot/dts/
+X:\tarch/*/boot/dts/excluded/
+
+BPF JIT
+M:\tB <b@example.com>
+F:\tarch/*/net/*
+
+THE REST
+M:\tC <c@example.com>
+F:\t*
+F:\t*/
+";
+        let index = MaintainersIndex::from_reader(maintainers.as_bytes()).unwrap();
+        let matcher = index.file_matcher();
+        let cases: &[(&str, &[&str])] = &[
+            ("arch/arm64/boot/dts/qcom/sm8650.dtsi", &["DT"]),
+            ("arch/arm/boot/dts/board.dts", &["DT"]),
+            ("arch/arm64/boot/dts/excluded/x.dts", &[]),
+            ("arch/arm64/kernel/setup.c", &[]),
+            ("arch/x86/net/bpf_jit_comp.c", &["BPF JIT"]),
+            ("arch/x86/net/sub/file.c", &[]),
+            // "*/" is the catch-all spelling and keeps matching only what
+            // "*" does: top-level files.
+            ("Makefile", &["THE REST"]),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(index.match_file(path), *expected, "match_file({path})");
+            assert_eq!(matcher.match_file(path), *expected, "matcher({path})");
+        }
+        assert!(index.is_global_maintainer("c@example.com"));
     }
 
     #[test]
