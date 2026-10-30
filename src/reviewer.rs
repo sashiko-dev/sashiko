@@ -2736,8 +2736,7 @@ impl Reviewer {
                                             worktree_path.map(|wt| wt.to_path_buf())
                                         };
                                         if let Some(target_dir) = base_path {
-                                            let mut tb =
-                                                crate::toolbox::ToolBox::new(target_dir, None);
+                                            let mut tb = crate::toolbox::ToolBox::new(target_dir);
                                             if let Some(m_sha) = mainline_sha {
                                                 tb.set_virtual_head(m_sha);
                                             }

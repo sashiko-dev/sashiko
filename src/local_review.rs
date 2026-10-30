@@ -570,9 +570,6 @@ async fn review_single_patch(
             .await
             .context("Failed to create AI provider")?;
         let provider = decorate_provider(provider, ai, llm_semaphore, quota, &retry_budget);
-        // The directory itself: read_prompt resolves a name against it.
-        let prompts_tool_path = Some(options.prompts.clone());
-
         let mut patch_files = Vec::new();
         if let Some(sha) = patch_shas.get(&p.index).filter(|s| is_safe_git_rev(s)) {
             let output = crate::git_cmd::in_dir_async(&worktree.path)
@@ -603,7 +600,7 @@ async fn review_single_patch(
             p.index, patch_files
         );
 
-        let mut tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
+        let mut tools = ToolBox::new(worktree.path.clone());
         tools.set_active_patch_files(patch_files);
 
         if let Some(sha) = patch_shas.get(&p.index) {

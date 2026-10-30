@@ -709,7 +709,7 @@ impl BugWorker {
                             review_id: None,
                         });
 
-                        let mut tb = ToolBox::new(std::path::PathBuf::from(&repo_path), None);
+                        let mut tb = ToolBox::new(std::path::PathBuf::from(&repo_path));
                         if let Some(ref sha) = bug.discovered_in_commit {
                             tb.set_virtual_head(sha.clone());
                         }

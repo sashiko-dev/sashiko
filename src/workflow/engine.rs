@@ -498,7 +498,7 @@ mod tests {
     async fn test_workflow_sequential_and_early_exit() {
         let provider = Arc::new(MockProvider::single(r#"{"items": ["leak in foo"]}"#));
         let tmp = tempfile::tempdir().unwrap();
-        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf()));
         let env = WorkflowEnv {
             provider,
             tools,
@@ -547,7 +547,7 @@ mod tests {
             r#"{"items": ["concern_b"]}"#.to_string(),
         ]));
         let tmp = tempfile::tempdir().unwrap();
-        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf()));
         let env = WorkflowEnv {
             provider,
             tools,
@@ -616,7 +616,7 @@ mod tests {
             r#"{"items": ["concern_ok"]}"#.to_string(),
         ]));
         let tmp = tempfile::tempdir().unwrap();
-        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf()));
         let env = WorkflowEnv {
             provider,
             tools,
@@ -674,7 +674,7 @@ mod tests {
             r#"{"items": ["concern_ok"]}"#.to_string(),
         ]));
         let tmp = tempfile::tempdir().unwrap();
-        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf()));
         let env = WorkflowEnv {
             provider,
             tools,
@@ -720,7 +720,7 @@ mod tests {
     async fn test_workflow_best_effort_total_failure() {
         let provider = Arc::new(MockProvider::single("__ERROR__"));
         let tmp = tempfile::tempdir().unwrap();
-        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf()));
         let env = WorkflowEnv {
             provider,
             tools,
@@ -769,7 +769,7 @@ mod tests {
             r#"{"items": ["c2"]}"#.to_string(),
         ]));
         let tmp = tempfile::tempdir().unwrap();
-        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf()));
         let env = WorkflowEnv {
             provider,
             tools,
@@ -838,7 +838,7 @@ mod tests {
     async fn test_skipped_stage_emits_skipped_event_and_no_started_or_finished() {
         let provider = Arc::new(MockProvider::single(r#"{"items": ["c1"]}"#));
         let tmp = tempfile::tempdir().unwrap();
-        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf()));
         let env = WorkflowEnv {
             provider,
             tools,
@@ -906,7 +906,7 @@ mod tests {
             "still not valid json".to_string(),
         ]));
         let tmp = tempfile::tempdir().unwrap();
-        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf()));
         let env = WorkflowEnv {
             provider,
             tools,
@@ -959,7 +959,7 @@ mod tests {
             "still not valid json".to_string(),
         ]));
         let tmp = tempfile::tempdir().unwrap();
-        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf()));
         let env = WorkflowEnv {
             provider,
             tools,
@@ -1020,7 +1020,7 @@ mod tests {
             r#"{"items": ["from_res_2"]}"#.to_string(),
         ]));
         let tmp = tempfile::tempdir().unwrap();
-        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf()));
         let env = WorkflowEnv {
             provider,
             tools,

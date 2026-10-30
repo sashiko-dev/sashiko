@@ -3868,7 +3868,7 @@ pub async fn check_bug_fixed_upstream_with_candidates(
         Some(provider.get_capabilities().model_name),
     );
 
-    let mut tb = ToolBox::new(repo_path.to_path_buf(), None);
+    let mut tb = ToolBox::new(repo_path.to_path_buf());
     tb.set_virtual_head(linus_sha.to_string());
     let tools = Arc::new(tb);
 
@@ -5189,7 +5189,7 @@ mod tests {
     #[tokio::test]
     async fn test_prefetch_bug_locations_filters_dangerous_and_non_c_paths() {
         let temp = tempfile::tempdir().unwrap();
-        let tb = Arc::new(ToolBox::new(temp.path().to_path_buf(), None));
+        let tb = Arc::new(ToolBox::new(temp.path().to_path_buf()));
 
         let dangerous_locations = json!([
             {"file": "../../etc/passwd", "line": 10},
@@ -5241,7 +5241,7 @@ static int target_kernel_func(int a, int b)
             .output()
             .unwrap();
 
-        let tb = Arc::new(ToolBox::new(path.to_path_buf(), None));
+        let tb = Arc::new(ToolBox::new(path.to_path_buf()));
         let locations = json!([
             {
                 "file": "test_file.c",
@@ -5319,7 +5319,7 @@ Call Trace:
             .output()
             .unwrap();
 
-        let tb = Arc::new(ToolBox::new(path.to_path_buf(), None));
+        let tb = Arc::new(ToolBox::new(path.to_path_buf()));
         let locations = json!([
             {
                 "file": "old_net.c",
@@ -5374,7 +5374,7 @@ Call Trace:
         .trim()
         .to_string();
 
-        let tb = Arc::new(ToolBox::new(path.to_path_buf(), None));
+        let tb = Arc::new(ToolBox::new(path.to_path_buf()));
         let locations = json!([
             {
                 "file": "file.c",
@@ -5992,7 +5992,7 @@ F:	drivers/net/ethernet/intel/e1000/
         let resolved_main = resolve_linus_sha(repo).await;
         assert_eq!(resolved_main.as_deref(), Some(sha1.as_str()));
 
-        let tb = Arc::new(ToolBox::new(repo.to_path_buf(), None));
+        let tb = Arc::new(ToolBox::new(repo.to_path_buf()));
         let locs = json!([{"file": "src/api.rs", "line": 3, "function_or_symbol": "handle_query"}]);
         let prefetched = prefetch_bug_locations(Some(&tb), &sha1, &Some(locs.clone())).await;
         assert!(

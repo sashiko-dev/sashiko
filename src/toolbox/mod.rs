@@ -31,7 +31,6 @@ pub mod git_log;
 pub mod git_ls;
 pub mod git_read_files;
 pub mod git_show;
-pub mod read_prompt;
 
 /// The Sashiko-specific context passed to LLM tools.
 ///
@@ -39,7 +38,6 @@ pub mod read_prompt;
 /// and a shared cache to avoid redundant command executions across tool runs.
 pub struct SashikoToolContext {
     pub worktree_path: PathBuf,
-    pub prompts_path: Option<PathBuf>,
     pub active_patch_files: RwLock<Vec<String>>,
     pub virtual_head: RwLock<Option<String>>,
     pub(crate) cache: Arc<RwLock<std::collections::HashMap<String, Value>>>,
@@ -71,13 +69,12 @@ pub struct ToolBox {
 }
 
 impl ToolBox {
-    /// Creates a new `ToolBox` configured for the given worktree and optional prompt registry.
-    pub fn new(worktree_path: PathBuf, prompts_path: Option<PathBuf>) -> Self {
+    /// Creates a new `ToolBox` configured for the given worktree.
+    pub fn new(worktree_path: PathBuf) -> Self {
         let cache = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
         let context = SashikoToolContext {
             worktree_path,
-            prompts_path,
             active_patch_files: RwLock::new(Vec::new()),
             virtual_head: RwLock::new(None),
             cache: cache.clone(),
@@ -92,10 +89,6 @@ impl ToolBox {
         registry.register(git_ls::GitLsTool);
         registry.register(git_grep::GitGrepTool);
         registry.register(git_find_files::GitFindFilesTool);
-
-        if context.prompts_path.is_some() {
-            registry.register(read_prompt::ReadPromptTool);
-        }
 
         Self {
             context,
