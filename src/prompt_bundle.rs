@@ -233,7 +233,6 @@ mod tests {
             "kernel/inline-template.md",
             "kernel/callstack.md",
             "kernel/locking.md",
-            "kernel/pointer-guards.md",
         ] {
             assert!(
                 PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
