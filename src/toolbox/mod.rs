@@ -160,37 +160,29 @@ impl ToolBox {
     /// the execution to the corresponding tool struct.
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
         let name_normalized = name.trim().to_lowercase();
-        let should_cache = name_normalized != "todowrite";
         let args = utils::normalize_json_numbers(args);
 
         let normalized_args = self.registry.normalize_tool_args(&name_normalized, &args);
 
-        let key = if should_cache {
-            let k = format!(
-                "{}:{}",
-                name_normalized,
-                serde_json::to_string(&normalized_args)?
-            );
-            {
-                let cache = self.cache.read().unwrap();
-                if let Some(val) = cache.get(&k) {
-                    return Ok(val.clone());
-                }
+        let key = format!(
+            "{}:{}",
+            name_normalized,
+            serde_json::to_string(&normalized_args)?
+        );
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(val) = cache.get(&key) {
+                return Ok(val.clone());
             }
-            Some(k)
-        } else {
-            None
-        };
+        }
 
         let res = self
             .registry
             .call(&name_normalized, args, &self.context)
             .await?;
 
-        if let Some(k) = key {
-            let mut cache = self.cache.write().unwrap();
-            cache.insert(k, res.clone());
-        }
+        let mut cache = self.cache.write().unwrap();
+        cache.insert(key, res.clone());
 
         Ok(res)
     }
