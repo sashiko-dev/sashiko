@@ -54,69 +54,6 @@ impl StageOutcome {
             .filter(|m| m.role == crate::ai::AiRole::Assistant)
             .count()
     }
-
-    /// Extracts deduplicated prompt file names requested via `read_prompt` tool calls in this stage's history.
-    pub fn read_prompts(&self) -> Vec<String> {
-        let mut prompts = Vec::new();
-        let mut idx = 0;
-        while idx < self.history.len() {
-            let msg = &self.history[idx];
-            let Some(ref calls) = msg.tool_calls else {
-                idx += 1;
-                continue;
-            };
-
-            // Pair each tool call with its corresponding AiRole::Tool response in the
-            // immediately following contiguous block of tool messages for this turn.
-            // Matching within the turn in positional order handles both providers with
-            // unique tool_call_id values and Gemini (which uses the function name as
-            // the ID for all parallel calls in a turn).
-            let tool_start = idx + 1;
-            let mut tool_end = tool_start;
-            while tool_end < self.history.len()
-                && self.history[tool_end].role == crate::ai::AiRole::Tool
-            {
-                tool_end += 1;
-            }
-            let tool_msgs = &self.history[tool_start..tool_end];
-            let mut used_tool_msg = vec![false; tool_msgs.len()];
-
-            for call in calls {
-                let matched_tool = tool_msgs
-                    .iter()
-                    .enumerate()
-                    .find(|(t_idx, t_msg)| {
-                        !used_tool_msg[*t_idx]
-                            && t_msg.tool_call_id.as_deref() == Some(call.id.as_str())
-                    })
-                    .map(|(t_idx, t_msg)| {
-                        used_tool_msg[t_idx] = true;
-                        t_msg
-                    });
-
-                let succeeded = matched_tool
-                    .and_then(|t_msg| t_msg.content.as_deref())
-                    .and_then(|content| serde_json::from_str::<Value>(content).ok())
-                    .is_some_and(|v| v.get("error").is_none());
-
-                if succeeded
-                    && call
-                        .function_name
-                        .trim()
-                        .eq_ignore_ascii_case("read_prompt")
-                    && let Some(name) = call.arguments.get("name").and_then(Value::as_str)
-                {
-                    let trimmed = crate::workflows::guard::normalize_prompt_relpath(name);
-                    if !trimmed.is_empty() && !prompts.iter().any(|p| p == trimmed) {
-                        prompts.push(trimmed.to_string());
-                    }
-                }
-            }
-
-            idx = tool_end;
-        }
-        prompts
-    }
 }
 
 /// Execution environment provided to stages during workflow runs.

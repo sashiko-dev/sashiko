@@ -945,12 +945,9 @@ fn analysis_stage(
                 reasoning_effort,
                 ..Default::default()
             })
-            .reduce_with_outcome(
-                move |state: &mut SashikoPatchReviewState,
-                      out: StageConcernsOutput,
-                      outcome: &crate::workflow::stage::StageOutcome| {
-                    let prompts =
-                        collect_stage_prompts(&state.selected_guides, def.guides, outcome);
+            .reduce(
+                move |state: &mut SashikoPatchReviewState, out: StageConcernsOutput| {
+                    let prompts = collect_stage_prompts(&state.selected_guides, def.guides);
                     append_stage_items_with_prompts(
                         &mut state.all_concerns,
                         &out.concerns,
@@ -1131,8 +1128,8 @@ Return ONLY a JSON object with 'findings', 'inconclusive_concerns', and 'dismiss
             ..Default::default()
         })
         .skip_if(|s| s.all_concerns.is_empty() && s.all_dismissed_concerns.is_empty())
-        .reduce_with_outcome(|state, out: VerificationOutput, outcome| {
-            apply_verification_stage_output(state, out, outcome, analysis_stage_by_name);
+        .reduce(|state, out: VerificationOutput| {
+            apply_verification_stage_output(state, out, analysis_stage_by_name);
         })
         .build()
 }
@@ -1211,13 +1208,12 @@ Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every
             reasoning_effort: effort.map(crate::ai::EffortMode::verification_stage_effort),
             ..Default::default()
         })
-        .reduce_with_outcome(move |state, out: PostVerificationOutput, outcome| {
+        .reduce(move |state, out: PostVerificationOutput| {
             apply_post_verification_stage_output(
                 state,
                 stage_name,
                 &batch_for_reduce,
                 out,
-                outcome,
                 analysis_stage_by_name,
             );
         })

@@ -80,8 +80,8 @@ pub fn sanitize_guide_name(name: &str) -> bool {
     plain
 }
 
-/// Verifies that a relative prompt path (from `def.guides`, `selected_guides`,
-/// or `read_prompt`) is a safe `.md` path within the prompt bundle without
+/// Verifies that a relative prompt path (from `def.guides` or
+/// `selected_guides`) is a safe `.md` path within the prompt bundle without
 /// parent-directory traversal or absolute components.
 pub fn sanitize_prompt_relpath(path: &str) -> bool {
     let trimmed = normalize_prompt_relpath(path);

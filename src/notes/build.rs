@@ -1359,7 +1359,6 @@ mod tests {
                 tokens_in: 0,
                 tokens_out: 0,
                 tokens_cached: 0,
-                prompts_read: vec![],
                 history_start: 0,
                 history_end: 3,
             }],
