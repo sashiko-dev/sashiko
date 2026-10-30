@@ -25,6 +25,7 @@ pub mod notes_corpus;
 pub mod prior_attribution;
 pub mod prior_feedback;
 pub mod qemu_patch_review;
+pub mod related_preexisting;
 pub mod review_map;
 pub mod sashiko_patch_review;
 pub mod verification_shards;
@@ -155,13 +156,13 @@ pub fn refine_planned_stages_with_post_verification(
     planned_stages: &[String],
     resolved_stages: &[&'static str],
 ) -> Vec<String> {
-    if resolved_stages
-        .first()
-        .is_some_and(|name| prior_attribution::is_prior_attribution_stage_name(name))
-    {
-        // `prior-attribution` has no placeholder: it runs only when there
-        // are findings and prior context, so its batches are inserted ahead
-        // of the report stages once resolved.
+    if resolved_stages.first().is_some_and(|name| {
+        prior_attribution::is_prior_attribution_stage_name(name)
+            || related_preexisting::is_related_preexisting_stage_name(name)
+    }) {
+        // `prior-attribution` and the related pre-existing stages have no
+        // placeholder: they run only when their inputs exist, so they are
+        // inserted ahead of the report stages once resolved.
         let insert_at = planned_stages
             .iter()
             .position(|s| s == "report" || s == "summary")

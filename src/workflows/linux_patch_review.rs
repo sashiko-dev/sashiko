@@ -101,6 +101,15 @@ pub struct LinuxPatchReviewState {
     pub inconclusive_concerns: Vec<Value>,
     /// Candidate pre-existing concerns extracted for separate processing.
     pub concerns: Vec<Value>,
+    /// Bugs already reported near the code this patch touches; related
+    /// pre-existing candidates matching one of them are never reported again.
+    pub known_disclosures: Vec<crate::related_preexisting::BugKey>,
+    /// Related pre-existing candidates the selection stage picked, with how
+    /// they relate to the patch.
+    pub related_preexisting_selected: Vec<Value>,
+    /// Related pre-existing candidates a stage decided not to report, with
+    /// the reason.
+    pub related_preexisting_dismissed: Vec<Value>,
 
     /// Verified findings from the verification and post-verification stages.
     pub findings: Vec<Value>,
@@ -2509,6 +2518,9 @@ pub fn stage_short_label(name: &str) -> Option<&'static str> {
     if crate::workflows::prior_attribution::is_prior_attribution_stage_name(name) {
         return Some(crate::workflows::prior_attribution::PRIOR_ATTRIBUTION_SHORT_LABEL);
     }
+    if crate::workflows::related_preexisting::is_related_preexisting_stage_name(name) {
+        return Some(crate::workflows::related_preexisting::RELATED_PREEXISTING_SHORT_LABEL);
+    }
     if let Some(s) = consolidation_stage_by_name(name) {
         return Some(s.short);
     }
@@ -2546,6 +2558,7 @@ pub fn is_known_stage(name: &str) -> bool {
     analysis_stage_by_name(&normalized).is_some()
         || crate::workflows::prior_feedback::is_prior_feedback_stage_name(&normalized)
         || crate::workflows::prior_attribution::is_prior_attribution_stage_name(&normalized)
+        || crate::workflows::related_preexisting::is_related_preexisting_stage_name(&normalized)
         || consolidation_stage_by_name(&normalized).is_some()
         || matches!(normalized.as_str(), "pre-screen" | "planning")
 }
@@ -3911,6 +3924,14 @@ pub fn build_linux_patch_review_workflow_with_effort(
             },
             ParallelPolicy::BestEffort,
         )
+        // Related pre-existing bugs are reported outside the findings, so
+        // they are picked before a review without new findings exits.
+        .resolved_parallel(
+            move |state| {
+                crate::workflows::related_preexisting::resolve_selection_stage(state, temperature)
+            },
+            ParallelPolicy::BestEffort,
+        )
         .early_exit_if(
             |s| s.findings.is_empty(),
             "No findings validated in verification stages",
@@ -4897,7 +4918,7 @@ mod tests {
     fn test_build_workflow_graph_structure() {
         let workflow = build_linux_patch_review_workflow();
         assert_eq!(workflow.name, "linux_patch_review");
-        assert_eq!(workflow.steps.len(), 7);
+        assert_eq!(workflow.steps.len(), 8);
     }
 
     #[test]
