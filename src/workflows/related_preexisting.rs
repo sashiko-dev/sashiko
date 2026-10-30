@@ -16,7 +16,8 @@
 //!
 //! See designs/DESIGN_RELATED_PREEXISTING_BUGS.md. The deterministic
 //! pre-filter lives in `crate::related_preexisting`; this module runs the
-//! LLM selection over its candidates.
+//! LLM selection over its candidates and then a tool-assisted disclosure
+//! check of each selected one.
 
 use std::collections::BTreeSet;
 
@@ -39,7 +40,8 @@ pub const RELATED_PREEXISTING_SHORT_LABEL: &str = "Related Pre-existing";
 
 /// Whether `name` is one of this module's stages.
 pub fn is_related_preexisting_stage_name(name: &str) -> bool {
-    normalize_stage_name(name) == SELECTION_STAGE_NAME
+    let normalized = normalize_stage_name(name);
+    normalized == SELECTION_STAGE_NAME || CHECK_STAGE_NAMES.contains(&normalized.as_str())
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
@@ -294,6 +296,256 @@ pub fn resolve_selection_stage(
     )]
 }
 
+/// Static names for the per-candidate disclosure checks. Their number caps
+/// how many selected candidates are checked, and the budget never exceeds it.
+pub static CHECK_STAGE_NAMES: [&str; 2] =
+    ["related-preexisting-check-1", "related-preexisting-check-2"];
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecuritySensitivity {
+    NotSecuritySensitive,
+    SecuritySensitive,
+    Unknown,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostPatchStatus {
+    StillPresent,
+    RemovedByPatch,
+    FixedByPatch,
+    MovedOrChanged,
+    Unknown,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisclosureDecision {
+    Report,
+    Drop,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct DisclosureCheckOutput {
+    pub security_sensitivity: SecuritySensitivity,
+    pub security_reasoning: String,
+    pub post_patch_status: PostPatchStatus,
+    #[serde(default)]
+    pub post_patch_evidence: String,
+    pub decision: DisclosureDecision,
+    #[serde(default)]
+    pub drop_reason: String,
+    #[serde(default)]
+    pub report_text: String,
+}
+
+impl DisclosureCheckOutput {
+    /// Whether the candidate may be reported: only a bug that is not
+    /// security-sensitive and still present after the patch, with the
+    /// evidence and the note filled in. Anything else, including `Unknown`
+    /// on either question, is dropped.
+    pub fn passes(&self) -> bool {
+        self.decision == DisclosureDecision::Report
+            && self.security_sensitivity == SecuritySensitivity::NotSecuritySensitive
+            && self.post_patch_status == PostPatchStatus::StillPresent
+            && !self.post_patch_evidence.trim().is_empty()
+            && !self.report_text.trim().is_empty()
+    }
+}
+
+const CHECK_INSTRUCTION: &str = r#"# Check a pre-existing bug before telling the patch author about it
+
+The bug under "Candidate" already existed before this patch. An earlier stage judged it closely related to the patch ("relation", "relation_reason", "cited_code"), so the review would mention it to the author in a public mailing list reply. Before that happens, answer two questions with the repository tools. The Target Commit SHA is the patched tree; use HEAD^ (or the Baseline SHA) for the code before the patch.
+
+1. Is it security-sensitive? Answer "SecuritySensitive" if a reasonable maintainer would want it handled privately (for example through security@kernel.org) instead of on a public list: memory corruption or use-after-free reachable from an unprivileged or remote context, privilege escalation, information leaks across a privilege boundary, or anything else that gives an attacker a capability. Answer "NotSecuritySensitive" only when you can explain why it cannot be abused that way (for example it needs root, is a resource leak on a rare admin-only path, or is a functional or locking bug without an attacker-controlled trigger). Answer "Unknown" if you cannot tell.
+
+2. Is it still present once this patch is applied? Read the affected code at the Target Commit SHA. Answer "StillPresent" only if the defective code is still there and still reachable, and quote it from the patched tree in "post_patch_evidence" with file and line. Answer "RemovedByPatch" if the patch deletes the code, "FixedByPatch" if the patch fixes it, "MovedOrChanged" if the patch reworks it so the report would no longer match, and "Unknown" if you cannot tell.
+
+Report the bug ("decision": "Report") only when it is "NotSecuritySensitive" and "StillPresent". Otherwise drop it and say why in "drop_reason". Do not give the candidate the benefit of the doubt: an unverified answer is "Unknown", and "Unknown" means drop.
+
+When reporting, write "report_text": a short, self-contained note to the patch author in the style of a Linux kernel mailing list reply. Quote the relevant lines from the patched tree prefixed with "> ", explain the problem in plain sentences, say how it relates to their patch, and suggest a fix. State clearly that the issue was not introduced by this patch. Plain text only: no markdown, no backticks, no headings, at most about 25 lines."#;
+
+const CHECK_SCHEMA: &str = r#"Return ONLY a JSON object with these keys:
+- "security_sensitivity": "NotSecuritySensitive", "SecuritySensitive" or "Unknown"
+- "security_reasoning": plain-text explanation, never using markdown backticks
+- "post_patch_status": "StillPresent", "RemovedByPatch", "FixedByPatch", "MovedOrChanged" or "Unknown"
+- "post_patch_evidence": file:line and the verbatim code from the patched tree (required for "StillPresent")
+- "decision": "Report" or "Drop"
+- "drop_reason": why the bug is dropped (required for "Drop", empty for "Report")
+- "report_text": the note to the author (required for "Report", empty for "Drop")
+
+Example Output:
+```json
+{
+  "security_sensitivity": "NotSecuritySensitive",
+  "security_reasoning": "The leak needs CAP_SYS_ADMIN to trigger through the debugfs knob, so an unprivileged user cannot exhaust memory with it.",
+  "post_patch_status": "StillPresent",
+  "post_patch_evidence": "drivers/foo/foo.c:212: if (!buf)\n\treturn -EINVAL;",
+  "decision": "Report",
+  "drop_reason": "",
+  "report_text": "This isn't a bug introduced by this patch, but the same missing unlock exists a few lines below the path you fixed:\n\n> \tif (!buf)\n> \t\treturn -EINVAL;\n\nfoo_probe() returns here with dev->lock still held. Would it make sense to route this through the same out_unlock label in this series?"
+}
+```"#;
+
+/// Checks a disclosure-check answer for internal consistency, returning an
+/// error that names the exact rule broken.
+pub fn validate_disclosure_check(out: &DisclosureCheckOutput) -> Result<(), String> {
+    if out.security_reasoning.trim().is_empty() {
+        return Err("\"security_reasoning\" must explain the security answer.".to_string());
+    }
+    match out.decision {
+        DisclosureDecision::Report => {
+            if out.security_sensitivity != SecuritySensitivity::NotSecuritySensitive {
+                return Err(
+                    "\"decision\": \"Report\" requires \"security_sensitivity\": \"NotSecuritySensitive\"; otherwise use \"Drop\"."
+                        .to_string(),
+                );
+            }
+            if out.post_patch_status != PostPatchStatus::StillPresent {
+                return Err(
+                    "\"decision\": \"Report\" requires \"post_patch_status\": \"StillPresent\"; otherwise use \"Drop\"."
+                        .to_string(),
+                );
+            }
+            if out.post_patch_evidence.trim().is_empty() {
+                return Err(
+                    "\"StillPresent\" requires \"post_patch_evidence\" quoting the code from the patched tree."
+                        .to_string(),
+                );
+            }
+            if out.report_text.trim().is_empty() {
+                return Err(
+                    "\"decision\": \"Report\" requires a non-empty \"report_text\".".to_string(),
+                );
+            }
+            if out.report_text.contains('`') {
+                return Err(
+                    "\"report_text\" must be plain text; remove every backtick.".to_string()
+                );
+            }
+        }
+        DisclosureDecision::Drop => {
+            if out.drop_reason.trim().is_empty() {
+                return Err(
+                    "\"decision\": \"Drop\" requires a non-empty \"drop_reason\".".to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Records a disclosure check: a candidate that passes joins the related
+/// bugs the review reports, anything else is kept with the reason.
+pub fn apply_disclosure_check(
+    state: &mut LinuxPatchReviewState,
+    stage_name: &str,
+    candidate: &Value,
+    out: DisclosureCheckOutput,
+) {
+    let mut item = candidate.clone();
+    let passes = out.passes();
+    if let Some(map) = item.as_object_mut() {
+        map.insert(
+            "security_sensitivity".to_string(),
+            json!(out.security_sensitivity),
+        );
+        map.insert(
+            "security_reasoning".to_string(),
+            json!(out.security_reasoning),
+        );
+        map.insert(
+            "post_patch_status".to_string(),
+            json!(out.post_patch_status),
+        );
+        map.insert(
+            "post_patch_evidence".to_string(),
+            json!(out.post_patch_evidence),
+        );
+        if passes {
+            map.insert("report_text".to_string(), json!(out.report_text.trim()));
+        } else {
+            map.insert("dismissed_by".to_string(), json!(stage_name));
+            let reason = if out.drop_reason.trim().is_empty() {
+                "did not pass the disclosure check".to_string()
+            } else {
+                out.drop_reason
+            };
+            map.insert("dismissed_reason".to_string(), json!(reason));
+        }
+    }
+    if passes {
+        state.related_preexisting_reported.push(item);
+    } else {
+        state.related_preexisting_dismissed.push(item);
+    }
+}
+
+fn disclosure_check_stage(
+    stage_name: &'static str,
+    candidate: Value,
+    max_turns: usize,
+    temperature: f32,
+    reasoning_effort: Option<crate::ai::ReasoningEffort>,
+) -> Box<dyn ExecutableStage<LinuxPatchReviewState>> {
+    let rendered = serde_json::to_string_pretty(&candidate).unwrap_or_else(|_| "{}".to_string());
+    let user_template = PromptTemplate::<LinuxPatchReviewState>::new(format!(
+        "{CHECK_INSTRUCTION}\n\nCandidate:\n{{{{candidate}}}}\n\n{CHECK_SCHEMA}"
+    ))
+    .with_var("candidate", move |_: &LinuxPatchReviewState| {
+        rendered.clone()
+    });
+
+    Box::new(
+        Stage::builder(stage_name)
+            .system_prompt(crate::workflows::linux_patch_review::linux_system_prompt(
+                true,
+            ))
+            .user_prompt(user_template)
+            .output_format(OutputFormat::json().with_validator(
+                |out: &DisclosureCheckOutput, _: &LinuxPatchReviewState| {
+                    validate_disclosure_check(out)
+                },
+            ))
+            .policy(StagePolicy {
+                tools: ToolScope::All,
+                max_turns,
+                temperature,
+                reasoning_effort,
+                ..Default::default()
+            })
+            .reduce(
+                move |state: &mut LinuxPatchReviewState, out: DisclosureCheckOutput| {
+                    apply_disclosure_check(state, stage_name, &candidate, out);
+                },
+            )
+            .build(),
+    )
+}
+
+/// One disclosure check per selected candidate, or none.
+pub fn resolve_disclosure_check_stages(
+    state: &LinuxPatchReviewState,
+    max_turns: usize,
+    temperature: f32,
+) -> Vec<Box<dyn ExecutableStage<LinuxPatchReviewState>>> {
+    let reasoning_effort = state
+        .effort
+        .map(crate::ai::EffortMode::verification_stage_effort);
+    state
+        .related_preexisting_selected
+        .iter()
+        .zip(CHECK_STAGE_NAMES.iter())
+        .map(|(candidate, &name)| {
+            disclosure_check_stage(
+                name,
+                candidate.clone(),
+                max_turns,
+                temperature,
+                reasoning_effort,
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +723,111 @@ diff --git a/mm/foo.c b/mm/foo.c
             )
             .is_err()
         );
+    }
+    fn check(decision: DisclosureDecision) -> DisclosureCheckOutput {
+        DisclosureCheckOutput {
+            security_sensitivity: SecuritySensitivity::NotSecuritySensitive,
+            security_reasoning: "needs root".to_string(),
+            post_patch_status: PostPatchStatus::StillPresent,
+            post_patch_evidence: "mm/foo.c:20: return -EINVAL;".to_string(),
+            decision,
+            drop_reason: String::new(),
+            report_text: "> return -EINVAL;\n\nThis isn't introduced by this patch, but ..."
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn test_budget_never_exceeds_the_check_stages() {
+        let huge: String = (0..1000).map(|i| format!("+line {i}\n")).collect();
+        assert!(patch_budget(&huge) <= CHECK_STAGE_NAMES.len());
+    }
+
+    #[test]
+    fn test_validate_disclosure_check_rules() {
+        assert_eq!(
+            validate_disclosure_check(&check(DisclosureDecision::Report)),
+            Ok(())
+        );
+
+        let mut sensitive = check(DisclosureDecision::Report);
+        sensitive.security_sensitivity = SecuritySensitivity::SecuritySensitive;
+        assert!(
+            validate_disclosure_check(&sensitive)
+                .unwrap_err()
+                .contains("NotSecuritySensitive")
+        );
+
+        let mut removed = check(DisclosureDecision::Report);
+        removed.post_patch_status = PostPatchStatus::RemovedByPatch;
+        assert!(
+            validate_disclosure_check(&removed)
+                .unwrap_err()
+                .contains("StillPresent")
+        );
+
+        let mut no_evidence = check(DisclosureDecision::Report);
+        no_evidence.post_patch_evidence = String::new();
+        assert!(
+            validate_disclosure_check(&no_evidence)
+                .unwrap_err()
+                .contains("post_patch_evidence")
+        );
+
+        let mut ticks = check(DisclosureDecision::Report);
+        ticks.report_text = "use `foo()`".to_string();
+        assert!(
+            validate_disclosure_check(&ticks)
+                .unwrap_err()
+                .contains("backtick")
+        );
+
+        let drop_without_reason = check(DisclosureDecision::Drop);
+        assert!(
+            validate_disclosure_check(&drop_without_reason)
+                .unwrap_err()
+                .contains("drop_reason")
+        );
+    }
+
+    #[test]
+    fn test_apply_disclosure_check_reports_only_passing_candidates() {
+        let mut s = state();
+        let candidate = selection_candidates(&s).remove(0);
+
+        apply_disclosure_check(
+            &mut s,
+            CHECK_STAGE_NAMES[0],
+            &candidate,
+            check(DisclosureDecision::Report),
+        );
+        assert_eq!(s.related_preexisting_reported.len(), 1);
+        assert!(
+            s.related_preexisting_reported[0]["report_text"]
+                .as_str()
+                .unwrap()
+                .starts_with("> return")
+        );
+
+        let mut unknown = check(DisclosureDecision::Drop);
+        unknown.security_sensitivity = SecuritySensitivity::Unknown;
+        unknown.drop_reason = "cannot tell who can reach it".to_string();
+        apply_disclosure_check(&mut s, CHECK_STAGE_NAMES[1], &candidate, unknown);
+        assert_eq!(s.related_preexisting_reported.len(), 1);
+        assert_eq!(s.related_preexisting_dismissed.len(), 1);
+        assert_eq!(
+            s.related_preexisting_dismissed[0]["dismissed_by"],
+            CHECK_STAGE_NAMES[1]
+        );
+    }
+
+    #[test]
+    fn test_one_check_per_selected_candidate() {
+        let mut s = state();
+        assert!(resolve_disclosure_check_stages(&s, 5, 0.0).is_empty());
+        let candidates = selection_candidates(&s);
+        s.related_preexisting_selected = candidates;
+        assert_eq!(resolve_disclosure_check_stages(&s, 5, 0.0).len(), 2);
+        assert!(is_related_preexisting_stage_name(CHECK_STAGE_NAMES[1]));
     }
 }
