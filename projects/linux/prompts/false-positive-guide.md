@@ -286,7 +286,10 @@ to them before reading them
 ### 13. Implicit Guard Conditions
 
 **Before reporting NULL dereference**:
-- Load and fully analyze pointer-guards.md for EVERY NULL pointer
+- Trace every condition on the path to the dereference (loop filters,
+  early returns, helper checks) and show that none of them rules out
+  NULL, including guards on other state that is set together with the
+  pointer
 
 ### 14. Patch series false positive removal
 
@@ -373,8 +376,9 @@ Do not skip steps. Do not claim completion without producing the output.
 
 Before reporting ANY regression, verify:
 
-0. For NULL pointer dereferences, load pointer-guards.md
-   - Output: "reviewed" or "not applicable - not a NULL dereference issue"
+0. For NULL pointer dereferences, check the guards on the path (section 13)
+   - Output: each guard and why it does not rule out NULL, or "not
+     applicable - not a NULL dereference issue"
 1. **Can I prove this path executes?**
    - Find calling code that reaches here
      - Output: quote the call chain with locations (e.g., "caller@file:line → target@file:line")

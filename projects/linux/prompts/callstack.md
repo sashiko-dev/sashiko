@@ -7,8 +7,6 @@ analysis traverses the full callstack — both up and down — to identify
 side effects, unintended consequences, and regressions that would be invisible
 when examining modified functions in isolation.
 
-See pointer-guards.md for how to decide whether a NULL pointer is guarded.
-
 Note: foo->ptr dereferences foo BUT NOT ptr
 
 This callstack analysis is required for all non-trivial changes.
