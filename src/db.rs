@@ -1072,6 +1072,59 @@ const UPSERT_PATCHSET_SECTION_SQL: &str = "INSERT INTO patchset_maintainer_secti
      VALUES (?, ?, ?) \
      ON CONFLICT(patchset_id, subsystem) DO UPDATE SET source = excluded.source";
 
+/// Records an upstream grant section on a bug. Grant rows carry no source
+/// column: being in this table is what makes them grant rows.
+#[cfg(feature = "server")]
+const INSERT_BUG_UPSTREAM_SECTION_SQL: &str =
+    "INSERT OR IGNORE INTO bug_upstream_sections (bug_id, subsystem) VALUES (?, ?)";
+
+/// The same statement for a patchset, kept separate for the reason given on
+/// [`UPSERT_PATCHSET_SECTION_SQL`].
+#[cfg(feature = "server")]
+const INSERT_PATCHSET_UPSTREAM_SECTION_SQL: &str =
+    "INSERT OR IGNORE INTO patchset_upstream_sections (patchset_id, subsystem) VALUES (?, ?)";
+
+/// The ids of bugs attributed to any of `n` section titles, through either a
+/// MAINTAINERS row or an upstream grant row. Takes `2 * n` parameters: the
+/// titles, then the same titles again.
+#[cfg(feature = "server")]
+fn authorized_bug_ids_subquery(n: usize) -> String {
+    let placeholders = vec!["?"; n].join(", ");
+    format!(
+        "SELECT bug_id FROM bug_subsystems
+          WHERE source = '{}' AND subsystem COLLATE NOCASE IN ({placeholders})
+         UNION
+         SELECT bug_id FROM bug_upstream_sections
+          WHERE subsystem COLLATE NOCASE IN ({placeholders})",
+        SubsystemSource::MaintainersSection.as_str(),
+    )
+}
+
+/// Splits an attribution into the rows for the `source`-carrying table and
+/// the upstream grant titles, trimmed, without empties or duplicates.
+#[cfg(feature = "server")]
+fn split_upstream_grants(
+    sections: &[AttributedSubsystem],
+) -> (
+    std::collections::BTreeMap<&str, SubsystemSource>,
+    std::collections::BTreeSet<&str>,
+) {
+    let mut owned = std::collections::BTreeMap::new();
+    let mut granted = std::collections::BTreeSet::new();
+    for section in sections {
+        let name = section.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if section.source == SubsystemSource::UpstreamGrant {
+            granted.insert(name);
+        } else {
+            owned.insert(name, section.source);
+        }
+    }
+    (owned, granted)
+}
+
 /// A subsystem name together with the provenance of that name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AttributedSubsystem {
@@ -2612,6 +2665,30 @@ impl Database {
             }
         }
 
+        if current_version < 18 {
+            info!("Applying database migration version 18 (upstream grant sections)...");
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 18 {
+                info!(
+                    "Database already at version {} under the migration lock; skipping version 18.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                tx.execute_batch(include_str!("migrations/018_upstream_sections.sql"))
+                    .await?;
+                tx.execute("PRAGMA user_version = 18", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
         let has_patchwork_outbox = {
             let mut rows = self
                 .conn
@@ -2630,7 +2707,7 @@ impl Database {
             .await?;
         }
 
-        info!("Database schema is up to date at version 17.");
+        info!("Database schema is up to date at version 18.");
 
         Ok(())
     }
@@ -3553,7 +3630,16 @@ impl Database {
 
         for sub in &bug.subsystems {
             let trimmed = sub.name.trim();
-            if !trimmed.is_empty() {
+            if trimmed.is_empty() {
+                continue;
+            }
+            if sub.source == SubsystemSource::UpstreamGrant {
+                self.execute(
+                    INSERT_BUG_UPSTREAM_SECTION_SQL,
+                    libsql::params![id, trimmed],
+                )
+                .await?;
+            } else {
                 self.execute(
                     UPSERT_BUG_SUBSYSTEM_SQL,
                     libsql::params![id, trimmed, sub.source.as_str()],
@@ -3847,15 +3933,20 @@ impl Database {
             return Ok(sections);
         }
         let placeholders = vec!["?"; bug_ids.len()].join(", ");
+        // Upstream grant rows confer the same authority as MAINTAINERS rows.
+        // UNION also drops a title that both tables hold.
         let sql = format!(
             "SELECT bug_id, subsystem FROM bug_subsystems
-             WHERE source = '{}' AND bug_id IN ({})
+              WHERE source = '{}' AND bug_id IN ({placeholders})
+             UNION
+             SELECT bug_id, subsystem FROM bug_upstream_sections
+              WHERE bug_id IN ({placeholders})
              ORDER BY subsystem ASC",
             SubsystemSource::MaintainersSection.as_str(),
-            placeholders
         );
         let params: Vec<libsql::Value> = bug_ids
             .iter()
+            .chain(bug_ids)
             .map(|&id| libsql::Value::Integer(id))
             .collect();
         let mut rows = self.conn.query(&sql, params).await?;
@@ -3888,6 +3979,14 @@ impl Database {
             if name.is_empty() {
                 continue;
             }
+            if section.source == SubsystemSource::UpstreamGrant {
+                self.execute(
+                    INSERT_PATCHSET_UPSTREAM_SECTION_SQL,
+                    libsql::params![patchset_id, name],
+                )
+                .await?;
+                continue;
+            }
             self.execute(
                 UPSERT_PATCHSET_SECTION_SQL,
                 libsql::params![patchset_id, name, section.source.as_str()],
@@ -3903,17 +4002,36 @@ impl Database {
     /// every stored diff in one pass and a stale row from an earlier attempt
     /// must not survive. Pruning matters for the same reason the bug side
     /// prunes: a section that no longer matches has to stop conferring
-    /// authority.
+    /// authority. Upstream grant entries replace the patchset's grant rows
+    /// the same way.
     pub async fn replace_patchset_maintainer_sections(
         &self,
         patchset_id: i64,
         sections: &[AttributedSubsystem],
     ) -> Result<()> {
-        let wanted: std::collections::BTreeMap<&str, SubsystemSource> = sections
-            .iter()
-            .map(|s| (s.name.trim(), s.source))
-            .filter(|(name, _)| !name.is_empty())
-            .collect();
+        // Two tables change together, so a reader must never see one updated
+        // and the other not, and a failure must leave neither half applied.
+        if self.in_transaction {
+            return self
+                .write_patchset_maintainer_sections(patchset_id, sections)
+                .await;
+        }
+        let tx = self.begin_transaction().await?;
+        self.with_connection((*tx).clone())
+            .write_patchset_maintainer_sections(patchset_id, sections)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn write_patchset_maintainer_sections(
+        &self,
+        patchset_id: i64,
+        sections: &[AttributedSubsystem],
+    ) -> Result<()> {
+        let (wanted, granted) = split_upstream_grants(sections);
+        self.write_patchset_upstream_sections(patchset_id, &granted)
+            .await?;
 
         // The read is drained and the cursor dropped before any write, because
         // libsql refuses to commit a transaction that still has a statement in
@@ -3953,6 +4071,102 @@ impl Database {
         Ok(())
     }
 
+    /// Sets a patchset's upstream grant sections to exactly `granted`, in one
+    /// transaction so that access is never seen revoked in between.
+    pub async fn replace_patchset_upstream_sections<S: AsRef<str>>(
+        &self,
+        patchset_id: i64,
+        granted: impl IntoIterator<Item = S>,
+    ) -> Result<()> {
+        let granted: Vec<String> = granted
+            .into_iter()
+            .map(|g| g.as_ref().to_string())
+            .collect();
+        if self.in_transaction {
+            return self
+                .write_patchset_upstream_sections(patchset_id, &granted)
+                .await;
+        }
+        let tx = self.begin_transaction().await?;
+        self.with_connection((*tx).clone())
+            .write_patchset_upstream_sections(patchset_id, &granted)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn write_patchset_upstream_sections<S: AsRef<str>>(
+        &self,
+        patchset_id: i64,
+        granted: impl IntoIterator<Item = S>,
+    ) -> Result<()> {
+        self.execute(
+            "DELETE FROM patchset_upstream_sections WHERE patchset_id = ?",
+            libsql::params![patchset_id],
+        )
+        .await?;
+        for name in granted {
+            let name = name.as_ref().trim();
+            if name.is_empty() {
+                continue;
+            }
+            self.execute(
+                INSERT_PATCHSET_UPSTREAM_SECTION_SQL,
+                libsql::params![patchset_id, name],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Sets a bug's upstream grant sections to exactly `granted`. Callers
+    /// hold a transaction: the bug attribution writer and the batch below.
+    async fn write_bug_upstream_sections<S: AsRef<str>>(
+        &self,
+        bug_id: i64,
+        granted: impl IntoIterator<Item = S>,
+    ) -> Result<()> {
+        self.execute(
+            "DELETE FROM bug_upstream_sections WHERE bug_id = ?",
+            libsql::params![bug_id],
+        )
+        .await?;
+        for name in granted {
+            let name = name.as_ref().trim();
+            if name.is_empty() {
+                continue;
+            }
+            self.execute(
+                INSERT_BUG_UPSTREAM_SECTION_SQL,
+                libsql::params![bug_id, name],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Deletes every upstream grant row, for when no grant is configured, in
+    /// one transaction so that bugs and patchsets lose their grants together.
+    pub async fn clear_upstream_sections(&self) -> Result<()> {
+        const DELETES: [&str; 2] = [
+            "DELETE FROM bug_upstream_sections",
+            "DELETE FROM patchset_upstream_sections",
+        ];
+        if self.in_transaction {
+            for sql in DELETES {
+                self.execute(sql, ()).await?;
+            }
+            return Ok(());
+        }
+        let tx = self.begin_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        for sql in DELETES {
+            tx_db.execute(sql, ()).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Returns the MAINTAINERS section titles that grant authority over this
     /// patchset.
     ///
@@ -3980,15 +4194,19 @@ impl Database {
             return Ok(sections);
         }
         let placeholders = vec!["?"; patchset_ids.len()].join(", ");
+        // Upstream grant rows confer the same authority as MAINTAINERS rows.
         let sql = format!(
             "SELECT patchset_id, subsystem FROM patchset_maintainer_sections
-             WHERE source = '{}' AND patchset_id IN ({})
+              WHERE source = '{}' AND patchset_id IN ({placeholders})
+             UNION
+             SELECT patchset_id, subsystem FROM patchset_upstream_sections
+              WHERE patchset_id IN ({placeholders})
              ORDER BY subsystem ASC",
             SubsystemSource::MaintainersSection.as_str(),
-            placeholders
         );
         let params: Vec<libsql::Value> = patchset_ids
             .iter()
+            .chain(patchset_ids)
             .map(|&id| libsql::Value::Integer(id))
             .collect();
         let mut rows = self.conn.query(&sql, params).await?;
@@ -4953,11 +5171,10 @@ impl Database {
         subsystems: &[AttributedSubsystem],
     ) -> Result<()> {
         self.execute("UPDATE bugs SET audit_author = ?, audit_tool = ?, audit_model = ?, updated_at = ? WHERE id = ?", libsql::params![self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), chrono::Utc::now().timestamp(), id]).await?;
-        let wanted: std::collections::BTreeMap<&str, SubsystemSource> = subsystems
-            .iter()
-            .map(|s| (s.name.trim(), s.source))
-            .filter(|(name, _)| !name.is_empty())
-            .collect();
+        // Grant entries replace the bug's grant rows; the rest go through the
+        // provenance-carrying table below.
+        let (wanted, granted) = split_upstream_grants(subsystems);
+        self.write_bug_upstream_sections(id, &granted).await?;
 
         // The read is drained and the cursor dropped before any write, because
         // libsql refuses to commit a transaction that still has a statement in
@@ -5621,17 +5838,9 @@ impl Database {
             if titles.is_empty() {
                 return Ok((Vec::new(), 0));
             }
-            let placeholders = vec!["?"; titles.len()].join(", ");
-            conditions.push(
-                format!(
-                    "id IN (SELECT bug_id FROM bug_subsystems
-                            WHERE source = '{}' AND subsystem COLLATE NOCASE IN ({}))",
-                    SubsystemSource::MaintainersSection.as_str(),
-                    placeholders
-                )
-                .into(),
-            );
-            for title in titles {
+            let subquery = authorized_bug_ids_subquery(titles.len());
+            conditions.push(format!("id IN ({subquery})").into());
+            for title in titles.iter().chain(&titles) {
                 query_params.push(libsql::Value::Text(title.to_string()));
             }
         }
@@ -5889,16 +6098,11 @@ impl Database {
                 if titles.is_empty() {
                     return Ok(Vec::new());
                 }
-                let placeholders = vec!["?"; titles.len()].join(", ");
-                for title in &titles {
+                let subquery = authorized_bug_ids_subquery(titles.len());
+                for title in titles.iter().chain(&titles) {
                     params.push(libsql::Value::Text((*title).to_string()));
                 }
-                format!(
-                    " AND b.id IN (SELECT bug_id FROM bug_subsystems
-                                   WHERE source = '{}' AND subsystem COLLATE NOCASE IN ({}))",
-                    SubsystemSource::MaintainersSection.as_str(),
-                    placeholders
-                )
+                format!(" AND b.id IN ({subquery})")
             }
         };
         let sql = format!(
@@ -8352,6 +8556,20 @@ impl Database {
                     .await?;
                     tx.execute(
                         "DELETE FROM patchset_maintainer_sections WHERE patchset_id = ?",
+                        libsql::params![merge_from_id],
+                    )
+                    .await?;
+
+                    // Merge upstream grant sections; the rows carry no
+                    // provenance, so a union is all there is to do.
+                    tx.execute(
+                        "INSERT OR IGNORE INTO patchset_upstream_sections (patchset_id, subsystem)
+                         SELECT ?, subsystem FROM patchset_upstream_sections WHERE patchset_id = ?",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM patchset_upstream_sections WHERE patchset_id = ?",
                         libsql::params![merge_from_id],
                     )
                     .await?;
@@ -15245,6 +15463,72 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_upstream_grant_rows_confer_access_but_are_not_displayed() -> Result<()> {
+        let db = setup_db().await;
+        let soc = "ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)";
+        let mut bug: NewBug = serde_json::from_value(json!({"bugid": "b1", "title": "t"}))?;
+        bug.subsystems = vec![
+            AttributedSubsystem::from_maintainers("ARM/QUALCOMM SUPPORT"),
+            AttributedSubsystem::from_upstream_grant(soc),
+        ];
+        let id = db.create_bug(&bug).await?;
+
+        assert_eq!(
+            db.authorizing_sections_for_bug(id).await?,
+            vec![soc.to_string(), "ARM/QUALCOMM SUPPORT".to_string()]
+        );
+        // Display and facets keep showing ownership only.
+        assert_eq!(
+            db.get_subsystems_for_bug(id).await?,
+            vec!["ARM/QUALCOMM SUPPORT".to_string()]
+        );
+        assert_eq!(
+            stored_subsystem_sources(&db, id).await?,
+            vec![(
+                "ARM/QUALCOMM SUPPORT".to_string(),
+                "maintainers_section".to_string()
+            )]
+        );
+
+        let scope = vec![soc.to_ascii_lowercase()];
+        let (items, total) = db
+            .list_bugs(ListBugsParams {
+                visibility: BugVisibility::Sections(&scope),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!((total, items[0].id), (1, id));
+        let counts = db
+            .get_subsystems_bug_counts(
+                Some(BugLifecycleStatus::New),
+                BugVisibility::Sections(&scope),
+            )
+            .await?;
+        assert_eq!(counts, vec![("ARM/QUALCOMM SUPPORT".to_string(), 1)]);
+
+        // Replacing the attribution without the grant revokes it.
+        db.update_bug_subsystems(
+            id,
+            &[AttributedSubsystem::from_maintainers(
+                "ARM/QUALCOMM SUPPORT",
+            )],
+        )
+        .await?;
+        assert_eq!(
+            db.authorizing_sections_for_bug(id).await?,
+            vec!["ARM/QUALCOMM SUPPORT".to_string()]
+        );
+        let (_, total) = db
+            .list_bugs(ListBugsParams {
+                visibility: BugVisibility::Sections(&scope),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(total, 0);
+        Ok(())
+    }
+
     #[test]
     fn test_bare_subsystem_name_deserializes_as_caller_supplied() {
         let bug: NewBug = serde_json::from_value(json!({
@@ -16164,6 +16448,55 @@ mod tests {
                 ),
             ],
             "provenance survives the round trip"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_patchset_upstream_grant_rows_confer_access() -> Result<()> {
+        let db = setup_db().await;
+        let ps = patchset_for_sections(&db, 1).await?;
+        let soc = "ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)";
+
+        db.add_patchset_maintainer_sections(
+            ps,
+            &[
+                AttributedSubsystem::from_maintainers("ARM/QUALCOMM SUPPORT"),
+                AttributedSubsystem::from_upstream_grant(soc),
+            ],
+        )
+        .await?;
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec![soc.to_string(), "ARM/QUALCOMM SUPPORT".to_string()]
+        );
+        assert_eq!(
+            db.patchset_maintainer_sections(ps)
+                .await?
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>(),
+            vec!["ARM/QUALCOMM SUPPORT".to_string()],
+            "grant rows are not displayed as ownership"
+        );
+
+        db.replace_patchset_maintainer_sections(
+            ps,
+            &[AttributedSubsystem::from_maintainers(
+                "ARM/QUALCOMM SUPPORT",
+            )],
+        )
+        .await?;
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec!["ARM/QUALCOMM SUPPORT".to_string()]
+        );
+
+        db.replace_patchset_upstream_sections(ps, [soc]).await?;
+        db.clear_upstream_sections().await?;
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec!["ARM/QUALCOMM SUPPORT".to_string()]
         );
         Ok(())
     }
@@ -27367,7 +27700,7 @@ mod tests {
         let db = setup_db().await;
         let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
         let version: u32 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
 
         for (table, expected_cols) in [
             (
