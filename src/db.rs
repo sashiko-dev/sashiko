@@ -1640,6 +1640,20 @@ fn is_placeholder_or_reply(subject: &str, subject_index: u32) -> bool {
     subject == "(placeholder)" || (subject_index == 0 && Database::is_reply_subject(subject))
 }
 
+/// Whether a read path should lazily reconcile the lineage of a patchset:
+/// an unlinked email patchset that predates version lineage (migration 14
+/// left `version` NULL). Any version, including v1, may have predecessors
+/// (an RFC, or an earlier posting with the same tag). Reconciling stores
+/// `version`, so each row is reconciled lazily at most once.
+#[cfg(feature = "server")]
+fn needs_lazy_lineage(
+    previous_patchset_id: Option<i64>,
+    has_stored_version: bool,
+    mr_number: Option<i64>,
+) -> bool {
+    previous_patchset_id.is_none() && !has_stored_version && mr_number.is_none()
+}
+
 #[cfg(feature = "server")]
 fn effective_version(stored: Option<u32>, subject: &str) -> u32 {
     stored
@@ -9897,7 +9911,7 @@ impl Database {
                 })
                 .unwrap_or(1);
 
-            if prev_id.is_none() && stored_ver.is_none() && ver > 1 && mr_number.is_none() {
+            if needs_lazy_lineage(prev_id, stored_ver.is_some(), mr_number) {
                 if let Err(e) = self.reconcile_ancestor_version_lineage(id).await {
                     warn!("Failed to lazily reconcile version lineage for patchset {id}: {e}");
                 } else {
@@ -10042,11 +10056,7 @@ impl Database {
                 })
                 .unwrap_or(1);
 
-            if previous_patchset_id.is_none()
-                && stored_version.is_none()
-                && effective_version > 1
-                && mr_number.is_none()
-            {
+            if needs_lazy_lineage(previous_patchset_id, stored_version.is_some(), mr_number) {
                 if let Err(e) = self.reconcile_ancestor_version_lineage(pid).await {
                     warn!("Failed to lazily reconcile version lineage for patchset {pid}: {e}");
                 } else if let Ok(Some(subj)) = Self::read_lineage_subject(&self.conn, pid).await {
@@ -10320,11 +10330,7 @@ impl Database {
                 })
                 .unwrap_or(1);
 
-            if previous_patchset_id.is_none()
-                && stored_version.is_none()
-                && effective_version > 1
-                && mr_number.is_none()
-            {
+            if needs_lazy_lineage(previous_patchset_id, stored_version.is_some(), mr_number) {
                 if let Err(e) = self.reconcile_ancestor_version_lineage(pid).await {
                     warn!("Failed to lazily reconcile version lineage for patchset {pid}: {e}");
                 } else if let Ok(Some(subj)) = Self::read_lineage_subject(&self.conn, pid).await {
@@ -12129,8 +12135,9 @@ impl Database {
     }
 
     /// Lazily reconciles unlinked pre-migration-14 ancestor patchsets
-    /// (`version IS NULL` and effective version > 1) along the backward chain
-    /// starting at `start_id`, without cancelling any historical patchset.
+    /// (`version IS NULL`, see `needs_lazy_lineage`) along the backward
+    /// chain starting at `start_id`, without cancelling any historical
+    /// patchset.
     pub(crate) async fn reconcile_ancestor_version_lineage(&self, start_id: i64) -> Result<()> {
         const MAX_CHAIN_HOPS: usize = 32;
         let mut curr_id = start_id;
@@ -12143,7 +12150,7 @@ impl Database {
                 curr_id = prev_id;
                 continue;
             }
-            if subj.stored_version.is_some() || subj.version() <= 1 || subj.mr_number.is_some() {
+            if !needs_lazy_lineage(None, subj.stored_version.is_some(), subj.mr_number) {
                 break;
             }
             self.reconcile_version_lineage_with_options(curr_id, false, false)
@@ -30059,6 +30066,37 @@ mod tests {
             .map(|v| v["id"].as_i64().unwrap())
             .collect();
         assert_eq!(chain, vec![rfc2, v1, v2]);
+    }
+
+    /// Pre-migration-14 rows (`version IS NULL`, unlinked) for an RFC and
+    /// the v1 that followed it: when v2 arrives, the lazy ancestor pass
+    /// also links v1 to the RFC instead of stopping at version 1.
+    #[tokio::test]
+    async fn test_version_lineage_lazily_links_pre_migration_v1_to_rfc() {
+        let db = setup_db().await;
+        let author = "Dev <dev@example.org>";
+        let subj = |tag: &str| format!("[{tag}] mm: damon: fix quota reset");
+        let d0 = 1_780_000_000;
+        let rfc = ingest_single(&db, author, d0, "l1@x", &subj("RFC PATCH")).await;
+        let v1 = ingest_single(&db, author, d0 + 3 * DAY, "l2@x", &subj("PATCH")).await;
+        db.execute(
+            "UPDATE patchsets SET version = NULL, previous_patchset_id = NULL, version_link_signal = NULL WHERE id IN (?, ?)",
+            libsql::params![rfc, v1],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
+            libsql::params![rfc],
+        )
+        .await
+        .unwrap();
+
+        let v2 = ingest_single(&db, author, d0 + 6 * DAY, "l3@x", &subj("PATCH v2")).await;
+        assert_linked(&db, v2, v1, "subject_author").await;
+        assert_linked(&db, v1, rfc, "subject_author").await;
+        // Lazy reconciliation never cancels a historical predecessor.
+        assert_status(&db, rfc, "Pending").await;
     }
 
     /// A new version posted without changing the tag (a day later) links
