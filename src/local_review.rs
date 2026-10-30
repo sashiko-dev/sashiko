@@ -870,6 +870,33 @@ fn build_review_output(
     out
 }
 
+/// Appends one patch's related pre-existing bugs (reported and dismissed)
+/// to the series-wide lists, tagged with the patch they belong to.
+fn merge_related_preexisting(
+    review: &Value,
+    patch_index: i64,
+    patch_subject: &str,
+    reported: &mut Vec<Value>,
+    dismissed: &mut Vec<Value>,
+) {
+    for (key, combined) in [
+        ("related_preexisting", reported),
+        ("related_preexisting_dismissed", dismissed),
+    ] {
+        for item in review
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let mut item_val = item.clone();
+            item_val["patch_index"] = json!(patch_index);
+            item_val["patch_subject"] = json!(patch_subject);
+            combined.push(item_val);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_worker_in_worktree(
     worktree: &GitWorktree,
@@ -1131,6 +1158,8 @@ async fn run_worker_in_worktree(
     let mut combined_findings = Vec::new();
     let mut combined_concerns = Vec::new();
     let mut combined_dismissed_concerns = Vec::new();
+    let mut combined_related = Vec::new();
+    let mut combined_related_dismissed = Vec::new();
     let mut combined_prior_resolutions = Vec::new();
     let mut combined_inline = String::new();
     let mut combined_history = Vec::new();
@@ -1195,6 +1224,13 @@ async fn run_worker_in_worktree(
             if let Some(dismissed) = review.get("dismissed_concerns").and_then(|v| v.as_array()) {
                 combined_dismissed_concerns.extend(dismissed.clone());
             }
+            merge_related_preexisting(
+                review,
+                p_idx,
+                &patch_subject,
+                &mut combined_related,
+                &mut combined_related_dismissed,
+            );
             if let Some(resolutions) = review.get("prior_resolutions").and_then(|v| v.as_array()) {
                 for r in resolutions {
                     let mut r_val = r.clone();
@@ -1249,7 +1285,7 @@ async fn run_worker_in_worktree(
             total_tokens_cached.saturating_add(res["tokens_cached"].as_u64().unwrap_or(0));
     }
 
-    let review_output = build_review_output(
+    let mut review_output = build_review_output(
         combined_summary,
         combined_findings,
         combined_concerns,
@@ -1259,6 +1295,15 @@ async fn run_worker_in_worktree(
         total_dismissed_concerns_count,
         single_review_map,
     );
+    // The daemon reserves and mails the related bugs from here, so they must
+    // survive the merge of the per-patch outputs.
+    if let Some(obj) = review_output.as_object_mut() {
+        obj.insert("related_preexisting".to_string(), json!(combined_related));
+        obj.insert(
+            "related_preexisting_dismissed".to_string(),
+            json!(combined_related_dismissed),
+        );
+    }
 
     let mut combined_result = json!({
         "patchset_id": patchset_id,
@@ -1762,6 +1807,23 @@ mod tests {
         // is already past its deadline stops rather than retrying through it.
         assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
         Ok(())
+    }
+
+    #[test]
+    fn test_merge_related_preexisting_keeps_reported_and_dismissed() {
+        let review = json!({
+            "related_preexisting": [{"description": "a", "report_text": "note"}],
+            "related_preexisting_dismissed": [{"description": "b"}],
+        });
+        let (mut reported, mut dismissed) = (Vec::new(), Vec::new());
+        merge_related_preexisting(&review, 2, "mm: fix", &mut reported, &mut dismissed);
+        merge_related_preexisting(&json!({}), 3, "other", &mut reported, &mut dismissed);
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0]["report_text"], "note");
+        assert_eq!(reported[0]["patch_index"], 2);
+        assert_eq!(reported[0]["patch_subject"], "mm: fix");
+        assert_eq!(dismissed.len(), 1);
+        assert_eq!(dismissed[0]["description"], "b");
     }
 
     #[test]

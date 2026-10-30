@@ -110,6 +110,9 @@ pub struct LinuxPatchReviewState {
     /// Related pre-existing candidates a stage decided not to report, with
     /// the reason.
     pub related_preexisting_dismissed: Vec<Value>,
+    /// Related pre-existing bugs that passed the disclosure check, each with
+    /// the note for the patch author in `report_text`.
+    pub related_preexisting_reported: Vec<Value>,
 
     /// Verified findings from the verification and post-verification stages.
     pub findings: Vec<Value>,
@@ -148,6 +151,11 @@ impl LinuxPatchReviewState {
             &mut self.verification_dismissed,
             &mut self.post_verification_findings,
             &mut self.post_verification_dismissed,
+            // Copies of `concerns`; grounded the same way so a related bug
+            // keeps the fingerprint of the concern the bug pipeline gets.
+            &mut self.related_preexisting_selected,
+            &mut self.related_preexisting_dismissed,
+            &mut self.related_preexisting_reported,
         ] {
             crate::worker::resolve_finding_locations_with_parsed_diff(
                 &worktree,
@@ -3932,6 +3940,16 @@ pub fn build_linux_patch_review_workflow_with_effort(
             },
             ParallelPolicy::BestEffort,
         )
+        .resolved_parallel(
+            move |state| {
+                crate::workflows::related_preexisting::resolve_disclosure_check_stages(
+                    state,
+                    max_turns,
+                    temperature,
+                )
+            },
+            ParallelPolicy::BestEffort,
+        )
         .early_exit_if(
             |s| s.findings.is_empty(),
             "No findings validated in verification stages",
@@ -4918,7 +4936,7 @@ mod tests {
     fn test_build_workflow_graph_structure() {
         let workflow = build_linux_patch_review_workflow();
         assert_eq!(workflow.name, "linux_patch_review");
-        assert_eq!(workflow.steps.len(), 8);
+        assert_eq!(workflow.steps.len(), 9);
     }
 
     #[test]
@@ -5633,10 +5651,19 @@ mod tests {
                 "problem": "inconclusive concern 1",
                 "locations": [{"file": "kernel/sched/core.c", "code_snippet": "void schedule(void)"}]
             })],
+            related_preexisting_reported: vec![json!({
+                "description": "related 1",
+                "locations": [{"file": "kernel/sched/core.c", "code_snippet": "__schedule(SM_NONE);"}]
+            })],
             ..Default::default()
         };
 
         state.resolve_locations();
+
+        assert_eq!(
+            state.related_preexisting_reported[0]["locations"][0]["line"],
+            3
+        );
 
         assert_eq!(state.findings[0]["locations"][0]["line"], 2);
         assert_eq!(state.findings[0]["locations"][0]["in_diff"], true);
