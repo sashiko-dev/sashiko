@@ -16,7 +16,254 @@
 //!
 //! See designs/DESIGN_RELATED_PREEXISTING_BUGS.md.
 
-use crate::db::SeverityFloor;
+use crate::db::{Severity, SeverityFloor};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+
+/// Problem descriptions sharing at least this fraction of their words
+/// (Jaccard similarity of the word sets) describe the same bug when they also
+/// point at the same file.
+pub const SAME_PROBLEM_SIMILARITY: f64 = 0.5;
+
+/// Patches changing at most this many lines may report one related bug;
+/// larger ones may report two.
+pub const SMALL_PATCH_CHANGED_LINES: usize = 30;
+
+/// Words too common in bug descriptions to tell two bugs apart.
+const STOP_WORDS: [&str; 24] = [
+    "the", "and", "for", "with", "that", "this", "from", "when", "into", "can", "may", "not",
+    "its", "are", "was", "but", "via", "after", "before", "without", "missing", "bug", "issue",
+    "path",
+];
+
+/// Identifies a bug well enough to tell whether two reports describe the
+/// same one. Built from a concern or finding, or from a recorded disclosure.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BugKey {
+    /// Hash of the first location and the normalized problem; equal for the
+    /// same concern object across a review, its rerun and the bug pipeline.
+    pub fingerprint: String,
+    /// Files the locations point at.
+    pub files: Vec<String>,
+    /// Normalized function or symbol names of the locations.
+    pub symbols: Vec<String>,
+    /// Distinctive lowercase words of the problem description.
+    pub problem_words: Vec<String>,
+}
+
+fn normalize_symbol(raw: &str) -> String {
+    raw.trim()
+        .trim_end_matches("()")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn problem_words(problem: &str) -> Vec<String> {
+    problem
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .map(str::to_ascii_lowercase)
+        .filter(|w| w.len() >= 3 && !STOP_WORDS.contains(&w.as_str()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The problem text of a concern (`description`) or finding (`problem`).
+pub fn problem_of(item: &Value) -> &str {
+    item.get("problem")
+        .or_else(|| item.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+impl BugKey {
+    /// Builds the key of a concern or finding from its problem and locations.
+    pub fn from_item(item: &Value) -> Self {
+        Self::new(problem_of(item), item.get("locations"))
+    }
+
+    pub fn new(problem: &str, locations: Option<&Value>) -> Self {
+        let locations = locations
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let field = |loc: &Value, key: &str| {
+            loc.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let files: BTreeSet<String> = locations.iter().filter_map(|l| field(l, "file")).collect();
+        let symbols: BTreeSet<String> = locations
+            .iter()
+            .filter_map(|l| field(l, "function_or_symbol"))
+            .map(|s| normalize_symbol(&s))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let words = problem_words(problem);
+
+        let first = locations.first();
+        let mut hasher = Sha256::new();
+        hasher.update(
+            first
+                .and_then(|l| field(l, "file"))
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        hasher.update(b"\0");
+        let first_symbol = first
+            .and_then(|l| field(l, "function_or_symbol"))
+            .map(|s| normalize_symbol(&s))
+            .unwrap_or_default();
+        hasher.update(first_symbol.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(words.join(" ").as_bytes());
+        let fingerprint = hasher
+            .finalize()
+            .iter()
+            .take(16)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        Self {
+            fingerprint,
+            files: files.into_iter().collect(),
+            symbols: symbols.into_iter().collect(),
+            problem_words: words,
+        }
+    }
+
+    fn problem_similarity(&self, other: &Self) -> f64 {
+        let a: BTreeSet<&str> = self.problem_words.iter().map(String::as_str).collect();
+        let b: BTreeSet<&str> = other.problem_words.iter().map(String::as_str).collect();
+        let union = a.union(&b).count();
+        if union == 0 {
+            return 0.0;
+        }
+        a.intersection(&b).count() as f64 / union as f64
+    }
+
+    /// Whether two keys describe the same bug: the same fingerprint, or the
+    /// same file together with the same function or a near-identical
+    /// problem description. Deliberately eager to match, because reporting
+    /// a bug twice is worse than skipping a second bug in the same function.
+    pub fn is_same_bug(&self, other: &Self) -> bool {
+        if self.fingerprint == other.fingerprint {
+            return true;
+        }
+        if !self.files.iter().any(|f| other.files.contains(f)) {
+            return false;
+        }
+        self.symbols.iter().any(|s| other.symbols.contains(s))
+            || self.problem_similarity(other) >= SAME_PROBLEM_SIMILARITY
+    }
+}
+
+/// Files a patch touches, split by whether they survive it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatchFiles {
+    /// Post-image paths of files the patch modifies, adds or renames into.
+    pub surviving: BTreeSet<String>,
+    /// Paths of files the patch deletes.
+    pub deleted: BTreeSet<String>,
+}
+
+impl PatchFiles {
+    pub fn from_diff(diff: &str) -> Self {
+        let mut files = Self::default();
+        let mut current: Option<String> = None;
+        let mut current_deleted = false;
+        let finish = |path: Option<String>, deleted: bool, files: &mut Self| {
+            if let Some(path) = path {
+                if deleted {
+                    files.deleted.insert(path);
+                } else {
+                    files.surviving.insert(path);
+                }
+            }
+        };
+        for line in diff.lines() {
+            if let Some(rest) = line.strip_prefix("diff --git ") {
+                finish(current.take(), current_deleted, &mut files);
+                current_deleted = false;
+                current = rest
+                    .rsplit_once(" b/")
+                    .map(|(_, b)| b.trim().trim_matches('"').to_string());
+            } else if line.starts_with("deleted file mode") || line.trim_end() == "+++ /dev/null" {
+                current_deleted = true;
+            }
+        }
+        finish(current, current_deleted, &mut files);
+        files
+    }
+}
+
+/// How many related bugs the review of a patch may report.
+pub fn patch_budget(diff: &str) -> usize {
+    let changed = diff
+        .lines()
+        .filter(|l| {
+            (l.starts_with('+') && !l.starts_with("+++"))
+                || (l.starts_with('-') && !l.starts_with("---"))
+        })
+        .count();
+    if changed <= SMALL_PATCH_CHANGED_LINES {
+        1
+    } else {
+        2
+    }
+}
+
+/// Deterministic first cut of verified pre-existing concerns: severe
+/// enough, located in a file the patch touches and keeps, and not the same
+/// bug as one already reported (`known`) or as an earlier candidate.
+///
+/// Returned candidates carry an `id` (`RP1`, `RP2`, ...) for the selection
+/// stage to cite. Lines and sides are not trusted here because concern
+/// locations are not grounded until the workflow ends; the selection and
+/// disclosure-check stages judge proximity with the diff and tools.
+pub fn prefilter_candidates(
+    concerns: &[Value],
+    diff: &str,
+    min_severity: SeverityFloor,
+    known: &[BugKey],
+) -> Vec<Value> {
+    let files = PatchFiles::from_diff(diff);
+    let mut accepted: Vec<BugKey> = Vec::new();
+    let mut out = Vec::new();
+    for concern in concerns {
+        let severity = Severity::from_str(
+            concern
+                .get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        if !min_severity.admits(severity) {
+            continue;
+        }
+        let key = BugKey::from_item(concern);
+        if !key.files.iter().any(|f| files.surviving.contains(f)) {
+            continue;
+        }
+        if known
+            .iter()
+            .chain(accepted.iter())
+            .any(|k| k.is_same_bug(&key))
+        {
+            continue;
+        }
+        let mut candidate = concern.clone();
+        if let Some(map) = candidate.as_object_mut() {
+            map.insert("id".to_string(), json!(format!("RP{}", out.len() + 1)));
+        }
+        out.push(candidate);
+        accepted.push(key);
+    }
+    out
+}
 
 /// Whether a patch review looks for related pre-existing bugs to report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -247,5 +494,149 @@ mod gate {
             pr.mr_title = Some("fix the queue");
             assert_eq!(evaluate_gate(&pr, &policy()), Ok(SeverityFloor::High));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DIFF: &str = "\
+diff --git a/mm/foo.c b/mm/foo.c
+--- a/mm/foo.c
++++ b/mm/foo.c
+@@ -10,3 +10,3 @@ int foo(void)
+-\tspin_lock(&a);
++\tspin_lock_irq(&a);
+diff --git a/mm/old.c b/mm/old.c
+deleted file mode 100644
+--- a/mm/old.c
++++ /dev/null
+@@ -1,2 +0,0 @@
+-int old;
+-int older;
+diff --git a/mm/a.c b/mm/b.c
+similarity index 90%
+rename from mm/a.c
+rename to mm/b.c
+";
+
+    fn concern(problem: &str, severity: &str, file: &str, symbol: &str) -> Value {
+        json!({
+            "description": problem,
+            "severity": severity,
+            "preexisting": true,
+            "locations": [{"file": file, "function_or_symbol": symbol, "line": 12}],
+        })
+    }
+
+    #[test]
+    fn test_patch_files_split_surviving_and_deleted() {
+        let files = PatchFiles::from_diff(DIFF);
+        assert_eq!(
+            files.surviving.into_iter().collect::<Vec<_>>(),
+            vec!["mm/b.c".to_string(), "mm/foo.c".to_string()]
+        );
+        assert_eq!(
+            files.deleted.into_iter().collect::<Vec<_>>(),
+            vec!["mm/old.c".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_patch_budget_scales_with_changed_lines() {
+        assert_eq!(patch_budget(DIFF), 1);
+        let big: String = (0..31).map(|i| format!("+line {i}\n")).collect();
+        assert_eq!(patch_budget(&format!("+++ b/x\n{big}")), 2);
+    }
+
+    #[test]
+    fn test_bug_key_matching() {
+        let a = BugKey::from_item(&concern(
+            "missing unlock of dev->lock on the error path",
+            "High",
+            "mm/foo.c",
+            "foo_probe()",
+        ));
+        // Same concern object: same fingerprint.
+        assert_eq!(
+            a.fingerprint,
+            BugKey::from_item(&concern(
+                "missing unlock of dev->lock on the error path",
+                "Critical",
+                "mm/foo.c",
+                "foo_probe"
+            ))
+            .fingerprint
+        );
+        // Same file and function, different wording: same bug.
+        let same_fn = BugKey::from_item(&concern("refcount leak", "High", "mm/foo.c", "FOO_PROBE"));
+        assert!(a.is_same_bug(&same_fn));
+        // Same file, other function, near-identical wording: same bug.
+        let reworded = BugKey::from_item(&concern(
+            "dev->lock unlock missing on error path",
+            "High",
+            "mm/foo.c",
+            "foo_remove",
+        ));
+        assert!(a.is_same_bug(&reworded));
+        // Same file, other function, different problem: different bugs.
+        let other = BugKey::from_item(&concern(
+            "integer overflow computing the buffer size",
+            "High",
+            "mm/foo.c",
+            "foo_alloc",
+        ));
+        assert!(!a.is_same_bug(&other));
+        // Same wording in another file: different bugs.
+        let elsewhere = BugKey::from_item(&concern(
+            "missing unlock of dev->lock on the error path",
+            "High",
+            "mm/bar.c",
+            "bar_probe",
+        ));
+        assert!(!a.is_same_bug(&elsewhere));
+    }
+
+    #[test]
+    fn test_prefilter_keeps_severe_bugs_in_surviving_touched_files() {
+        let concerns = vec![
+            concern("use after free of the queue", "High", "mm/foo.c", "foo"),
+            concern("too minor", "Medium", "mm/foo.c", "foo_minor"),
+            concern("bug in a deleted file", "Critical", "mm/old.c", "old"),
+            concern(
+                "bug in an untouched file",
+                "Critical",
+                "mm/other.c",
+                "other",
+            ),
+            concern("bug in the renamed file", "Critical", "mm/b.c", "b"),
+            concern("same bug, reported twice", "High", "mm/foo.c", "foo"),
+            concern("no severity", "Unknown", "mm/foo.c", "foo_unknown"),
+        ];
+        let kept = prefilter_candidates(&concerns, DIFF, SeverityFloor::High, &[]);
+        let problems: Vec<&str> = kept.iter().map(problem_of).collect();
+        assert_eq!(
+            problems,
+            vec!["use after free of the queue", "bug in the renamed file"]
+        );
+        assert_eq!(kept[0]["id"], "RP1");
+        assert_eq!(kept[1]["id"], "RP2");
+
+        let with_medium = prefilter_candidates(&concerns, DIFF, SeverityFloor::Medium, &[]);
+        assert_eq!(with_medium.len(), 3);
+
+        // Already reported elsewhere: dropped.
+        let known = vec![BugKey::from_item(&concern(
+            "use after free of the queue",
+            "High",
+            "mm/foo.c",
+            "foo",
+        ))];
+        let kept = prefilter_candidates(&concerns, DIFF, SeverityFloor::High, &known);
+        assert_eq!(
+            kept.iter().map(problem_of).collect::<Vec<_>>(),
+            vec!["bug in the renamed file"]
+        );
     }
 }
