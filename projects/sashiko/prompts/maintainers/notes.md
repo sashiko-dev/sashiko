@@ -1,8 +1,10 @@
 +++
 title = "Maintainer Notes and Code Notes Architecture Policy"
 paths = [
+    "projects/gcc/prompts/maintainers/",
     "projects/linux/prompts/maintainers/",
     "projects/linux/prompts/notes/",
+    "projects/qemu/prompts/maintainers/",
     "projects/sashiko/prompts/maintainers/",
     "projects/sashiko/prompts/notes/",
     "src/notes/",
