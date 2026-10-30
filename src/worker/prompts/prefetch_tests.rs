@@ -75,7 +75,7 @@ async fn review_requests_use_target_prefetch_or_explicit_failure() {
             sha.clone()
         };
         let provider = Arc::new(RecordingProvider::default());
-        let mut tools = ToolBox::new(repo.to_path_buf(), None);
+        let mut tools = ToolBox::new(repo.to_path_buf());
         tools.set_virtual_head(target.clone());
         let mut worker = Worker::new(
             provider.clone(),

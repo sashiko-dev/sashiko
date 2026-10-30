@@ -1674,10 +1674,8 @@ mod tests {
         let provider = std::sync::Arc::new(RecordingProvider {
             temperatures: std::sync::Mutex::new(Vec::new()),
         });
-        let tools = std::sync::Arc::new(crate::toolbox::ToolBox::new(
-            temp_dir.path().to_path_buf(),
-            None,
-        ));
+        let tools =
+            std::sync::Arc::new(crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf()));
         let env = crate::workflow::stage::WorkflowEnv {
             provider: provider.clone(),
             tools,
@@ -1783,10 +1781,8 @@ mod tests {
         std::fs::write(prompts_dir.join("prompt-injection.md"), "").unwrap();
 
         let provider = std::sync::Arc::new(MockVerificationProvider);
-        let tools = std::sync::Arc::new(crate::toolbox::ToolBox::new(
-            temp_dir.path().to_path_buf(),
-            None,
-        ));
+        let tools =
+            std::sync::Arc::new(crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf()));
         let env = crate::workflow::stage::WorkflowEnv {
             provider,
             tools,

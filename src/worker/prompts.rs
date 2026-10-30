@@ -1220,7 +1220,7 @@ mod tests {
         std::fs::create_dir_all(&prompts_dir).unwrap();
 
         let provider = std::sync::Arc::new(MockProviderAlwaysFails);
-        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf());
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
             project: ProjectId::Linux,
@@ -1333,7 +1333,7 @@ mod tests {
         let provider = std::sync::Arc::new(MockBlockedProvider {
             attempts: AtomicUsize::new(0),
         });
-        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf());
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
             project: ProjectId::Linux,
@@ -1373,7 +1373,7 @@ mod tests {
         let provider = std::sync::Arc::new(MockBlockedProvider {
             attempts: AtomicUsize::new(0),
         });
-        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf());
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
             project: ProjectId::Linux,
@@ -1417,7 +1417,7 @@ mod tests {
         let provider = std::sync::Arc::new(MockBlockedProvider {
             attempts: AtomicUsize::new(0),
         });
-        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf());
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
             project: ProjectId::Linux,
@@ -1522,7 +1522,7 @@ mod tests {
         std::fs::create_dir_all(&prompts_dir).unwrap();
 
         let provider = std::sync::Arc::new(MockMultiStageSeriesProvider);
-        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf());
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
             project: ProjectId::Linux,
@@ -1709,7 +1709,7 @@ mod tests {
 
         for project in [ProjectId::Linux, ProjectId::Sashiko] {
             let provider = std::sync::Arc::new(MockFindingWithoutReportProvider);
-            let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+            let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf());
             let prompts = PromptRegistry::new(prompts_dir.clone());
             let config = WorkerConfig {
                 project,
@@ -1809,10 +1809,7 @@ mod tests {
         // With report_preexisting: false, verification routes pre-existing findings only to concerns (0 findings).
         let mut worker_default = Worker::new(
             std::sync::Arc::new(MockPreexistingOnlyProvider),
-            std::sync::Arc::new(crate::toolbox::ToolBox::new(
-                temp_dir.path().to_path_buf(),
-                None,
-            )),
+            std::sync::Arc::new(crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf())),
             PromptRegistry::new(prompts_dir.clone()),
             WorkerConfig {
                 project: ProjectId::Linux,
@@ -1843,10 +1840,7 @@ mod tests {
         // With report_preexisting: true, verification and report stages run and produce findings + inline report.
         let mut worker_preexisting = Worker::new(
             std::sync::Arc::new(MockPreexistingOnlyProvider),
-            std::sync::Arc::new(crate::toolbox::ToolBox::new(
-                temp_dir.path().to_path_buf(),
-                None,
-            )),
+            std::sync::Arc::new(crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf())),
             PromptRegistry::new(prompts_dir),
             WorkerConfig {
                 project: ProjectId::Linux,
@@ -1955,10 +1949,7 @@ mod tests {
         let review = |provider: std::sync::Arc<dyn crate::ai::AiProvider>| {
             let mut worker = Worker::new(
                 provider,
-                std::sync::Arc::new(crate::toolbox::ToolBox::new(
-                    temp_dir.path().to_path_buf(),
-                    None,
-                )),
+                std::sync::Arc::new(crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf())),
                 PromptRegistry::new(prompts_dir.clone()),
                 WorkerConfig {
                     project: ProjectId::Linux,

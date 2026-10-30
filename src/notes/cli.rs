@@ -514,7 +514,7 @@ async fn llm_env<'a>(
     ));
     let provider =
         crate::local_review::decorate_provider(provider, &settings.ai, &semaphore, &quota, &None);
-    let mut tools = ToolBox::new(repo.to_path_buf(), Some(prompts_dir.to_path_buf()));
+    let mut tools = ToolBox::new(repo.to_path_buf());
     tools.set_virtual_head(sha.to_string());
     Ok(WorkflowEnv {
         provider,

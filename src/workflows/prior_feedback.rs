@@ -1358,10 +1358,7 @@ mod tests {
         // runtime prompt isolation: fresh specialist stages must see zero prior
         // discussions, whereas prior-feedback receives <untrusted_prior_discussions>.
         let prompts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("projects/linux/prompts");
-        let tools = Arc::new(ToolBox::new(
-            std::env::temp_dir(),
-            Some(prompts_dir.clone()),
-        ));
+        let tools = Arc::new(ToolBox::new(std::env::temp_dir()));
         let spec_mock = Arc::new(RecordingMockProvider {
             requests: Mutex::new(Vec::new()),
             response_json: r#"{"concerns": [], "dismissed_concerns": []}"#.to_string(),

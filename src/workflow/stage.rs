@@ -783,7 +783,7 @@ mod tests {
     async fn test_a_batch_of_tool_calls_runs_concurrently() {
         let tmp = tempfile::tempdir().unwrap();
         let provider = Arc::new(ToolCallingProvider::probing(3));
-        let mut toolbox = ToolBox::new(tmp.path().to_path_buf(), None);
+        let mut toolbox = ToolBox::new(tmp.path().to_path_buf());
         toolbox.register_tool(ConcurrencyProbe {
             barrier: Arc::new(tokio::sync::Barrier::new(3)),
         });
@@ -815,7 +815,7 @@ mod tests {
         let provider = Arc::new(ToolCallingProvider::rejecting(&["a", "a"]));
         let env = WorkflowEnv {
             provider: provider.clone(),
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -859,7 +859,7 @@ mod tests {
         let provider = Arc::new(ToolCallingProvider::rejecting(&["a"]).repeated_next_turn());
         let env = WorkflowEnv {
             provider: provider.clone(),
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -903,7 +903,7 @@ mod tests {
         let provider = Arc::new(ToolCallingProvider::rejecting(&["a", "b", "a"]));
         let env = WorkflowEnv {
             provider: provider.clone(),
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -945,7 +945,7 @@ mod tests {
         let provider = Arc::new(ToolCallingProvider::rejecting(&["a", "b", "c"]));
         let env = WorkflowEnv {
             provider: provider.clone(),
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -977,7 +977,7 @@ mod tests {
         let provider = Arc::new(ToolCallingProvider::rejecting(&["x"]));
         let env = WorkflowEnv {
             provider: provider.clone(),
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -1050,7 +1050,7 @@ mod tests {
         });
         let env = WorkflowEnv {
             provider,
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -1146,7 +1146,7 @@ mod tests {
         });
         let env = WorkflowEnv {
             provider: provider.clone(),
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -1201,7 +1201,7 @@ mod tests {
         });
         let bad_env = WorkflowEnv {
             provider: bad_provider,
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };

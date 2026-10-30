@@ -1412,10 +1412,8 @@ diff --git a/hw/net/virtio-net.c b/hw/net/virtio-net.c
         let provider = std::sync::Arc::new(RecordingProvider {
             temperatures: std::sync::Mutex::new(Vec::new()),
         });
-        let tools = std::sync::Arc::new(crate::toolbox::ToolBox::new(
-            temp_dir.path().to_path_buf(),
-            None,
-        ));
+        let tools =
+            std::sync::Arc::new(crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf()));
         let env = crate::workflow::stage::WorkflowEnv {
             provider: provider.clone(),
             tools,
@@ -1497,10 +1495,8 @@ diff --git a/hw/net/virtio-net.c b/hw/net/virtio-net.c
         std::fs::write(prompts_dir.join("severity.md"), "").unwrap();
 
         let provider = std::sync::Arc::new(MockVerificationProvider);
-        let tools = std::sync::Arc::new(crate::toolbox::ToolBox::new(
-            temp_dir.path().to_path_buf(),
-            None,
-        ));
+        let tools =
+            std::sync::Arc::new(crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf()));
         let env = crate::workflow::stage::WorkflowEnv {
             provider,
             tools,

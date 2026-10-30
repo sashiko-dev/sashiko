@@ -29,17 +29,14 @@ mod tests {
         page.split('\n').count()
     }
 
-    fn get_test_paths() -> (PathBuf, PathBuf) {
-        let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    fn get_test_paths() -> PathBuf {
         // Use current repo as the test repo
-        let linux_path = root.clone();
-        let prompts_path = root.join("projects/linux/prompts");
-        (linux_path, prompts_path)
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
     }
 
     #[test]
     fn test_virtualize_ref() {
-        let mut toolbox = ToolBox::new(PathBuf::from("."), None);
+        let mut toolbox = ToolBox::new(PathBuf::from("."));
 
         // Without virtual HEAD, should return original
         assert_eq!(toolbox.virtualize_ref("HEAD"), "HEAD");
@@ -77,8 +74,8 @@ mod tests {
 
     #[test]
     fn test_git_ls_linux() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({ "revision": "HEAD", "path": "." });
@@ -91,8 +88,8 @@ mod tests {
 
     #[test]
     fn test_read_files_linux_readme() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -113,8 +110,8 @@ mod tests {
 
     #[test]
     fn test_git_log() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({ "range": "HEAD", "limit": 1 });
@@ -127,8 +124,8 @@ mod tests {
 
     #[test]
     fn test_git_show_head() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({ "object": "HEAD" });
@@ -163,7 +160,7 @@ mod tests {
     #[test]
     fn test_git_show_virtual_head() {
         let (_temp_dir, repo_path) = setup_test_repo();
-        let mut toolbox = ToolBox::new(repo_path.clone(), None);
+        let mut toolbox = ToolBox::new(repo_path.clone());
         let rt = Runtime::new().unwrap();
 
         // Resolve actual HEAD~1 SHA
@@ -197,8 +194,8 @@ mod tests {
     }
     #[test]
     fn test_git_show_file_full() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({ "object": "HEAD:README.md" });
@@ -210,8 +207,8 @@ mod tests {
 
     #[test]
     fn test_git_show_file_range() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -232,8 +229,8 @@ mod tests {
 
     #[test]
     fn test_git_show_file_default_limit() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -253,8 +250,8 @@ mod tests {
 
     #[test]
     fn test_git_show_raw_caching() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         // Clear/initialize cache check
@@ -308,8 +305,8 @@ mod tests {
 
     #[test]
     fn test_git_blame_readme() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args =
@@ -324,8 +321,8 @@ mod tests {
 
     #[test]
     fn test_git_blame_truncation() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -365,8 +362,8 @@ mod tests {
 
     #[test]
     fn test_git_grep_relative_path() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         // Search for "Sashiko" which should be in README.md
@@ -396,8 +393,8 @@ mod tests {
 
     #[test]
     fn test_git_grep_hyphen_pattern() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         // Search for a pattern starting with a hyphen (e.g. "-ETIMEDOUT" or "--")
@@ -418,8 +415,8 @@ mod tests {
 
     #[test]
     fn test_git_grep_invalid_revision() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -432,71 +429,9 @@ mod tests {
     }
 
     #[test]
-    fn test_read_prompt() {
-        let (linux_path, prompts_path) = get_test_paths();
-        // Enable prompt tool by passing path
-        let toolbox = ToolBox::new(linux_path.clone(), Some(prompts_path.clone()));
-        let rt = Runtime::new().unwrap();
-
-        // Ensure we have a dummy prompt file to read
-        // The real review-prompts might not be populated in test env, check first
-        // Or assume severity.md exists as per repo structure.
-        // But tests might run in clean env. Let's create a dummy one if we can or check existence.
-        // Since we are running in the actual repo, review-prompts should exist.
-
-        let args = json!({ "name": "severity.md" });
-        if prompts_path.join("severity.md").exists() {
-            let result = rt
-                .block_on(toolbox.call("read_prompt", args.clone()))
-                .expect("Failed to call read_prompt");
-            assert!(result.get("content").is_some());
-        } else {
-            // If file doesn't exist (e.g. CI), skip assertion on content but check tool availability
-            println!("Skipping read_prompt content check: severity.md not found");
-        }
-
-        // Test disabled tool
-        let toolbox_disabled = ToolBox::new(linux_path, None);
-        let result = rt.block_on(toolbox_disabled.call("read_prompt", args));
-        assert!(result.is_err());
-    }
-
-    /// read_prompt resolves the requested name against its base, so the base
-    /// has to be the prompt directory. Handed a file, every call fails while
-    /// canonicalizing, which is how a caller passing `<prompts>/tool.md` went
-    /// unnoticed: the tool is optional, so its errors look like the model
-    /// simply choosing not to use it.
-    #[test]
-    fn test_read_prompt_base_is_the_prompt_directory() {
-        let (linux_path, prompts_path) = get_test_paths();
-        let rt = Runtime::new().unwrap();
-        // A guide the workflow already loads by name, so it cannot go missing
-        // without breaking the review itself. The nested path also covers the
-        // subdirectory case, which is most of what the tool is asked for.
-        let args = json!({ "name": "locking.md" });
-
-        let toolbox = ToolBox::new(linux_path.clone(), Some(prompts_path.clone()));
-        let result = rt
-            .block_on(toolbox.call("read_prompt", args.clone()))
-            .expect("a name under the prompt directory must resolve");
-        assert!(!result["content"].as_str().unwrap_or_default().is_empty());
-
-        for alt in ["review-prompts/kernel/locking.md", "./locking.md"] {
-            let alt_res = rt
-                .block_on(toolbox.call("read_prompt", json!({ "name": alt })))
-                .unwrap_or_else(|e| panic!("expected {alt} to resolve: {e}"));
-            assert_eq!(alt_res["content"], result["content"]);
-        }
-
-        // A file as the base cannot resolve anything.
-        let wrong = ToolBox::new(linux_path, Some(prompts_path.join("tool.md")));
-        assert!(rt.block_on(wrong.call("read_prompt", args)).is_err());
-    }
-
-    #[test]
     fn test_git_read_files_truncation() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -530,8 +465,8 @@ mod tests {
 
     #[test]
     fn test_git_show_truncation() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -581,7 +516,7 @@ mod tests {
         run_git(&["add", "empty.txt"]);
         run_git(&["commit", "-m", "Add empty file"]);
 
-        let toolbox = ToolBox::new(repo_path, None);
+        let toolbox = ToolBox::new(repo_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -602,8 +537,8 @@ mod tests {
 
     #[test]
     fn test_git_read_files_with_float_line_ranges() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -626,8 +561,8 @@ mod tests {
 
     #[test]
     fn test_git_tools_reject_invalid_paths() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         for bad_path in ["../outside", "/etc/passwd"] {
@@ -739,7 +674,7 @@ mod tests {
 
         assert!(!repo_path.join("deleted_dir").exists());
 
-        let toolbox = ToolBox::new(repo_path, None);
+        let toolbox = ToolBox::new(repo_path);
         let rt = Runtime::new().unwrap();
 
         // git_read_files on historical deleted path in HEAD~1
@@ -775,17 +710,17 @@ mod tests {
         // the response cache key and of the prompt prefix a provider can
         // cache. They must not depend on the registry's hash map order,
         // which is random for every new registry.
-        let (repo, prompts) = get_test_paths();
+        let repo = get_test_paths();
         let names = |tb: &ToolBox| -> Vec<String> {
             tb.get_declarations_generic()
                 .into_iter()
                 .map(|t| t.name)
                 .collect()
         };
-        let first = names(&ToolBox::new(repo.clone(), Some(prompts.clone())));
+        let first = names(&ToolBox::new(repo.clone()));
         let mut sorted = first.clone();
         sorted.sort();
         assert_eq!(first, sorted, "declarations are not in name order");
-        assert_eq!(first, names(&ToolBox::new(repo, Some(prompts))));
+        assert_eq!(first, names(&ToolBox::new(repo)));
     }
 }

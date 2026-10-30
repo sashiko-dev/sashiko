@@ -1791,7 +1791,7 @@ async fn analyze_bug(
                 break;
             }
         }
-        let mut tb = crate::toolbox::ToolBox::new(repo_path, None);
+        let mut tb = crate::toolbox::ToolBox::new(repo_path);
         if let Some(m_sha) = mainline_sha {
             tb.set_virtual_head(m_sha);
         }

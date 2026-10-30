@@ -51,11 +51,10 @@ Know these before changing anything near them.
   `@include(...)` and the `@includes` marker from the *template*, never from
   substituted values. See `src/workflow/prompt.rs` and its tests.
 
-- **Pre-screen and `read_prompt` guide names** — the pre-screen stage and
-  per-stage `read_prompt` tool calls let the model choose which guide files are
-  inlined into downstream prompts (`sanitize_guide_path` for top-level
-  pre-screen guides and `sanitize_prompt_relpath` for top-level, `subsystem/`,
-  or `patterns/` prompt guides in `src/workflows/guard.rs`). Both sanitizers
+- **Pre-screen guide names** — the pre-screen stage lets the model choose
+  which guide files are inlined into downstream prompts (`sanitize_guide_path`
+  for top-level pre-screen guides and `sanitize_prompt_relpath` for top-level,
+  `subsystem/`, or `patterns/` prompt guides in `src/workflows/guard.rs`). Both sanitizers
   reject any path containing `..`, `\`, leading `/`, or subdirectories outside
   `subsystem/` and `patterns/` before it becomes a path. These are the places
   model output legitimately becomes a prompt filename, and the sanitizers in
