@@ -1923,31 +1923,23 @@
         // their browser until the content is updated.
         // Leave `headline`, `body`, and `items` empty to keep the banner hidden.
         const WHATS_NEW = {
-            id: '2026-10-12-whats-new-v2',
+            id: '2026-10-30-whats-new-v3',
             title: "What's New in Sashiko",
-            date: '2026-10-12',
-            headline: "What's new: maintainer embargo access & early embargo release, shareable bug links, and review map",
+            date: '2026-10-30',
+            headline: "What's new: maintainer notes & auto-generated code notes (67.3% recall), prior-version review tracking, and experimental GCC & QEMU support",
             body: '',
             items: [
                 {
-                    title: 'Maintainer embargo access & early embargo release',
-                    description: 'Signed-in maintainers can view embargoed reviews immediately without waiting for the timer, and use the new "Release Embargo" button on a patchset page to publish results early.'
+                    title: 'Maintainer notes & auto-generated code notes',
+                    description: 'Maintainer notes (projects/linux/prompts/maintainers/) give subsystem maintainers a dedicated place for high-level guidance, coding preferences, and subsystem policies. Alongside them, agents build per-version or per-tree code notes directly from the source tree and past fixes, lifting benchmark recall from 64% to 67.3%.'
                 },
                 {
-                    title: 'Shareable bug links',
-                    description: 'Anyone with a direct bug link (linux-<uuid>) can now view the report read-only. Use "Copy Link" on any bug page to share it.'
+                    title: 'Patchset version history & prior review tracking',
+                    description: 'Patchsets and individual patches now link across versions (v1 → v2 → …). When reviewing a new version, Sashiko checks earlier human and AI comments on the series, drops points that were already fixed or pushed back on, and credits the original reviewer when an earlier issue is still unaddressed.'
                 },
                 {
-                    title: 'Review map',
-                    description: 'Click "View Review Map" on any review to see everything Sashiko checked, including concerns it investigated and ruled out.'
-                },
-                {
-                    title: 'Prerequisite patch & stable baseline support',
-                    description: 'Series with standalone prerequisite-message-id trailers and bare stable-tree version tags now apply cleanly.'
-                },
-                {
-                    title: 'New mailing lists & 30-day login',
-                    description: 'Now tracking linux-usb, linux-kbuild, linux-erofs, linux-fscrypt, and linux-fsverity. Web sign-ins stay active for 30 days.'
+                    title: 'Experimental GCC & QEMU support',
+                    description: 'Sashiko now has experimental support for reviewing GCC (--project gcc, 58.5% recall on the 1,000-bug GCC benchmark) and QEMU (--project qemu) patches with project-specific prompts and workflows.'
                 }
             ]
         };
