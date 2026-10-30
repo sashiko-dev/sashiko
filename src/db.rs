@@ -1787,6 +1787,76 @@ fn effective_version(stored: Option<u32>, subject: &str) -> u32 {
         .unwrap_or(1)
 }
 
+/// What the related pre-existing bug gate reads about a patchset.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchsetGateInfo {
+    pub effective_version: u32,
+    pub to_recipients: Option<String>,
+    pub cc_recipients: Option<String>,
+}
+
+#[cfg(feature = "server")]
+impl Database {
+    /// Version and recipients of a patchset, for deciding whether its review
+    /// reports related pre-existing bugs.
+    pub async fn get_patchset_gate_info(
+        &self,
+        patchset_id: i64,
+    ) -> Result<Option<PatchsetGateInfo>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT version, COALESCE(subject, ''), to_recipients, cc_recipients
+                   FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let stored: Option<u32> = row.get(0)?;
+        let subject: String = row.get(1)?;
+        Ok(Some(PatchsetGateInfo {
+            effective_version: effective_version(stored, &subject),
+            to_recipients: row.get(2)?,
+            cc_recipients: row.get(3)?,
+        }))
+    }
+
+    /// Titles of the earlier postings of a patchset's series, newest first,
+    /// following `previous_patchset_id`: the pull request title for forge
+    /// revisions, the subject otherwise. Bounded, and safe against a cycle.
+    pub async fn get_patchset_predecessor_titles(&self, patchset_id: i64) -> Result<Vec<String>> {
+        const MAX_CHAIN_HOPS: usize = 32;
+        let mut seen = std::collections::HashSet::from([patchset_id]);
+        let mut titles = Vec::new();
+        let mut current = patchset_id;
+        while titles.len() < MAX_CHAIN_HOPS {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT prev.id, COALESCE(prev.mr_title, prev.subject, '')
+                       FROM patchsets cur
+                       JOIN patchsets prev ON prev.id = cur.previous_patchset_id
+                      WHERE cur.id = ?",
+                    libsql::params![current],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                break;
+            };
+            let previous: i64 = row.get(0)?;
+            if !seen.insert(previous) {
+                break;
+            }
+            titles.push(row.get(1)?);
+            current = previous;
+        }
+        Ok(titles)
+    }
+}
+
 /// The patchset being reconciled, as stored.
 #[cfg(feature = "server")]
 struct LineageSubject {
@@ -17606,6 +17676,103 @@ mod tests {
             .await
             .unwrap();
         assert!(!releasable.iter().any(|patchset| patchset.id == ps_id));
+    }
+
+    #[tokio::test]
+    async fn test_patchset_predecessor_titles_walk_the_chain() {
+        let db = setup_db().await;
+        let mut ids = Vec::new();
+        for (i, subject) in [
+            "[RFC] mm: first idea",
+            "[RFC v2] mm: second idea",
+            "[PATCH] mm: final idea",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let msg = format!("chain-{i}@x");
+            // Distinct authors and subjects keep the three postings apart.
+            let author = format!("A{i} <a{i}@x>");
+            let thread_id = db
+                .create_thread(&msg, subject, 1000 + i as i64)
+                .await
+                .unwrap();
+            db.create_message(
+                &msg,
+                thread_id,
+                None,
+                &author,
+                subject,
+                1000 + i as i64,
+                "body",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let ps_id = db
+                .create_patchset(
+                    thread_id,
+                    None,
+                    &msg,
+                    subject,
+                    &author,
+                    1000 + i as i64,
+                    1,
+                    1,
+                    "",
+                    "",
+                    None,
+                    1,
+                    None,
+                    false,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            ids.push(ps_id);
+        }
+        for pair in ids.windows(2) {
+            db.execute(
+                "UPDATE patchsets SET previous_patchset_id = ? WHERE id = ?",
+                libsql::params![pair[0], pair[1]],
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.get_patchset_predecessor_titles(ids[2]).await.unwrap(),
+            vec![
+                "[RFC v2] mm: second idea".to_string(),
+                "[RFC] mm: first idea".to_string()
+            ]
+        );
+        assert!(
+            db.get_patchset_predecessor_titles(ids[0])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A cycle stops instead of looping.
+        db.execute(
+            "UPDATE patchsets SET previous_patchset_id = ? WHERE id = ?",
+            libsql::params![ids[2], ids[0]],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_patchset_predecessor_titles(ids[2])
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

@@ -48,6 +48,8 @@ pub struct WorkerSubprocessOverrides {
     pub settings_path: Option<PathBuf>,
     pub report_preexisting: bool,
     pub skip_patch_ids: std::collections::HashSet<i64>,
+    /// Set per patchset by the related pre-existing bug gate, never daemon-wide.
+    pub related_preexisting: crate::related_preexisting::RelatedPreexistingMode,
 }
 
 #[derive(Clone)]
@@ -859,6 +861,9 @@ impl Reviewer {
                     patchset_id, e
                 );
             }
+
+            ctx.worker_overrides.related_preexisting =
+                Self::related_preexisting_gate(&ctx, &patchset).await;
 
             let has_ancestor = ctx
                 .db
@@ -2109,6 +2114,79 @@ impl Reviewer {
             )))
     }
 
+    /// Decides whether the review of `patchset` reports related pre-existing
+    /// bugs. Any failure to read what the decision needs leaves the feature
+    /// off for this patchset rather than guessing.
+    async fn related_preexisting_gate(
+        ctx: &ReviewContext,
+        patchset: &PatchsetRow,
+    ) -> crate::related_preexisting::RelatedPreexistingMode {
+        use crate::related_preexisting::{GateInputs, RelatedPreexistingMode, evaluate_gate};
+
+        let patchset_id = patchset.id;
+        let info = match ctx.db.get_patchset_gate_info(patchset_id).await {
+            Ok(Some(info)) => info,
+            Ok(None) => return RelatedPreexistingMode::Disabled,
+            Err(e) => {
+                warn!(
+                    "Related pre-existing bugs off for patchset {}: reading it failed: {}",
+                    patchset_id, e
+                );
+                return RelatedPreexistingMode::Disabled;
+            }
+        };
+        let predecessor_titles = match ctx.db.get_patchset_predecessor_titles(patchset_id).await {
+            Ok(titles) => titles,
+            Err(e) => {
+                warn!(
+                    "Related pre-existing bugs off for patchset {}: reading its lineage failed: {}",
+                    patchset_id, e
+                );
+                return RelatedPreexistingMode::Disabled;
+            }
+        };
+        let policy = match EmailPolicyConfig::load_async(&ctx.settings.review.email_policy_path)
+            .await
+        {
+            Ok(policy) => policy,
+            Err(e) => {
+                warn!(
+                    "Related pre-existing bugs off for patchset {}: loading the email policy failed: {}",
+                    patchset_id, e
+                );
+                return RelatedPreexistingMode::Disabled;
+            }
+        };
+        let recipients: Vec<String> = [&info.to_recipients, &info.cc_recipients]
+            .into_iter()
+            .flat_map(|list| crate::patch::split_address_list(list.as_deref().unwrap_or_default()))
+            .collect();
+        let inputs = GateInputs {
+            project: ctx.settings.project.kind.unwrap_or_default(),
+            subject: patchset.subject.as_deref().unwrap_or_default(),
+            mr_title: patchset.mr_title.as_deref(),
+            effective_version: info.effective_version,
+            predecessor_titles: &predecessor_titles,
+            recipients: &recipients,
+        };
+        match evaluate_gate(&inputs, &policy) {
+            Ok(min_severity) => {
+                info!(
+                    "Related pre-existing bugs on for patchset {} (min severity {})",
+                    patchset_id, min_severity
+                );
+                RelatedPreexistingMode::Enabled { min_severity }
+            }
+            Err(reason) => {
+                info!(
+                    "Related pre-existing bugs off for patchset {}: {:?}",
+                    patchset_id, reason
+                );
+                RelatedPreexistingMode::Disabled
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn process_patch_review(
         ctx: &ReviewContext,
@@ -3174,6 +3252,9 @@ async fn run_review_tool_with_cmd_and_overrides(
 
     if worker_overrides.report_preexisting {
         cmd.arg("--report-preexisting");
+    } else if let Some(min_severity) = worker_overrides.related_preexisting.min_severity() {
+        cmd.arg("--related-preexisting-min-severity")
+            .arg(min_severity.as_str());
     }
 
     cmd.args([

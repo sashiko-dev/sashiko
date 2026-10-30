@@ -92,6 +92,7 @@ async fn review_requests_use_target_prefetch_or_explicit_failure() {
                 stages: Some(vec!["goal".to_string()]),
                 skip_report: false,
                 report_preexisting: false,
+                related_preexisting: Default::default(),
                 effort: None,
                 use_code_notes: false,
                 code_notes_scope: Default::default(),

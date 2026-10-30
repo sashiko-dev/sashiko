@@ -57,6 +57,7 @@ pub mod prior_context;
 pub mod project;
 pub mod prompt_bundle;
 pub mod prompt_namespaces;
+pub mod related_preexisting;
 pub mod repo_sync;
 #[cfg(feature = "server")]
 pub mod reviewer;

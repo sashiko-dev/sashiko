@@ -52,6 +52,7 @@ pub struct WorkerOptions {
     pub current_tree: bool,
     pub agent: bool,
     pub report_preexisting: bool,
+    pub related_preexisting: crate::related_preexisting::RelatedPreexistingMode,
 }
 
 impl Default for WorkerOptions {
@@ -68,6 +69,7 @@ impl Default for WorkerOptions {
             current_tree: false,
             agent: false,
             report_preexisting: false,
+            related_preexisting: Default::default(),
         }
     }
 }
@@ -631,6 +633,7 @@ async fn review_single_patch(
                 stages: stages.clone(),
                 skip_report: options.agent,
                 report_preexisting: options.report_preexisting,
+                related_preexisting: options.related_preexisting,
                 effort: settings.effective_effort(),
                 use_code_notes: settings.review.use_code_notes,
                 code_notes_scope: settings.review.code_notes_scope,
