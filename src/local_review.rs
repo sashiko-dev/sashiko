@@ -84,6 +84,7 @@ pub struct ReviewOptions {
     pub custom_prompt: Option<String>,
     pub agent: bool,
     pub report_preexisting: bool,
+    pub related_preexisting: crate::related_preexisting::RelatedPreexistingMode,
 }
 
 impl Default for ReviewOptions {
@@ -95,6 +96,7 @@ impl Default for ReviewOptions {
             custom_prompt: None,
             agent: false,
             report_preexisting: false,
+            related_preexisting: Default::default(),
         }
     }
 }
@@ -289,6 +291,7 @@ pub async fn run_git_review(
             current_tree: true,
             agent: options.agent,
             report_preexisting: options.report_preexisting,
+            related_preexisting: options.related_preexisting,
             ..WorkerOptions::default()
         },
         settings,
@@ -1491,6 +1494,13 @@ pub fn format_agent_review_output(result: &Value) -> Value {
     });
 
     if let Some(obj) = out.as_object_mut() {
+        if let Some(related) = result
+            .get("review")
+            .and_then(|r| r.get("related_preexisting"))
+            .filter(|v| v.as_array().is_some_and(|items| !items.is_empty()))
+        {
+            obj.insert("related_preexisting".into(), related.clone());
+        }
         if let Some(partial) = result.get("partial") {
             obj.insert("partial".into(), partial.clone());
         }

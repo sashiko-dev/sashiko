@@ -157,6 +157,21 @@ enum Commands {
         #[arg(long)]
         report_preexisting: bool,
 
+        /// Report only the few pre-existing bugs closely related to the
+        /// change, after checking they are not security-sensitive and survive it
+        #[arg(long, conflicts_with = "report_preexisting")]
+        report_related_preexisting: bool,
+
+        /// Lowest severity of a related pre-existing bug to report
+        /// (low, medium, high, critical)
+        #[arg(
+            long,
+            value_name = "SEVERITY",
+            default_value = "high",
+            requires = "report_related_preexisting"
+        )]
+        related_preexisting_min_severity: sashiko::db::SeverityFloor,
+
         /// Custom prompt to append to the review task
         #[arg(long)]
         custom_prompt: Option<String>,
@@ -566,6 +581,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 input,
                 baseline,
                 report_preexisting,
+                report_related_preexisting,
+                related_preexisting_min_severity,
                 custom_prompt,
                 prompts,
                 format,
@@ -579,12 +596,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     format!("Failed to load settings from {}", settings_path.display())
                 })?;
 
+                let related_preexisting = related_preexisting_mode(
+                    project,
+                    *report_related_preexisting,
+                    *related_preexisting_min_severity,
+                )?;
                 return handle_review_command(
                     project,
                     input.clone(),
                     baseline.clone(),
                     settings,
                     *report_preexisting,
+                    related_preexisting,
                     custom_prompt.clone(),
                     resolve_prompts_path(prompts.clone(), project)?,
                     *format,
@@ -2599,6 +2622,7 @@ async fn handle_review_command(
     baseline: Option<String>,
     mut settings: Settings,
     report_preexisting: bool,
+    related_preexisting: RelatedPreexistingMode,
     custom_prompt: Option<String>,
     prompts: PathBuf,
     format: OutputFormat,
@@ -2833,6 +2857,7 @@ async fn handle_review_command(
             custom_prompt,
             agent,
             report_preexisting,
+            related_preexisting,
         },
         &settings,
         Some(&progress),
@@ -3192,6 +3217,55 @@ fn print_review_result(
     write_review_result(&mut stdout, result, input, report_preexisting)
 }
 
+/// The related pre-existing mode `sashiko review` runs in. Only the Linux
+/// workflow has the selection and disclosure-check stages, so asking for it
+/// on another project is an error rather than a review that silently
+/// reports nothing.
+fn related_preexisting_mode(
+    project: ProjectId,
+    requested: bool,
+    min_severity: sashiko::db::SeverityFloor,
+) -> Result<RelatedPreexistingMode, String> {
+    if !requested {
+        return Ok(RelatedPreexistingMode::Disabled);
+    }
+    if project != ProjectId::Linux {
+        return Err(format!(
+            "--report-related-preexisting is only supported for --project linux, not {}",
+            project.as_str()
+        ));
+    }
+    Ok(RelatedPreexistingMode::Enabled { min_severity })
+}
+
+/// Prints the related pre-existing bugs of `--report-related-preexisting`,
+/// each with the note the review wrote for the author. Like other
+/// pre-existing bugs they do not affect the exit code.
+fn write_related_preexisting(out: &mut impl WriteColor, review: &Value) -> std::io::Result<()> {
+    let Some(items) = review
+        .get("related_preexisting")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+    else {
+        return Ok(());
+    };
+    writeln!(out, "\nRelated Pre-existing Findings:")?;
+    for item in items {
+        let severity = item
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown");
+        let problem = sashiko::related_preexisting::problem_of(item).trim();
+        writeln!(out, "- [{severity}] {problem}")?;
+        if let Some(note) = item.get("report_text").and_then(Value::as_str) {
+            for line in note.trim().lines() {
+                writeln!(out, "    {line}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_review_result(
     out: &mut impl WriteColor,
     result: &Value,
@@ -3218,7 +3292,11 @@ fn write_review_result(
 
     let counts = count_findings_slice(&patch_findings);
     let total = counts.critical + counts.high + counts.medium + counts.low;
-    let has_preexisting = report_preexisting && !preexisting_findings.is_empty();
+    let has_related = review
+        .get("related_preexisting")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty());
+    let has_preexisting = (report_preexisting && !preexisting_findings.is_empty()) || has_related;
 
     if total == 0 && !result_has_error(result) {
         write_colored(
@@ -3238,6 +3316,8 @@ fn write_review_result(
         write_finding_counts(out, &preexisting_counts)?;
         write_grouped_findings(out, &preexisting_findings, true)?;
     }
+
+    write_related_preexisting(out, review)?;
 
     if let Some(inline) = result.get("inline_review").and_then(|v| v.as_str())
         && !inline.trim().is_empty()
@@ -5262,6 +5342,90 @@ mod tests {
     #[test]
     fn test_unknown_project_is_rejected_by_the_parser() {
         assert!(Cli::try_parse_from(["sashiko", "--project", "freebsd"]).is_err());
+    }
+
+    #[test]
+    fn test_review_parses_related_preexisting_flags() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["sashiko", "review"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all)
+        };
+        let Some(Commands::Review {
+            report_related_preexisting,
+            related_preexisting_min_severity,
+            ..
+        }) = parse(&["--report-related-preexisting"]).unwrap().command
+        else {
+            panic!("expected the review subcommand");
+        };
+        assert!(report_related_preexisting);
+        assert_eq!(
+            related_preexisting_min_severity,
+            sashiko::db::SeverityFloor::High
+        );
+
+        let Some(Commands::Review {
+            related_preexisting_min_severity,
+            ..
+        }) = parse(&[
+            "--report-related-preexisting",
+            "--related-preexisting-min-severity",
+            "medium",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("expected the review subcommand");
+        };
+        assert_eq!(
+            related_preexisting_min_severity,
+            sashiko::db::SeverityFloor::Medium
+        );
+
+        assert!(parse(&["--report-preexisting", "--report-related-preexisting"]).is_err());
+        assert!(parse(&["--related-preexisting-min-severity", "low"]).is_err());
+    }
+
+    #[test]
+    fn test_related_preexisting_mode_is_linux_only() {
+        use sashiko::db::SeverityFloor;
+        assert_eq!(
+            related_preexisting_mode(ProjectId::Sashiko, false, SeverityFloor::High),
+            Ok(RelatedPreexistingMode::Disabled)
+        );
+        assert_eq!(
+            related_preexisting_mode(ProjectId::Linux, true, SeverityFloor::Medium),
+            Ok(RelatedPreexistingMode::Enabled {
+                min_severity: SeverityFloor::Medium
+            })
+        );
+        let err = related_preexisting_mode(ProjectId::Qemu, true, SeverityFloor::High).unwrap_err();
+        assert!(err.contains("only supported for --project linux"), "{err}");
+    }
+
+    #[test]
+    fn test_write_review_result_renders_related_preexisting() {
+        let result = serde_json::json!({
+            "review": {
+                "findings": [],
+                "related_preexisting": [{
+                    "description": "mm: lock held on the -EINVAL return",
+                    "severity": "High",
+                    "report_text": "> return -EINVAL;\n\nNot introduced by this patch, but ...",
+                }],
+            },
+        });
+        let mut out = termcolor::NoColor::new(Vec::new());
+        write_review_result(&mut out, &result, "HEAD", false).unwrap();
+        let text = String::from_utf8(out.into_inner()).unwrap();
+        assert!(text.contains("Related Pre-existing Findings:"), "{text}");
+        assert!(text.contains("No patch-introduced issues found."), "{text}");
+        assert!(
+            text.contains("- [High] mm: lock held on the -EINVAL return"),
+            "{text}"
+        );
+        assert!(text.contains("    > return -EINVAL;"), "{text}");
     }
 
     #[test]
