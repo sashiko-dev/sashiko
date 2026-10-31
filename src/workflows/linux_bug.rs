@@ -1819,6 +1819,16 @@ pub fn generate_bugid_for_project(project: ProjectId) -> String {
     format!("{}-{}", project.as_str(), uuid::Uuid::new_v4())
 }
 
+/// The audit tool that records an upstream fix check of `project`'s bugs.
+pub fn fix_check_tool(project: ProjectId) -> &'static str {
+    match project {
+        ProjectId::Linux => "sashiko:linux_bug:fix_check",
+        ProjectId::Sashiko => "sashiko:sashiko_bug:fix_check",
+        ProjectId::Gcc => "sashiko:gcc_bug:fix_check",
+        ProjectId::Qemu => "sashiko:qemu_bug:fix_check",
+    }
+}
+
 pub fn infer_project_from_bug_or_tool(
     bugid: Option<&str>,
     tool: Option<&str>,
@@ -4692,12 +4702,7 @@ pub async fn check_bug_fixed_upstream_with_candidates(
         }
     };
 
-    let fix_tool = match project {
-        ProjectId::Linux => "sashiko:linux_bug:fix_check",
-        ProjectId::Sashiko => "sashiko:sashiko_bug:fix_check",
-        ProjectId::Gcc => "sashiko:gcc_bug:fix_check",
-        ProjectId::Qemu => "sashiko:qemu_bug:fix_check",
-    };
+    let fix_tool = fix_check_tool(project);
 
     if candidates.is_empty() {
         db.with_bug_actor("sashiko", fix_tool, None)
