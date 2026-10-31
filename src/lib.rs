@@ -32,6 +32,8 @@ pub mod email_policy;
 #[cfg(feature = "server")]
 pub mod email_router;
 #[cfg(feature = "server")]
+pub mod email_text;
+#[cfg(feature = "server")]
 pub mod events;
 #[cfg(feature = "server")]
 pub mod fetcher;

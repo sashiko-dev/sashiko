@@ -2116,6 +2116,56 @@ impl Reviewer {
             )))
     }
 
+    /// Reserves the related pre-existing bugs the review of `patch_msg_id`
+    /// reported, so no other review reports them too. With the feature off
+    /// for this patchset, earlier unmailed reservations of the patch are
+    /// dropped instead. A failure drops them as well: the email then goes
+    /// out without related bugs rather than with stale ones.
+    async fn reserve_related_preexisting(ctx: &ReviewContext, patch_msg_id: &str, review: &Value) {
+        let result = if ctx
+            .worker_overrides
+            .related_preexisting
+            .min_severity()
+            .is_some()
+        {
+            let candidates = crate::related_preexisting::disclosure_candidates(review);
+            ctx.db
+                .reserve_preexisting_disclosures(
+                    patch_msg_id,
+                    &candidates,
+                    crate::related_preexisting::same_disclosed_bug,
+                )
+                .await
+                .map(|won| {
+                    if !candidates.is_empty() {
+                        info!(
+                            "Reserved {} of {} related pre-existing bug(s) for {}",
+                            won.len(),
+                            candidates.len(),
+                            patch_msg_id
+                        );
+                    }
+                })
+        } else {
+            ctx.db
+                .release_preexisting_reservations(patch_msg_id)
+                .await
+                .map(|_| ())
+        };
+        if let Err(e) = result {
+            warn!(
+                "Failed to reserve related pre-existing bugs for {}: {}",
+                patch_msg_id, e
+            );
+            if let Err(e) = ctx.db.release_preexisting_reservations(patch_msg_id).await {
+                warn!(
+                    "Failed to drop related pre-existing reservations for {}: {}",
+                    patch_msg_id, e
+                );
+            }
+        }
+    }
+
     /// Duplicate-check keys of the related pre-existing bugs already recorded
     /// in the files `diffs` touch, for the worker to skip. Unmailed
     /// reservations of these very patches (from an earlier run) are left out,
@@ -2712,6 +2762,26 @@ impl Reviewer {
                                 let result_desc = "Review completed successfully.";
 
                                 let inline_review = json_output["inline_review"].as_str();
+
+                                // Reserve related pre-existing bugs before the
+                                // review counts as complete: a crash after it
+                                // completes would otherwise skip straight to
+                                // the idempotent notification path and lose
+                                // them. A reservation of a review that never
+                                // completes expires on its own.
+                                if let Some(patch_msg_id) = input_payload["patches"]
+                                    .as_array()
+                                    .and_then(|arr| arr.iter().find(|p| p["index"] == index))
+                                    .and_then(|p| p["message_id"].as_str())
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    Self::reserve_related_preexisting(
+                                        ctx,
+                                        patch_msg_id,
+                                        review_content,
+                                    )
+                                    .await;
+                                }
 
                                 // Persist the Reviewed status before queueing
                                 // pre-existing bug discoveries or notifications so
@@ -3898,6 +3968,11 @@ impl Reviewer {
             None => return Ok(()),
         };
 
+        // Related pre-existing bugs recorded for this patch. Including the
+        // ones already stamped as mailed is safe: the outbox never replaces a
+        // sent email of a patch, so they can only refresh an unsent one.
+        let related = ctx.db.preexisting_disclosures_for_patch(msg_id).await?;
+
         let references_hdr = match &msg_details.references_hdr {
             Some(refs) if !refs.trim().is_empty() => {
                 format!("{} {}", refs.trim(), msg_id_clean)
@@ -3941,6 +4016,7 @@ impl Reviewer {
                     "Muted by bot loop guard",
                 )
                 .await?;
+            ctx.db.release_preexisting_reservations(msg_id).await?;
             return Ok(());
         }
 
@@ -4017,7 +4093,7 @@ impl Reviewer {
             &sender_address,
         );
 
-        if total_issues_count == 0 {
+        if total_issues_count == 0 && related.is_empty() {
             let mut sent_positive_review = false;
             if let Some((pos_to, pos_cc)) = EmailRouter::resolve_positive_recipients(
                 &policy,
@@ -4150,6 +4226,7 @@ impl Reviewer {
                         "Muted by policy",
                     )
                     .await?;
+                ctx.db.release_preexisting_reservations(msg_id).await?;
             }
             EmailAction::Send { to, cc, .. } => {
                 let to_json = serde_json::to_string(&to)?;
@@ -4167,10 +4244,7 @@ impl Reviewer {
                 let mut header = String::new();
 
                 if total_issues_count > 0 {
-                    header.push_str(&format!(
-                        "Thank you for your contribution! Sashiko AI review found {} potential issue(s) to consider:\n",
-                        total_issues_count
-                    ));
+                    header.push_str(&crate::email_text::findings_header(total_issues_count));
 
                     let mut sorted_findings = new_findings.clone();
                     let sort_by_severity = |a: &Value, b: &Value| {
@@ -4195,21 +4269,49 @@ impl Reviewer {
                             .get("severity")
                             .and_then(|v| v.as_str())
                             .unwrap_or("Unknown");
-                        format!("- [{}] {}\n", severity, problem)
+                        crate::email_text::bullet(severity, problem)
                     };
 
                     for f in &sorted_findings {
                         header.push_str(&format_finding(f));
                     }
 
+                    header.push_str(&crate::related_preexisting::related_email_header(
+                        total_issues_count,
+                        &related,
+                    ));
                     header.push_str("--\n\n");
+                } else {
+                    header.push_str(&crate::related_preexisting::related_email_header(
+                        0, &related,
+                    ));
                 }
 
                 let mut footer = String::new();
 
                 footer.push_str(&format!("\n\n-- \nSashiko AI review · {}", target_url));
 
-                let final_body = format!("{}{}{}", header, inline_review.trim_end(), footer);
+                // Without new findings the inline review only says so, and the
+                // header already did.
+                let mut body = if total_issues_count > 0 {
+                    inline_review.trim_end().to_string()
+                } else {
+                    String::new()
+                };
+                if !related.is_empty() {
+                    // After an inline review, a divider keeps the related notes
+                    // from reading like part of its last comment.
+                    if !body.is_empty() {
+                        body.push_str("\n\n");
+                        body.push_str(&crate::related_preexisting::related_email_divider(
+                            related.len(),
+                        ));
+                        body.push_str("\n\n");
+                    }
+                    body.push_str(&crate::related_preexisting::related_email_section(&related));
+                }
+
+                let final_body = format!("{}{}{}", header, body, footer);
 
                 let status = match &ctx.settings.smtp {
                     None => "Disabled",
@@ -4217,8 +4319,11 @@ impl Reviewer {
                     _ => "Pending",
                 };
 
-                ctx.db
-                    .insert_email_outbox(
+                // A Pending email stamps the related bugs as mailed in the same
+                // transaction that queues it.
+                let queued = ctx
+                    .db
+                    .insert_review_email_outbox(
                         patch_id,
                         status,
                         &to_json,
@@ -4227,8 +4332,20 @@ impl Reviewer {
                         msg_id_clean,
                         &references_hdr,
                         &final_body,
+                        (!related.is_empty()).then_some(msg_id),
                     )
                     .await?;
+
+                // Anything but a queued Pending email lets a later review report
+                // the bugs: a disabled or dry-run email is never sent, and an
+                // email that was not queued (the patch already has an
+                // unreplaceable one) does not carry them. Releasing only drops
+                // unstamped rows, and a Pending email stamps its rows in the
+                // transaction that queues it, so no mailed bug is released; a
+                // superseded worker is fenced out of the release.
+                if !related.is_empty() && (!queued || status != "Pending") {
+                    ctx.db.release_preexisting_reservations(msg_id).await?;
+                }
 
                 info!(
                     "Queued email for patch {}/{} (ID: {})",
@@ -5686,6 +5803,268 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
     }
 
     #[tokio::test]
+    async fn test_queue_notifications_mails_related_bugs_once() -> Result<()> {
+        use crate::db::{DisclosureRelation, NewPreexistingDisclosure};
+
+        let temp_dir = tempdir()?;
+        let policy_path = temp_dir.path().join("email_policy.toml");
+        std::fs::write(
+            &policy_path,
+            r#"
+            [defaults]
+            reply_to = ["author"]
+            "#,
+        )?;
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.email_policy_path = policy_path.to_str().unwrap().to_string();
+        settings.smtp = Some(crate::settings::SmtpSettings {
+            transport: crate::settings::MailTransport::Smtp,
+            server: Some("localhost".to_string()),
+            port: Some(25),
+            username: None,
+            password: None,
+            sendmail_path: None,
+            sender_address: "bot@sashiko.dev".to_string(),
+            reply_to: None,
+            dry_run: false,
+        });
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
+        db.create_message(
+            "msg_id_p1",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Subject",
+            1000,
+            "Body\nSigned-off-by: Author <author@example.com>",
+            "to@example.com",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
+                None, false, None, None,
+            )
+            .await?
+            .unwrap();
+        let p_id = db.create_patch(ps_id, "msg_id_p1", 1, "diff").await?;
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(1)),
+            db: db.clone(),
+            settings,
+            baseline_registry: Arc::new(
+                crate::baseline::BaselineRegistry::new(Path::new("."), None).unwrap(),
+            ),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+            worker_overrides: WorkerSubprocessOverrides::default(),
+        };
+
+        db.reserve_preexisting_disclosures(
+            "msg_id_p1",
+            &[NewPreexistingDisclosure {
+                fingerprint: "fp".to_string(),
+                problem: "mm: lock held on the -EINVAL return".to_string(),
+                severity: Severity::High,
+                relation: DisclosureRelation::SamePattern,
+                locations_json: "[]".to_string(),
+                bug_key_json: "{}".to_string(),
+                report_text: "> return -EINVAL;\n\nThis isn't introduced by this patch, but ..."
+                    .to_string(),
+                files: vec!["mm/foo.c".to_string()],
+            }],
+            |_, _| false,
+        )
+        .await?;
+
+        // No new findings: the related bug alone gets a normal review email.
+        Reviewer::queue_notifications(
+            &ctx,
+            ps_id,
+            None,
+            p_id,
+            "msg_id_p1",
+            "msg_id_1",
+            1,
+            "No issues found.",
+            Some(&Vec::new()),
+            "summary",
+        )
+        .await?;
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, body FROM email_outbox WHERE patch_id = ?",
+                libsql::params![p_id],
+            )
+            .await?;
+        let row = rows.next().await?.expect("expected an email");
+        let status: String = row.get(0)?;
+        let body: String = row.get(1)?;
+        assert_eq!(status, "Pending");
+        assert!(
+            body.starts_with(
+                "Thank you for your contribution! Sashiko AI review found no new issues\n\
+                 in this patch, but noticed 1 related pre-existing issue it does not\n"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("- [High] mm: lock held on the -EINVAL return"),
+            "{body}"
+        );
+        assert!(body.contains("> return -EINVAL;"), "{body}");
+        assert!(!body.contains("No issues found."), "{body}");
+        let recorded = db.preexisting_disclosures_for_patch("msg_id_p1").await?;
+        assert!(recorded[0].disclosed_at.is_some());
+
+        // Once that email is sent, a rerun cannot queue another one; its new
+        // reservations are released, while the mailed bug stays recorded.
+        db.execute(
+            "UPDATE email_outbox SET status = 'Sent' WHERE patch_id = ?",
+            libsql::params![p_id],
+        )
+        .await?;
+        db.reserve_preexisting_disclosures(
+            "msg_id_p1",
+            &[NewPreexistingDisclosure {
+                fingerprint: "fp-rerun".to_string(),
+                problem: "mm: another related bug".to_string(),
+                severity: Severity::High,
+                relation: DisclosureRelation::SameCode,
+                locations_json: "[]".to_string(),
+                bug_key_json: "{}".to_string(),
+                report_text: "note".to_string(),
+                files: vec!["mm/other.c".to_string()],
+            }],
+            |_, _| false,
+        )
+        .await?;
+        Reviewer::queue_notifications(
+            &ctx,
+            ps_id,
+            None,
+            p_id,
+            "msg_id_p1",
+            "msg_id_1",
+            1,
+            "No issues found.",
+            Some(&Vec::new()),
+            "summary",
+        )
+        .await?;
+        let recorded = db.preexisting_disclosures_for_patch("msg_id_p1").await?;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].fingerprint, "fp");
+
+        // Once mailed, the bug is never reserved again, not even by this patch.
+        let won = db
+            .reserve_preexisting_disclosures(
+                "msg_id_p2",
+                &[NewPreexistingDisclosure {
+                    fingerprint: "fp".to_string(),
+                    problem: "same".to_string(),
+                    severity: Severity::High,
+                    relation: DisclosureRelation::SameCode,
+                    locations_json: "[]".to_string(),
+                    bug_key_json: "{}".to_string(),
+                    report_text: "again".to_string(),
+                    files: vec!["mm/foo.c".to_string()],
+                }],
+                crate::related_preexisting::same_disclosed_bug,
+            )
+            .await?;
+        assert!(won.is_empty());
+
+        // With new findings, the related note follows the inline review
+        // behind a divider, and every line we write fits in 72 columns.
+        db.create_message(
+            "msg_id_p3",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Subject 3",
+            1000,
+            "Body",
+            "to@example.com",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let p3_id = db.create_patch(ps_id, "msg_id_p3", 2, "diff").await?;
+        db.reserve_preexisting_disclosures(
+            "msg_id_p3",
+            &[NewPreexistingDisclosure {
+                fingerprint: "fp3".to_string(),
+                problem: "mm: refcount leak on the retry path of foo_alloc()".to_string(),
+                severity: Severity::High,
+                relation: DisclosureRelation::SameCode,
+                locations_json: "[]".to_string(),
+                bug_key_json: "{}".to_string(),
+                report_text: "The retry path also leaks the reference.".to_string(),
+                files: vec!["mm/bar.c".to_string()],
+            }],
+            |_, _| false,
+        )
+        .await?;
+        let findings = vec![json!({
+            "problem": "mm: out_unlock frees priv->buf twice on the foo_hw_init() error path",
+            "severity": "High",
+            "preexisting": false
+        })];
+        Reviewer::queue_notifications(
+            &ctx,
+            ps_id,
+            None,
+            p3_id,
+            "msg_id_p3",
+            "msg_id_1",
+            2,
+            "inline review content",
+            Some(&findings),
+            "summary",
+        )
+        .await?;
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT body FROM email_outbox WHERE patch_id = ?",
+                libsql::params![p3_id],
+            )
+            .await?;
+        let body: String = rows.next().await?.expect("expected an email").get(0)?;
+        let expected_head = "\
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] mm: out_unlock frees priv->buf twice on the foo_hw_init() error
+  path
+It also noticed 1 related pre-existing issue this patch does not
+introduce:
+- [High] mm: refcount leak on the retry path of foo_alloc()
+--
+
+inline review content
+
+Related pre-existing issue, not introduced by this patch:
+
+The retry path also leaks the reference.
+
+-- ";
+        assert!(body.starts_with(expected_head), "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_queue_notifications_split_summary() -> Result<()> {
         let temp_dir = tempdir()?;
         let policy_path = temp_dir.path().join("email_policy.toml");
@@ -5800,7 +6179,8 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
         let row = rows.next().await?.expect("Expected email in outbox");
         let body: String = row.get(0)?;
         let expected_mixed_body = "\
-Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
 - [High] New High issue
 - [Low] New Low issue
 --
@@ -5862,7 +6242,8 @@ inline review content\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchse
         let row = rows.next().await?.expect("Expected email in outbox");
         let body: String = row.get(0)?;
         let expected_new_only_body = "\
-Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
 - [High] New High issue
 - [Low] New Low issue
 --
@@ -6001,7 +6382,8 @@ inline review content 2\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         let row = rows.next().await?.expect("Expected email in outbox");
         let body: String = row.get(0)?;
         let expected_scenario_4 = "\
-Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
 - [High] New High issue
 - [Low] New Low issue
 --
