@@ -413,6 +413,11 @@ const CLEAN_PATCHSET_PREDICATE: &str = "
         SELECT 1 FROM reviews r
         JOIN findings f ON f.review_id = r.id
         WHERE r.patchset_id = p.id AND r.status = 'Reviewed'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM patches pd
+        JOIN preexisting_disclosures d ON d.patch_message_id = pd.message_id
+        WHERE pd.patchset_id = p.id AND d.disclosed_at IS NULL
     )";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -11336,6 +11341,22 @@ impl Database {
             )
             .await?;
         if finding_rows.next().await?.is_some() {
+            return Ok(PatchsetReviewOutcome::HasFindings);
+        }
+
+        // Mirrors CLEAN_PATCHSET_PREDICATE: an unmailed related pre-existing
+        // bug is held like a finding.
+        let mut related_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM patches pd
+                 JOIN preexisting_disclosures d ON d.patch_message_id = pd.message_id
+                 WHERE pd.patchset_id = ? AND d.disclosed_at IS NULL
+                 LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if related_rows.next().await?.is_some() {
             Ok(PatchsetReviewOutcome::HasFindings)
         } else {
             Ok(PatchsetReviewOutcome::Clean)
@@ -14116,6 +14137,9 @@ AND NOT EXISTS (
 #[cfg(feature = "server")]
 impl Database {
     #[allow(clippy::too_many_arguments)]
+    /// Returns whether a row was written (inserted or refreshed); `false`
+    /// when the claim is gone, the patchset is cancelled, or the patch
+    /// already has an email that can no longer be replaced.
     pub async fn insert_email_outbox(
         &self,
         patch_id: i64,
@@ -14126,13 +14150,46 @@ impl Database {
         in_reply_to: &str,
         references_hdr: &str,
         body: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        self.insert_review_email_outbox(
+            patch_id,
+            status,
+            to_addresses,
+            cc_addresses,
+            subject,
+            in_reply_to,
+            references_hdr,
+            body,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::insert_email_outbox`], and when the row is written with
+    /// status `Pending` it also stamps the live related pre-existing bug
+    /// reservations of `disclose_for` (a patch Message-ID) as mailed, in the
+    /// same transaction. Stamping separately would let the email worker send
+    /// the email before the stamp, and a retry would then see an unreplaceable
+    /// email and could not tell whether it carried the bugs.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_review_email_outbox(
+        &self,
+        patch_id: i64,
+        status: &str,
+        to_addresses: &str,
+        cc_addresses: &str,
+        subject: &str,
+        in_reply_to: &str,
+        references_hdr: &str,
+        body: &str,
+        disclose_for: Option<&str>,
+    ) -> Result<bool> {
         // Prevent duplicate emails for the same patch; if an unsent row from an
         // aborted attempt exists, refresh its payload with the latest review.
         let tx = self.begin_immediate_transaction().await?;
         let tx_db = self.with_connection((*tx).clone());
         if !tx_db.is_patchset_claim_active_for_outbox(None).await? {
-            return Ok(());
+            return Ok(false);
         }
         let mut ps_rows = tx
             .query(
@@ -14143,7 +14200,7 @@ impl Database {
         if let Some(ps_row) = ps_rows.next().await?
             && ps_row.get::<Option<String>>(0)?.as_deref() == Some("Cancelled")
         {
-            return Ok(());
+            return Ok(false);
         }
         drop(ps_rows);
         let existing = {
@@ -14191,15 +14248,16 @@ impl Database {
                     ],
                 )
                 .await?;
+                Self::stamp_disclosures_in(&tx, status, disclose_for).await?;
                 tx.commit().await?;
-                return Ok(());
+                return Ok(true);
             }
             tracing::info!(
                 "Email outbox entry already exists for patch_id {} (status {}), skipping to prevent duplicates.",
                 patch_id,
                 existing_status
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let created_at = chrono::Utc::now().timestamp();
@@ -14219,7 +14277,32 @@ impl Database {
             ],
         )
         .await?;
+        Self::stamp_disclosures_in(&tx, status, disclose_for).await?;
         tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Stamps the live reservations of `disclose_for` as mailed inside the
+    /// outbox transaction `tx`, for a `Pending` email only.
+    async fn stamp_disclosures_in(
+        tx: &libsql::Transaction,
+        status: &str,
+        disclose_for: Option<&str>,
+    ) -> Result<()> {
+        let Some(patch_message_id) = disclose_for.filter(|_| status == "Pending") else {
+            return Ok(());
+        };
+        let now = chrono::Utc::now().timestamp();
+        tx.execute(
+            "UPDATE preexisting_disclosures SET disclosed_at = ?1
+              WHERE patch_message_id = ?2 AND disclosed_at IS NULL AND reserved_at > ?3",
+            libsql::params![
+                now,
+                patch_message_id,
+                now - preexisting_disclosures::RESERVATION_TTL_SECS
+            ],
+        )
+        .await?;
         Ok(())
     }
 
@@ -17655,6 +17738,45 @@ mod tests {
                 .unwrap()
         );
         db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        // An unmailed related pre-existing bug is held by the embargo too.
+        db.reserve_preexisting_disclosures(
+            "msg_clean_embargo",
+            &[NewPreexistingDisclosure {
+                fingerprint: "fp".to_string(),
+                problem: "related".to_string(),
+                severity: Severity::High,
+                relation: DisclosureRelation::SameCode,
+                locations_json: "[]".to_string(),
+                bug_key_json: "{}".to_string(),
+                report_text: "note".to_string(),
+                files: vec!["mm/foo.c".to_string()],
+            }],
+            |_, _| false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::HasFindings
+        );
+        let releasable = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap();
+        assert!(!releasable.iter().any(|patchset| patchset.id == ps_id));
+        assert!(
+            !db.claim_patchset_embargo_release(ps_id, now + 1201)
+                .await
+                .unwrap()
+        );
+        db.mark_preexisting_disclosed("msg_clean_embargo")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Clean
+        );
 
         db.create_finding(Finding {
             review_id,

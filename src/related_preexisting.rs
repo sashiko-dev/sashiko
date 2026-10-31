@@ -295,6 +295,131 @@ impl RelatedPreexistingMode {
 
 #[cfg(feature = "server")]
 pub use gate::{GateInputs, GateSkipReason, evaluate_gate};
+#[cfg(feature = "server")]
+pub use reporting::{
+    disclosure_candidates, related_email_divider, related_email_header, related_email_section,
+    same_disclosed_bug,
+};
+
+#[cfg(feature = "server")]
+mod reporting {
+    use super::{BugKey, problem_of};
+    use crate::db::{
+        DisclosureRelation, NewPreexistingDisclosure, PreexistingDisclosure, Severity,
+    };
+    use serde_json::Value;
+
+    /// The related bugs a worker reported (`related_preexisting` in its
+    /// review output), ready to reserve. Items without a note or with an
+    /// unknown relation are skipped rather than mailed half-formed.
+    pub fn disclosure_candidates(review: &Value) -> Vec<NewPreexistingDisclosure> {
+        let Some(items) = review.get("related_preexisting").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .filter_map(|item| {
+                let report_text = item.get("report_text")?.as_str()?.trim();
+                if report_text.is_empty() {
+                    return None;
+                }
+                let relation: DisclosureRelation =
+                    serde_json::from_value(item.get("relation")?.clone()).ok()?;
+                let key = BugKey::from_item(item);
+                Some(NewPreexistingDisclosure {
+                    fingerprint: key.fingerprint.clone(),
+                    problem: problem_of(item).trim().to_string(),
+                    severity: Severity::from_str(
+                        item.get("severity")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    ),
+                    relation,
+                    locations_json: item
+                        .get("locations")
+                        .map(Value::to_string)
+                        .unwrap_or_else(|| "[]".to_string()),
+                    bug_key_json: serde_json::to_string(&key).ok()?,
+                    report_text: report_text.to_string(),
+                    files: key.files,
+                })
+            })
+            .collect()
+    }
+
+    /// The duplicate rule for reservations. A key that cannot be read
+    /// counts as the same bug, so a damaged row blocks instead of letting a
+    /// bug be reported twice.
+    pub fn same_disclosed_bug(
+        candidate: &NewPreexistingDisclosure,
+        existing: &PreexistingDisclosure,
+    ) -> bool {
+        let (Ok(a), Ok(b)) = (
+            serde_json::from_str::<BugKey>(&candidate.bug_key_json),
+            serde_json::from_str::<BugKey>(&existing.bug_key_json),
+        ) else {
+            return true;
+        };
+        a.is_same_bug(&b)
+    }
+
+    use crate::email_text::{bullet, count, wrap, wrap_prose};
+
+    fn summary_lines(rows: &[PreexistingDisclosure]) -> String {
+        rows.iter()
+            .map(|d| bullet(d.severity.as_str(), &d.problem))
+            .collect()
+    }
+
+    fn issues(n: usize) -> String {
+        count(
+            n,
+            "related pre-existing issue",
+            "related pre-existing issues",
+        )
+    }
+
+    /// The line that sets the related notes apart from the inline review
+    /// when the email also carries new findings.
+    pub fn related_email_divider(n: usize) -> String {
+        if n == 1 {
+            "Related pre-existing issue, not introduced by this patch:".to_string()
+        } else {
+            "Related pre-existing issues, not introduced by this patch:".to_string()
+        }
+    }
+
+    /// The opening lines of a review email that carries related bugs,
+    /// wrapped at 72 columns. `new_issues` is the number of findings
+    /// the patch introduces.
+    pub fn related_email_header(new_issues: usize, rows: &[PreexistingDisclosure]) -> String {
+        if rows.is_empty() {
+            return String::new();
+        }
+        if new_issues == 0 {
+            let sentence = format!(
+                "Thank you for your contribution! Sashiko AI review found no new issues in this patch, but noticed {} it does not introduce:",
+                issues(rows.len())
+            );
+            format!("{}{}--\n\n", wrap(&sentence, "", ""), summary_lines(rows))
+        } else {
+            let sentence = format!(
+                "It also noticed {} this patch does not introduce:",
+                issues(rows.len())
+            );
+            format!("{}{}", wrap(&sentence, "", ""), summary_lines(rows))
+        }
+    }
+
+    /// The notes for the related bugs, appended after the inline review,
+    /// with their prose wrapped at 72 columns.
+    pub fn related_email_section(rows: &[PreexistingDisclosure]) -> String {
+        rows.iter()
+            .map(|d| wrap_prose(&d.report_text))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
 
 #[cfg(feature = "server")]
 mod gate {
@@ -637,6 +762,124 @@ rename to mm/b.c
         assert_eq!(
             kept.iter().map(problem_of).collect::<Vec<_>>(),
             vec!["bug in the renamed file"]
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_disclosure_candidates_and_email_text() {
+        use crate::db::{DisclosureRelation, PreexistingDisclosure};
+
+        let review = json!({
+            "related_preexisting": [
+                {
+                    "description": "lock held on the -EINVAL return",
+                    "severity": "High",
+                    "relation": "SamePattern",
+                    "report_text": "  > return -EINVAL;\n\nnote one  ",
+                    "locations": [{"file": "mm/foo.c", "function_or_symbol": "foo_probe"}],
+                },
+                {"description": "no note", "relation": "SameCode", "report_text": " "},
+                {"description": "bad relation", "relation": "Nearby", "report_text": "x"},
+            ]
+        });
+        let candidates = disclosure_candidates(&review);
+        assert_eq!(candidates.len(), 1);
+        let c = &candidates[0];
+        assert_eq!(c.relation, DisclosureRelation::SamePattern);
+        assert_eq!(c.severity, Severity::High);
+        assert_eq!(c.files, vec!["mm/foo.c".to_string()]);
+        assert_eq!(c.report_text, "> return -EINVAL;\n\nnote one");
+
+        let row = |key: &str| PreexistingDisclosure {
+            id: 1,
+            patch_message_id: "p@x".to_string(),
+            fingerprint: c.fingerprint.clone(),
+            problem: c.problem.clone(),
+            severity: c.severity,
+            relation: c.relation,
+            locations_json: c.locations_json.clone(),
+            bug_key_json: key.to_string(),
+            report_text: c.report_text.clone(),
+            reserved_at: 0,
+            disclosed_at: None,
+            bug_id: None,
+            files: c.files.clone(),
+        };
+        assert!(same_disclosed_bug(c, &row(&c.bug_key_json)));
+        // An unreadable key blocks rather than risking a second report.
+        assert!(same_disclosed_bug(c, &row("not json")));
+
+        let rows = vec![row(&c.bug_key_json)];
+        let alone = related_email_header(0, &rows);
+        assert_eq!(
+            alone,
+            "Thank you for your contribution! Sashiko AI review found no new issues\n\
+             in this patch, but noticed 1 related pre-existing issue it does not\n\
+             introduce:\n\
+             - [High] lock held on the -EINVAL return\n\
+             --\n\n"
+        );
+        let with_findings = related_email_header(2, &[rows[0].clone(), rows[0].clone()]);
+        assert!(
+            with_findings.starts_with("It also noticed 2 related pre-existing issues this"),
+            "{with_findings}"
+        );
+        assert!(related_email_header(0, &[]).is_empty());
+        assert_eq!(
+            related_email_section(&rows),
+            "> return -EINVAL;\n\nnote one"
+        );
+
+        // Long problems wrap with a hanging indent; every line fits.
+        let mut long = rows[0].clone();
+        long.problem = "net: foo: priv->lock held on the -EINVAL return in foo_probe() after the config parse fails".to_string();
+        let header = related_email_header(0, &[long]);
+        assert!(
+            header
+                .lines()
+                .all(|l| l.len() <= crate::email_text::WRAP_WIDTH),
+            "{header}"
+        );
+        assert!(header.contains("\n  "), "{header}");
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_related_email_section_wraps_prose_but_not_quotes() {
+        use crate::db::{DisclosureRelation, PreexistingDisclosure};
+        let quote =
+            "> \tif (!cfg && some_rather_long_condition_name(priv, cfg, FOO_FLAG_A, FOO_FLAG_B))";
+        let note = format!(
+            "This isn't a bug introduced by this patch, but the same missing unlock exists a few lines below the path you fixed:\n\n{quote}\n> \t\treturn -EINVAL;\n\nfoo_probe() returns here with priv->lock\nstill held."
+        );
+        let row = PreexistingDisclosure {
+            id: 1,
+            patch_message_id: "p@x".to_string(),
+            fingerprint: "fp".to_string(),
+            problem: "p".to_string(),
+            severity: Severity::High,
+            relation: DisclosureRelation::SamePattern,
+            locations_json: "[]".to_string(),
+            bug_key_json: "{}".to_string(),
+            report_text: note,
+            reserved_at: 0,
+            disclosed_at: None,
+            bug_id: None,
+            files: Vec::new(),
+        };
+        let section = related_email_section(&[row]);
+        assert_eq!(
+            section,
+            format!(
+                "This isn't a bug introduced by this patch, but the same missing unlock\n\
+                 exists a few lines below the path you fixed:\n\
+                 \n\
+                 {quote}\n\
+                 > \t\treturn -EINVAL;\n\
+                 \n\
+                 foo_probe() returns here with priv->lock still held."
+            )
         );
     }
 }
