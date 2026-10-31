@@ -30,4 +30,5 @@ pub const PROJECT_PROMPT_NAMESPACES: &[(&str, &str)] = &[
     ("sashiko", "sashiko"),
     ("gcc", "gcc"),
     ("qemu", "qemu"),
+    ("zephyr", "zephyr"),
 ];

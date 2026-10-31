@@ -128,6 +128,7 @@ impl BugWorker {
             crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
             crate::project::ProjectId::Gcc => "sashiko:gcc_bug",
             crate::project::ProjectId::Qemu => "sashiko:qemu_bug",
+            crate::project::ProjectId::Zephyr => "sashiko:zephyr_bug",
         };
         self.db = Arc::new(self.db.with_bug_actor("system", bug_tool, None));
         self
@@ -676,6 +677,7 @@ impl BugWorker {
             crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
             crate::project::ProjectId::Gcc => "sashiko:gcc_bug",
             crate::project::ProjectId::Qemu => "sashiko:qemu_bug",
+            crate::project::ProjectId::Zephyr => "sashiko:zephyr_bug",
         };
         let actor = if !bug.reporter.is_empty() {
             bug.reporter.as_str()

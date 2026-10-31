@@ -41,6 +41,7 @@ pub enum ProjectId {
     Sashiko,
     Gcc,
     Qemu,
+    Zephyr,
 }
 
 impl ProjectId {
@@ -52,6 +53,7 @@ impl ProjectId {
             ProjectId::Sashiko => "sashiko",
             ProjectId::Gcc => "gcc",
             ProjectId::Qemu => "qemu",
+            ProjectId::Zephyr => "zephyr",
         }
     }
 
@@ -62,6 +64,7 @@ impl ProjectId {
             ProjectId::Sashiko => "Sashiko",
             ProjectId::Gcc => "GCC",
             ProjectId::Qemu => "QEMU",
+            ProjectId::Zephyr => "Zephyr",
         }
     }
 
@@ -69,7 +72,7 @@ impl ProjectId {
     pub fn mainline_branch(self) -> &'static str {
         match self {
             ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu => "master",
-            ProjectId::Sashiko => "main",
+            ProjectId::Sashiko | ProjectId::Zephyr => "main",
         }
     }
 
@@ -89,6 +92,7 @@ impl ProjectId {
                     || url.contains("qemu.org")
                     || url.contains("qemu/qemu")
             }
+            ProjectId::Zephyr => url.contains("zephyrproject-rtos/zephyr"),
         }
     }
 
@@ -107,6 +111,7 @@ impl ProjectId {
             ProjectId::Sashiko => "sashiko",
             ProjectId::Gcc => "gcc",
             ProjectId::Qemu => "qemu",
+            ProjectId::Zephyr => "zephyr",
         }
     }
 
@@ -117,7 +122,7 @@ impl ProjectId {
     pub fn uses_maintainers(self) -> bool {
         match self {
             ProjectId::Linux => true,
-            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu => false,
+            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu | ProjectId::Zephyr => false,
         }
     }
 
@@ -132,7 +137,7 @@ impl ProjectId {
             ProjectId::Linux => {
                 crate::authority::TrustedBots(&["lkp@intel.com", "*@syzkaller.appspotmail.com"])
             }
-            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu => {
+            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu | ProjectId::Zephyr => {
                 crate::authority::TrustedBots(&[])
             }
         }
@@ -146,6 +151,7 @@ impl ProjectId {
             ProjectId::Sashiko => "projects/sashiko/mailing_lists.toml",
             ProjectId::Gcc => "projects/gcc/mailing_lists.toml",
             ProjectId::Qemu => "projects/qemu/mailing_lists.toml",
+            ProjectId::Zephyr => "projects/zephyr/mailing_lists.toml",
         }
     }
 
@@ -155,7 +161,7 @@ impl ProjectId {
     pub fn upstream_maintainers_path(self) -> Option<&'static str> {
         match self {
             ProjectId::Linux => Some("projects/linux/upstream_maintainers.toml"),
-            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu => None,
+            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu | ProjectId::Zephyr => None,
         }
     }
 
@@ -181,6 +187,10 @@ impl ProjectId {
             },
             ProjectId::Qemu => Upstream {
                 url: "https://gitlab.com/qemu-project/qemu.git",
+                seed: Seed::None,
+            },
+            ProjectId::Zephyr => Upstream {
+                url: "https://github.com/zephyrproject-rtos/zephyr.git",
                 seed: Seed::None,
             },
         }
@@ -228,6 +238,7 @@ impl FromStr for ProjectId {
             "sashiko" => Ok(ProjectId::Sashiko),
             "gcc" => Ok(ProjectId::Gcc),
             "qemu" => Ok(ProjectId::Qemu),
+            "zephyr" => Ok(ProjectId::Zephyr),
             _ => Err(UnknownProject(s.to_string())),
         }
     }
@@ -266,6 +277,7 @@ impl ProjectId {
         ProjectId::Sashiko,
         ProjectId::Gcc,
         ProjectId::Qemu,
+        ProjectId::Zephyr,
     ];
 }
 
@@ -297,10 +309,14 @@ mod tests {
         // checked against a match the compiler forces to stay exhaustive.
         for project in ProjectId::ALL {
             match project {
-                ProjectId::Linux | ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu => {}
+                ProjectId::Linux
+                | ProjectId::Sashiko
+                | ProjectId::Gcc
+                | ProjectId::Qemu
+                | ProjectId::Zephyr => {}
             }
         }
-        assert_eq!(ProjectId::ALL.len(), 4);
+        assert_eq!(ProjectId::ALL.len(), 5);
     }
 
     #[test]
@@ -317,6 +333,7 @@ mod tests {
         assert_eq!(ProjectId::Sashiko.display_name(), "Sashiko");
         assert_eq!(ProjectId::Gcc.display_name(), "GCC");
         assert_eq!(ProjectId::Qemu.display_name(), "QEMU");
+        assert_eq!(ProjectId::Zephyr.display_name(), "Zephyr");
     }
 
     #[test]
@@ -346,6 +363,7 @@ mod tests {
         assert_eq!(ProjectId::from_str("Linux"), Ok(ProjectId::Linux));
         assert_eq!(ProjectId::from_str("  SASHIKO "), Ok(ProjectId::Sashiko));
         assert_eq!(ProjectId::from_str("QEMU"), Ok(ProjectId::Qemu));
+        assert_eq!(ProjectId::from_str("Zephyr"), Ok(ProjectId::Zephyr));
     }
 
     #[test]
@@ -374,6 +392,7 @@ mod tests {
         assert_eq!(ProjectId::Linux.prompt_dir(), "kernel");
         assert_eq!(ProjectId::Sashiko.prompt_dir(), "sashiko");
         assert_eq!(ProjectId::Qemu.prompt_dir(), "qemu");
+        assert_eq!(ProjectId::Zephyr.prompt_dir(), "zephyr");
     }
 
     #[test]

@@ -81,6 +81,15 @@ pub fn qemu_severity_guide() -> &'static str {
         .expect("qemu/severity.md must exist in prompt bundle")
 }
 
+/// Returns the compiled-in content of `zephyr/severity.md`.
+pub fn zephyr_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "zephyr/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("zephyr/severity.md must exist in prompt bundle")
+}
+
 /// Returns the compiled-in severity guide for `project`.
 pub fn severity_guide(project: ProjectId) -> &'static str {
     match project {
@@ -88,6 +97,7 @@ pub fn severity_guide(project: ProjectId) -> &'static str {
         ProjectId::Sashiko => sashiko_severity_guide(),
         ProjectId::Gcc => gcc_severity_guide(),
         ProjectId::Qemu => qemu_severity_guide(),
+        ProjectId::Zephyr => zephyr_severity_guide(),
     }
 }
 
@@ -280,6 +290,23 @@ mod tests {
             assert!(
                 PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
                 "missing QEMU framing file in bundle: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_zephyr_prompt_bundle_integrity() {
+        let required_framing = [
+            "zephyr/review-core.md",
+            "zephyr/severity.md",
+            "zephyr/false-positive-guide.md",
+            "zephyr/report-template.md",
+            "zephyr/maintainers/general.md",
+        ];
+        for path in required_framing {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing Zephyr framing file in bundle: {path}"
             );
         }
     }
