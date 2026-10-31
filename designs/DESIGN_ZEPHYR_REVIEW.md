@@ -70,7 +70,7 @@ post-verification states that a Kconfig or Devicetree logic error is not noise.
 | `execution-context` | `arch/`, `drivers/`, `kernel/`, `soc/`, or interrupt, timer, and callback symbols |
 | `synchronization` | `kernel/`, or lock, workqueue, and thread symbols |
 | `device-drivers` | `drivers/`, `include/zephyr/drivers/`, or `DEVICE_*` symbols |
-| `devicetree` | `dts/`, `boards/`, `.dts`, `.dtsi`, and overlay files, or `DT_*` symbols |
+| `devicetree` | `dts/`, `boards/`, `.dts`, `.dtsi`, and overlay files, or `DT_*` / `DEVICE_DT_GET*` symbols |
 | `kconfig` | Kconfig, `.conf`, and `_defconfig` files |
 | `userspace` | `kernel/userspace/`, or system call symbols |
 | `dma-and-cache` | `drivers/dma/`, `drivers/cache/`, or cache and DMA symbols |
