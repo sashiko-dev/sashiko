@@ -95,6 +95,10 @@ pub struct ReviewInput {
     pub id: i64,
     pub subject: String,
     pub patches: Vec<PatchInput>,
+    /// Related pre-existing bugs already reported in the files this series
+    /// touches, so the review does not pick them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_disclosures: Vec<crate::related_preexisting::BugKey>,
 }
 
 /// Selects the code notes for a review and renders their prompt block.
@@ -485,7 +489,8 @@ impl Worker {
             skip_report: self.skip_report,
             report_preexisting: self.report_preexisting,
             related_preexisting: self.related_preexisting,
-            known_disclosures: Vec::new(),
+            known_disclosures: serde_json::from_value(patchset["known_disclosures"].clone())
+                .unwrap_or_default(),
             related_preexisting_selected: Vec::new(),
             related_preexisting_dismissed: Vec::new(),
             related_preexisting_reported: Vec::new(),

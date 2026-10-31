@@ -260,6 +260,7 @@ pub async fn build_review_input_from_git(
             id: 0,
             subject,
             patches,
+            known_disclosures: Vec::new(),
         },
         shas,
     ))
@@ -311,6 +312,7 @@ pub async fn run_worker(
     let patchset_id = input.id;
     let subject = input.subject;
     let patches = input.patches;
+    let known_disclosures = input.known_disclosures;
     let baseline_arg = if options.current_tree {
         options.baseline.clone().unwrap_or_default()
     } else {
@@ -397,6 +399,7 @@ pub async fn run_worker(
         patchset_id,
         subject,
         patches,
+        &known_disclosures,
         &baseline_arg,
         &baseline_sha,
         &options,
@@ -528,6 +531,7 @@ async fn review_single_patch(
     p: &PatchInput,
     all_patches: &[PatchInput],
     rich_patches: &[Value],
+    known_disclosures: &[crate::related_preexisting::BugKey],
     patch_shas: &HashMap<i64, String>,
     options: &WorkerOptions,
     baseline_sha: &str,
@@ -691,7 +695,8 @@ async fn review_single_patch(
             "subject": subject,
             "patches": rich_patches,
             "patch_index": Some(p.index),
-            "baseline": baseline_sha
+            "baseline": baseline_sha,
+            "known_disclosures": known_disclosures,
         });
 
         match worker
@@ -906,6 +911,7 @@ async fn run_worker_in_worktree(
     patchset_id: i64,
     subject: String,
     patches: Vec<PatchInput>,
+    known_disclosures: &[crate::related_preexisting::BugKey],
     baseline_arg: &str,
     baseline_sha: &str,
     options: &WorkerOptions,
@@ -1118,6 +1124,7 @@ async fn run_worker_in_worktree(
                 p,
                 all_patches,
                 &rich_patches,
+                known_disclosures,
                 patch_shas,
                 options,
                 baseline_sha,
