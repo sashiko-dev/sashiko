@@ -958,11 +958,13 @@ impl Reviewer {
                 })
                 .unwrap_or_default();
 
+            let known_disclosures = Self::known_related_disclosures(&ctx, &diffs).await;
             let input_payload = json!({
                 "id": patchset_id,
                 "message_id": patchset_msg_id,
                 "subject": patchset.subject.clone().unwrap_or("Unknown".to_string()),
-                "patches": patches_json
+                "patches": patches_json,
+                "known_disclosures": known_disclosures,
             });
 
             let skip_filters: Vec<String> = patchset
@@ -2112,6 +2114,43 @@ impl Reviewer {
                 "Failed to queue notifications for patch {}/{} (ID: {})",
                 patchset_id, index, patch_id
             )))
+    }
+
+    /// Duplicate-check keys of the related pre-existing bugs already recorded
+    /// in the files `diffs` touch, for the worker to skip. Unmailed
+    /// reservations of these very patches (from an earlier run) are left out,
+    /// since the review replaces them. Empty when the feature is off for the
+    /// patchset or the lookup fails; the reservation re-checks everything.
+    async fn known_related_disclosures(
+        ctx: &ReviewContext,
+        diffs: &[(i64, i64, String, String, String, i64, String)],
+    ) -> Vec<crate::related_preexisting::BugKey> {
+        if ctx
+            .worker_overrides
+            .related_preexisting
+            .min_severity()
+            .is_none()
+        {
+            return Vec::new();
+        }
+        let mut files = std::collections::BTreeSet::new();
+        for (_, _, diff, ..) in diffs {
+            files.extend(crate::related_preexisting::PatchFiles::from_diff(diff).surviving);
+        }
+        let files: Vec<String> = files.into_iter().collect();
+        let own: std::collections::HashSet<&str> =
+            diffs.iter().map(|(.., msg_id)| msg_id.as_str()).collect();
+        match ctx.db.preexisting_disclosures_in_files(&files).await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|d| d.disclosed_at.is_some() || !own.contains(d.patch_message_id.as_str()))
+                .filter_map(|d| serde_json::from_str(&d.bug_key_json).ok())
+                .collect(),
+            Err(e) => {
+                warn!("Failed to load recorded related pre-existing bugs: {}", e);
+                Vec::new()
+            }
+        }
     }
 
     /// Decides whether the review of `patchset` reports related pre-existing
@@ -5206,6 +5245,86 @@ fi
                         +++ b/mainline.txt\n\
                         @@ -1 +1 @@\n-new\n+newer\n";
         assert_baseline_failure_log(&ctx, tip_diff, "Unrecognized patch application failure.").await
+    }
+
+    #[tokio::test]
+    async fn test_known_related_disclosures_skip_own_unmailed_reservations() -> Result<()> {
+        use crate::db::{DisclosureRelation, NewPreexistingDisclosure};
+        use crate::related_preexisting::{BugKey, RelatedPreexistingMode};
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let mut ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(1)),
+            db: db.clone(),
+            settings,
+            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None).unwrap()),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+            worker_overrides: WorkerSubprocessOverrides::default(),
+        };
+
+        let candidate = |problem: &str| {
+            let key = BugKey::new(
+                problem,
+                Some(&json!([{"file": "mm/foo.c", "function_or_symbol": problem}])),
+            );
+            NewPreexistingDisclosure {
+                fingerprint: key.fingerprint.clone(),
+                problem: problem.to_string(),
+                severity: Severity::High,
+                relation: DisclosureRelation::SameCode,
+                locations_json: "[]".to_string(),
+                bug_key_json: serde_json::to_string(&key).unwrap(),
+                report_text: "note".to_string(),
+                files: key.files,
+            }
+        };
+        let any = |_: &NewPreexistingDisclosure, _: &crate::db::PreexistingDisclosure| false;
+        // Mailed by another series, reserved by another series, mailed by
+        // this patch, and reserved (unmailed) by this patch.
+        db.reserve_preexisting_disclosures("other-mailed", &[candidate("a")], any)
+            .await?;
+        db.mark_preexisting_disclosed("other-mailed").await?;
+        db.reserve_preexisting_disclosures("other-reserved", &[candidate("b")], any)
+            .await?;
+        db.reserve_preexisting_disclosures("own", &[candidate("c")], any)
+            .await?;
+        db.mark_preexisting_disclosed("own").await?;
+        db.reserve_preexisting_disclosures("own", &[candidate("d")], any)
+            .await?;
+
+        let diffs = vec![(
+            1,
+            1,
+            "diff --git a/mm/foo.c b/mm/foo.c\n--- a/mm/foo.c\n+++ b/mm/foo.c\n".to_string(),
+            "subject".to_string(),
+            "author".to_string(),
+            0,
+            "own".to_string(),
+        )];
+
+        assert!(
+            Reviewer::known_related_disclosures(&ctx, &diffs)
+                .await
+                .is_empty()
+        );
+
+        ctx.worker_overrides.related_preexisting = RelatedPreexistingMode::Enabled {
+            min_severity: crate::db::SeverityFloor::High,
+        };
+        let mut symbols: Vec<String> = Reviewer::known_related_disclosures(&ctx, &diffs)
+            .await
+            .into_iter()
+            .flat_map(|k| k.symbols)
+            .collect();
+        symbols.sort();
+        assert_eq!(symbols, vec!["a", "b", "c"]);
+        Ok(())
     }
 
     #[tokio::test]
