@@ -636,7 +636,7 @@ pub async fn create_provider_cached(
         }
         .await;
         match opened {
-            Ok(cached) if replay => Ok(Arc::new(cached)),
+            Ok(cached) if replay => Ok(Arc::new(cached.with_resume(ai.resume))),
             Ok(cached) => Ok(Arc::new(cached.record_only())),
             // Recording is only for a later --resume, so it never fails a review.
             Err(e) if !replay => {
