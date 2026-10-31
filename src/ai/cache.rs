@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     AiProvider, AiProviderDecorator, AiRequest, AiResponse, CacheStats, ProviderCapabilities,
-    get_log_prefix,
+    ReasoningEffort, get_log_prefix,
 };
 
 /// A date as the workflows' system prompts state it ("%A, %B %d, %Y").
@@ -30,6 +30,7 @@ pub struct CachingAiProvider {
     inner: Arc<dyn AiProvider>,
     store: Arc<ResponseCacheStore>,
     replay: bool,
+    resume: bool,
 }
 
 impl CachingAiProvider {
@@ -57,7 +58,9 @@ impl CachingAiProvider {
                 response_json TEXT NOT NULL,
                 tokens_saved INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
-            );",
+            );
+            CREATE INDEX IF NOT EXISTS idx_response_cache_provider_model
+                ON response_cache (provider, model);",
         )
         .await?;
 
@@ -101,6 +104,7 @@ impl CachingAiProvider {
             inner,
             store,
             replay: true,
+            resume: false,
         })
     }
 
@@ -111,7 +115,12 @@ impl CachingAiProvider {
         self
     }
 
-    fn compute_cache_key(&self, request: &AiRequest) -> String {
+    pub fn with_resume(mut self, resume: bool) -> Self {
+        self.resume = resume;
+        self
+    }
+
+    fn canonical_request_json(request: &AiRequest) -> String {
         let mut val = serde_json::to_value(request).unwrap_or_default();
         // Strip nondeterministic fields
         if let serde_json::Value::Object(ref mut map) = val {
@@ -125,16 +134,130 @@ impl CachingAiProvider {
             }
         }
         super::scrub_thought_signatures(&mut val);
-        let canonical = serde_json::to_string(&val).unwrap_or_default();
+        serde_json::to_string(&val).unwrap_or_default()
+    }
+
+    fn compute_cache_key_for_identity(identity: &str, canonical: &str) -> String {
         // The model and the provider's own knobs never appear in the request,
         // so hash them alongside it. Without them a raised reasoning effort
         // replays the answer recorded at the lower one.
         let mut hasher = Sha256::new();
-        hasher.update(self.inner.cache_identity().as_bytes());
+        hasher.update(identity.as_bytes());
         hasher.update(b"\0");
         hasher.update(canonical.as_bytes());
         let hash = hasher.finalize();
         hash.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    #[cfg(test)]
+    fn compute_cache_key(&self, request: &AiRequest) -> String {
+        let canonical = Self::canonical_request_json(request);
+        Self::compute_cache_key_for_identity(&self.inner.cache_identity(), &canonical)
+    }
+
+    fn candidate_canonicals(request: &AiRequest) -> Vec<String> {
+        let efforts = [
+            request.reasoning_effort,
+            None,
+            Some(ReasoningEffort::Low),
+            Some(ReasoningEffort::Medium),
+            Some(ReasoningEffort::High),
+        ];
+        let mut seen_efforts = Vec::with_capacity(4);
+        let mut canonicals = Vec::with_capacity(4);
+        let mut cand_req = request.clone();
+        for effort in efforts {
+            if !seen_efforts.contains(&effort) {
+                seen_efforts.push(effort);
+                cand_req.reasoning_effort = effort;
+                canonicals.push(Self::canonical_request_json(&cand_req));
+            }
+        }
+        canonicals
+    }
+
+    fn strip_response_thought_signatures(resp: &mut AiResponse) {
+        resp.thought_signature = None;
+        if let Some(ref mut calls) = resp.tool_calls {
+            for call in calls {
+                call.thought_signature = None;
+            }
+        }
+    }
+
+    async fn query_cache_row(&self, hash: &str) -> Result<Option<(String, i64, i64, String)>> {
+        let mut rows = self
+            .store
+            .conn
+            .query(
+                "SELECT response_json, tokens_saved, created_at FROM response_cache WHERE request_hash = ?",
+                libsql::params![hash.to_string()],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let response_json: String = row.get(0)?;
+            let tokens_saved: i64 = row.get(1)?;
+            let created_at: i64 = row.get(2)?;
+            return Ok(Some((
+                response_json,
+                tokens_saved,
+                created_at,
+                hash[..12].to_string(),
+            )));
+        }
+        Ok(None)
+    }
+
+    async fn candidate_resume_hashes(
+        &self,
+        request: &AiRequest,
+        primary_hash: &str,
+    ) -> Result<Vec<String>> {
+        let mut rows = self
+            .store
+            .conn
+            .query("SELECT DISTINCT provider, model FROM response_cache", ())
+            .await?;
+
+        let mut pairs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let prov: String = row.get(0)?;
+            let model: String = row.get(1)?;
+            pairs.push((prov, model));
+        }
+
+        let current_identity = self.inner.cache_identity();
+        let current_model = self.inner.get_capabilities().model_name;
+
+        let mut candidate_identities = vec![current_identity.clone()];
+        let mut seen_identities = std::collections::HashSet::from([current_identity.clone()]);
+
+        for (prov, other_model) in pairs {
+            let candidates = [
+                prov,
+                current_identity.replacen(&current_model, &other_model, 1),
+                other_model,
+            ];
+            for cand in candidates {
+                if seen_identities.insert(cand.clone()) {
+                    candidate_identities.push(cand);
+                }
+            }
+        }
+
+        let canonicals = Self::candidate_canonicals(request);
+        let mut candidate_hashes = Vec::new();
+        let mut seen_hashes = std::collections::HashSet::new();
+        for cand_id in &candidate_identities {
+            for cand_canonical in &canonicals {
+                let cand_hash = Self::compute_cache_key_for_identity(cand_id, cand_canonical);
+                if cand_hash != primary_hash && seen_hashes.insert(cand_hash.clone()) {
+                    candidate_hashes.push(cand_hash);
+                }
+            }
+        }
+
+        Ok(candidate_hashes)
     }
 }
 
@@ -149,60 +272,65 @@ impl AiProvider for CachingAiProvider {
             inner: f(self.inner.clone()),
             store: self.store.clone(),
             replay: self.replay,
+            resume: self.resume,
         }))
     }
 
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        let hash = self.compute_cache_key(&request);
+        let canonical = Self::canonical_request_json(&request);
+        let hash = Self::compute_cache_key_for_identity(&self.inner.cache_identity(), &canonical);
         let hash_prefix = &hash[..12];
 
         if self.replay {
-            let mut rows = self
-                .store
-                .conn
-                .query(
-                    "SELECT response_json, tokens_saved, created_at FROM response_cache WHERE request_hash = ?",
-                    libsql::params![hash.clone()],
-                )
-                .await?;
+            let mut is_cross_model = false;
+            let mut cached_entry = self.query_cache_row(&hash).await?;
 
-            if let Some(row) = rows.next().await? {
-                let response_json: String = row.get(0)?;
-                let tokens_saved: i64 = row.get(1)?;
-                let created_at: i64 = row.get(2)?;
-                if let Ok(mut resp) = serde_json::from_str::<AiResponse>(&response_json) {
-                    let (origin, total) = if created_at >= self.store.session_start {
-                        self.store.hits_this.fetch_add(1, Ordering::Relaxed);
-                        let t = self
-                            .store
-                            .tokens_saved_this
-                            .fetch_add(tokens_saved as u64, Ordering::Relaxed)
-                            + tokens_saved as u64;
-                        ("this session", t)
-                    } else {
-                        self.store.hits_prev.fetch_add(1, Ordering::Relaxed);
-                        let t = self
-                            .store
-                            .tokens_saved_prev
-                            .fetch_add(tokens_saved as u64, Ordering::Relaxed)
-                            + tokens_saved as u64;
-                        ("previous session", t)
-                    };
-                    info!(
-                        "Cache hit [{}] ({}) — {} tokens saved (total {}: {})",
-                        hash_prefix, origin, tokens_saved, origin, total
-                    );
-                    if let Some(ref mut usage) = resp.usage {
-                        // The hit serves the whole prompt from this cache, so all
-                        // of it counts as cached.  cached_tokens is a breakdown
-                        // of prompt_tokens rather than an addend.  The count
-                        // recorded with the response covers this same prompt.
-                        usage.cached_tokens = Some(usage.prompt_tokens);
+            if cached_entry.is_none() && self.resume {
+                for cand_hash in self.candidate_resume_hashes(&request, &hash).await? {
+                    if let Some(entry) = self.query_cache_row(&cand_hash).await? {
+                        cached_entry = Some(entry);
+                        is_cross_model = true;
+                        break;
                     }
-                    return Ok(resp);
                 }
             }
-            drop(rows);
+
+            if let Some((response_json, tokens_saved, created_at, hit_prefix)) = cached_entry
+                && let Ok(mut resp) = serde_json::from_str::<AiResponse>(&response_json)
+            {
+                if is_cross_model {
+                    Self::strip_response_thought_signatures(&mut resp);
+                }
+                let (origin, total) = if created_at >= self.store.session_start {
+                    self.store.hits_this.fetch_add(1, Ordering::Relaxed);
+                    let t = self
+                        .store
+                        .tokens_saved_this
+                        .fetch_add(tokens_saved as u64, Ordering::Relaxed)
+                        + tokens_saved as u64;
+                    ("this session", t)
+                } else {
+                    self.store.hits_prev.fetch_add(1, Ordering::Relaxed);
+                    let t = self
+                        .store
+                        .tokens_saved_prev
+                        .fetch_add(tokens_saved as u64, Ordering::Relaxed)
+                        + tokens_saved as u64;
+                    ("previous session", t)
+                };
+                info!(
+                    "Cache hit [{}] ({}) — {} tokens saved (total {}: {})",
+                    hit_prefix, origin, tokens_saved, origin, total
+                );
+                if let Some(ref mut usage) = resp.usage {
+                    // The hit serves the whole prompt from this cache, so all
+                    // of it counts as cached.  cached_tokens is a breakdown
+                    // of prompt_tokens rather than an addend.  The count
+                    // recorded with the response covers this same prompt.
+                    usage.cached_tokens = Some(usage.prompt_tokens);
+                }
+                return Ok(resp);
+            }
         }
 
         debug!("Cache miss [{}]", hash_prefix);
@@ -212,6 +340,7 @@ impl AiProvider for CachingAiProvider {
         let response_json = serde_json::to_string(&resp)?;
         let request_json = serde_json::to_string(&request)?;
         let caps = self.inner.get_capabilities();
+        let cache_id = self.inner.cache_identity();
         let tokens_saved = resp
             .usage
             .as_ref()
@@ -229,7 +358,7 @@ impl AiProvider for CachingAiProvider {
                 "INSERT OR REPLACE INTO response_cache (request_hash, provider, model, request_json, response_json, tokens_saved, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 libsql::params![
                     hash,
-                    caps.model_name.clone(),
+                    cache_id,
                     caps.model_name,
                     request_json,
                     response_json,
@@ -260,26 +389,38 @@ impl AiProvider for CachingAiProvider {
     }
 
     async fn forget(&self, request: &AiRequest) {
-        let hash = self.compute_cache_key(request);
-        // Like the insert above, a failure here is not fatal: the worst case
-        // is that a retry is served this answer again, as it was before.
-        let result = self
-            .store
-            .conn
-            .execute(
-                "DELETE FROM response_cache WHERE request_hash = ?",
-                libsql::params![hash.clone()],
-            )
-            .await;
+        let canonical = Self::canonical_request_json(request);
+        let hash = Self::compute_cache_key_for_identity(&self.inner.cache_identity(), &canonical);
+        let mut hashes_to_delete = vec![hash];
         let prefix = get_log_prefix();
-        match result {
-            Ok(0) => debug!(
-                "{}Cache forget [{}]: nothing to forget",
-                prefix,
-                &hash[..12]
-            ),
-            Ok(_) => info!("{}Cache forget [{}]", prefix, &hash[..12]),
-            Err(e) => warn!("{}Cache forget [{}] failed: {:#}", prefix, &hash[..12], e),
+        if self.resume {
+            match self
+                .candidate_resume_hashes(request, &hashes_to_delete[0])
+                .await
+            {
+                Ok(cands) => hashes_to_delete.extend(cands),
+                Err(e) => {
+                    warn!(
+                        "{}Failed to resolve candidate resume hashes to forget: {:#}",
+                        prefix, e
+                    );
+                }
+            }
+        }
+        for h in &hashes_to_delete {
+            let result = self
+                .store
+                .conn
+                .execute(
+                    "DELETE FROM response_cache WHERE request_hash = ?",
+                    libsql::params![h.clone()],
+                )
+                .await;
+            match result {
+                Ok(0) => debug!("{}Cache forget [{}]: nothing to forget", prefix, &h[..12]),
+                Ok(_) => info!("{}Cache forget [{}]", prefix, &h[..12]),
+                Err(e) => warn!("{}Cache forget [{}] failed: {:#}", prefix, &h[..12], e),
+            }
         }
         self.inner.forget(request).await
     }
@@ -773,5 +914,159 @@ mod tests {
             patch("Monday, October 26, 2026"),
             patch("Tuesday, October 27, 2026")
         );
+    }
+
+    #[tokio::test]
+    async fn test_cross_model_replay_on_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("response_cache.db");
+        let path_str = path.to_str().unwrap();
+
+        struct MockModelProvider {
+            model: String,
+            identity: String,
+            calls: Arc<AtomicU64>,
+        }
+
+        #[async_trait]
+        impl AiProvider for MockModelProvider {
+            async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(AiResponse {
+                    content: Some(format!("answer from {}", self.model)),
+                    thought: Some("internal reasoning".to_string()),
+                    thought_signature: Some(format!("sig-{}", self.model)),
+                    tool_calls: Some(vec![crate::ai::ToolCall {
+                        id: "tc_1".to_string(),
+                        function_name: "read".to_string(),
+                        arguments: serde_json::json!({}),
+                        thought_signature: Some(format!("tool-sig-{}", self.model)),
+                    }]),
+                    usage: Some(crate::ai::AiUsage {
+                        prompt_tokens: 100,
+                        completion_tokens: 20,
+                        total_tokens: 120,
+                        cached_tokens: None,
+                    }),
+                    truncated: false,
+                })
+            }
+
+            fn get_capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    model_name: self.model.clone(),
+                    context_window_size: 128_000,
+                }
+            }
+
+            fn cache_identity(&self) -> String {
+                self.identity.clone()
+            }
+        }
+
+        let calls1 = Arc::new(AtomicU64::new(0));
+        let model1 = Arc::new(MockModelProvider {
+            model: "model-a".to_string(),
+            identity: crate::ai::cache_identity_with("model-a", &[("thinking", Some("high"))]),
+            calls: calls1.clone(),
+        });
+
+        let cached1 = CachingAiProvider::new(model1, path_str, 30).await.unwrap();
+        let mut request_with_effort = AiRequest {
+            messages: vec![crate::ai::AiMessage {
+                role: crate::ai::AiRole::User,
+                content: Some("test prompt".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            reasoning_effort: Some(ReasoningEffort::Medium),
+            ..Default::default()
+        };
+
+        // First model generates and caches the answer with reasoning_effort = Some(Medium).
+        let resp1 = cached1
+            .generate_content(request_with_effort.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp1.content.as_deref(), Some("answer from model-a"));
+        assert_eq!(calls1.load(Ordering::SeqCst), 1);
+
+        // Same model cache hit preserves thought_signature on response and tool_calls.
+        let resp1_cached = cached1
+            .generate_content(request_with_effort.clone())
+            .await
+            .unwrap();
+        assert_eq!(calls1.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            resp1_cached.thought_signature.as_deref(),
+            Some("sig-model-a")
+        );
+        assert_eq!(
+            resp1_cached.tool_calls.as_ref().unwrap()[0]
+                .thought_signature
+                .as_deref(),
+            Some("tool-sig-model-a")
+        );
+
+        // Second model with different model_name and knobs, without resume:
+        // misses the cache because cache identities differ.
+        let calls2 = Arc::new(AtomicU64::new(0));
+        let model2 = Arc::new(MockModelProvider {
+            model: "model-b".to_string(),
+            identity: crate::ai::cache_identity_with("model-b", &[("thinking", Some("medium"))]),
+            calls: calls2.clone(),
+        });
+        let cached2_no_resume = CachingAiProvider::new(model2.clone(), path_str, 30)
+            .await
+            .unwrap();
+        let resp2 = cached2_no_resume
+            .generate_content(request_with_effort.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp2.content.as_deref(), Some("answer from model-b"));
+        assert_eq!(calls2.load(Ordering::SeqCst), 1);
+
+        // Third model with with_resume(true) and reasoning_effort = None (e.g. non-Argon model):
+        // successfully replayed across models AND across different reasoning_effort values,
+        // with foreign thought_signature stripped from response and tool_calls.
+        request_with_effort.reasoning_effort = None;
+        let request_no_effort = request_with_effort;
+        let calls3 = Arc::new(AtomicU64::new(0));
+        let model3 = Arc::new(MockModelProvider {
+            model: "model-c".to_string(),
+            identity: crate::ai::cache_identity_with("model-c", &[("thinking", Some("high"))]),
+            calls: calls3.clone(),
+        });
+        let cached3_resume = CachingAiProvider::new(model3.clone(), path_str, 30)
+            .await
+            .unwrap()
+            .with_resume(true);
+        let resp3 = cached3_resume
+            .generate_content(request_no_effort.clone())
+            .await
+            .unwrap();
+        // Model was never called because cached turn was replayed
+        assert_eq!(calls3.load(Ordering::SeqCst), 0);
+        assert!(resp3.content.is_some());
+        assert!(resp3.thought_signature.is_none());
+        assert!(
+            resp3.tool_calls.as_ref().unwrap()[0]
+                .thought_signature
+                .is_none()
+        );
+
+        // Calling forget() with resume: true clears both primary and candidate hashes
+        // across all reasoning_effort values and models.
+        cached3_resume.forget(&request_no_effort).await;
+
+        // Next generate_content() with model-c must now miss and call model-c.
+        let resp4 = cached3_resume
+            .generate_content(request_no_effort.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp4.content.as_deref(), Some("answer from model-c"));
+        assert_eq!(calls3.load(Ordering::SeqCst), 1);
     }
 }
