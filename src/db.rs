@@ -6528,6 +6528,34 @@ impl Database {
         Ok(())
     }
 
+    /// Like [`Self::link_review_to_bug`], and in the same write also links
+    /// the related pre-existing disclosure the review recorded under
+    /// `disclosure_fingerprint` to the bug. Under a bug claim both happen in
+    /// the claim-checked transaction, so a worker whose lease expired, or a
+    /// bug folded in the meantime, cannot leave the disclosure pointing at
+    /// the wrong bug.
+    pub async fn link_review_and_disclosure_to_bug(
+        &self,
+        review_id: i64,
+        bug_id: i64,
+        is_newly_discovered: bool,
+        disclosure_fingerprint: &str,
+    ) -> Result<()> {
+        let tx = match &self.bug_claim {
+            Some(claim) => self.begin_bug_write(claim.bug_id).await?,
+            None => self.begin_immediate_transaction().await?,
+        };
+        let tx_db = self.with_connection((*tx).clone());
+        tx_db
+            .insert_bug_review(review_id, bug_id, is_newly_discovered)
+            .await?;
+        tx_db
+            .link_preexisting_disclosure_to_bug(review_id, disclosure_fingerprint, bug_id)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn insert_bug_review(
         &self,
         review_id: i64,
@@ -6672,12 +6700,31 @@ impl Database {
             libsql::params![params.ephemeral_id],
         )
         .await?;
+        tx.execute(
+            "UPDATE preexisting_disclosures SET bug_id = ?1 WHERE bug_id = ?2",
+            libsql::params![params.canonical_id, params.ephemeral_id],
+        )
+        .await?;
 
         tx.commit().await?;
         Ok(true)
     }
 
+    /// Moves a bug's review links and related-bug disclosures to another
+    /// bug, all or nothing.
     pub async fn migrate_review_bugs(&self, from_bug_id: i64, to_bug_id: i64) -> Result<()> {
+        if self.in_transaction {
+            return self.migrate_review_bugs_in(from_bug_id, to_bug_id).await;
+        }
+        let tx = self.begin_immediate_transaction().await?;
+        self.with_connection((*tx).clone())
+            .migrate_review_bugs_in(from_bug_id, to_bug_id)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn migrate_review_bugs_in(&self, from_bug_id: i64, to_bug_id: i64) -> Result<()> {
         self.execute(
             "INSERT OR IGNORE INTO bug_reviews (review_id, bug_id, is_newly_discovered)
              SELECT review_id, ?, 0 FROM bug_reviews WHERE bug_id = ?",
@@ -6687,6 +6734,11 @@ impl Database {
         self.execute(
             "DELETE FROM bug_reviews WHERE bug_id = ?",
             libsql::params![from_bug_id],
+        )
+        .await?;
+        self.execute(
+            "UPDATE preexisting_disclosures SET bug_id = ?1 WHERE bug_id = ?2",
+            libsql::params![to_bug_id, from_bug_id],
         )
         .await?;
         Ok(())

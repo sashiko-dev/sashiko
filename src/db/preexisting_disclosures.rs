@@ -331,21 +331,25 @@ impl Database {
         Ok(released)
     }
 
-    /// Links the disclosure of `fingerprint` in the review of
-    /// `patch_message_id` to the tracked bug the bug pipeline settled on.
-    /// Returns whether a still-unlinked disclosure was updated; an existing
-    /// link is kept.
+    /// Links the disclosure of `fingerprint` made by the review `review_id`
+    /// (matched through the Message-ID of the reviewed patch) to the tracked
+    /// bug the bug pipeline settled on. Returns whether a still-unlinked
+    /// disclosure was updated; an existing link is kept.
     pub async fn link_preexisting_disclosure_to_bug(
         &self,
-        patch_message_id: &str,
+        review_id: i64,
         fingerprint: &str,
         bug_id: i64,
     ) -> Result<bool> {
         let updated = self
             .execute(
                 "UPDATE preexisting_disclosures SET bug_id = ?1
-                  WHERE patch_message_id = ?2 AND fingerprint = ?3 AND bug_id IS NULL",
-                libsql::params![bug_id, patch_message_id, fingerprint],
+                  WHERE fingerprint = ?2 AND bug_id IS NULL
+                    AND patch_message_id IN (
+                        SELECT p.message_id FROM reviews r
+                          JOIN patches p ON p.id = r.patch_id
+                         WHERE r.id = ?3)",
+                libsql::params![bug_id, fingerprint, review_id],
             )
             .await?;
         Ok(updated > 0)
@@ -671,22 +675,89 @@ mod tests {
         .await
         .unwrap();
 
+        let thread_id = db.create_thread("p1@x", "Subject", 1000).await.unwrap();
+        db.create_message(
+            "p1@x", thread_id, None, "A <a@x>", "Subject", 1000, "body", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "p1@x", "Subject", "A", 1000, 1, 1, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db.create_patch(ps_id, "p1@x", 1, "diff").await.unwrap();
+        db.execute(
+            "INSERT INTO reviews (id, patchset_id, patch_id, status) VALUES (5, ?, ?, 'Reviewed')",
+            libsql::params![ps_id, patch_id],
+        )
+        .await
+        .unwrap();
+
         assert!(
-            db.link_preexisting_disclosure_to_bug("p1@x", "a", 7)
+            db.link_preexisting_disclosure_to_bug(5, "a", 7)
                 .await
                 .unwrap()
         );
         assert!(
-            !db.link_preexisting_disclosure_to_bug("p1@x", "a", 8)
+            !db.link_preexisting_disclosure_to_bug(5, "a", 8)
                 .await
                 .unwrap()
         );
         assert!(
-            !db.link_preexisting_disclosure_to_bug("p1@x", "zz", 8)
+            !db.link_preexisting_disclosure_to_bug(5, "zz", 8)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.link_preexisting_disclosure_to_bug(6, "a", 8)
                 .await
                 .unwrap()
         );
         let rows = db.preexisting_disclosures_for_patch("p1@x").await.unwrap();
         assert_eq!(rows[0].bug_id, Some(7));
+
+        // Folding the bug into another moves the disclosure along.
+        db.migrate_review_bugs(7, 8).await.unwrap();
+        let rows = db.preexisting_disclosures_for_patch("p1@x").await.unwrap();
+        assert_eq!(rows[0].bug_id, Some(8));
+
+        // The bug pipeline links the review and the disclosure in one
+        // claim-checked write: without the bug's lease, neither changes.
+        db.mark_preexisting_disclosed("p1@x").await.unwrap();
+        db.reserve_preexisting_disclosures(
+            "p1@x",
+            &[candidate("b", &["mm/bar.c"])],
+            same_fingerprint,
+        )
+        .await
+        .unwrap();
+        let stale = db.with_bug_claim(7, "expired-worker");
+        assert!(
+            stale
+                .link_review_and_disclosure_to_bug(5, 7, true, "b")
+                .await
+                .is_err()
+        );
+        let unlinked = |rows: Vec<PreexistingDisclosure>| {
+            rows.into_iter()
+                .find(|d| d.fingerprint == "b")
+                .unwrap()
+                .bug_id
+        };
+        assert_eq!(
+            unlinked(db.preexisting_disclosures_for_patch("p1@x").await.unwrap()),
+            None
+        );
+        db.link_review_and_disclosure_to_bug(5, 7, true, "b")
+            .await
+            .unwrap();
+        assert_eq!(
+            unlinked(db.preexisting_disclosures_for_patch("p1@x").await.unwrap()),
+            Some(7)
+        );
     }
 }
