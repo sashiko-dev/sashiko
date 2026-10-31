@@ -50,6 +50,9 @@ sashiko review
 sashiko review HEAD~3..HEAD
 sashiko review --report-preexisting
 
+# Report only the one or two pre-existing bugs closely related to the change
+sashiko review --report-related-preexisting [--related-preexisting-min-severity medium]
+
 # Continue a review cut short by a quota stop, a timeout or Ctrl-C
 sashiko review HEAD~3..HEAD --resume
 ```
