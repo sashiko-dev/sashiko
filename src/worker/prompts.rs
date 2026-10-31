@@ -976,6 +976,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zephyr_device_lookup_loads_devicetree_guidance() {
+        let prompts =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("projects/zephyr/prompts");
+        let marker = "<maintainer_note subsystem=\"Devicetree and Bindings\">";
+        for expression in [
+            "DEVICE_DT_GET(node)",
+            "DEVICE_DT_GET_OR_NULL(node)",
+            "DT_GPIO_CTLR(node, gpios)",
+        ] {
+            let diff = format!(
+                "diff --git a/samples/demo/src/main.c b/samples/demo/src/main.c\n@@ -0,0 +1 @@\n+const void *dev = {expression};\n"
+            );
+            assert!(
+                select_maintainer_notes(&prompts, &diff).contains(marker),
+                "{expression}"
+            );
+        }
+        let unrelated = "diff --git a/samples/demo/src/main.c b/samples/demo/src/main.c\n@@ -0,0 +1 @@\n+int answer = 42;\n";
+        assert!(!select_maintainer_notes(&prompts, unrelated).contains(marker));
+    }
+
+    #[test]
     fn test_planned_stages_follow_the_resolved_fan_out() {
         assert_eq!(
             crate::workflows::planned_stages_from(
