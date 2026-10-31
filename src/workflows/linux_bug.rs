@@ -2355,6 +2355,8 @@ struct DedupAttemptContext<'a> {
     db: &'a Database,
     bug_row_id: i64,
     review_id: Option<i64>,
+    /// Fingerprint the review recorded if it mailed this bug as related.
+    disclosure_fingerprint: &'a str,
     project: ProjectId,
     project_label: &'a str,
     context_tag: Option<&'a str>,
@@ -2443,7 +2445,14 @@ impl DedupAttemptContext<'_> {
                 return Ok(None);
             }
             if let Some(r_id) = self.review_id {
-                self.db.link_review_to_bug(r_id, existing.id, false).await?;
+                self.db
+                    .link_review_and_disclosure_to_bug(
+                        r_id,
+                        existing.id,
+                        false,
+                        self.disclosure_fingerprint,
+                    )
+                    .await?;
             }
             return Ok(Some(BugOutcome::Duplicate {
                 existing_bug: existing,
@@ -2693,11 +2702,17 @@ pub async fn process_issue_worker_for_project(
         verified_locations.as_ref(),
     );
 
+    // The review keyed any related-bug disclosure of this candidate by the
+    // concern it handed over, which is exactly this input.
+    let disclosure_fingerprint =
+        crate::related_preexisting::BugKey::new(&input.problem, input.locations.as_ref())
+            .fingerprint;
     let dedup_ctx = DedupAttemptContext {
         runner: &runner,
         db,
         bug_row_id: bug_row.id,
         review_id: input.review_id,
+        disclosure_fingerprint: &disclosure_fingerprint,
         project,
         project_label,
         context_tag,
@@ -2853,7 +2868,11 @@ pub async fn process_issue_worker_for_project(
 
     let saved_bug = db.get_bug(bug_row.id).await?.expect("Saved bug must exist");
     if let Some(r_id) = input.review_id {
-        db.link_review_to_bug(r_id, saved_bug.id, true).await?;
+        let disclosure_fingerprint =
+            crate::related_preexisting::BugKey::new(&input.problem, input.locations.as_ref())
+                .fingerprint;
+        db.link_review_and_disclosure_to_bug(r_id, saved_bug.id, true, &disclosure_fingerprint)
+            .await?;
     }
     info!(
         "Successfully registered newly verified {} bug {} ({})",
