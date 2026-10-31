@@ -781,6 +781,7 @@ fn is_non_linux_project_url(url: &str) -> bool {
         || lower.contains("qemu-project/qemu")
         || lower.contains("qemu.org")
         || lower.contains("qemu/qemu")
+        || lower.contains("zephyrproject-rtos/zephyr")
         || lower.contains("sashiko")
 }
 
@@ -1779,10 +1780,16 @@ F: patterns/
 
     #[tokio::test]
     async fn test_fork_origin_uses_configured_project() {
-        for (project, upstream) in [(
-            ProjectId::Sashiko,
-            "https://github.com/sashiko-dev/sashiko.git",
-        )] {
+        for (project, upstream) in [
+            (
+                ProjectId::Sashiko,
+                "https://github.com/sashiko-dev/sashiko.git",
+            ),
+            (
+                ProjectId::Zephyr,
+                "https://github.com/zephyrproject-rtos/zephyr.git",
+            ),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let repo = dir.path();
             git(repo, &["init", "--quiet"]).await;

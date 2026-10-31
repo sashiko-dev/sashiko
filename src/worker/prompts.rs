@@ -66,6 +66,9 @@ use crate::workflows::qemu_patch_review::{
 use crate::workflows::sashiko_patch_review::{
     build_sashiko_patch_review_workflow_with_effort, sashiko_system_prompt,
 };
+use crate::workflows::zephyr_patch_review::{
+    build_zephyr_patch_review_workflow_with_effort, zephyr_system_prompt,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -446,11 +449,13 @@ impl Worker {
         };
 
         let follow_up_series_context = match self.project {
-            ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu => build_follow_up_series_context(
-                self.series_range.as_deref(),
-                &patchset,
-                &target_commit_sha,
-            ),
+            ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu | ProjectId::Zephyr => {
+                build_follow_up_series_context(
+                    self.series_range.as_deref(),
+                    &patchset,
+                    &target_commit_sha,
+                )
+            }
             ProjectId::Sashiko => build_sashiko_series_context(
                 self.series_range.as_deref(),
                 &patchset,
@@ -546,6 +551,7 @@ impl Worker {
                 ProjectId::Sashiko => sashiko_system_prompt(true),
                 ProjectId::Gcc => gcc_system_prompt(true),
                 ProjectId::Qemu => qemu_system_prompt(true),
+                ProjectId::Zephyr => zephyr_system_prompt(true),
             };
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
@@ -575,6 +581,11 @@ impl Worker {
                 self.effort,
             ),
             ProjectId::Qemu => build_qemu_patch_review_workflow_with_effort(
+                self.max_interactions,
+                self.temperature,
+                self.effort,
+            ),
+            ProjectId::Zephyr => build_zephyr_patch_review_workflow_with_effort(
                 self.max_interactions,
                 self.temperature,
                 self.effort,
