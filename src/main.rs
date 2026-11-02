@@ -1246,6 +1246,7 @@ async fn run_daemon(
     let worker_db = db.clone();
     let mapping = settings.subsystems.mapping.clone();
     let email_policy_path = settings.review.email_policy_path.clone();
+    let review_settings = settings.review.clone();
     let mut policy =
         sashiko::email_policy::EmailPolicyConfig::load_async(&email_policy_path).await?;
     let db_worker_handle = tokio::spawn(async move {
@@ -1295,8 +1296,15 @@ async fn run_daemon(
                     }
                 };
                 let mut receipt = article.receipt.take();
-                match process_parsed_article(&worker_db, article, git_patch_id, &policy, &mapping)
-                    .await
+                match process_parsed_article(
+                    &worker_db,
+                    article,
+                    git_patch_id,
+                    &policy,
+                    &mapping,
+                    &review_settings,
+                )
+                .await
                 {
                     ProcessStatus::Ingested => {
                         // The article is on disk, so the fetch loop may finally
@@ -3610,6 +3618,7 @@ async fn process_parsed_article(
     git_patch_id: Option<String>,
     policy: &sashiko::email_policy::EmailPolicyConfig,
     subsystem_mapping: &[sashiko::settings::SubsystemMapping],
+    review_settings: &sashiko::settings::ReviewSettings,
 ) -> ProcessStatus {
     let ParsedArticle {
         group,
@@ -4057,7 +4066,7 @@ async fn process_parsed_article(
         };
 
         match worker_db
-            .create_patchset(
+            .create_patchset_with_default_priority(
                 thread_id,
                 cover_letter_id.as_deref(),
                 metadata.message_id.as_str(),
@@ -4077,6 +4086,7 @@ async fn process_parsed_article(
                 strict_author,
                 skip_filters.as_ref(),
                 only_filters.as_ref(),
+                review_settings.default_priority,
             )
             .await
         {
@@ -4122,6 +4132,70 @@ async fn process_parsed_article(
                             "Failed to set embargo_until for patchset {}: {}",
                             patchset_id, e
                         );
+                    }
+                }
+
+                let priority = review_settings.calculate_priority(&subject);
+                if let Err(e) = worker_db
+                    .update_patchset_priority_on_ingest(
+                        patchset_id,
+                        priority,
+                        review_settings.default_priority,
+                    )
+                    .await
+                {
+                    warn!("Failed to set priority on patchset {}: {}", patchset_id, e);
+                }
+
+                if review_settings.batch_window_secs > 0 && !review_settings.batch_tiers.is_empty()
+                {
+                    let (series_author, series_date) =
+                        match worker_db.get_patchset_author_and_date(patchset_id).await {
+                            Ok(Some((a, d))) => (a, d),
+                            _ => (
+                                author.clone(),
+                                metadata.received_date.unwrap_or(metadata.date),
+                            ),
+                        };
+                    let window_duration = review_settings.batch_window_secs as i64;
+                    let window_start = series_date.saturating_sub(window_duration);
+                    let window_end = series_date.saturating_add(window_duration);
+                    match worker_db
+                        .count_recent_patchsets_by_author(&series_author, window_start, window_end)
+                        .await
+                    {
+                        Ok(count) => {
+                            let mut matched_priority: Option<i64> = None;
+                            for tier in &review_settings.batch_tiers {
+                                if count >= tier.min_size {
+                                    matched_priority = Some(match matched_priority {
+                                        Some(p) => p.min(tier.priority),
+                                        None => tier.priority,
+                                    });
+                                }
+                            }
+                            if let Some(batch_prio) = matched_priority
+                                && let Err(e) = worker_db
+                                    .deprioritize_author_batch(
+                                        &series_author,
+                                        window_start,
+                                        window_end,
+                                        batch_prio,
+                                    )
+                                    .await
+                            {
+                                warn!(
+                                    "Failed to deprioritize author batch for {}: {}",
+                                    series_author, e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to count recent patchsets for {}: {}",
+                                series_author, e
+                            );
+                        }
                     }
                 }
 

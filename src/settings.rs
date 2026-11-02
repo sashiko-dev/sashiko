@@ -1040,6 +1040,28 @@ impl Default for GitSettings {
     }
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BatchTier {
+    pub min_size: usize,
+    pub priority: i64,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PriorityRule {
+    pub regex: String,
+    pub priority: i64,
+}
+
+fn default_priority() -> i64 {
+    500
+}
+
+fn default_batch_window_secs() -> u64 {
+    30
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
@@ -1089,6 +1111,18 @@ pub struct ReviewSettings {
     /// supports effort levels and is ignored otherwise.
     #[serde(default)]
     pub effort: Option<EffortMode>,
+    /// Default queue dispatch priority for patchsets without matching priority rules.
+    #[serde(default = "default_priority")]
+    pub default_priority: i64,
+    /// Sliding window duration in seconds for author batch submission deprioritization.
+    #[serde(default = "default_batch_window_secs")]
+    pub batch_window_secs: u64,
+    /// Sliding-window batch thresholds that demote queue priority for bulk submissions.
+    #[serde(default)]
+    pub batch_tiers: Vec<BatchTier>,
+    /// Regex rules matching subject prefixes to assign elevated queue priority tiers.
+    #[serde(default)]
+    pub priority_rules: Vec<PriorityRule>,
     #[serde(skip)]
     pub stages: Option<Vec<String>>,
 }
@@ -1105,6 +1139,16 @@ impl ReviewSettings {
             return None;
         }
         Some(self.effort.unwrap_or(EffortMode::Mid))
+    }
+
+    /// Computes the initial priority for a patchset based on subject regex rules.
+    pub fn calculate_priority(&self, subject: &str) -> i64 {
+        for rule in &self.priority_rules {
+            if regex::Regex::new(&rule.regex).is_ok_and(|re| re.is_match(subject)) {
+                return rule.priority;
+            }
+        }
+        self.default_priority
     }
 }
 
@@ -1402,6 +1446,14 @@ impl Settings {
                 "[review] email_policy_path ({}) is invalid: {}",
                 self.review.email_policy_path, e
             ));
+        }
+        for rule in &self.review.priority_rules {
+            if let Err(e) = regex::Regex::new(&rule.regex) {
+                return Err(format!(
+                    "[review.priority_rules] invalid regex {:?}: {}",
+                    rule.regex, e
+                ));
+            }
         }
         Ok(())
     }
@@ -2477,5 +2529,90 @@ mod tests {
         std::fs::write(&path, toml).unwrap();
         let err = Settings::from_file(&path).unwrap_err();
         assert!(err.to_string().contains("invalid ai.max_rps"));
+    }
+
+    #[test]
+    fn test_priority_rules_and_batch_tiers_deserialization() {
+        let toml_str = r#"
+            concurrency = 4
+            default_priority = 600
+            batch_window_secs = 60
+            [[batch_tiers]]
+            min_size = 5
+            priority = 450
+            [[batch_tiers]]
+            min_size = 20
+            priority = 250
+            [[priority_rules]]
+            regex = "(?i)^(\\[PATCH[^\\]]*\\]\\s*)?CRITICAL:"
+            priority = 950
+        "#;
+        let review: ReviewSettings = toml::from_str(toml_str).unwrap();
+        assert_eq!(review.default_priority, 600);
+        assert_eq!(review.batch_window_secs, 60);
+        assert_eq!(review.batch_tiers.len(), 2);
+        assert_eq!(review.batch_tiers[0].min_size, 5);
+        assert_eq!(review.batch_tiers[0].priority, 450);
+        assert_eq!(review.batch_tiers[1].min_size, 20);
+        assert_eq!(review.batch_tiers[1].priority, 250);
+        assert_eq!(review.priority_rules.len(), 1);
+        assert_eq!(review.priority_rules[0].priority, 950);
+    }
+
+    #[test]
+    fn test_priority_calculation_matching_and_fallbacks() {
+        let toml_str = r#"
+            concurrency = 4
+            default_priority = 500
+            [[priority_rules]]
+            regex = "(?i)^(\\[PATCH[^\\]]*\\]\\s*)?CRITICAL:"
+            priority = 900
+            [[priority_rules]]
+            regex = "(?i)^(\\[PATCH[^\\]]*\\]\\s*)?FIX:"
+            priority = 800
+        "#;
+        let review: ReviewSettings = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(
+            review.calculate_priority("[PATCH] CRITICAL: kernel panic on boot"),
+            900
+        );
+        assert_eq!(
+            review.calculate_priority("[PATCH v2] critical: null pointer dereference"),
+            900
+        );
+        assert_eq!(
+            review.calculate_priority("[PATCH 1/2] fix: off by one in buffer bounds"),
+            800
+        );
+        assert_eq!(
+            review.calculate_priority("[PATCH] net: add new ethtool stats"),
+            500
+        );
+    }
+
+    #[test]
+    fn test_priority_rules_validation_rejects_bad_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Settings.toml");
+        let toml = r#"
+            [ai]
+            provider = "gemini"
+            model = "gemini-2.5-pro"
+            [review]
+            concurrency = 1
+            worktree_dir = "review_trees"
+            [[review.priority_rules]]
+            regex = "(?i)[unclosed bracket"
+            priority = 900
+            [database]
+            url = "sashiko.db"
+            [git]
+            repository_path = "linux"
+        "#;
+        std::fs::write(&path, toml).unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        let err = settings.validate_for_daemon().unwrap_err();
+        assert!(err.contains("[review.priority_rules] invalid regex"));
     }
 }
