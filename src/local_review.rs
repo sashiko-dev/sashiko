@@ -1111,10 +1111,10 @@ async fn run_worker_in_worktree(
     ));
     // Execute patch reviews concurrently with a limit
     let futures_stream = futures_util::stream::iter(patches_to_review.iter().map(|p| {
-        let rich_patches = rich_patches.clone();
+        let rich_patches = &rich_patches;
         let patch_shas = &patch_shas;
         let options = &options;
-        let subject_clone = subject.clone();
+        let subject = &subject;
         let all_patches = &patches;
         let llm_semaphore = &llm_semaphore;
         let quota = &quota;
@@ -1123,10 +1123,10 @@ async fn run_worker_in_worktree(
                 worktree,
                 settings,
                 patchset_id,
-                &subject_clone,
+                subject,
                 p,
                 all_patches,
-                &rich_patches,
+                rich_patches,
                 known_disclosures,
                 patch_shas,
                 options,
