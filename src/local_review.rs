@@ -1110,36 +1110,40 @@ async fn run_worker_in_worktree(
         settings.ai.max_tpm,
     ));
     // Execute patch reviews concurrently with a limit
-    let futures_stream = futures_util::stream::iter(patches_to_review.iter().map(|p| {
-        let rich_patches = &rich_patches;
-        let patch_shas = &patch_shas;
-        let options = &options;
-        let subject = &subject;
-        let all_patches = &patches;
-        let llm_semaphore = &llm_semaphore;
-        let quota = &quota;
-        async move {
-            let result = review_single_patch(
-                worktree,
-                settings,
-                patchset_id,
-                subject,
-                p,
-                all_patches,
-                rich_patches,
-                known_disclosures,
-                patch_shas,
-                options,
-                baseline_sha,
-                llm_semaphore,
-                quota,
-                timeout_seconds,
-                progress,
-            )
-            .await;
-            (p.index, result)
-        }
-    }));
+    let review_futures: Vec<_> = patches_to_review
+        .iter()
+        .map(|p| {
+            let rich_patches = &rich_patches;
+            let patch_shas = &patch_shas;
+            let options = &options;
+            let subject = &subject;
+            let all_patches = &patches;
+            let llm_semaphore = &llm_semaphore;
+            let quota = &quota;
+            async move {
+                let result = review_single_patch(
+                    worktree,
+                    settings,
+                    patchset_id,
+                    subject,
+                    p,
+                    all_patches,
+                    rich_patches,
+                    known_disclosures,
+                    patch_shas,
+                    options,
+                    baseline_sha,
+                    llm_semaphore,
+                    quota,
+                    timeout_seconds,
+                    progress,
+                )
+                .await;
+                (p.index, result)
+            }
+        })
+        .collect();
+    let futures_stream = futures_util::stream::iter(review_futures);
 
     // A failed patch must not discard the reviews of the other patches, so
     // collect every result and report the failures alongside them.
@@ -1683,6 +1687,23 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::sync::Arc;
+
+    /// Callers may run a review on a multi-threaded executor, which needs
+    /// the review futures to be Send. The compiler checks that when it
+    /// type-checks the closures below, so they are never called.
+    #[test]
+    fn review_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let _ = |input: ReviewInput, options: WorkerOptions, settings: &Settings| {
+            assert_send(&run_worker(input, options, settings, None));
+        };
+        let _ = |repo: PathBuf, input: String, options: ReviewOptions, settings: &Settings| {
+            assert_send(&run_git_review(repo, input, options, settings, None));
+        };
+        let _ = |options: WorkerOptions, settings: &Settings| {
+            assert_send(&run_worker_from_stdin(options, settings));
+        };
+    }
 
     /// A provider that does nothing; the decoration tests only care about
     /// whether it was wrapped, which `Arc::ptr_eq` answers directly.
