@@ -3978,8 +3978,8 @@ async fn process_parsed_article(
         }
     }
 
-    let cover_letter_id: Option<String> = if group == "git-fetch" {
-        // Always use root_msg_id for git-fetch to match the placeholder ID
+    let cover_letter_id = if group == "git-fetch" || source == MessageSource::ApiInject {
+        // Preserve the ID returned at submission so clients can find the patchset.
         Some(root_msg_id.clone())
     } else if group == "api-submit" || group.starts_with("git-import") {
         if metadata.total == 1 {
@@ -6130,6 +6130,114 @@ mod tests {
     }
 
     #[cfg(feature = "server")]
+    async fn ingest_api_submission(
+        source: MessageSource,
+        submission_id: &str,
+        messages: &[&[u8]],
+    ) -> Database {
+        let db = Database::new(&sashiko::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let policy = sashiko::email_policy::EmailPolicyConfig::default();
+        let review_settings = Settings::new().unwrap().review;
+
+        for raw in messages {
+            let (mut metadata, patch) = sashiko::patch::parse_email(raw).unwrap();
+            metadata.received_date = Some(2000);
+            let article = ParsedArticle {
+                group: "api-submit".to_string(),
+                article_id: submission_id.to_string(),
+                source,
+                metadata: Some(metadata),
+                patch,
+                baseline: None,
+                failed_error: None,
+                skip_filters: None,
+                only_filters: None,
+                mr_url: None,
+                mr_title: None,
+                mr_number: None,
+                receipt: None,
+            };
+            assert_eq!(
+                process_parsed_article(&db, article, None, &policy, &[], &review_settings).await,
+                ProcessStatus::Ingested
+            );
+        }
+        db
+    }
+
+    #[cfg(feature = "server")]
+    async fn assert_single_patch_submission_resolves(db: &Database, submission_id: &str) {
+        assert_eq!(db.count_patchsets(None, None).await.unwrap(), 1);
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(pending.len(), 1, "the submission must create one patchset");
+        assert_eq!(pending[0].total_parts, Some(1));
+        assert_eq!(pending[0].received_parts, Some(1));
+        let patchset_id = db
+            .find_patchset_id_by_msgid("patch@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending[0].id, patchset_id);
+        for msgid in [submission_id, "patch@example.com"] {
+            let details = db
+                .get_patchset_details_by_msgid(msgid, None, None)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("details must resolve for {msgid}"));
+            assert_eq!(details["id"], patchset_id);
+            let summary = db
+                .get_patchset_summary_by_msgid(msgid, None, None)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("summary must resolve for {msgid}"));
+            assert_eq!(summary["id"], patchset_id);
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_api_inject_single_patch_resolves_submission_id() {
+        let submission_id = "sashiko-inject-single@sashiko.local";
+        let raw = b"Message-ID: <patch@example.com>\r\nFrom: Author <author@example.com>\r\nSubject: [PATCH] Fix a bug\r\n\r\ndiff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
+        let db = ingest_api_submission(MessageSource::ApiInject, submission_id, &[raw]).await;
+        assert_single_patch_submission_resolves(&db, submission_id).await;
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_api_inject_single_patch_with_cover_resolves_submission_id() {
+        let submission_id = "sashiko-inject-cover@sashiko.local";
+        let cover: &[u8] = b"Message-ID: <cover@example.com>\r\nFrom: Author <author@example.com>\r\nSubject: [PATCH 0/1] Fix a bug\r\n\r\nCover letter\r\n";
+        let patch: &[u8] = b"Message-ID: <patch@example.com>\r\nFrom: Author <author@example.com>\r\nSubject: [PATCH 1/1] Fix a bug\r\nIn-Reply-To: <cover@example.com>\r\n\r\ndiff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
+        for messages in [[cover, patch], [patch, cover]] {
+            let db =
+                ingest_api_submission(MessageSource::ApiInject, submission_id, &messages).await;
+            assert_single_patch_submission_resolves(&db, submission_id).await;
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_api_fetch_thread_single_patch_keeps_message_identity() {
+        let raw = b"Message-ID: <patch@example.com>\r\nFrom: Author <author@example.com>\r\nSubject: [PATCH] Fix a bug\r\n\r\ndiff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
+        let db = ingest_api_submission(
+            MessageSource::ApiFetchThread,
+            "thread-root@example.com",
+            &[raw],
+        )
+        .await;
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].message_id.as_deref(), Some("patch@example.com"));
+    }
+
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn test_api_submit_multipart_without_cover_groups_into_single_patchset() {
         let db_settings = sashiko::settings::DatabaseSettings {
@@ -6237,5 +6345,23 @@ mod tests {
         assert_eq!(pending[0].total_parts, Some(2));
         assert_eq!(pending[0].received_parts, Some(2));
         assert_eq!(pending[0].status.as_deref(), Some("Pending"));
+        for msgid in [
+            submission_id.as_str(),
+            "part1@example.com",
+            "part2@example.com",
+        ] {
+            let details = db
+                .get_patchset_details_by_msgid(msgid, None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(details["id"], pending[0].id);
+            let summary = db
+                .get_patchset_summary_by_msgid(msgid, None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(summary["id"], pending[0].id);
+        }
     }
 }
