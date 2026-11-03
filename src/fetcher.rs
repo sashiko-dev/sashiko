@@ -1019,41 +1019,16 @@ impl FetchAgent {
     }
 
     async fn is_present(&self, commit_or_range: &str) -> bool {
-        let mut args = vec!["-c", "safe.bareRepository=all"];
-        let arg_str: String;
-
-        if let Some((start, end)) = commit_or_range.split_once("..") {
-            arg_str = format!("{}^{{commit}}..{}^{{commit}}", start, end);
-            args.extend(["rev-list", "-n", "1", &arg_str]);
+        let present = crate::git_ops::git_range_exists(&self.repo_path, commit_or_range).await;
+        if present {
+            info!("is_present: {} is present", commit_or_range);
         } else {
-            arg_str = format!("{}^{{commit}}", commit_or_range);
-            args.extend(["rev-parse", "--verify", &arg_str]);
-        };
-
-        let output = crate::git_cmd::in_dir_async(&self.repo_path)
-            .args(&args)
-            .output()
-            .await;
-
-        match output {
-            Ok(s) => {
-                let success = s.status.success();
-                if success {
-                    info!("is_present: {} is present", commit_or_range);
-                } else {
-                    info!(
-                        "is_present: {} is missing or not a commit. stderr: {}",
-                        commit_or_range,
-                        String::from_utf8_lossy(&s.stderr)
-                    );
-                }
-                success
-            }
-            Err(e) => {
-                error!("is_present: {} check failed: {}", commit_or_range, e);
-                false
-            }
+            info!(
+                "is_present: {} is missing or not a commit in local repository",
+                commit_or_range
+            );
         }
+        present
     }
 
     async fn resolve_sha(&self, commit: &str) -> Result<String> {
