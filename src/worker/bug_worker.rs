@@ -154,7 +154,8 @@ impl BugWorker {
             return 0;
         }
         let repo_path = std::path::Path::new(&self.repo_path);
-        let Some(mainline_sha) = crate::workflows::linux_bug::resolve_linus_sha(repo_path).await
+        let Some(mainline_sha) =
+            crate::workflows::linux_bug::resolve_mainline_sha(repo_path, self.project).await
         else {
             warn!(
                 "Skipping upstream bug fix check: could not resolve mainline tree SHA in {}",

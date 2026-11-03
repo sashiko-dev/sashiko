@@ -190,7 +190,12 @@ pub async fn resolve_scan_revision(repo_path: &Path, rev: Option<&str>) -> Resul
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
     }
 
-    if let Some(sha) = crate::workflows::linux_bug::resolve_linus_sha(repo_path).await {
+    if let Some(sha) = crate::workflows::linux_bug::resolve_mainline_sha(
+        repo_path,
+        crate::project::ProjectId::Linux,
+    )
+    .await
+    {
         return Ok(sha);
     }
 
