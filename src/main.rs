@@ -1013,12 +1013,17 @@ async fn run_daemon(
                         Some(root_msg_id.clone())
                     };
 
+                    let received_date = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .ok();
+
                     let metadata = sashiko::patch::PatchsetMetadata {
                         message_id: message_id.clone(),
                         subject,
                         author,
                         date: timestamp,
-                        received_date: None,
+                        received_date,
                         in_reply_to,
                         references: vec![root_msg_id.clone()],
                         index,
@@ -3596,6 +3601,7 @@ fn eprint_colored(color_choice: ColorChoice, color: Color, text: &str) -> std::i
 }
 
 #[cfg(feature = "server")]
+#[derive(Debug, PartialEq, Eq)]
 enum ProcessStatus {
     Ingested,
     Error,
@@ -6121,5 +6127,115 @@ mod tests {
             .unwrap();
         assert_eq!(recovered_run, 1);
         supervisor.abort();
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_api_submit_multipart_without_cover_groups_into_single_patchset() {
+        let db_settings = sashiko::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let policy = sashiko::email_policy::EmailPolicyConfig::default();
+        let mapping = Vec::new();
+
+        let submission_id = "inject-multipart-test".to_string();
+        let author = "Test Author <author@example.com>".to_string();
+
+        let article1 = ParsedArticle {
+            group: "api-submit".to_string(),
+            article_id: submission_id.clone(),
+            source: MessageSource::ApiInject,
+            metadata: Some(sashiko::patch::PatchsetMetadata {
+                message_id: "part1@example.com".to_string(),
+                subject: "[PATCH 1/2] First part".to_string(),
+                author: author.clone(),
+                date: 1000,
+                received_date: Some(2000),
+                in_reply_to: None,
+                references: vec![],
+                index: 1,
+                total: 2,
+                to: "linux-kernel@vger.kernel.org".to_string(),
+                cc: "".to_string(),
+                is_patch_or_cover: true,
+                version: None,
+                body: "diff 1".to_string(),
+            }),
+            patch: Some(sashiko::patch::Patch {
+                message_id: "part1@example.com".to_string(),
+                body: "diff 1".to_string(),
+                diff: "diff 1".to_string(),
+                part_index: 1,
+            }),
+            baseline: None,
+            failed_error: None,
+            skip_filters: None,
+            only_filters: None,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            receipt: None,
+        };
+
+        let article2 = ParsedArticle {
+            group: "api-submit".to_string(),
+            article_id: submission_id.clone(),
+            source: MessageSource::ApiInject,
+            metadata: Some(sashiko::patch::PatchsetMetadata {
+                message_id: "part2@example.com".to_string(),
+                subject: "[PATCH 2/2] Second part".to_string(),
+                author: author.clone(),
+                date: 1001,
+                received_date: Some(2001),
+                in_reply_to: None,
+                references: vec![],
+                index: 2,
+                total: 2,
+                to: "linux-kernel@vger.kernel.org".to_string(),
+                cc: "".to_string(),
+                is_patch_or_cover: true,
+                version: None,
+                body: "diff 2".to_string(),
+            }),
+            patch: Some(sashiko::patch::Patch {
+                message_id: "part2@example.com".to_string(),
+                body: "diff 2".to_string(),
+                diff: "diff 2".to_string(),
+                part_index: 2,
+            }),
+            baseline: None,
+            failed_error: None,
+            skip_filters: None,
+            only_filters: None,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            receipt: None,
+        };
+
+        let settings = sashiko::settings::Settings::new().unwrap();
+        let review_settings = settings.review;
+
+        let status1 =
+            process_parsed_article(&db, article1, None, &policy, &mapping, &review_settings).await;
+        assert_eq!(status1, ProcessStatus::Ingested);
+
+        let status2 =
+            process_parsed_article(&db, article2, None, &policy, &mapping, &review_settings).await;
+        assert_eq!(status2, ProcessStatus::Ingested);
+
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "both parts must merge into a single patchset"
+        );
+        assert_eq!(pending[0].total_parts, Some(2));
+        assert_eq!(pending[0].received_parts, Some(2));
+        assert_eq!(pending[0].status.as_deref(), Some("Pending"));
     }
 }
