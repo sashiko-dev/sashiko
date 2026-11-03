@@ -79,6 +79,8 @@ temperature = 1.0
 [server]
 host = "::"
 port = 8080
+# Expose cached daemon and review statistics at GET /metrics without authentication.
+prometheus_metrics_enabled = false
 # The URL this service is reachable at from outside, with no trailing slash.
 # Required whenever [smtp] is configured, because sign-in links are mailed and
 # the bind address above does not name a host a recipient can open. The server

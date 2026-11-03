@@ -255,7 +255,7 @@ pub struct AppState {
     pub email_worker_heartbeat: Option<Arc<std::sync::atomic::AtomicI64>>,
     pub sign_in_link_rate_limiter: SignInLinkRateLimiter,
     stats_timeline_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
-    stats_reviews_cache: AsyncCache<serde_json::Value>,
+    stats_reviews_cache: AsyncCache<ReviewStats>,
     stats_tools_cache: AsyncCache<serde_json::Value>,
     messages_count_cache: AsyncCache<usize>,
     patchsets_count_cache: AsyncCache<usize>,
@@ -317,7 +317,7 @@ pub fn build_router(
         bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
     });
 
-    Router::new()
+    let mut app = Router::new()
         .route("/health", get(health_check))
         .route("/api/health", get(health_check))
         .route("/api/config", get(get_config))
@@ -374,8 +374,11 @@ pub fn build_router(
             "/auth/verify",
             get_service(ServeFile::new("static/index.html")),
         )
-        .nest_service("/static", ServeDir::new("static"))
-        .layer(middleware::from_fn(redirect_www))
+        .nest_service("/static", ServeDir::new("static"));
+    if settings.server.prometheus_metrics_enabled {
+        app = app.route("/metrics", get(get_metrics));
+    }
+    app.layer(middleware::from_fn(redirect_www))
         .with_state(state)
 }
 
@@ -1964,6 +1967,179 @@ async fn get_message(
     }
 }
 
+async fn get_metrics(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, StatusCode> {
+    let Json(stats) = stats_reviews(State(state)).await?;
+    let mut body = String::new();
+    for (name, help, value) in daemon_gauges() {
+        write_gauge_family(&mut body, name, help, [(String::new(), value)]);
+    }
+    for (name, help, value) in review_total_gauges(&stats) {
+        write_gauge_family(&mut body, name, help, [(String::new(), value)]);
+    }
+    write_review_group_gauges(&mut body, &stats.reviews);
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    ))
+}
+
+/// Appends one gauge family in the Prometheus text exposition format: the
+/// HELP and TYPE header followed by one sample line per label set. Labels
+/// arrive already rendered, braces included, or empty for an unlabelled
+/// sample.
+fn write_gauge_family<V: std::fmt::Display>(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    samples: impl IntoIterator<Item = (String, V)>,
+) {
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+    for (labels, value) in samples {
+        out.push_str(&format!("{name}{labels} {value}\n"));
+    }
+}
+
+/// The in-memory gauges the metrics worker refreshes; none needs the
+/// database.
+fn daemon_gauges() -> [(&'static str, &'static str, usize); 6] {
+    [
+        (
+            "sashiko_pending_patches",
+            "Patches pending review.",
+            crate::metrics::get_pending_patches(),
+        ),
+        (
+            "sashiko_reviewing_patches",
+            "Patches under review.",
+            crate::metrics::get_reviewing_patches(),
+        ),
+        (
+            "sashiko_messages",
+            "Stored messages.",
+            crate::metrics::get_messages(),
+        ),
+        (
+            "sashiko_patchsets",
+            "Stored patchsets.",
+            crate::metrics::get_patchsets(),
+        ),
+        (
+            "sashiko_repo_packs",
+            "Review repository pack files.",
+            crate::metrics::get_repo_packs(),
+        ),
+        (
+            "sashiko_repo_pack_bytes",
+            "Review repository pack size in bytes.",
+            crate::metrics::get_repo_pack_bytes(),
+        ),
+    ]
+}
+
+/// The unlabelled gauges taken from the cached review statistics.
+fn review_total_gauges(stats: &ReviewStats) -> [(&'static str, &'static str, i64); 7] {
+    let bugs = &stats.bug_tokens;
+    [
+        (
+            "sashiko_reviews_completed",
+            "Reviews no longer queued, including skipped, cancelled and failed ones. Reruns can decrease this gauge.",
+            stats.total_reviews,
+        ),
+        (
+            "sashiko_reviews_failed",
+            "Finished reviews with failure or error statuses. Reruns can decrease this gauge.",
+            stats.total_failures,
+        ),
+        (
+            "sashiko_recent_bugs_analyzed",
+            "Bugs with recorded token usage among the latest 1000 bugs.",
+            bugs.bugs_analyzed,
+        ),
+        (
+            "sashiko_recent_bug_enrichment_stages",
+            "Enrichment stages with recorded token usage among the latest 1000 bugs.",
+            bugs.enrichment_stages,
+        ),
+        (
+            "sashiko_recent_bug_tokens_in",
+            "Input tokens from enrichment stages among the latest 1000 bugs.",
+            bugs.tokens_in,
+        ),
+        (
+            "sashiko_recent_bug_tokens_out",
+            "Output tokens from enrichment stages among the latest 1000 bugs.",
+            bugs.tokens_out,
+        ),
+        (
+            "sashiko_recent_bug_tokens_cached",
+            "Cached tokens from enrichment stages among the latest 1000 bugs.",
+            bugs.tokens_cached,
+        ),
+    ]
+}
+
+/// Picks the value one labelled gauge family reports for a review group.
+type ReviewGroupValue = fn(&ReviewGroupStats) -> i64;
+
+/// Appends the gauge families labelled by provider, model and status. The
+/// label set of each group is rendered once and shared by all four
+/// families.
+fn write_review_group_gauges(out: &mut String, reviews: &[ReviewGroupStats]) {
+    let labels: Vec<String> = reviews.iter().map(review_group_labels).collect();
+    let families: [(&str, &str, ReviewGroupValue); 4] = [
+        (
+            "sashiko_recent_reviews",
+            "Reviews by provider, model and status among the latest 1000 reviews.",
+            |r| r.count,
+        ),
+        (
+            "sashiko_recent_review_tokens_in",
+            "Input tokens by provider, model and status among the latest 1000 reviews.",
+            |r| r.tokens_in,
+        ),
+        (
+            "sashiko_recent_review_tokens_out",
+            "Output tokens by provider, model and status among the latest 1000 reviews.",
+            |r| r.tokens_out,
+        ),
+        (
+            "sashiko_recent_review_tokens_cached",
+            "Cached tokens by provider, model and status among the latest 1000 reviews.",
+            |r| r.tokens_cached,
+        ),
+    ];
+    for (name, help, value) in families {
+        let samples = labels
+            .iter()
+            .zip(reviews)
+            .map(|(labels, review)| (labels.clone(), value(review)));
+        write_gauge_family(out, name, help, samples);
+    }
+}
+
+/// Renders the label set of one review group, braces included, escaping the
+/// characters the exposition format requires in label values.
+fn review_group_labels(review: &ReviewGroupStats) -> String {
+    let labels: Vec<String> = [
+        ("provider", &review.provider),
+        ("model", &review.model),
+        ("status", &review.status),
+    ]
+    .into_iter()
+    .map(|(key, value)| {
+        let value = value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        format!("{key}=\"{value}\"")
+    })
+    .collect();
+    format!("{{{}}}", labels.join(","))
+}
+
 async fn get_stats(
     State(_state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -2008,7 +2184,7 @@ async fn stats_timeline(
 
 async fn stats_reviews(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<ReviewStats>, StatusCode> {
     let data = state
         .stats_reviews_cache
         .get_or_fetch(|| async {

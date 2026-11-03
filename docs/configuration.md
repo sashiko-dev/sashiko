@@ -311,11 +311,36 @@ Settings for the goose provider (`provider = "goose"`).
 |-----|------|---------|-------------|
 | `host` | string | `"::"` | Listen address. `"::"` binds to all interfaces (IPv4 and IPv6). |
 | `port` | integer | `8080` | Listen port for the web UI and API. |
+| `prometheus_metrics_enabled` | bool | `false` | Serves the `/api/stats` gauges and `/api/stats/reviews` statistics in Prometheus text format at `GET /metrics`, without authentication. Returns `404` when disabled. The six daemon gauges refresh about every 60 seconds; review statistics share the JSON endpoint's 60-second cache and query the database on a cache miss. A failed review stats refresh returns `500` for the whole scrape. |
 | `read_only` | bool | `false` | When true, disables write API endpoints. Set automatically by `--no-api`. |
 | `public_base_url` | string | -- | The URL the service is reachable at from outside, with no trailing slash. Required whenever `[smtp]` is configured: sign-in links and bug links are mailed, and the bind address names no host a recipient can open. The server refuses to start without it. |
 | `jwt_secret` | string | -- | Signs sign-in links and session tokens. Without it, sign-in returns `501` and no identity can be established. Keep it stable: replacing it invalidates every session and every unopened link. Prefer `SASHIKO__SERVER__JWT_SECRET` over writing it to disk. |
 | `log_sign_in_links` | bool | `false` | Writes sign-in links to the log. For a developer machine with no real users; a link in a log is a credential anyone reading the log can spend. |
 | `testing_mode` | bool | `false` | **Never enable on a reachable server.** Grants every caller operator capabilities and full bug access without signing in. For automated tests only. |
+
+The review totals are `sashiko_reviews_completed` (reviews no longer queued:
+every status except pending and in review, so skipped and cancelled reviews
+count too) and `sashiko_reviews_failed` (reviews with failure or error
+statuses). Both are gauges because reruns can lower the totals.
+
+The same cached response also supplies these snapshot gauges:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `sashiko_recent_reviews` | `provider`, `model`, `status` | Review counts among the latest 1,000 reviews |
+| `sashiko_recent_review_tokens_in` | `provider`, `model`, `status` | Input tokens among the latest 1,000 reviews |
+| `sashiko_recent_review_tokens_out` | `provider`, `model`, `status` | Output tokens among the latest 1,000 reviews |
+| `sashiko_recent_review_tokens_cached` | `provider`, `model`, `status` | Cached tokens among the latest 1,000 reviews |
+| `sashiko_recent_bugs_analyzed` | -- | Bugs with recorded token usage among the latest 1,000 bugs |
+| `sashiko_recent_bug_enrichment_stages` | -- | Enrichment stages with recorded token usage among the latest 1,000 bugs |
+| `sashiko_recent_bug_tokens_in` | -- | Input tokens from enrichment stages among the latest 1,000 bugs |
+| `sashiko_recent_bug_tokens_out` | -- | Output tokens from enrichment stages among the latest 1,000 bugs |
+| `sashiko_recent_bug_tokens_cached` | -- | Cached tokens from enrichment stages among the latest 1,000 bugs |
+
+These are snapshots rather than lifetime counters. Values can fall as older
+items leave the window; use them directly rather than with `rate()` or
+`increase()`. A review group with no entries in the window has no samples.
+They add no queries beyond the existing review stats refresh.
 
 Local tooling (`sashiko-cli`, the benchmark) authenticates with a token
 rather than an address. On every start the server writes a random one to

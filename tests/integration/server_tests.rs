@@ -72,6 +72,10 @@ struct TestServer {
 /// [`TestServer`] goes out of scope (the task is detached, so cleanup is
 /// automatic when the tokio runtime shuts down).
 async fn spawn_test_server(read_only: bool) -> TestServer {
+    spawn_test_server_with_settings(test_settings(read_only)).await
+}
+
+async fn spawn_test_server_with_settings(settings: Settings) -> TestServer {
     let db_settings = DatabaseSettings {
         url: ":memory:".to_string(),
         token: String::new(),
@@ -82,7 +86,7 @@ async fn spawn_test_server(read_only: bool) -> TestServer {
     let (event_tx, event_rx) = mpsc::channel::<Event>(100);
     let (fetch_tx, _fetch_rx) = mpsc::channel::<FetchRequest>(100);
 
-    let settings = Arc::new(test_settings(read_only));
+    let settings = Arc::new(settings);
     let app = build_router(
         settings,
         Arc::clone(&db),
@@ -112,6 +116,219 @@ async fn spawn_test_server(read_only: bool) -> TestServer {
         base_url,
         db,
         event_rx,
+    }
+}
+
+#[tokio::test]
+async fn test_prometheus_metrics_disabled_by_default() {
+    let server = spawn_test_server(false).await;
+    let response = reqwest::get(format!("{}/metrics", server.base_url))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+}
+
+#[tokio::test]
+async fn test_prometheus_metrics_enabled() {
+    let mut settings = test_settings(true);
+    settings.server.prometheus_metrics_enabled = true;
+    let server = spawn_test_server_with_settings(settings).await;
+    let response = reqwest::get(format!("{}/metrics", server.base_url))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let body = response.text().await.unwrap();
+    let stats: serde_json::Value = reqwest::get(format!("{}/api/stats", server.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for (metric, key) in [
+        ("sashiko_pending_patches", "pending"),
+        ("sashiko_reviewing_patches", "reviewing"),
+        ("sashiko_messages", "messages"),
+        ("sashiko_patchsets", "patchsets"),
+        ("sashiko_repo_packs", "repo_packs"),
+        ("sashiko_repo_pack_bytes", "repo_pack_bytes"),
+    ] {
+        assert!(
+            body.lines()
+                .any(|line| line.starts_with(&format!("# HELP {metric} ")))
+        );
+        assert!(
+            body.lines()
+                .any(|line| line == format!("# TYPE {metric} gauge"))
+        );
+        assert!(
+            body.lines()
+                .any(|line| line == format!("{metric} {}", stats[key]))
+        );
+    }
+    for metric in [
+        "sashiko_reviews_completed",
+        "sashiko_reviews_failed",
+        "sashiko_recent_bugs_analyzed",
+        "sashiko_recent_bug_enrichment_stages",
+        "sashiko_recent_bug_tokens_in",
+        "sashiko_recent_bug_tokens_out",
+        "sashiko_recent_bug_tokens_cached",
+    ] {
+        assert!(body.contains(&format!("# HELP {metric} ")));
+        assert!(body.contains(&format!("# TYPE {metric} gauge\n{metric} 0\n")));
+    }
+    for metric in [
+        "sashiko_recent_reviews",
+        "sashiko_recent_review_tokens_in",
+        "sashiko_recent_review_tokens_out",
+        "sashiko_recent_review_tokens_cached",
+    ] {
+        assert!(body.contains(&format!("# HELP {metric} ")));
+        assert!(body.contains(&format!("# TYPE {metric} gauge\n")));
+        assert!(!body.contains(&format!("{metric}{{")));
+    }
+    assert!(body.ends_with('\n'));
+}
+
+#[tokio::test]
+async fn test_prometheus_review_totals_share_json_cache() {
+    let mut settings = test_settings(true);
+    settings.server.prometheus_metrics_enabled = true;
+    let server = spawn_test_server_with_settings(settings).await;
+    server
+        .db
+        .conn
+        .execute(
+            "INSERT INTO patchsets (id, status, subject, author, date) \
+             VALUES (1, 'Pending', 'Test', 'Author <a@b.com>', 1234567890)",
+            (),
+        )
+        .await
+        .unwrap();
+    server
+        .db
+        .conn
+        .execute(
+            "INSERT INTO reviews (patchset_id, status, created_at) VALUES \
+             (1, 'Reviewed', 1234567890), (1, 'Failed', 1234567890), \
+             (1, 'Error', 1234567890), (1, 'Apply Failed', 1234567890), \
+             (1, 'Pending', 1234567890), (1, 'In Review', 1234567890)",
+            (),
+        )
+        .await
+        .unwrap();
+
+    let stats: serde_json::Value = reqwest::get(format!("{}/api/stats/reviews", server.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["total_reviews"], 4);
+    assert_eq!(stats["total_failures"], 3);
+
+    // Reruns lower the database totals, but both endpoints share the cached snapshot.
+    server
+        .db
+        .conn
+        .execute("UPDATE reviews SET status = 'Pending'", ())
+        .await
+        .unwrap();
+    let response = reqwest::get(format!("{}/metrics", server.base_url))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    for (metric, key) in [
+        ("sashiko_reviews_completed", "total_reviews"),
+        ("sashiko_reviews_failed", "total_failures"),
+    ] {
+        assert!(body.contains(&format!("# TYPE {metric} gauge\n{metric} {}\n", stats[key])));
+    }
+}
+
+#[tokio::test]
+async fn test_prometheus_metrics_fails_when_review_stats_unavailable() {
+    let mut settings = test_settings(true);
+    settings.server.prometheus_metrics_enabled = true;
+    let server = spawn_test_server_with_settings(settings).await;
+    server
+        .db
+        .conn
+        .execute("DROP TABLE reviews", ())
+        .await
+        .unwrap();
+
+    let response = reqwest::get(format!("{}/metrics", server.base_url))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 500);
+}
+
+#[tokio::test]
+async fn test_prometheus_recent_stats_and_label_escaping() {
+    let mut settings = test_settings(true);
+    settings.server.prometheus_metrics_enabled = true;
+    let server = spawn_test_server_with_settings(settings).await;
+    for sql in [
+        "INSERT INTO patchsets (id, status, subject, author, date) \
+         VALUES (1, 'Pending', 'Test', 'Author <a@b.com>', 1234567890)",
+        "INSERT INTO ai_interactions (id, tokens_in, tokens_out, tokens_cached) \
+         VALUES ('metrics-test', 10, 20, 5)",
+        "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 1001) \
+         INSERT INTO bugs (id, bugid, title, reporter, reported_at, created_at, updated_at) \
+         SELECT x, 'sashiko-test-' || x, 'Test', 'test@example.org', 1, 1, 1 FROM cnt",
+        "INSERT INTO bug_enrichments \
+         (bug_id, kind, tool, created_at, tokens_in, tokens_out, tokens_cached) VALUES \
+         (1, 'analysis', 'ai', 1, 999, 999, 999), \
+         (2, 'analysis', 'ai', 1, 10, 20, 5), \
+         (2, 'analysis', 'ai', 2, 7, 8, 2), \
+         (3, 'analysis', 'ai', 1, NULL, NULL, NULL)",
+    ] {
+        server.db.conn.execute(sql, ()).await.unwrap();
+    }
+    server
+        .db
+        .conn
+        .execute(
+            "INSERT INTO reviews \
+             (patchset_id, provider, model, status, interaction_id, created_at) \
+             VALUES (1, ?1, ?2, ?3, 'metrics-test', 1234567890)",
+            libsql::params!["test\"provider", "test\\model", "Reviewed\n\"\\status"],
+        )
+        .await
+        .unwrap();
+
+    let response = reqwest::get(format!("{}/metrics", server.base_url))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    let labels = r#"provider="test\"provider",model="test\\model",status="Reviewed\n\"\\status""#;
+    for (name, value) in [
+        ("sashiko_recent_reviews", 1),
+        ("sashiko_recent_review_tokens_in", 10),
+        ("sashiko_recent_review_tokens_out", 20),
+        ("sashiko_recent_review_tokens_cached", 5),
+    ] {
+        assert!(
+            body.lines()
+                .any(|line| line == format!("{name}{{{labels}}} {value}")),
+            "missing {name} with escaped labels in {body}"
+        );
+    }
+    for (name, value) in [
+        ("sashiko_recent_bugs_analyzed", 1),
+        ("sashiko_recent_bug_enrichment_stages", 2),
+        ("sashiko_recent_bug_tokens_in", 17),
+        ("sashiko_recent_bug_tokens_out", 28),
+        ("sashiko_recent_bug_tokens_cached", 7),
+    ] {
+        assert!(body.contains(&format!("# TYPE {name} gauge\n{name} {value}\n")));
     }
 }
 
@@ -430,7 +647,9 @@ async fn test_patchset_page_size_reaches_the_query() {
 
 #[tokio::test]
 async fn test_stats_reviews_and_tools_endpoints() {
-    let server = spawn_test_server(false).await;
+    let mut settings = test_settings(false);
+    settings.server.prometheus_metrics_enabled = true;
+    let server = spawn_test_server_with_settings(settings).await;
     let client = reqwest::Client::new();
 
     server
@@ -498,6 +717,26 @@ async fn test_stats_reviews_and_tools_endpoints() {
     assert_eq!(group["tokens_in"], 10000);
     assert_eq!(group["tokens_out"], 20000);
     assert_eq!(group["tokens_cached"], 5000);
+
+    let metrics = client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metrics.status(), 200);
+    let metrics = metrics.text().await.unwrap();
+    for (name, value) in [
+        ("sashiko_recent_reviews", 1000),
+        ("sashiko_recent_review_tokens_in", 10000),
+        ("sashiko_recent_review_tokens_out", 20000),
+        ("sashiko_recent_review_tokens_cached", 5000),
+    ] {
+        assert!(metrics.contains(&format!(
+            "{name}{{provider=\"\",model=\"\",status=\"Reviewed\"}} {value}\n"
+        )));
+    }
+    assert!(!metrics.contains("status=\"Failed\""));
+    assert!(metrics.contains("\nsashiko_reviews_failed 5\n"));
 
     let resp = client
         .get(format!("{}/api/stats/tools", server.base_url))
