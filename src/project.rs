@@ -65,6 +65,33 @@ impl ProjectId {
         }
     }
 
+    /// The upstream development branch, independent of a fork's URL.
+    pub fn mainline_branch(self) -> &'static str {
+        match self {
+            ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu => "master",
+            ProjectId::Sashiko => "main",
+        }
+    }
+
+    /// URL hints for selecting this project's upstream and known mirrors.
+    pub fn matches_upstream_url(self, url: &str) -> bool {
+        let url = url.to_ascii_lowercase();
+        match self {
+            ProjectId::Linux => url.contains("torvalds/linux"),
+            ProjectId::Sashiko => url.contains("sashiko-dev/sashiko"),
+            ProjectId::Gcc => {
+                url.contains("gcc.gnu.org/git/gcc")
+                    || url.contains("gnutools/gcc")
+                    || url.contains("gcc-mirror/gcc")
+            }
+            ProjectId::Qemu => {
+                url.contains("qemu-project/qemu")
+                    || url.contains("qemu.org")
+                    || url.contains("qemu/qemu")
+            }
+        }
+    }
+
     /// The subdirectory of the installed prompt bundle holding this project's
     /// prompts.
     ///

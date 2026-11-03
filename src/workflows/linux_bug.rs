@@ -2088,13 +2088,14 @@ async fn run_with_bug_dedup_lease<T>(
     }
 }
 
-async fn get_master_sha(tools: Option<&Arc<ToolBox>>) -> String {
-    let Some(tb) = tools else {
-        return "master".to_string();
-    };
-    resolve_linus_sha(tb.get_worktree_path())
-        .await
-        .unwrap_or_else(|| "master".to_string())
+async fn get_mainline_sha(tools: Option<&Arc<ToolBox>>, project: ProjectId) -> String {
+    if let Some(tools) = tools {
+        resolve_mainline_sha(tools.get_worktree_path(), project)
+            .await
+            .unwrap_or_else(|| project.mainline_branch().to_string())
+    } else {
+        project.mainline_branch().to_string()
+    }
 }
 
 async fn format_commit(tools: Option<&Arc<ToolBox>>, sha: Option<String>) -> Option<String> {
@@ -2751,7 +2752,7 @@ pub async fn run_standalone_bug_pipeline_for_project(
         .filter(|s| (7..=40).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit()))
     {
         Some(sha) => sha.to_string(),
-        None => get_master_sha(tools.as_ref()).await,
+        None => get_mainline_sha(tools.as_ref(), project).await,
     };
 
     let mut effective_source_files: Vec<String> = input
@@ -3263,7 +3264,7 @@ pub async fn process_issue_worker_for_project(
     {
         sha.to_string()
     } else {
-        get_master_sha(tools.as_ref()).await
+        get_mainline_sha(tools.as_ref(), project).await
     };
     let dedup_owner = bug_dedup_lease_owner(bug_row.id, db.bug_claim_owner());
 
@@ -3777,36 +3778,28 @@ async fn run_git_query_capped(
     })
 }
 
-/// Resolves the current HEAD commit SHA of the upstream mainline tree in `repo_path`.
+/// Resolves the upstream development tip for the configured project.
 ///
-/// Prefers a remote whose URL matches `torvalds/linux`, `gcc.gnu.org/git/gcc`,
-/// `gnutools/gcc`, `qemu-project/qemu`, or `qemu/qemu` (`{name}/master`) or
-/// `sashiko-dev/sashiko` (`{name}/main`), falling back to `origin/master`,
-/// `origin/main`, `master`, `main`, and `HEAD`.
-pub async fn resolve_linus_sha(repo_path: &std::path::Path) -> Option<String> {
+/// Prefers a matching upstream remote, then the project's branch under origin,
+/// the local branch, and HEAD. Other projects' reference remotes are ignored.
+pub async fn resolve_mainline_sha(
+    repo_path: &std::path::Path,
+    project: ProjectId,
+) -> Option<String> {
+    let branch = project.mainline_branch();
     let mut candidate_refs = Vec::new();
     match run_git_query(repo_path, &["remote", "-v"]).await {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
                 let mut parts = line.split_whitespace();
-                if let (Some(name), Some(url)) = (parts.next(), parts.next()) {
-                    if url.contains("torvalds/linux")
-                        || url.contains("gcc.gnu.org/git/gcc")
-                        || url.contains("gnutools/gcc")
-                        || url.contains("qemu-project/qemu")
-                        || url.contains("qemu.org")
-                        || url.contains("qemu/qemu")
-                    {
-                        let r = format!("{}/master", name);
-                        if !candidate_refs.contains(&r) {
-                            candidate_refs.push(r);
-                        }
-                    } else if url.contains("sashiko-dev/sashiko") {
-                        let r = format!("{}/main", name);
-                        if !candidate_refs.contains(&r) {
-                            candidate_refs.push(r);
-                        }
+                if let (Some(name), Some(url), Some("(fetch)")) =
+                    (parts.next(), parts.next(), parts.next())
+                    && project.matches_upstream_url(url)
+                {
+                    let candidate = format!("{name}/{branch}");
+                    if !candidate_refs.contains(&candidate) {
+                        candidate_refs.push(candidate);
                     }
                 }
             }
@@ -3816,17 +3809,29 @@ pub async fn resolve_linus_sha(repo_path: &std::path::Path) -> Option<String> {
             warn!("Failed to query git remotes for mainline tree: {}", e);
         }
     }
-    for fallback in [
-        "linus/master",
-        "origin/master",
-        "origin/main",
-        "master",
-        "main",
-        "HEAD",
-    ] {
-        let s = fallback.to_string();
-        if !candidate_refs.contains(&s) {
-            candidate_refs.push(s);
+    // Match BaselineRegistry's deterministic ordering of upstream remotes.
+    candidate_refs.sort_by(|a, b| {
+        a.rsplit_once('/')
+            .map(|(remote, _)| remote)
+            .cmp(&b.rsplit_once('/').map(|(remote, _)| remote))
+    });
+    let fallback_refs: &[&str] = match project {
+        ProjectId::Linux => &[
+            "linus/master",
+            "origin/master",
+            "origin/main",
+            "master",
+            "main",
+            "HEAD",
+        ],
+        ProjectId::Gcc | ProjectId::Qemu => {
+            &["origin/master", "origin/main", "master", "main", "HEAD"]
+        }
+        ProjectId::Sashiko => &["origin/main", "main", "HEAD"],
+    };
+    for fallback in fallback_refs {
+        if !candidate_refs.iter().any(|candidate| candidate == fallback) {
+            candidate_refs.push((*fallback).to_string());
         }
     }
 
@@ -6949,6 +6954,146 @@ F:	drivers/net/ethernet/intel/e1000/
     }
 
     #[tokio::test]
+    async fn mainline_resolution_ignores_other_projects_and_stale_master() {
+        for (project, upstream) in [(
+            ProjectId::Sashiko,
+            "https://github.com/sashiko-dev/sashiko.git",
+        )] {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path();
+            let old = init_test_git_repo(repo);
+            let run = |args: &[&str]| {
+                let out = crate::git_cmd::in_dir(repo).args(args).output().unwrap();
+                assert!(out.status.success(), "git {:?} failed: {:?}", args, out);
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            run(&[
+                "remote",
+                "add",
+                "a-linux",
+                "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+            ]);
+            run(&[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/contributor/renamed-tree.git",
+            ]);
+            run(&["update-ref", "refs/remotes/origin/master", &old]);
+            run(&["commit", "--allow-empty", "-m", "new mainline"]);
+            let tip = run(&["rev-parse", "HEAD"]);
+            run(&["update-ref", "refs/remotes/origin/main", &tip]);
+            run(&["commit", "--allow-empty", "-m", "Linux reference tip"]);
+            let linux_tip = run(&["rev-parse", "HEAD"]);
+            run(&["update-ref", "refs/remotes/a-linux/master", &linux_tip]);
+
+            assert_eq!(resolve_mainline_sha(repo, project).await, Some(tip.clone()));
+            // Linux takes Linus's tree over the fork's master.
+            assert_eq!(
+                resolve_mainline_sha(repo, ProjectId::Linux).await,
+                Some(linux_tip.clone())
+            );
+            let tools = Arc::new(ToolBox::new(repo.to_path_buf()));
+            assert_eq!(get_mainline_sha(Some(&tools), project).await, tip);
+            assert_eq!(
+                get_mainline_sha(Some(&tools), ProjectId::Linux).await,
+                linux_tip
+            );
+
+            // A known upstream is preferred over a fork's older main branch.
+            run(&["remote", "add", "upstream", upstream]);
+            run(&["update-ref", "refs/remotes/upstream/main", &tip]);
+            run(&["update-ref", "refs/remotes/origin/main", &old]);
+            // A push destination does not supply origin's tracking refs.
+            run(&["remote", "set-url", "--push", "origin", upstream]);
+            assert_eq!(resolve_mainline_sha(repo, project).await, Some(tip));
+
+            // Linux retains its existing origin/main fallback when no matching
+            // upstream remote or origin/master ref exists.
+            run(&["remote", "remove", "a-linux"]);
+            run(&["update-ref", "-d", "refs/remotes/origin/master"]);
+            assert_eq!(
+                resolve_mainline_sha(repo, ProjectId::Linux).await,
+                Some(old)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mainline_registry_and_bug_checks_choose_the_same_mirror() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let old = init_test_git_repo(repo);
+        let run = |args: &[&str]| {
+            let out = crate::git_cmd::in_dir(repo).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["remote", "add", "origin", "https://gcc.gnu.org/git/gcc.git"]);
+        run(&[
+            "remote",
+            "add",
+            "origin-mirror",
+            "https://github.com/gcc-mirror/gcc.git",
+        ]);
+        run(&["update-ref", "refs/remotes/origin-mirror/master", &old]);
+        run(&["commit", "--allow-empty", "-m", "upstream tip"]);
+        let tip = run(&["rev-parse", "HEAD"]);
+        run(&["update-ref", "refs/remotes/origin/master", &tip]);
+        // Exercise both distinct mirrors and duplicate URLs in the remote map.
+        for url in [
+            "https://github.com/gcc-mirror/gcc.git",
+            "https://gcc.gnu.org/git/gcc.git",
+        ] {
+            run(&["remote", "set-url", "origin-mirror", url]);
+            let registry =
+                crate::baseline::BaselineRegistry::new(repo, None, Some(ProjectId::Gcc)).unwrap();
+            assert_eq!(registry.mainline_ref(), "origin/master");
+            let candidates = registry.resolve_candidates(&[], "fix cleanup", None).await;
+            let names: Vec<_> = candidates
+                .iter()
+                .filter_map(|candidate| match candidate {
+                    crate::baseline::BaselineResolution::RemoteTarget { name, .. } => {
+                        Some(name.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(names, vec!["origin", "origin-mirror"]);
+            assert_eq!(
+                resolve_mainline_sha(repo, ProjectId::Gcc).await,
+                Some(tip.clone())
+            );
+        }
+
+        // A backoff is per remote name, even when both names share a URL.
+        let timestamps = repo.join(".sashiko/fetch_timestamps");
+        std::fs::create_dir_all(&timestamps).unwrap();
+        std::fs::write(timestamps.join("origin.fail"), "").unwrap();
+        std::fs::write(timestamps.join("origin-mirror"), "").unwrap();
+        run(&[
+            "symbolic-ref",
+            "refs/remotes/origin-mirror/HEAD",
+            "refs/remotes/origin-mirror/master",
+        ]);
+        let registry =
+            crate::baseline::BaselineRegistry::new(repo, None, Some(ProjectId::Gcc)).unwrap();
+        let candidates = registry.resolve_candidates(&[], "fix cleanup", None).await;
+        let mut resolved = None;
+        for candidate in candidates {
+            if let crate::baseline::BaselineResolution::RemoteTarget { url, name, .. } = &candidate
+                && crate::git_ops::ensure_remote(repo, name, url, false)
+                    .await
+                    .is_ok()
+            {
+                resolved = Some(run(&["rev-parse", &candidate.as_str()]));
+                break;
+            }
+        }
+        assert_eq!(resolved, Some(old));
+    }
+
+    #[tokio::test]
     async fn test_sashiko_bug_triage_and_fix_check_flow() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
@@ -6982,7 +7127,7 @@ F:	drivers/net/ethernet/intel/e1000/
         let sha1 = run(&["rev-parse", "HEAD"]);
         run(&["update-ref", "refs/remotes/origin/main", &sha1]);
 
-        let resolved_main = resolve_linus_sha(repo).await;
+        let resolved_main = resolve_mainline_sha(repo, ProjectId::Sashiko).await;
         assert_eq!(resolved_main.as_deref(), Some(sha1.as_str()));
 
         let tb = Arc::new(ToolBox::new(repo.to_path_buf()));
