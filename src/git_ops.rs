@@ -568,6 +568,34 @@ pub async fn git_file_exists_at(repo_path: &Path, file_path: &str, commit: Optio
     matches!(output, Ok(out) if out.status.success())
 }
 
+/// Checks whether a commit or object exists in git using `cat-file -e`.
+pub async fn git_commit_exists(repo_path: &Path, commit: &str) -> bool {
+    let commit = commit.trim();
+    if commit.is_empty() || commit.starts_with('-') {
+        return false;
+    }
+    let obj = format!("{}^{{commit}}", commit);
+    let output = crate::git_cmd::in_dir_async(repo_path)
+        .args(["-c", "safe.bareRepository=all"])
+        .args(["cat-file", "-e", &obj])
+        .output()
+        .await;
+
+    matches!(output, Ok(out) if out.status.success())
+}
+
+/// Checks whether all endpoints in a commit range exist in git using `cat-file -e`.
+pub async fn git_range_exists(repo_path: &Path, commit_or_range: &str) -> bool {
+    if let Some((start, end)) = commit_or_range.split_once("..") {
+        let start = start.trim();
+        let end = end.trim_start_matches('.');
+        (start.is_empty() || git_commit_exists(repo_path, start).await)
+            && (end.is_empty() || git_commit_exists(repo_path, end).await)
+    } else {
+        git_commit_exists(repo_path, commit_or_range).await
+    }
+}
+
 /// Traces Git history to check if a file was renamed or moved across commits,
 /// returning its latest path at the given commit or top-of-trunk.
 pub async fn git_find_file_rename(
@@ -1904,6 +1932,33 @@ mod tests {
                 "accepted invalid revision {ref_name:?}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_git_commit_exists_and_range_exists() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        let head = run_test_git(repo.path(), &["rev-parse", "HEAD"]).await?;
+
+        assert!(git_commit_exists(repo.path(), &head).await);
+        assert!(git_commit_exists(repo.path(), "HEAD").await);
+        assert!(git_commit_exists(repo.path(), &head[..8]).await);
+
+        assert!(!git_commit_exists(repo.path(), "1111111111111111111111111111111111111111").await);
+        assert!(!git_commit_exists(repo.path(), "missing-branch").await);
+        assert!(!git_commit_exists(repo.path(), "HEAD^{tree}").await);
+        assert!(!git_commit_exists(repo.path(), "").await);
+        assert!(!git_commit_exists(repo.path(), "--all").await);
+
+        assert!(git_range_exists(repo.path(), &head).await);
+        assert!(git_range_exists(repo.path(), "HEAD..HEAD").await);
+        assert!(git_range_exists(repo.path(), &format!("{}..HEAD", head)).await);
+        assert!(git_range_exists(repo.path(), "..HEAD").await);
+        assert!(git_range_exists(repo.path(), "HEAD..").await);
+        assert!(!git_range_exists(repo.path(), "missing..HEAD").await);
+        assert!(!git_range_exists(repo.path(), "HEAD..missing").await);
+        assert!(!git_range_exists(repo.path(), "-n..HEAD").await);
+
         Ok(())
     }
 

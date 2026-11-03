@@ -556,6 +556,36 @@ async fn submit_patch(
                 _ => {}
             }
 
+            let repo_path = std::path::Path::new(&state.settings.git.repository_path);
+            let already_local =
+                repo_path.exists() && crate::git_ops::git_range_exists(repo_path, &sha).await;
+
+            if !already_local && repo.is_none() {
+                info!(
+                    "Refused remote fetch request for {}: commit not found in local repository and no remote URL provided",
+                    sha
+                );
+                return Err(StatusCode::BAD_REQUEST.into_response());
+            }
+
+            let effective_repo = if already_local {
+                if repo.is_some() {
+                    info!(
+                        "Target {} is already present in local git repository, skipping remote fetch for {}",
+                        sha, repo_display
+                    );
+                }
+                None
+            } else {
+                repo.clone()
+            };
+
+            let repo_display = if already_local {
+                "local".to_string()
+            } else {
+                repo_display
+            };
+
             let placeholder_id = format!("{}@sashiko.local", id);
             // Create a placeholder record in the DB so the user can track status
             let ps_id = match state
@@ -596,14 +626,14 @@ async fn submit_patch(
 
             if should_enqueue {
                 let req = FetchRequest {
-                    repo_url: repo.clone(),
+                    repo_url: effective_repo.clone(),
                     commit_hash: sha.clone(),
                     mr_url: None,
                     mr_title: None,
                     mr_number: None,
                 };
 
-                if crate::fetcher::url_has_embedded_credentials(repo.as_deref()) {
+                if crate::fetcher::url_has_embedded_credentials(effective_repo.as_deref()) {
                     if let Err(e) = state.fetch_sender.try_send(req) {
                         error!("Failed to send fetch request to queue: {}", e);
                         fail_fetching_patchset_logged(
@@ -617,7 +647,7 @@ async fn submit_patch(
                 } else {
                     if let Err(e) = state
                         .db
-                        .enqueue_fetch_request(repo.as_deref(), &sha, None, None, None)
+                        .enqueue_fetch_request(effective_repo.as_deref(), &sha, None, None, None)
                         .await
                     {
                         error!("Failed to persist fetch request in fetch_queue: {}", e);
@@ -3292,16 +3322,76 @@ mod tests {
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 
+        // Initialize an isolated temporary git repository with two commits.
+        let temp_repo = tempfile::tempdir().unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["-c", "safe.bareRepository=all", "init", "-q", "-b", "main"])
+            .output()
+            .await
+            .unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .await
+            .unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(temp_repo.path().join("value1.txt"), "base\n").unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["add", "value1.txt"])
+            .output()
+            .await
+            .unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["commit", "-q", "-s", "-m", "base"])
+            .output()
+            .await
+            .unwrap();
+        let head1_out = crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await
+            .unwrap();
+        let existing_sha_1 = String::from_utf8(head1_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        std::fs::write(temp_repo.path().join("value2.txt"), "second\n").unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["add", "value2.txt"])
+            .output()
+            .await
+            .unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["commit", "-q", "-s", "-m", "second"])
+            .output()
+            .await
+            .unwrap();
+        let head2_out = crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await
+            .unwrap();
+        let existing_sha_2 = String::from_utf8(head2_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
         // Everything that could authorize the request for another reason is
         // switched off, so only the token can be what admits it.
         let mut settings = crate::settings::Settings::new().unwrap();
         settings.server.testing_mode = false;
         settings.server.acl = crate::settings::AclSettings::default();
+        settings.git.repository_path = temp_repo.path().to_string_lossy().to_string();
         let settings = Arc::new(settings);
 
         let local_token = crate::auth::LocalToken::generate().unwrap();
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(10);
         let app = build_router(
             settings,
             db.clone(),
@@ -3400,6 +3490,83 @@ mod tests {
             .unwrap()
             .status();
         assert!(accepted.is_success(), "token was refused: {}", accepted);
+        let req_missing_with_remote = fetch_rx
+            .try_recv()
+            .expect("fetch request must be queued for missing commit with remote repo");
+        assert_eq!(
+            req_missing_with_remote.repo_url.as_deref(),
+            Some("https://example.org/linux.git")
+        );
+
+        // Missing commit with no repo URL is rejected immediately with 400.
+        let missing_no_repo = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "remote",
+                "sha": "fedcba9876543210fedcba9876543210fedcba98",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            missing_no_repo, 400,
+            "missing local commit without remote repo must be rejected with 400"
+        );
+
+        // Existing local commit with no remote repo URL is accepted and sets effective_repo to None.
+        let local_no_repo = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "remote",
+                "sha": existing_sha_1,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(
+            local_no_repo.is_success(),
+            "existing local commit without repo was refused: {}",
+            local_no_repo
+        );
+        let req_local_no_repo = fetch_rx
+            .try_recv()
+            .expect("fetch request must be queued for local commit");
+        assert_eq!(req_local_no_repo.commit_hash, existing_sha_1);
+        assert_eq!(
+            req_local_no_repo.repo_url, None,
+            "effective_repo must be None for local commit"
+        );
+
+        // Existing local commit with redundant remote repo URL is accepted and clears effective_repo to None.
+        let local_with_redundant_repo = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "remote",
+                "sha": existing_sha_2,
+                "repo": "https://example.org/linux.git",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(
+            local_with_redundant_repo.is_success(),
+            "existing local commit with remote repo was refused: {}",
+            local_with_redundant_repo
+        );
+        let req_local_with_redundant = fetch_rx
+            .try_recv()
+            .expect("fetch request must be queued for local commit with redundant repo");
+        assert_eq!(req_local_with_redundant.commit_hash, existing_sha_2);
+        assert_eq!(
+            req_local_with_redundant.repo_url, None,
+            "effective_repo must be cleared to None when commit already exists locally"
+        );
 
         // The token is an authority, not an identity, so it cannot act on a
         // bug however local its holder is.

@@ -2444,7 +2444,7 @@ bfBnKqGjJguuHd5ta5Vh5B51\n\
     async fn test_detect_github_repo_from_git_dir() {
         let dir = tempfile::tempdir().unwrap();
         let status = crate::git_cmd::in_dir_async(dir.path())
-            .args(["init", "--bare"])
+            .args(["-c", "safe.bareRepository=all", "init", "--bare"])
             .status()
             .await
             .unwrap();
@@ -2454,6 +2454,8 @@ bfBnKqGjJguuHd5ta5Vh5B51\n\
 
         let status = crate::git_cmd::in_dir_async(dir.path())
             .args([
+                "-c",
+                "safe.bareRepository=all",
                 "remote",
                 "add",
                 "origin",
