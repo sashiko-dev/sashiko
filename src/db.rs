@@ -2429,6 +2429,10 @@ impl Database {
     /// is how the parts of a series without a cover letter resolve. A patch
     /// can sit in two patchsets while the database is in that state, so that
     /// lookup takes the first claimant as well.
+    ///
+    /// An injection's synthetic submission id can name an empty message in
+    /// the patchset's thread. Resolve it only when that thread has exactly
+    /// one patchset, keeping the real cover or patch identity intact.
     pub async fn find_patchset_id_by_msgid(&self, msg_id: &str) -> Result<Option<i64>> {
         let candidates = Self::get_msgid_candidates(msg_id);
 
@@ -2457,6 +2461,27 @@ impl Database {
                 .await?;
             if let Ok(Some(row)) = rows.next().await {
                 return Ok(Some(row.get(0)?));
+            }
+        }
+
+        for clid in candidates
+            .iter()
+            .filter(|id| id.starts_with("sashiko-inject-") && id.ends_with("@sashiko.local"))
+        {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT p.id FROM messages m
+                     JOIN patchsets p ON p.thread_id = m.thread_id
+                     WHERE m.message_id = ? LIMIT 2",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                let id = row.get(0)?;
+                if rows.next().await?.is_none() {
+                    return Ok(Some(id));
+                }
             }
         }
 
@@ -21633,6 +21658,74 @@ mod tests {
             .unwrap();
         assert_eq!(updated["status"], "Failed");
         assert_eq!(updated["failed_reason"], "Fetch failed: timeout");
+    }
+
+    #[tokio::test]
+    async fn test_injection_msgid_lookup_requires_a_unique_patchset() {
+        let db = setup_db().await;
+        let submission_id = "sashiko-inject-1-2@sashiko.local";
+        let thread_id = db
+            .ensure_thread_for_message(submission_id, 1000)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.find_patchset_id_by_msgid(submission_id).await.unwrap(),
+            None
+        );
+
+        for id in [1, 2] {
+            db.conn
+                .execute(
+                    "INSERT INTO patchsets (id, thread_id) VALUES (?, ?)",
+                    libsql::params![id, thread_id],
+                )
+                .await
+                .unwrap();
+            let expected = (id == 1).then_some(1);
+            for msgid in [
+                submission_id.to_string(),
+                format!("<{submission_id}>"),
+                "sashiko-inject-1-2".to_string(),
+            ] {
+                assert_eq!(
+                    db.find_patchset_id_by_msgid(&msgid).await.unwrap(),
+                    expected
+                );
+            }
+        }
+
+        // A direct identity still wins when its thread contains other series.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = 2",
+                libsql::params![submission_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.find_patchset_id_by_msgid(submission_id).await.unwrap(),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_thread_lookup_does_not_alias_other_messages() {
+        let db = setup_db().await;
+        for msgid in [
+            "ordinary@example.com",
+            "sashiko-thread-1-2@sashiko.local",
+            "0123456789@sashiko.local",
+        ] {
+            let thread_id = db.ensure_thread_for_message(msgid, 1000).await.unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO patchsets (thread_id) VALUES (?)",
+                    libsql::params![thread_id],
+                )
+                .await
+                .unwrap();
+            assert_eq!(db.find_patchset_id_by_msgid(msgid).await.unwrap(), None);
+        }
     }
 
     /// Until the repair migration has run, a cover letter message id can name

@@ -3978,8 +3978,8 @@ async fn process_parsed_article(
         }
     }
 
-    let cover_letter_id = if group == "git-fetch" || source == MessageSource::ApiInject {
-        // Preserve the ID returned at submission so clients can find the patchset.
+    let cover_letter_id: Option<String> = if group == "git-fetch" {
+        // Always use root_msg_id for git-fetch to match the placeholder ID
         Some(root_msg_id.clone())
     } else if group == "api-submit" || group.starts_with("git-import") {
         if metadata.total == 1 {
@@ -6172,19 +6172,37 @@ mod tests {
     }
 
     #[cfg(feature = "server")]
-    async fn assert_single_patch_submission_resolves(db: &Database, submission_id: &str) {
+    async fn assert_single_patch_submission_resolves(
+        db: &Database,
+        submission_id: &str,
+        identity: &str,
+    ) {
         assert_eq!(db.count_patchsets(None, None).await.unwrap(), 1);
         let pending = db.get_pending_patchsets(10).await.unwrap();
         assert_eq!(pending.len(), 1, "the submission must create one patchset");
         assert_eq!(pending[0].total_parts, Some(1));
         assert_eq!(pending[0].received_parts, Some(1));
+        assert_eq!(pending[0].message_id.as_deref(), Some(identity));
+        let body = db
+            .get_message_body(pending[0].message_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        for trailer in [
+            "base-commit: 1111111111111111111111111111111111111111",
+            "prerequisite-patch-id: 2222222222222222222222222222222222222222",
+            "prerequisite-message-id: <prerequisite@example.com>",
+            "Based-on: <base@example.com>",
+        ] {
+            assert!(body.contains(trailer), "review body must retain {trailer}");
+        }
         let patchset_id = db
             .find_patchset_id_by_msgid("patch@example.com")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(pending[0].id, patchset_id);
-        for msgid in [submission_id, "patch@example.com"] {
+        for msgid in [submission_id, "patch@example.com", identity] {
             let details = db
                 .get_patchset_details_by_msgid(msgid, None, None)
                 .await
@@ -6204,21 +6222,21 @@ mod tests {
     #[tokio::test]
     async fn test_api_inject_single_patch_resolves_submission_id() {
         let submission_id = "sashiko-inject-single@sashiko.local";
-        let raw = b"Message-ID: <patch@example.com>\r\nFrom: Author <author@example.com>\r\nSubject: [PATCH] Fix a bug\r\n\r\ndiff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
+        let raw = b"Message-ID: <patch@example.com>\r\nFrom: Author <author@example.com>\r\nSubject: [PATCH] Fix a bug\r\n\r\ndiff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\nbase-commit: 1111111111111111111111111111111111111111\nprerequisite-patch-id: 2222222222222222222222222222222222222222\nprerequisite-message-id: <prerequisite@example.com>\nBased-on: <base@example.com>\n";
         let db = ingest_api_submission(MessageSource::ApiInject, submission_id, &[raw]).await;
-        assert_single_patch_submission_resolves(&db, submission_id).await;
+        assert_single_patch_submission_resolves(&db, submission_id, "patch@example.com").await;
     }
 
     #[cfg(feature = "server")]
     #[tokio::test]
     async fn test_api_inject_single_patch_with_cover_resolves_submission_id() {
         let submission_id = "sashiko-inject-cover@sashiko.local";
-        let cover: &[u8] = b"Message-ID: <cover@example.com>\r\nFrom: Author <author@example.com>\r\nSubject: [PATCH 0/1] Fix a bug\r\n\r\nCover letter\r\n";
+        let cover: &[u8] = b"Message-ID: <cover@example.com>\r\nFrom: Author <author@example.com>\r\nSubject: [PATCH 0/1] Fix a bug\r\n\r\nCover letter\r\nbase-commit: 1111111111111111111111111111111111111111\nprerequisite-patch-id: 2222222222222222222222222222222222222222\nprerequisite-message-id: <prerequisite@example.com>\nBased-on: <base@example.com>\n";
         let patch: &[u8] = b"Message-ID: <patch@example.com>\r\nFrom: Author <author@example.com>\r\nSubject: [PATCH 1/1] Fix a bug\r\nIn-Reply-To: <cover@example.com>\r\n\r\ndiff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
         for messages in [[cover, patch], [patch, cover]] {
             let db =
                 ingest_api_submission(MessageSource::ApiInject, submission_id, &messages).await;
-            assert_single_patch_submission_resolves(&db, submission_id).await;
+            assert_single_patch_submission_resolves(&db, submission_id, "cover@example.com").await;
         }
     }
 
