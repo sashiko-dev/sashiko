@@ -35,7 +35,10 @@ order that cannot deadlock.
 
 **5. Commit Message Hygiene.**
 Each patch must carry a `Signed-off-by` (DCO) trailer and its body must
-explain both *what* changed and *why*, not merely restate the diff.
+explain both *what* changed and *why*, not merely restate the diff. Bug-fix
+commits should carry a `Fixes: <12-char sha> ("<subject>")` trailer when the
+introducing commit in repository history can be identified with confidence
+(reported at `Low` severity when missing, malformed, or inaccurate).
 
 ## How to review here
 

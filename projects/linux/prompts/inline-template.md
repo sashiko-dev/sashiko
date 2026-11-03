@@ -191,7 +191,7 @@ quoted block.  This matches normal mailing list replies, and avoids making the
 review question appear before the text it is reviewing.  Put the question after
 that quoted block.
 
-For a missing Fixes: tag, quote the full commit message:
+For a missing, malformed, or inaccurate Fixes: tag, quote the full commit message and use [Severity: Low]:
 
 ```
 commit 533c6d48ce4a00a5deb5eea6c921b5d019838b5e
