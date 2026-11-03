@@ -70,3 +70,4 @@ Reachability never does.
     - Negligible performance regressions.
     - Unnecessary code complexity.
     - Missing documentation or comments.
+    - Missing, malformed, or inaccurate `Fixes:` trailer in the commit message.

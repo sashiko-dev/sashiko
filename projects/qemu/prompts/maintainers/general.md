@@ -19,6 +19,11 @@ contributing process (docs/devel/submitting-a-patch.rst).
   flag subjects that merely restate the diff.
 - A non-trivial commit body explains WHAT changed and WHY, not just HOW.
   Do not demand expanded rationale for trivial or self-explanatory commits.
+- Verify existing `Fixes: <12-char sha> ("<subject>")` trailers against
+  repository history and suggest adding a missing `Fixes:` trailer at `Low`
+  severity on bug-fix commits when the introducing commit in the repository
+  can be identified with confidence from git history (never on new features,
+  refactorings, cleanups, documentation, or commits in the same patch series).
 
 ## Style and tooling
 

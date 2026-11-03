@@ -20,3 +20,4 @@ Generic subjective code-quality and commit-message review guidance for all non-t
 - Check that the changelog is concise, without unnecessary verbosity.
 - Check that the changelog explains why the change is made, not just what it does.
 - Flag missing context that would help reviewers and maintainers understand the change.
+- Verify existing `Fixes: <12-char sha> ("<subject>")` trailers against repository history and suggest adding a missing `Fixes:` trailer at `Low` severity on bug-fix commits when the introducing commit in the repository can be identified with confidence from git history (never on new features, refactorings, cleanups, documentation, or commits in the same patch series).

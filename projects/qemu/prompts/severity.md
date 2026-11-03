@@ -91,3 +91,4 @@ auditable.
     - Defensive hardening where real-world inputs will not trigger the
       failure.
     - Confusing naming or stale comments in the touched area.
+    - Missing, malformed, or inaccurate `Fixes:` trailer in the commit message.

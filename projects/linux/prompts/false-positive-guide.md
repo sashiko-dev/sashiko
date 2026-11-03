@@ -494,9 +494,15 @@ Before reporting ANY regression, verify:
 - NEVER invent other methods to look forward in git history.
 - If the prompt included a range of git commits to check, look forward
   through that range for later patches that might resolve the bug you found.
-- Never search backwards in commit history.
+- Never search backwards in commit history when checking for series fixes.
 
 ## Special Cases
+
+### Fixes: Trailers
+- Suggesting `Fixes:` on new features, hardware enablement, refactorings, cleanups, documentation, or style/warning fixes → Do NOT report
+- Suggesting `Fixes:` pointing to an unmerged commit in the same patch series → Do NOT report (amend into the earlier patch instead)
+- Suggesting `Fixes:` when no single introducing commit in repository history can be proven by inspecting its diff with `git_show` → Do NOT report
+- Genuine bug fix missing `Fixes:` where `<fixes_context>`, `git_blame`, or `git_show` proves the exact introducing commit, or an existing `Fixes:` trailer with a malformed format, unresolvable SHA, wrong quoted subject, or wrong commit → Report at `Low` severity
 
 ### Test Code
 - Memory leaks in one-shot test programs at process exit → Usually OK
