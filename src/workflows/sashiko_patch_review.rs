@@ -76,7 +76,7 @@ Baseline SHA: {{{{baseline_sha}}}}
 
 Target Commit:
 {diff_var}
-{{{{prefetched_block}}}}{{{{custom_prompt_block}}}}"#
+{{{{prefetched_block}}}}{{{{fixes_block}}}}{{{{custom_prompt_block}}}}"#
     ))
     .with_var("target_commit_sha", |s: &SashikoPatchReviewState| {
         s.target_commit_sha.clone()
@@ -108,6 +108,9 @@ Target Commit:
                 s.prefetched_context
             )
         }
+    })
+    .with_var("fixes_block", move |s: &SashikoPatchReviewState| {
+        crate::worker::fixes_check::render_fixes_block(use_log, &s.fixes_analysis)
     })
     .include_file("review-core.md")
     .with_var("custom_prompt_block", |s: &SashikoPatchReviewState| {

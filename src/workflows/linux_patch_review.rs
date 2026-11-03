@@ -123,6 +123,8 @@ pub struct LinuxPatchReviewState {
     pub review_inline: String,
     /// Fix suggestions.
     pub fixes: String,
+    /// Pre-computed deterministic `Fixes:` trailer checks and `git blame` candidates.
+    pub fixes_analysis: crate::worker::fixes_check::FixesAnalysis,
 }
 
 impl LinuxPatchReviewState {
@@ -267,7 +269,7 @@ Baseline SHA: {{{{baseline_sha}}}}
 
 Target Commit:
 {diff_var}
-{{{{prefetched_block}}}}{{{{custom_prompt_block}}}}"#
+{{{{prefetched_block}}}}{{{{fixes_block}}}}{{{{custom_prompt_block}}}}"#
     ))
     .with_var("target_commit_sha", |s: &LinuxPatchReviewState| s.target_commit_sha.clone())
     .with_var("baseline_sha", |s: &LinuxPatchReviewState| s.baseline_sha.clone())
@@ -291,6 +293,9 @@ Target Commit:
                 s.prefetched_context
             )
         }
+    })
+    .with_var("fixes_block", move |s: &LinuxPatchReviewState| {
+        crate::worker::fixes_check::render_fixes_block(use_log, &s.fixes_analysis)
     })
     .with_var("custom_prompt_block", |s: &LinuxPatchReviewState| {
         s.custom_prompt.as_deref().map(str::trim).filter(|p| !p.is_empty()).map_or_else(String::new, |p| {
@@ -1947,8 +1952,7 @@ pub fn enrich_verification_output_for_stage(
     out: &mut VerificationOutput,
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
-    let vf_base = state.verification_findings.len();
-    for (idx, finding) in out.findings.iter_mut().enumerate() {
+    for finding in &mut out.findings {
         // Category 1a findings originate strictly from C* / PC* concerns.
         enrich_item_provenance(
             finding,
@@ -1958,13 +1962,39 @@ pub fn enrich_verification_output_for_stage(
             stage_lookup,
         );
         if let Some(map) = finding.as_object_mut() {
+            map.remove("prior_discussion_context");
+            map.remove("authority_evidence");
+        }
+    }
+    for dismissed in &mut out.dismissed_concerns {
+        enrich_item_provenance(
+            dismissed,
+            &state.all_dismissed_concerns,
+            &[],
+            &state.selected_guides,
+            stage_lookup,
+        );
+        if let Some(map) = dismissed.as_object_mut() {
+            map.remove("prior_discussion_context");
+        }
+    }
+    if state.project != "gcc" {
+        crate::worker::fixes_check::sanitize_fixes_findings_with_dismissals(
+            &state.fixes_analysis,
+            state.worktree_path.as_deref(),
+            &mut out.findings,
+            &mut out.dismissed_concerns,
+        );
+    }
+
+    let vf_base = state.verification_findings.len();
+    for (idx, finding) in out.findings.iter_mut().enumerate() {
+        if let Some(map) = finding.as_object_mut() {
             let vf_id = format!("VF{}", vf_base.saturating_add(idx).saturating_add(1));
             map.insert("id".to_string(), json!(vf_id));
             map.insert("stage_item_id".to_string(), json!(vf_id));
             map.insert("origin".to_string(), json!(stage_name));
             map.insert("verification_stage".to_string(), json!(stage_name));
-            map.remove("prior_discussion_context");
-            map.remove("authority_evidence");
         }
     }
     let ic_base = state.inconclusive_concerns.len();
@@ -1994,13 +2024,6 @@ pub fn enrich_verification_output_for_stage(
     assign_inconclusive_concerns_stages(&mut out.inconclusive_concerns);
     let vd_base = state.verification_dismissed.len();
     for (idx, dismissed) in out.dismissed_concerns.iter_mut().enumerate() {
-        enrich_item_provenance(
-            dismissed,
-            &state.all_dismissed_concerns,
-            &[],
-            &state.selected_guides,
-            stage_lookup,
-        );
         if let Some(map) = dismissed.as_object_mut() {
             map.insert(
                 "id".to_string(),
@@ -2011,7 +2034,6 @@ pub fn enrich_verification_output_for_stage(
             );
             map.insert("origin".to_string(), json!(stage_name));
             map.insert("verification_stage".to_string(), json!(stage_name));
-            map.remove("prior_discussion_context");
         }
     }
 }
@@ -3240,6 +3262,14 @@ pub fn apply_post_verification_stage_output(
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
     enrich_post_verification_output(&state.selected_guides, batch, &mut out, stage_lookup);
+    if state.project != "gcc" {
+        crate::worker::fixes_check::sanitize_fixes_findings_with_dismissals(
+            &state.fixes_analysis,
+            state.worktree_path.as_deref(),
+            &mut out.findings,
+            &mut out.dismissed_concerns,
+        );
+    }
     for finding in &mut out.findings {
         let pv_idx = state.post_verification_findings.len().saturating_add(1);
         let pvf_id = format!("PVF{pv_idx}");

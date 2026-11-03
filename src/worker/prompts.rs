@@ -465,6 +465,16 @@ impl Worker {
         };
         let maintainer_notes =
             select_maintainer_notes(&self.prompts.base_dir, &target_commit_diff_only);
+        let fixes_analysis = crate::worker::fixes_check::analyze_fixes_for_commit(
+            self.project,
+            worktree_path,
+            &baseline_sha,
+            &target_commit_sha,
+            self.series_range.as_deref(),
+            &target_commit_diff,
+            &target_commit_diff_only,
+        )
+        .await;
 
         let mut state = LinuxPatchReviewState {
             ps_id,
@@ -511,6 +521,7 @@ impl Worker {
             summary: String::new(),
             review_inline: String::new(),
             fixes: String::new(),
+            fixes_analysis,
         };
 
         if self.global_history.is_empty() {

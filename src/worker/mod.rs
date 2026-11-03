@@ -16,6 +16,7 @@
 pub mod bug_worker;
 #[cfg(feature = "server")]
 pub mod email;
+pub mod fixes_check;
 #[cfg(feature = "server")]
 pub mod forge;
 pub mod location_resolver;
