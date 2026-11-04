@@ -3894,7 +3894,7 @@ Return raw text output, not JSON."#
             ))
             .include_file("inline-template.md")
             .with_var("findings", |s: &LinuxPatchReviewState| {
-                serde_json::to_string_pretty(&s.findings).unwrap_or_default()
+                crate::workflows::prior_attribution::report_findings_json(&s.findings)
             }),
         )
         .output_format(OutputFormat::text_with_validator(

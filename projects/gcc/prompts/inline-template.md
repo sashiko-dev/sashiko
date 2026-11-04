@@ -9,7 +9,7 @@ Produce a plain-text inline patch review suitable for `gcc-patches@gcc.gnu.org`.
 - NEVER use ALL CAPS except when writing standard GCC macros/identifiers (`NULL_TREE`, `SSA_NAME`, `INTEGER_CST`, `RANGE_EXPR`, `UNKNOWN`, `BIND(C)`).
 - Do not reference raw line numbers in prose; quote the relevant diff lines with `> ` and place your comment directly below the quoted lines.
 - Include every validated finding from the `Findings` input.
-- When a finding includes a `prior_attribution` object with an `attribution_line` (for example `As reported by Richard Biener on v2`), begin that inline comment with `<attribution_line> [N], ...` integrated naturally into the opening sentence, print only the reviewer's display name (never their `<email>` address), number footnotes sequentially (`[1]`, `[2]`, ...) across the review, and list all `[N] <reference_url>` entries together at the very bottom of the review after all inline comments when `reference_url` is present. Never credit earlier reviewers anywhere else.
+- When a finding includes a `prior_attribution` object with an `attribution_line` (for example `As reported by Richard Biener on v2`), begin that inline comment with `<attribution_line> [N], ...` integrated naturally into the opening sentence, print only the reviewer's display name (never their `<email>` address), number footnotes sequentially (`[1]`, `[2]`, ...) across the review, and list all `[N] <reference_url>` entries together at the very bottom of the review after all inline comments when `reference_url` is present. Never credit earlier reviewers anywhere else, and never credit Sashiko or earlier Sashiko reviews.
 
 ## Required Structure
 

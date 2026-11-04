@@ -64,8 +64,9 @@ includes `prior_attribution` with an `attribution_line` (for example
 print only the reviewer's display name (never their `<email>` address), number
 footnotes sequentially (`[1]`, `[2]`, ...) across the review, and list all
 `[N] <reference_url>` entries together at the very bottom of the review when
-`reference_url` is present. Never credit earlier reviewers anywhere else, and
-use no backticks or markdown link syntax.
+`reference_url` is present. Never credit earlier reviewers anywhere else,
+never credit Sashiko or earlier Sashiko reviews, and use no backticks or
+markdown link syntax.
 
 If there are no findings at all, output exactly:
 
