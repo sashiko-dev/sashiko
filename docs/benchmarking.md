@@ -54,15 +54,15 @@ in the target version. They are checked when the suite is loaded, and the
 load fails if they are inconsistent:
 
 - `detect_with_attribution` requires `expected_reviewer` (`"Name <email>"`
-  exactly as in the `From:` header, or `"Sashiko"` for a seeded prior
-  finding), `expected_prior_version` (the **earliest** ancestor version in
-  which that reviewer raised the issue), and `expected_prior_message_ids`.
-  The Message-IDs (without angle brackets) list every message in that version
-  in which the reviewer raised the issue. For a seeded Sashiko finding, the
-  ID is the `patch_message_id` of the ancestor patch that the seeded review is
-  attached to. `expected_co_reviewers` lists other reviewers who raised the
-  same issue independently in the same version. Their messages are added to
-  `expected_prior_message_ids`.
+  exactly as in the `From:` header), `expected_prior_version` (the
+  **earliest** ancestor version in which that reviewer raised the issue), and
+  `expected_prior_message_ids`. The Message-IDs (without angle brackets) list
+  every message in that version in which the reviewer raised the issue.
+  Reviews never credit Sashiko, so `"Sashiko"` is rejected as a reviewer
+  everywhere; an issue raised earlier only by a prior Sashiko review is a
+  `detect_bug` entry. `expected_co_reviewers` lists other reviewers who
+  raised the same issue independently in the same version. Their messages
+  are added to `expected_prior_message_ids`.
 - `detect_bug` means that no earlier reviewer raised the issue. It must not
   set `expected_reviewer`, `expected_prior_version`, or
   `expected_prior_message_ids`.
@@ -89,7 +89,7 @@ Attribution is scored deterministically from the structured
 or judge opinion is used:
 
 - **Correct**: `raised_by_identities` contains the expected reviewer's email
-  (or `sashiko`, or a co-reviewer's email), `originally_raised_in_version`
+  (or a co-reviewer's email), `originally_raised_in_version`
   equals `expected_prior_version`, and at least one `evidence[].message_id` is
   in `expected_prior_message_ids`.
 - **Acceptable**: the attribution matches the entry's
@@ -107,6 +107,10 @@ or judge opinion is used:
   The summary reports these separately as "unexpected attributions".
 - **Missing**: an attribution was expected, but the matched finding has none,
   or no finding matched.
+
+An attribution that only links the finding to earlier Sashiko reviews
+(`origin_kind` `sashiko_review`, or `sashiko` as the only identity in older
+outputs) is not credit and is scored as if the finding had no attribution.
 
 The summary reports correct, wrong, missing, and acceptable attributions
 separately. The attribution rate is correct attributions divided by the
@@ -166,7 +170,9 @@ multi-version series:
 - **Seeded Sashiko findings:** four entries seed a synthetic prior Sashiko
   finding on v1 through `prior_findings`: `can_gs_usb_urb_anchor`,
   `seeded_pci_pwrctrl_endpoint_leak`, `seeded_spi_stm32_ospi_dma_leak`, and
-  `usb_tcpm_role_sw_errptr`. In the two `seeded_*` entries, the seed text is
+  `usb_tcpm_role_sw_errptr`. The first three are `detect_bug` entries: the
+  issue must still be detected, but no credit is expected because reviews
+  never credit Sashiko. In the two `seeded_*` entries, the seed text is
   written independently of the ground-truth description. In
   `can_gs_usb_urb_anchor`, the seed text is close to the description. In
   `usb_tcpm_role_sw_errptr`, the seed is a refuted claim (upstream reverted the

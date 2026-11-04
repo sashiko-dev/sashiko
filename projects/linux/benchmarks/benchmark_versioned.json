@@ -26,12 +26,7 @@
     ],
     "target_mbox": "can_gs_usb_urb_anchor/target.mbox",
     "baseline_commit": "1806d210e5a8f431ad4711766ae4a333d407d972",
-    "expected_behavior": "detect_with_attribution",
-    "expected_reviewer": "Sashiko",
-    "expected_prior_version": 1,
-    "expected_prior_message_ids": [
-      "20251225-gs_usb-fix-memory-leak-v1-1-a7b09e70d01d@pengutronix.de"
-    ],
+    "expected_behavior": "detect_bug",
     "lore_urls": [
       "https://lore.kernel.org/all/20251225-gs_usb-fix-memory-leak-v1-1-a7b09e70d01d@pengutronix.de/",
       "https://lore.kernel.org/all/20260105-gs_usb-fix-memory-leak-v2-1-cc6ed6438034@pengutronix.de/"
@@ -1406,12 +1401,7 @@
     ],
     "target_mbox": "seeded_pci_pwrctrl_endpoint_leak/target.mbox",
     "baseline_commit": "1c2b4a4c2bcb950f182eeeb33d94b565607608cf",
-    "expected_behavior": "detect_with_attribution",
-    "expected_reviewer": "Sashiko",
-    "expected_prior_version": 1,
-    "expected_prior_message_ids": [
-      "20260217-pwrctrl-fixes-7-0-v1-1-b5671e58934f@oss.qualcomm.com"
-    ],
+    "expected_behavior": "detect_bug",
     "lore_urls": [
       "https://lore.kernel.org/all/20260217-pwrctrl-fixes-7-0-v1-0-b5671e58934f@oss.qualcomm.com/",
       "https://lore.kernel.org/all/20260217-pwrctrl-fixes-7-0-v1-1-b5671e58934f@oss.qualcomm.com/",
@@ -1446,12 +1436,7 @@
     ],
     "target_mbox": "seeded_spi_stm32_ospi_dma_leak/target.mbox",
     "baseline_commit": "7d0a66e4bb9081d75c82ec4957c50034cb0ea449",
-    "expected_behavior": "detect_with_attribution",
-    "expected_reviewer": "Sashiko",
-    "expected_prior_version": 1,
-    "expected_prior_message_ids": [
-      "20251205-upstream_qspi_ospi_updates-v1-1-7e6c8b9f5141@foss.st.com"
-    ],
+    "expected_behavior": "detect_bug",
     "lore_urls": [
       "https://lore.kernel.org/all/20251205-upstream_qspi_ospi_updates-v1-0-7e6c8b9f5141@foss.st.com/",
       "https://lore.kernel.org/all/20251205-upstream_qspi_ospi_updates-v1-1-7e6c8b9f5141@foss.st.com/",
