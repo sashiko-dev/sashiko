@@ -18,12 +18,15 @@ filters them out. This feature mentions a pre-existing bug **only when it is cle
 
 ## 2. Relevant current-state facts
 
-1. Pre-existing items are split off **after verification** in
-   `record_verified_findings` (`src/workflows/linux_patch_review.rs`),
-   so they are already verified and have a severity.
-   Their grounded locations carry `in_diff` and `side` (`PARENT`/`REVISION`).
-2. The review email is queued before BugWorker claims any bug candidate.
-   So the selection has to happen inside the review pipeline (Option A, agreed).
+1. Pre-existing items found during a patch review (`state.concerns`) are not yet
+   verified on mainline or deduplicated until `BugWorker` runs asynchronously.
+   Verified, deduplicated pre-existing bugs live in the `bugs` table
+   (`lifecycle_status = 'open' AND duplicate_of_id IS NULL`) with a public
+   `<project>-<uuid>` identifier (`bugid`), severity, locations, and report.
+2. The review email is queued before `BugWorker` finishes processing newly discovered
+   concerns from the current patch. Therefore, related pre-existing bug candidates in
+   daemon reviews are loaded from the already-verified `Open` bugs in the `bugs` table
+   touching the patchset's files, and passed into the review pipeline via `ReviewInput`.
 3. Nothing records that a bug was emailed. Reruns delete `reviews` and `bug_reviews` rows.
 4. **RFC and lineage:**
    - `parse_subject_version` (`src/patch.rs`) reads `[RFC v3]` as v3 and `[RFC]` as unversioned (so v1).
@@ -36,20 +39,16 @@ filters them out. This feature mentions a pre-existing bug **only when it is cle
 
 ```mermaid
 flowchart TD
-    V["verification / post-verification"] --> Split["record_verified_findings"]
-    Split -->|new| F["findings"]
-    Split -->|preexisting| C["concerns (verified)"]
-    C --> Bug["BugWorker queue (unchanged)"]
-    C --> Gate{"Gate (reviewer, before spawn): linux AND enabled AND first non-RFC posting"}
+    DB["bugs table (lifecycle_status = 'open', canonical)"] --> Gate{"Gate (reviewer, before spawn): linux AND enabled AND first non-RFC posting"}
     Gate -->|no| Done["no extra cost"]
-    Gate -->|yes| Pre["1. Deterministic pre-filter (file level)"]
+    Gate -->|yes| Pre["1. Deterministic pre-filter (file level + min_severity + not disclosed)"]
     Pre -->|"0 left"| Done
     Pre --> Sel["2. LLM: related-preexisting-selection (per-patch budget)"]
     Sel -->|"0 selected"| Done
-    Sel --> Chk["3. LLM per candidate: preexisting-disclosure-check (tools, patched tree, writes report_text)"]
-    Chk -->|pass| Out["worker output: related_preexisting[]"]
-    Out --> Res["4. Reviewer: atomic reservation in preexisting_disclosures (dedup)"]
-    Res -->|won| Email["review email: findings + 'Related pre-existing issue' section"]
+    Sel --> Chk["3. LLM per candidate: preexisting-disclosure-check (tools, patched tree, writes report_text with [BUG_REF])"]
+    Chk -->|pass| Out["worker output: related_preexisting[] (carries bug_id and bugid)"]
+    Out --> Res["4. Reviewer: atomic reservation in preexisting_disclosures (records bug_id)"]
+    Res -->|won| Email["review email: summary bullet [N] + related note [N] + '[N] https://<domain>/#/bug/<bugid>'"]
     Res -->|lost| Drop["dropped (already reported elsewhere)"]
     Email --> Mark["mark disclosed_at"]
 ```
@@ -73,8 +72,11 @@ flowchart TD
   The worker gets `--related-preexisting-min-severity <sev> --related-preexisting-budget <n>`.
   These become a typed `RelatedPreexistingMode::{Disabled, Enabled { min_severity, budget }}` in the review state (default `Disabled`).
   This mode is separate from the CLI flag `report_preexisting`, which reports everything.
-- Disclosures already recorded in the files the patch touches are passed to the worker as a new `ReviewInput` field.
-  Selection uses them to avoid spending its budget on repeats. The authoritative check is still the reservation (§3.6).
+- Verified open canonical bugs (`lifecycle_status = 'open' AND duplicate_of_id IS NULL`)
+  and disclosures already recorded in the files the patch touches are passed to the worker
+  via `ReviewInput` (`candidate_bugs` and `known_disclosures`). Selection uses them to pick
+  from verified database bugs and avoid spending its budget on repeats. The authoritative
+  deduplication check is still the reservation (§3.6).
 
 ### 3.2 Policy (R3, R7): per mailing list
 Per mailing list, at least for now:
@@ -140,24 +142,32 @@ Output schema:
   `projects/linux/prompts/` (with a bundle test, because a missing include renders as empty).
 - `StillPresent` requires quoting the defective code **from the post-image**.
   If the patch deletes or rewrites it, the result is `RemovedByPatch`/`FixedByPatch`, and the candidate is dropped.
-- Validator: `decision == Report` is only accepted when `post_patch_evidence` and `report_text` are filled in.
-- Items that pass are emitted as a separate worker output array, `related_preexisting[]`. **They are not added to
-  `findings` and not written into the report stage's prose.** If a later reservation loses, there is no stale text to remove.
-- Dropped candidates are logged as `dismissed_concerns`. All concerns still go to BugWorker as before.
+- Validator: `decision == Report` is only accepted when `post_patch_evidence` and `report_text` are filled in,
+  and `report_text` includes the `[BUG_REF]` placeholder integrated into its opening sentence.
+- Items that pass are emitted as a separate worker output array, `related_preexisting[]`, preserving `bug_id`
+  and `bugid` (`<project>-<uuid>`). **They are not added to `findings` and not written into the report stage's prose.**
+  If a later reservation loses, there is no stale text to remove.
+- Dropped candidates are logged as `dismissed_concerns`.
 
 ### 3.6 Step 4: reservation and reporting (R6: never twice)
 When the worker returns, the reviewer reserves each `related_preexisting` item in one `BEGIN IMMEDIATE` transaction.
 Concurrent reviews, including other patches of the same series, are serialized by SQLite's write lock.
 - For each item, load the disclosures recorded in the same files, excluding only rows for **this patch's own
   Message-ID** (from a rerun). Other patches of the same series count.
-- The item is a **duplicate** if any loaded disclosure has the same fingerprint, shares a file **and** a
-  function/symbol with it, or reaches lexical vector similarity ≥ 0.5 in the same file.
+- The item is a **duplicate** if any loaded disclosure has the same `bug_id`, the same fingerprint, shares a file
+  **and** a function/symbol with it, or reaches lexical vector similarity ≥ 0.5 in the same file.
   This is deliberately aggressive: two different bugs in one function means only the first is ever mentioned.
-- Non-duplicates are inserted as **reserved** rows (`disclosed_at` NULL) in the same transaction.
-  Duplicates are dropped and logged.
+- Non-duplicates are inserted as **reserved** rows (`disclosed_at` NULL, with `bug_id` set from the candidate)
+  in the same transaction. Duplicates are dropped and logged.
 - Email:
+  - Each reserved disclosure with a `bugid` (`<project>-<uuid>`) is assigned a sequential footnote number `[N]`
+    continuing after any `[1]..[k]` footnote definitions at the bottom of `inline_review`.
+  - The top summary bullet renders `- [<Severity>] <problem> [N]`.
   - The reviewer renders a "Related pre-existing issue(s)" section from the reserved rows' `report_text`,
-    after the inline review.
+    replacing `[BUG_REF]` with `[N]`, after the inline review.
+  - All `[N] <url>` footnote definitions (both prior-discussion links from `inline_review` and
+    `[N] https://<domain>/#/bug/<bugid>` links for the related pre-existing bugs) are emitted together at the
+    very bottom of the review body, immediately above the `-- ` signature.
   - It sets `disclosed_at` when the email is queued. Embargo release re-renders from the same rows, keyed by the patch Message-ID.
   - If routing mutes or skips the email, or the outbox does not queue it, or the email is disabled or a dry run,
     the patch's reserved rows are deleted so they don't block a later review.
