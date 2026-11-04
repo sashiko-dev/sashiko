@@ -21,7 +21,7 @@ use crate::baseline::{BaselineRegistry, BaselineResolution, CommitId, extract_fi
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity};
 use crate::email_policy::EmailPolicyConfig;
 use crate::email_router::{Action as EmailAction, EmailRouter};
-use crate::git_ops::{GitWorktree, PatchApplyFailure, ensure_remote, get_commit_hash};
+use crate::git_ops::{GitWorktree, PatchApplyFailure, get_commit_hash};
 use crate::prerequisites::{PrerequisitePatch, resolve_prerequisites_from_lore};
 use crate::settings::Settings;
 use crate::utils::redact_secret;
@@ -1597,11 +1597,14 @@ impl Reviewer {
             let mut current_log = format!("Trying baseline: {}\n", baseline_ref);
             let mut current_status = "Failed".to_string();
 
-            // Check remote
+            // Check remote: ensure configured locally without blocking on routine network sync.
+            // If local refs exist, ensure_remote_if_missing skips network I/O completely,
+            // relying on background sync workers to keep them fresh.
             if let BaselineResolution::RemoteTarget { url, name, .. } = candidate
-                && let Err(e) = ensure_remote(&repo_path, name, url, false).await
+                && let Err(e) =
+                    crate::git_ops::ensure_remote_if_missing(&repo_path, name, url, None).await
             {
-                let msg = format!("Failed to fetch remote {}: {}\n", redact_secret(url), e);
+                let msg = format!("Failed to set up remote {}: {}\n", name, e);
                 current_log.push_str(&msg);
                 error!("{}", msg.trim());
                 attempts.push(BaselineAttempt {

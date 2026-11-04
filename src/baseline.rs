@@ -401,12 +401,11 @@ impl BaselineRegistry {
             for remote in custom_remotes {
                 let refspecs = remote.refspecs();
 
-                // Fetch to ensure we have the latest branches (Issue 1)
-                if let Err(e) = crate::git_ops::ensure_remote_with_refspecs(
+                // Ensure remote is configured without blocking review dispatch on routine sync
+                if let Err(e) = crate::git_ops::ensure_remote_if_missing(
                     &self.repo_path,
                     &remote.name,
                     &remote.url,
-                    false,
                     refspecs.as_deref(),
                 )
                 .await
