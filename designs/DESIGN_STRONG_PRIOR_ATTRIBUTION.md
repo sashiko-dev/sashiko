@@ -1,6 +1,6 @@
 # Design: Credit Only People, and Only for the Same Defect
 
-Status: Proposed
+Status: Implemented
 
 Related: `designs/DESIGN_PREVIOUS_VERSION_FEEDBACK.md` (Section 4.2,
 "Evidence-Anchored prior-attribution"), `docs/benchmarking.md`
