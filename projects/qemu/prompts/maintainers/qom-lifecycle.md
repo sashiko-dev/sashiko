@@ -34,6 +34,8 @@ resource bugs are asymmetry between the two.
   access still in flight: memory regions delisted before or atomically with
   tearing down their backing, timers deleted before the state they touch is
   freed, bottom halves cancelled.
+- Machines don't need an `unrealize` function and aren't expected to release
+  their resources.
 - `instance_finalize` runs after `unrealize`; anything it frees must be
   allocated in `instance_init` or unconditionally in `realize`, or the free
   must be guarded by the same condition as the allocation.
