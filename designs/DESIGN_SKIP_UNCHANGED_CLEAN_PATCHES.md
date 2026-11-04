@@ -35,7 +35,7 @@ finite.
   present in the `patches_json` input of the patches that are
   reviewed, so cross-patch context is unchanged.
 - Record why the patch was skipped and which prior review it inherits
-  from, so the dashboard and the outbox can explain the outcome.
+  from, so the dashboard can explain the outcome.
 - Default off. Operators opt in per deployment.
 
 ## 3. Non-Goals
@@ -49,7 +49,7 @@ finite.
   skips (the commit message is not where bugs live), and that is the
   intended trade-off.
 - Cross-project matching. A daemon database serves one project (the
-  `project` key in the `meta` table), so the hash never meets a patch
+  `project` key in the `meta` table), so a lookup never meets a patch
   from another project.
 - Any change to the local `sashiko review` command. It has no
   database and reviews whatever commits it is given.
@@ -57,108 +57,210 @@ finite.
 ## 4. Anti-Goals
 
 - Silently dropping a patch from the series without a record. Every
-  skip must leave a `reviews` row and an outbox entry a maintainer can
-  find.
+  skip must leave a `reviews` row a maintainer can find.
 - Skipping when the prior review did not finish (`Failed`,
   `Cancelled`) or when it reported pre-existing findings only. "No
   findings" means a `Reviewed` review with zero `findings` rows of any
-  kind.
+  kind. With `linux_bug.enabled = false`, the default, a review stores
+  no pre-existing findings at all, so there a review that reported
+  only pre-existing issues does read as clean. That is the verdict
+  every other reader of that deployment's database sees for it.
 
 ## 5. Design
 
-### 5.1 Normalized diff hash
+### 5.1 Identity: exact diff, indexed by Git patch ID
 
-Add a `diff_hash TEXT` column to `patches` with a partial index on
-`(diff_hash) WHERE diff_hash IS NOT NULL`, via a new migration under
-`src/migrations/`. The hash is SHA-256 over the output of the existing
-`normalize_patch_diff_lines` in `src/prior_context.rs`, which already
-drops the pre-`diff --git` header and every `index` line so a rebase
-does not change the result. That function becomes `pub(crate)` and
-gains a sibling `patch_diff_hash(diff: &str) -> String` next to it.
+Two patches carry the same change when their diffs are equal line for
+line after dropping what a rebase rewrites: the mail text before the
+first `diff --git` header, the blob SHAs on `index` lines, and the line
+ranges on `@@` hunk headers. The first two are the normalization
+`compute_inter_version_diff` in `src/prior_context.rs` already applies;
+`patch_diffs_equivalent` exposes it as a predicate and adds the third,
+because a hunk that moved only because code above it grew or shrank is
+the same hunk. The function context after the ranges still has to
+match. Whitespace stays significant. A reindented hunk is a different
+patch.
 
-The hash is computed when the patch row is created (ingestor, forge,
-Patchwork, and backfill paths all funnel into `create_patchset`), and
-backfilled lazily: the review worker computes and stores it for any
-patch it loads with a NULL hash. No bulk backfill migration is run;
-old rows become hashable the first time they are touched.
+The database needs no new column to find candidates. `patches.
+git_patch_id` is computed by the ingest path for every patch and is
+already indexed (migration 12). `git patch-id --stable` ignores
+whitespace and line numbers, so it is a superset of the identity above:
+every exact match shares a patch ID, and a patch ID match is confirmed
+by comparing the diffs in Rust. A patch with no stored ID (an empty
+diff) is never skipped.
 
 ### 5.2 Lookup
 
-Before building `valid_jobs` in `src/reviewer.rs` (the loop that today
-applies the size limits), the worker asks the database for a reusable
-prior review:
+`Database::find_clean_review_candidates` runs from `process_patch_review`
+in `src/reviewer.rs`, after the ignored-files check and before a review
+row is claimed:
 
 ```sql
-SELECT r.id, r.patchset_id, p.id
+SELECT r.id, p.id, p.patchset_id, ps.subject, ps.version, p.part_index,
+       p.diff, r.model, r.prompts_hash, r.baseline_commit,
+       r.cheap, r.stages
 FROM patches p
 JOIN reviews r ON r.patch_id = p.id
-WHERE p.diff_hash = ?1
+JOIN patchsets ps ON ps.id = p.patchset_id
+WHERE p.git_patch_id = ?1
   AND p.id != ?2
   AND r.status = 'Reviewed'
   AND r.created_at >= ?3
-  AND NOT EXISTS (SELECT 1 FROM findings f WHERE f.review_id = r.id)
-ORDER BY r.created_at DESC
-LIMIT 1
+  AND r.inherited_from_review_id IS NULL
+ORDER BY r.created_at DESC, r.id DESC
+LIMIT 8
 ```
 
-`?3` is `now - max_age`.
+`?3` is `now - max_age`. Each row also carries whether the review has
+any `findings`. The reviewer walks the candidates newest first and
+stops at the first whose diff passes `patch_diffs_equivalent`: if that
+review found something, nothing older is reused, because the newest
+verdict on a diff overrules every clean one before it; if it was clean
+and meets the conditions in 5.3, it is the source. The limit keeps a
+patch carried across many series from pulling every copy's diff out of
+the database.
 
-Two candidate sources are deliberately treated the same way: a patch
-linked through `patches.previous_patch_id` (same series, earlier
-version) and an unrelated patch anywhere in the project with the same
-hash (a patch carried across two different series, or a resend under a
-new thread). The hash is the identity; lineage is only used to pick
-the label shown to humans.
+Reviews that themselves inherited a verdict are excluded, so a chain of
+reposts always ends at the review a model produced, and the age bound
+is measured from that review, not from the latest repost.
+
+Lineage (`patches.previous_patch_id`) is not consulted. A patch moved
+between series, or resent under a new thread, matches the same way as
+one in the same version chain. The prior patchset's subject and part
+index label the match for humans.
 
 ### 5.3 Skip conditions
 
 All of the following must hold:
 
 1. `review.skip_unchanged_clean = true`.
-2. A matching prior review exists per 5.2.
-3. The prior review's `model` and `prompts_hash` match the current
+2. The patchset's `target_review_count` is one. `sashiko-cli rerun`
+   raises it to force a model run, and the skip must not satisfy that
+   request with another inherited row.
+3. The patch's `PriorVersionContext` is empty for audit: no
+   `prior_findings` and no `discussion_threads`. Either one means the
+   prior-feedback stage has work to do on this patch, and that stage
+   only runs inside a full review. The check reads the same
+   `prior_version_context` the model would be given. If that context
+   could not be built, because a lookup failed, no patch of the series
+   is skipped: an absent context then means unknown, not empty.
+4. A matching prior review exists per 5.2, and it is clean.
+5. The prior review's `model` and `prompts_hash` match the current
    worker's, unless `review.skip_unchanged_clean_any_model = true`.
    The default is strict: a prompt or model change is exactly when a
    re-review of an old clean patch is worth paying for.
-4. If `review.skip_unchanged_clean_require_same_baseline = true`, the
-   current baseline is the same commit as the prior review's baseline
-   (`reviews.baseline_id` resolves to the same SHA). Off by default.
+6. If `review.skip_unchanged_clean_require_same_baseline = true`, the
+   patch is applied to the same tree as the reviewed copy was: the
+   current baseline is the same commit as the prior review's
+   `baseline_commit`, and the patches ahead of this one in its series
+   match, one for one and in order, the patches ahead of the reviewed
+   copy in its series. Off by default.
+7. The prior review ran at least the pipeline the current worker
+   would. `review.cheap` folds the exploratory analysis stages into one
+   pass and `--stages` runs a named subset of them. Neither changes the
+   model or the prompts, so condition 5 cannot see them. A full prior
+   review covers any current configuration; a cheap one covers only a
+   cheap worker, and a stage subset covers only a worker limited to
+   the same stages. No setting waives this: `any_model` accepts another
+   model's verdict, not a narrower review's.
+8. Nobody but Sashiko replied to the reviewed copy's patch mail.
+   Condition 3 finds prior discussion through patchset lineage, and
+   5.2 deliberately matches without it. A patch reviewed clean,
+   criticized on the list, and resent under a new thread has no
+   lineage to the criticism, so the lookup asks the `messages` table
+   directly. A reply that is itself a patch or a cover letter is
+   another submission, not discussion: the rest of a series threaded
+   under its first patch, or a later version sent in reply. Sashiko's
+   own reply is its review, and the walk continues beneath it, since
+   an answer to that review is discussion of the patch. The copies
+   that already inherited the verdict are asked about as well: when
+   v2 inherits from v1 and draws the criticism, a v3 with no lineage
+   to v2 still lands on v1's review. Replies to the cover letter and
+   forge comments are not consulted here; a forge series keeps its
+   lineage, so condition 3 covers it.
 
-Condition 4 is relaxed by default on purpose. A series reposted a week
+Condition 6 is relaxed by default on purpose. A series reposted a week
 later lands on a newer `-next` tip, so the baseline nearly always
 moves, and a strict check would save nothing on the motivating
-workload. The same diff on a different tree can be a different patch,
-which is why the check exists at all; operators reviewing against a
-fast-moving tree where that matters can turn it on. The age bound in
-5.6 limits how far the baseline can drift under the default.
+workload. The same holds for the patches ahead of this one: a repost
+that rewrites 1/5 and leaves 3/5 alone is the workload, and under the
+default 3/5 inherits a verdict reached on top of the old 1/5. The same
+diff on a different tree can be a different patch, which is why the
+check exists at all; operators for whom that matters can turn it on.
+The age bound in 5.6 limits how far the baseline can drift under the
+default.
 
 ### 5.4 What happens on a skip
 
-- The patch gets status `Skipped`, as size-limited patches do today.
-- A `reviews` row is inserted with `status = 'Reviewed'`, zero
-  findings, `summary` set to a fixed string naming the inherited review
-  (`Unchanged since <label>; prior review <id> found no issues`), and a
-  new nullable column `reviews.inherited_from_review_id` pointing at
-  the prior review. `model`, `prompts_hash`, and `provider` are copied
-  from the prior review so the row is honest about which run produced
-  the verdict.
+The skip leaves behind exactly what the existing ignored-files skip
+does, plus the link to the inherited review:
+
+- A `reviews` row is claimed through `claim_or_create_in_review` and
+  completed with `status = 'Skipped'` and a `result_description` of
+  the form `Skipped: unchanged since review <id> of "<subject>" (patch
+  <n>) found no issues`. The row carries the current worker's `model`
+  and `prompts_hash`, as any review row does, and the new
+  `inherited_from_review_id` names the review whose verdict it reuses.
+- `inherited_from_review_id` and `baseline_commit` are written while
+  the row is still `In Review`, before the status change, so a failure
+  between the two leaves a row the orphan cleanup already handles
+  rather than a `Skipped` row with no source. Reclaiming a `Pending`
+  row for a model run clears both columns again, so a review the model
+  produces is never mistaken for an inherited one. Provenance is only
+  ever read together with `status = 'Skipped'`.
+- The patch gets status `Skipped`.
+- A retry of an interrupted series stops at the inherited row the same
+  way it stops at a `Reviewed` one: `count_successful_reviews` counts
+  a `Skipped` row with provenance as one finished pass. The early
+  return then leaves the patch `Skipped` instead of marking it
+  `Reviewed`.
 - No AI interaction is created and no tokens are counted.
-- The email outbox receives the existing `Skipped due to no findings`
-  entry, so delivery behaviour is identical to a fresh clean review.
-- Forge posting: the patch contributes nothing to the PR comment, same
-  as a fresh clean review.
+- No mail is queued, and the patch contributes nothing to a forge
+  comment. The verdict is not news to the author, who has the earlier
+  review.
+- A Patchwork check is queued where the list's policy enables one, in
+  state `success` with a description saying the patch is unchanged
+  since an earlier review. A patch the model reviews clean gets a
+  check, and without this one the inherited patch would show none.
+  The check waits out an embargo like any other notification, and
+  `queue_patchset_notifications` sends it on release.
+- While the patchset is embargoed the patch reads as `Embargoed`, as a
+  `Reviewed` patch does. `Skipped` would tell a viewer which patches
+  of the series came out clean.
 - The patch stays in `patches_json` for the other jobs with its
   `prior_version_context` intact.
 
-The `<label>` is the version label from `PriorVersionContext` when the
-match came through lineage (`v6 3/30`), else the prior patchset's
-subject.
+Every normal review now also records `reviews.baseline_commit`, the
+commit its worktree was checked out at, so the same-baseline rule in
+5.3 has something to compare. `baselines.last_known_commit` cannot
+serve: it moves with every sync.
+
+A review narrowed by `review.cheap` or `--stages` records its coverage
+as well, in `reviews.cheap` and `reviews.stages`, for condition 7. The
+two columns default to a full review, and claiming a row for a model
+run resets them in the statement that makes the claim. A full review
+therefore writes nothing extra. For a narrowed one the write is not
+best effort, unlike the baseline commit: a run that failed to record
+itself would read as a full review, so the model run does not start
+until the write succeeds.
 
 ### 5.5 Whole-series skip
 
 If every patch in a patchset is skipped, the patchset still completes
 as `Reviewed` through the normal path (zero valid jobs is already a
-handled state for size-limited series). No special case.
+handled state for size-limited series).
+
+Three readers of the result needed to learn the new row. The clean
+patchset predicate behind early embargo release,
+`get_patchset_review_outcome`, and `count_successful_reviews` all
+counted `Reviewed` rows toward a patch's target review count, and the
+first two recognized only the ignored-files `Skipped` row as an
+exemption from it. A `Skipped` row with `inherited_from_review_id` set
+now counts as one finished review in all three. Counting it, rather
+than exempting the patch, is what makes a rerun behave: the rerun
+raises the target to two, the inherited row supplies one, and the model
+runs exactly once more. A reposted series whose every patch inherited
+is clean and releasable rather than stranded as incomplete.
 
 ### 5.6 Settings
 
@@ -171,7 +273,8 @@ skip_unchanged_clean = false
 skip_unchanged_clean_max_age_days = 90
 # Reuse a clean review even when the model or prompts have changed.
 skip_unchanged_clean_any_model = false
-# Reuse a clean review only when the baseline commit is the same.
+# Reuse a clean review only when the baseline commit is the same and the
+# patches ahead of it in the series are unchanged too.
 skip_unchanged_clean_require_same_baseline = false
 ```
 
@@ -180,33 +283,59 @@ in `docs/configuration.md`. `sashiko review` ignores all four.
 
 ### 5.7 Observability
 
-- `info!` on every skip, naming patchset, index, the inherited review
-  id, and which of the relaxed flags were required for the match.
-- A `reviews_skipped_unchanged_total` counter in `src/metrics.rs`.
-- The dashboard patch view shows the inherited review link where it
-  would otherwise show findings. The web UI change is a single
-  conditional in `static/index.html` keyed on
-  `inherited_from_review_id`.
+- `info!` on every skip, naming patchset, index, patch id, and the
+  inherited review with its patchset and part.
+- A `reviews_skipped_unchanged` counter in `src/metrics.rs`, exposed
+  by the stats endpoint. It counts since process start; the durable
+  record is `inherited_from_review_id`.
+- The dashboard shows the review's `result_description` as the
+  tooltip of a skipped patch in the list and as the placeholder in the
+  patch pane, so the inherited review's id is one hover away.
 
 ## 6. Risks
 
 **A clean review was wrong, and the skip propagates the miss.** A
 false negative in v3 now also suppresses v4 through v9. Mitigations:
 the `max_age` bound, the strict model/prompt default so a prompt fix
-re-reviews everything, and `sashiko-cli rerun` (which already exists) to
-force a fresh run on a patchset. This is the accepted cost of the
-feature and the reason it is off by default.
+re-reviews everything, the newest-verdict rule so one later review
+that catches the bug ends the chain, and `sashiko-cli rerun`, which
+raises the target review count and thereby disables the skip for that
+patchset. This is the accepted cost of the feature and the reason it
+is off by default.
 
-**Baseline drift changes the meaning of an identical diff.** Accepted
-by default: the age bound caps the drift, and condition 4 offers a
-strict mode for trees where it is not acceptable.
+**Baseline drift changes the meaning of an identical diff.** So does a
+change to an earlier patch of the same series. Both are accepted by
+default: the age bound caps the drift, and condition 6 offers a strict
+mode for trees where it is not acceptable.
 
-**Hash collisions.** SHA-256 collisions within one database are not a
-practical concern.
+**The model and prompt check is coarser than its name.** `prompts_hash`
+is the commit the binary was built from, so under the strict default
+every rebuild re-reviews everything, and a change that leaves the
+commit alone, such as `review.effort`, is not seen. An operator who
+wants reuse across upgrades sets `any_model` and takes both.
 
-**Lazy backfill produces no skips for the first repost after
-deployment.** Correct and acceptable: the first posting after the
-feature ships is hashed when reviewed, and the next repost skips.
+**The diff comparison keeps the mail's tail.** The stored diff runs to
+the end of the mail, so a new git version in the signature or a new
+`base-commit:` trailer makes two copies compare unequal. The skip is
+lost, not misapplied.
+
+**Git patch-id groups patches that differ only in whitespace.** That
+is why the patch ID is only the index and the diffs are compared byte
+for byte before a verdict is reused.
+
+**Old reviews have no baseline_commit.** The column is filled from the
+first review after this change ships. Under the default the column is
+not consulted; with the same-baseline rule on, a review with a NULL
+baseline is simply never reused.
+
+**Old reviews have no recorded coverage.** They read as full reviews,
+which is what a review was before `review.cheap` existed. A deployment
+that ran cheap or stage-limited reviews before this change ships can
+have those verdicts inherited by a full review until they age out;
+shortening `skip_unchanged_clean_max_age_days` for that window, or
+leaving the feature off until it passes, avoids it. Reasoning effort is
+not part of the coverage: it is a model parameter, and like a model
+change it is the operator's to weigh.
 
 ## 7. Alternatives Considered
 
@@ -217,12 +346,18 @@ does and it needs the LLM.
 
 **Match on `previous_patch_id` lineage only.** Simpler, but misses the
 common case of a patch moved between series or resent under a new
-thread, and lineage reconciliation is itself heuristic. The hash is
-cheaper and more reliable; lineage becomes a labeling aid.
+thread, and lineage reconciliation is itself heuristic. The patch ID
+index plus an exact diff comparison is cheaper and more reliable.
 
 **Compare the full patch including the commit message.** Would skip far
 less often (authors touch commit messages on nearly every repost) for
 no safety gain, since the review targets the code.
+
+**A dedicated normalized-diff hash column.** The first draft of this
+design added `patches.diff_hash` with its own index and a lazy backfill.
+`git_patch_id` already exists, is indexed, and is computed at ingest for
+every patch; one in-process comparison per candidate makes it an exact
+identity. The column and the backfill were dropped.
 
 **Rely on the AI response cache.** The cache keys on the full request,
 which includes the whole series as context, so a one-patch change in
@@ -231,21 +366,23 @@ engine and counts cached tokens.
 
 ## 8. Implementation Steps
 
-Each step is one commit.
+Each step is one commit, in this order on the branch:
 
-1. Migration: `patches.diff_hash` with partial index,
-   `reviews.inherited_from_review_id`.
-2. `patch_diff_hash` helper in `prior_context.rs` with tests covering
-   the rebase-only case and a one-line change.
-3. Store the hash on patch creation; lazy backfill in the worker.
-4. `ReviewSettings` fields, defaults, `Settings.toml` comments,
+1. Migration 22: `reviews.inherited_from_review_id`,
+   `reviews.baseline_commit`, and the coverage columns `reviews.cheap`
+   and `reviews.stages`.
+2. `patch_diffs_equivalent` in `prior_context.rs`, with a test for the
+   rebase-only case, a whitespace change, and a one-line change.
+3. `ReviewSettings` fields, defaults, `Settings.toml` comments,
    `docs/configuration.md`.
-5. `Database::find_reusable_clean_review` with the query from 5.2 and
-   a test exercising each predicate.
-6. Reviewer: the skip branch, the inherited review row, outbox entry,
-   metrics, logging. Tests: skip taken, skip refused on each
-   condition, series with all patches skipped.
-7. Dashboard conditional.
+4. `Database::find_clean_review_candidates`, `ReviewCoverage`, and
+   the column writers, with a test exercising each predicate.
+5. `CLEAN_PATCHSET_PREDICATE` and `get_patchset_review_outcome` accept
+   an inherited row.
+6. Reviewer: the skip branch and its gate, baseline commit and
+   coverage recording, metrics, logging. Tests: skip taken end to end, a retry reusing the
+   row, each refusal, and the gate.
+7. Dashboard: show the skip reason.
 
 ## 9. Open Decisions For The Operator
 
