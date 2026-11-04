@@ -4284,6 +4284,11 @@ impl Reviewer {
                 let final_subject = format!("{}{}", subject_prefix, patch_subject);
 
                 let msg_id_clean = msg_id.trim_matches(|c| c == '<' || c == '>');
+                let (inline_body, inline_footnotes, start_ref) = if total_issues_count > 0 {
+                    crate::related_preexisting::split_inline_review_footnotes(inline_review)
+                } else {
+                    ("", Vec::new(), 1)
+                };
 
                 let mut header = String::new();
 
@@ -4320,14 +4325,15 @@ impl Reviewer {
                         header.push_str(&format_finding(f));
                     }
 
-                    header.push_str(&crate::related_preexisting::related_email_header(
+                    header.push_str(&crate::related_preexisting::related_email_header_from(
                         total_issues_count,
                         &related,
+                        start_ref,
                     ));
                     header.push_str("--\n\n");
                 } else {
-                    header.push_str(&crate::related_preexisting::related_email_header(
-                        0, &related,
+                    header.push_str(&crate::related_preexisting::related_email_header_from(
+                        0, &related, start_ref,
                     ));
                 }
 
@@ -4337,11 +4343,7 @@ impl Reviewer {
 
                 // Without new findings the inline review only says so, and the
                 // header already did.
-                let mut body = if total_issues_count > 0 {
-                    inline_review.trim_end().to_string()
-                } else {
-                    String::new()
-                };
+                let mut body = inline_body.to_string();
                 if !related.is_empty() {
                     // After an inline review, a divider keeps the related notes
                     // from reading like part of its last comment.
@@ -4352,7 +4354,22 @@ impl Reviewer {
                         ));
                         body.push_str("\n\n");
                     }
-                    body.push_str(&crate::related_preexisting::related_email_section(&related));
+                    body.push_str(&crate::related_preexisting::related_email_section_from(
+                        &related, start_ref,
+                    ));
+                }
+                let related_footnotes = crate::related_preexisting::related_email_footnotes(
+                    &related, start_ref, domain,
+                );
+                if !inline_footnotes.is_empty() || !related_footnotes.is_empty() {
+                    if !body.is_empty() {
+                        body.push_str("\n\n");
+                    }
+                    let all_footnotes: Vec<&str> = inline_footnotes
+                        .into_iter()
+                        .chain(related_footnotes.iter().map(String::as_str))
+                        .collect();
+                    body.push_str(&all_footnotes.join("\n"));
                 }
 
                 let final_body = format!("{}{}{}", header, body, footer);
@@ -6141,6 +6158,95 @@ The retry path also leaks the reference.
 
 -- ";
         assert!(body.starts_with(expected_head), "{body}");
+
+        // When the related disclosure links to a canonical bug in the database
+        // and the inline review already carries prior-version footnotes [1]..[4],
+        // the related bug is numbered [5] in the header bullet, in the opening
+        // sentence of report_text, and at the end of the review after [4].
+        db.execute(
+            "INSERT INTO bugs (id, bugid, title, lifecycle_status, pipeline_state, reporter,
+                               reported_at, created_at, updated_at)
+             VALUES (77, 'linux-7f9a2c4b-3e1d-4a80-9b5c-1d2e3f4a5b6c', 'leak', 'open', 'succeeded', 'r', 0, 0, 0)",
+            (),
+        )
+        .await?;
+        db.create_message(
+            "msg_id_p4",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Subject 4",
+            1000,
+            "Body",
+            "to@example.com",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let p4_id = db.create_patch(ps_id, "msg_id_p4", 3, "diff").await?;
+        db.reserve_preexisting_disclosures(
+            "msg_id_p4",
+            &[NewPreexistingDisclosure {
+                fingerprint: "fp4".to_string(),
+                problem: "mm: refcount leak on the retry path of foo_alloc()".to_string(),
+                severity: Severity::High,
+                relation: DisclosureRelation::SameCode,
+                locations_json: "[]".to_string(),
+                bug_key_json: "{}".to_string(),
+                report_text: "This isn't a bug introduced by this patch, but the same missing unlock [BUG_REF] exists a few lines below the path you fixed:\n\n> \treturn -EINVAL;".to_string(),
+                files: vec!["mm/baz.c".to_string()],
+                bug_id: Some(77),
+                bugid: Some("linux-7f9a2c4b-3e1d-4a80-9b5c-1d2e3f4a5b6c".to_string()),
+            }],
+            |_, _| false,
+        )
+        .await?;
+        Reviewer::queue_notifications(
+            &ctx,
+            ps_id,
+            None,
+            p4_id,
+            "msg_id_p4",
+            "msg_id_1",
+            3,
+            "inline review content (previously raised in v1 [4]).\n\n[4] https://lore.kernel.org/all/prior@example.com/",
+            Some(&findings),
+            "summary",
+        )
+        .await?;
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT body FROM email_outbox WHERE patch_id = ?",
+                libsql::params![p4_id],
+            )
+            .await?;
+        let body4: String = rows.next().await?.expect("expected an email").get(0)?;
+        let expected_body4 = "\
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] mm: out_unlock frees priv->buf twice on the foo_hw_init() error
+  path
+It also noticed 1 related pre-existing issue this patch does not
+introduce:
+- [High] mm: refcount leak on the retry path of foo_alloc() [5]
+--
+
+inline review content (previously raised in v1 [4]).
+
+Related pre-existing issue, not introduced by this patch:
+
+This isn't a bug introduced by this patch, but the same missing unlock
+[5] exists a few lines below the path you fixed:
+
+> \treturn -EINVAL;
+
+[4] https://lore.kernel.org/all/prior@example.com/
+[5] https://sashiko.dev/#/bug/linux-7f9a2c4b-3e1d-4a80-9b5c-1d2e3f4a5b6c
+
+-- ";
+        assert!(body4.starts_with(expected_body4), "{body4}");
         Ok(())
     }
 

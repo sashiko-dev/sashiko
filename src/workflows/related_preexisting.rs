@@ -374,7 +374,7 @@ The bug under "Candidate" already existed before this patch. An earlier stage ju
 
 Report the bug ("decision": "Report") only when it is "NotSecuritySensitive" and "StillPresent". Otherwise drop it and say why in "drop_reason". Do not give the candidate the benefit of the doubt: an unverified answer is "Unknown", and "Unknown" means drop.
 
-When reporting, write "report_text": a short, self-contained note to the patch author in the style of a Linux kernel mailing list reply. Quote the relevant lines from the patched tree prefixed with "> ", explain the problem in plain sentences, say how it relates to their patch, and suggest a fix. State clearly that the issue was not introduced by this patch. Plain text only: no markdown, no backticks, no headings, at most about 25 lines."#;
+When reporting, write "report_text": a short, self-contained note to the patch author in the style of a Linux kernel mailing list reply. Integrate the literal placeholder [BUG_REF] naturally into the opening sentence where the pre-existing issue is introduced (the mailer replaces [BUG_REF] with a footnote number such as [5] pointing to the tracked bug report at the end of the review). Quote the relevant lines from the patched tree prefixed with "> ", explain the problem in plain sentences, say how it relates to their patch, and suggest a fix. State clearly that the issue was not introduced by this patch. Plain text only: no markdown, no backticks, no headings, at most about 25 lines."#;
 
 const CHECK_SCHEMA: &str = r#"Return ONLY a JSON object with these keys:
 - "security_sensitivity": "NotSecuritySensitive", "SecuritySensitive" or "Unknown"
@@ -383,7 +383,7 @@ const CHECK_SCHEMA: &str = r#"Return ONLY a JSON object with these keys:
 - "post_patch_evidence": file:line and the verbatim code from the patched tree (required for "StillPresent")
 - "decision": "Report" or "Drop"
 - "drop_reason": why the bug is dropped (required for "Drop", empty for "Report")
-- "report_text": the note to the author (required for "Report", empty for "Drop")
+- "report_text": the note to the author, integrating [BUG_REF] naturally into the opening sentence (required for "Report", empty for "Drop")
 
 Example Output:
 ```json
@@ -394,7 +394,7 @@ Example Output:
   "post_patch_evidence": "drivers/foo/foo.c:212: if (!buf)\n\treturn -EINVAL;",
   "decision": "Report",
   "drop_reason": "",
-  "report_text": "This isn't a bug introduced by this patch, but the same missing unlock exists a few lines below the path you fixed:\n\n> \tif (!buf)\n> \t\treturn -EINVAL;\n\nfoo_probe() returns here with dev->lock still held. Would it make sense to route this through the same out_unlock label in this series?"
+  "report_text": "This isn't a bug introduced by this patch, but the same missing unlock [BUG_REF] exists a few lines below the path you fixed:\n\n> \tif (!buf)\n> \t\treturn -EINVAL;\n\nfoo_probe() returns here with dev->lock still held. Would it make sense to route this through the same out_unlock label in this series?"
 }
 ```"#;
 
@@ -433,6 +433,15 @@ pub fn validate_disclosure_check(out: &DisclosureCheckOutput) -> Result<(), Stri
                 return Err(
                     "\"report_text\" must be plain text; remove every backtick.".to_string()
                 );
+            }
+            if !out
+                .report_text
+                .contains(crate::related_preexisting::BUG_REF_PLACEHOLDER)
+            {
+                return Err(format!(
+                    "\"report_text\" must include the {} placeholder integrated naturally into the opening sentence.",
+                    crate::related_preexisting::BUG_REF_PLACEHOLDER
+                ));
             }
         }
         DisclosureDecision::Drop => {
@@ -758,8 +767,9 @@ diff --git a/mm/foo.c b/mm/foo.c
             post_patch_evidence: "mm/foo.c:20: return -EINVAL;".to_string(),
             decision,
             drop_reason: String::new(),
-            report_text: "> return -EINVAL;\n\nThis isn't introduced by this patch, but ..."
-                .to_string(),
+            report_text:
+                "> return -EINVAL;\n\nThis isn't introduced by this patch, but the leak [BUG_REF] ..."
+                    .to_string(),
         }
     }
 
@@ -801,11 +811,19 @@ diff --git a/mm/foo.c b/mm/foo.c
         );
 
         let mut ticks = check(DisclosureDecision::Report);
-        ticks.report_text = "use `foo()`".to_string();
+        ticks.report_text = "use `foo()` [BUG_REF]".to_string();
         assert!(
             validate_disclosure_check(&ticks)
                 .unwrap_err()
                 .contains("backtick")
+        );
+
+        let mut no_bug_ref = check(DisclosureDecision::Report);
+        no_bug_ref.report_text = "This isn't introduced by this patch.".to_string();
+        assert!(
+            validate_disclosure_check(&no_bug_ref)
+                .unwrap_err()
+                .contains("[BUG_REF]")
         );
 
         let drop_without_reason = check(DisclosureDecision::Drop);
