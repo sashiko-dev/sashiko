@@ -17,6 +17,7 @@ use crate::baseline::CommitId;
 use crate::db::{AttributedSubsystem, Database, Finding, Severity};
 use crate::events::Event;
 use crate::fetcher::FetchAgent;
+use crate::prior_context::{OriginKind, SASHIKO_IDENTITY};
 use crate::project::ProjectId;
 use crate::reviewer::{Reviewer, WorkerSubprocessOverrides};
 use crate::settings::Settings;
@@ -252,7 +253,7 @@ impl BenchmarkEntry {
                 };
                 if canonical_reviewer_identity(reviewer).is_none() {
                     bail!(
-                        "case {label}: expected_reviewer {reviewer:?} must be \"Name <email>\" or \"Sashiko\""
+                        "case {label}: expected_reviewer {reviewer:?} must be \"Name <email>\"; Sashiko is never credited"
                     );
                 }
                 let Some(version) = self.expected_prior_version else {
@@ -269,7 +270,7 @@ impl BenchmarkEntry {
                     .find(|r| canonical_reviewer_identity(r).is_none())
                 {
                     bail!(
-                        "case {label}: expected_co_reviewers entry {bad:?} must be \"Name <email>\" or \"Sashiko\""
+                        "case {label}: expected_co_reviewers entry {bad:?} must be \"Name <email>\"; Sashiko is never credited"
                     );
                 }
                 if self.is_versioned() && !self.ancestor_mboxes.iter().any(|a| a.version == version)
@@ -320,7 +321,7 @@ impl BenchmarkEntry {
         for acc in &self.acceptable_attributions {
             if canonical_reviewer_identity(&acc.reviewer).is_none() {
                 bail!(
-                    "case {label}: acceptable_attributions reviewer {:?} must be \"Name <email>\" or \"Sashiko\"",
+                    "case {label}: acceptable_attributions reviewer {:?} must be \"Name <email>\"; Sashiko is never credited",
                     acc.reviewer
                 );
             }
@@ -374,11 +375,12 @@ pub fn validate_benchmark_entries(entries: &[BenchmarkEntry]) -> Result<()> {
 /// Canonical identity for an expected reviewer, compared exactly against the
 /// `raised_by_identities` of a finding's structured prior attribution.
 ///
-/// "Sashiko" maps to `sashiko`; "Name <email>" maps to the lowercased email.
+/// "Name <email>" maps to the lowercased email. "Sashiko" has no reviewer
+/// identity: reviews never credit Sashiko, so ground truth cannot expect it.
 fn canonical_reviewer_identity(reviewer: &str) -> Option<String> {
     let trimmed = reviewer.trim();
     if trimmed.eq_ignore_ascii_case("sashiko") {
-        return Some("sashiko".to_string());
+        return None;
     }
     canonical_identity(trimmed)
 }
@@ -435,6 +437,8 @@ struct ScoredPriorAttribution {
     #[serde(default)]
     originally_raised_in_version: Option<u32>,
     #[serde(default)]
+    origin_kind: Option<String>,
+    #[serde(default)]
     raised_by_identities: Vec<String>,
     #[serde(default)]
     evidence: Vec<ScoredAttributionEvidence>,
@@ -460,7 +464,7 @@ pub(crate) fn score_attribution(
     }
     let attribution = matched_finding
         .and_then(|f| f.prior_attribution.as_ref())
-        .filter(|v| !v.is_null());
+        .filter(|v| !v.is_null() && !is_linkage_only(v));
     let Some(raw) = attribution else {
         return entry
             .expected_behavior
@@ -475,6 +479,26 @@ pub(crate) fn score_attribution(
         return Some(AttributionOutcome::Acceptable);
     }
     Some(AttributionOutcome::Wrong)
+}
+
+/// Whether a stored attribution only links a finding to earlier Sashiko
+/// reviews instead of crediting someone (see `PriorAttribution::is_credit`).
+/// Older outputs without `origin_kind` count as linkage-only when Sashiko is
+/// their only identity. Linkage-only attributions are scored as no credit.
+fn is_linkage_only(raw: &Value) -> bool {
+    let Ok(parsed) = serde_json::from_value::<ScoredPriorAttribution>(raw.clone()) else {
+        return false;
+    };
+    match parsed.origin_kind.as_deref() {
+        Some(kind) => kind == OriginKind::SashikoReview.as_str(),
+        None => {
+            !parsed.raised_by_identities.is_empty()
+                && parsed
+                    .raised_by_identities
+                    .iter()
+                    .all(|id| id.trim().eq_ignore_ascii_case(SASHIKO_IDENTITY))
+        }
+    }
 }
 
 /// An attribution is acceptable when every credited identity is covered by
@@ -5129,8 +5153,10 @@ mod tests {
             score_attribution(&entry, Some(&f)),
             Some(AttributionOutcome::Wrong)
         );
+    }
 
-        let sashiko = attribution_entry("Sashiko", 1, &["v1-p1@example.com"]);
+    #[test]
+    fn test_score_attribution_treats_sashiko_linkage_as_no_credit() {
         let pf = serde_json::json!({
             "originally_raised_by": "Sashiko",
             "originally_raised_in_version": 1,
@@ -5138,11 +5164,27 @@ mod tests {
             "raised_by_identities": ["sashiko"],
             "evidence": [{ "source_ref": "PF1", "version": 1, "message_id": "v1-p1@example.com", "quote": "q" }]
         });
-        let f = finding_with_attribution(Some(pf));
-        assert_eq!(
-            score_attribution(&sashiko, Some(&f)),
-            Some(AttributionOutcome::Correct)
-        );
+        // Older outputs lack origin_kind; Sashiko as the only identity is
+        // still linkage, not credit.
+        let legacy = serde_json::json!({
+            "originally_raised_in_version": 1,
+            "raised_by_identities": ["sashiko"],
+            "evidence": [{ "message_id": "v1-p1@example.com" }]
+        });
+        let detect_bug = BenchmarkEntry {
+            commit: "c@example.com".to_string(),
+            expected_behavior: BenchmarkExpectedBehavior::DetectBug,
+            ..Default::default()
+        };
+        let human = attribution_entry("Jan Kara <jack@suse.cz>", 1, &["m1@suse.cz"]);
+        for raw in [pf, legacy] {
+            let f = finding_with_attribution(Some(raw));
+            assert_eq!(score_attribution(&detect_bug, Some(&f)), None);
+            assert_eq!(
+                score_attribution(&human, Some(&f)),
+                Some(AttributionOutcome::Missing)
+            );
+        }
     }
 
     #[test]
@@ -5443,7 +5485,7 @@ mod tests {
         assert_eq!(score_attribution(&suppression, Some(&f)), None);
 
         // No matched finding on an attribution entry means missing credit.
-        let entry = attribution_entry("Sashiko", 1, &["v1-p1@example.com"]);
+        let entry = attribution_entry("Jan Kara <jack@suse.cz>", 1, &["m1@suse.cz"]);
         assert_eq!(
             score_attribution(&entry, None),
             Some(AttributionOutcome::Missing)
@@ -5480,6 +5522,10 @@ mod tests {
             prior_findings: vec![],
         }];
         assert!(not_an_ancestor.validate_attribution_labels().is_err());
+
+        let sashiko = attribution_entry("Sashiko", 1, &["v1-p1@example.com"]);
+        let err = sashiko.validate_attribution_labels().unwrap_err();
+        assert!(err.to_string().contains("Sashiko is never credited"));
 
         let detect_bug_with_reviewer = BenchmarkEntry {
             expected_behavior: BenchmarkExpectedBehavior::DetectBug,
@@ -6201,8 +6247,7 @@ mod tests {
     }
 
     /// Checks that every Message-ID in `ids` names a message in the bundled
-    /// mbox of `version` whose From address is one of `reviewers`. For
-    /// Sashiko, the ID must be the patch a seeded prior finding is attached to.
+    /// mbox of `version` whose From address is one of `reviewers`.
     fn resolve_credit_ids(
         entry: &BenchmarkEntry,
         archive: &HashMap<String, String>,
@@ -6232,19 +6277,11 @@ mod tests {
             .iter()
             .filter_map(|r| canonical_reviewer_identity(r))
             .collect();
-        let seeded: BTreeSet<&str> = ancestor
-            .prior_findings
-            .iter()
-            .filter_map(|pf| pf.patch_message_id.as_deref())
-            .collect();
         for mid in ids {
             let Some(author) = authors.get(mid.as_str()) else {
                 failures.push(format!("case {cid}: {mid} not in v{version} mbox"));
                 continue;
             };
-            if accepted.contains("sashiko") && seeded.contains(mid.as_str()) {
-                continue;
-            }
             let from = canonical_identity(author).unwrap_or_default();
             if !accepted.contains(&from) {
                 failures.push(format!(
