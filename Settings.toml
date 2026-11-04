@@ -132,6 +132,17 @@ ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
 # Reasoning effort on Argon models: "low", "mid" (default), "high", or
 # "dynamic". Other models ignore it.
 # effort = "mid"
+# Skip the model run for a patch whose diff matches, modulo rebase noise,
+# a patch already reviewed with no findings. The patch gets a Skipped
+# review that names the review it inherits from.
+# skip_unchanged_clean = false
+# Only reuse a clean review completed within this many days.
+# skip_unchanged_clean_max_age_days = 90
+# Reuse a clean review even when the model or prompts have changed.
+# skip_unchanged_clean_any_model = false
+# Reuse a clean review only when the baseline commit is the same and the
+# patches ahead of it in the series are unchanged too.
+# skip_unchanged_clean_require_same_baseline = false
 # Default queue dispatch priority for patchsets (default: 500).
 # default_priority = 500
 # Sliding window duration in seconds for author batch submission deprioritization (default: 30).

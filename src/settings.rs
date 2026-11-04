@@ -1237,6 +1237,30 @@ pub struct ReviewSettings {
     /// Combine exploratory analysis stages into a single stage to reduce cost and latency.
     #[serde(default)]
     pub cheap: bool,
+    /// Skip the model run for a patch whose diff matches, modulo rebase
+    /// noise, a patch already reviewed to completion with no findings.
+    /// The patch gets a Skipped review that names the review it inherits
+    /// from. A review narrowed by `cheap` or `--stages` is reused only by
+    /// a review narrowed the same way. Off by default; see
+    /// designs/DESIGN_SKIP_UNCHANGED_CLEAN_PATCHES.md.
+    #[serde(default)]
+    pub skip_unchanged_clean: bool,
+    /// Only a clean review completed within this many days is reused.
+    /// With the baseline check off this is the only bound on how stale an
+    /// inherited verdict can be.
+    #[serde(default = "default_skip_unchanged_clean_max_age_days")]
+    pub skip_unchanged_clean_max_age_days: u64,
+    /// Reuse a clean review produced by a different model or prompt set.
+    /// Off by default, because a prompt or model change is exactly when a
+    /// re-review of an old clean patch is worth paying for.
+    #[serde(default)]
+    pub skip_unchanged_clean_any_model: bool,
+    /// Reuse a clean review only when it ran against the same baseline
+    /// commit and the patches ahead of it in the series are unchanged
+    /// too. Off by default: a reposted series nearly always lands on a
+    /// newer tip, so requiring the same tree would skip almost nothing.
+    #[serde(default)]
+    pub skip_unchanged_clean_require_same_baseline: bool,
     #[serde(skip)]
     pub stages: Option<Vec<String>>,
 }
@@ -1300,6 +1324,10 @@ fn default_review_timeout() -> u64 {
 
 fn default_max_retries() -> u32 {
     3
+}
+
+fn default_skip_unchanged_clean_max_age_days() -> u64 {
+    90
 }
 
 fn default_email_policy_path() -> String {
@@ -1930,6 +1958,39 @@ mod tests {
         assert!(settings.database.url.is_empty());
         assert!(settings.git.repository_path.is_empty());
         assert!(settings.validate_for_daemon().is_err());
+    }
+
+    /// The clean-review reuse knobs are off unless asked for, with the age
+    /// bound the only one that carries a non-zero default.
+    #[test]
+    fn test_skip_unchanged_clean_defaults_off_and_parses() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Settings.toml");
+        let ai = "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n";
+
+        std::fs::write(&path, format!("{}\n[review]\nconcurrency = 8\n", ai)).unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        assert!(!settings.review.skip_unchanged_clean);
+        assert_eq!(settings.review.skip_unchanged_clean_max_age_days, 90);
+        assert!(!settings.review.skip_unchanged_clean_any_model);
+        assert!(!settings.review.skip_unchanged_clean_require_same_baseline);
+
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n[review]\nconcurrency = 8\nskip_unchanged_clean = true\n\
+                 skip_unchanged_clean_max_age_days = 7\n\
+                 skip_unchanged_clean_any_model = true\n\
+                 skip_unchanged_clean_require_same_baseline = true\n",
+                ai
+            ),
+        )
+        .unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        assert!(settings.review.skip_unchanged_clean);
+        assert_eq!(settings.review.skip_unchanged_clean_max_age_days, 7);
+        assert!(settings.review.skip_unchanged_clean_any_model);
+        assert!(settings.review.skip_unchanged_clean_require_same_baseline);
     }
 
     /// A local review's own reduced shape ignored keys it did not know, so a
