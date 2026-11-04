@@ -1,0 +1,584 @@
+[
+    {
+        "Commit": "8a39d00670f0792c1186e442e1dd28fe0326f2ee",
+        "Fixed-by": "3a07249981629ace483ebbef81ef6b34c2d2afec",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_io_bus_get_dev() releases kvm->srcu before returning the matched kvm_io_device, so the device can be unregistered and freed while the caller inspects it."
+    },
+    {
+        "Commit": "0cfc85b8f5cf3b77463d61542191c75ba0cc3a5f",
+        "Fixed-by": "9f1667098c6ae7ec81a9a56859cfdacb822aa0d0",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_hyp_handle_fpsimd()'s ESR_ELx_EC_SYS64 case WARNs if !is_hyp_ctxt(), but kvm_hyp_handle_zcr_el2() reaches it for a ZCR_EL2 access from a nested (non-hyp) context, which a guest can trigger; at EL2 the WARN becomes a hyp_panic."
+    },
+    {
+        "Commit": "a1319260bf62951e279ea228f682bf4b8834a3c2",
+        "Fixed-by": "d133aa75e39dd72e0b8577ab1f5fc17c72246536",
+        "subsystem": "kvm/arm64",
+        "problem_description": "__debug_save_trace() prohibits trace via TRFCR_EL1 but leaves the TRBE Trace Buffer Unit enabled (TRBLIMITR_EL1.E), which may still translate host VAs out of context in guest/EL2 context: SErrors, corruption, lockups."
+    },
+    {
+        "Commit": "0bc9a9e85fcf4ffb69846b961273fde4eb0d03ab",
+        "Fixed-by": "2e813a6e8ebe142a7f40e39cebb924223914c130",
+        "subsystem": "kvm/arm64",
+        "problem_description": "__timer_enable_traps() sets CNTHCTL_EL1TVT/EL1TVCT unconditionally when has_broken_cntvoff(), unlike timer_set_traps() which requires a non-zero vtimer offset; under hVHE every guest traps its virtual timer, and a protected guest, whose sysreg handler lacks CNTV_*, gets an UNDEF."
+    },
+    {
+        "Commit": "afa9b48f327c9ef36bfba4c643a29385a633252b",
+        "Fixed-by": "028d8df0a1e376c6a87409302d9b6131ea4374f6",
+        "subsystem": "kvm/arm64",
+        "problem_description": "___kvm_hyp_init() stashes LR in kvm_nvhe_init_params::tmp with the EL2 stage-1 MMU off; the field is not CWG-aligned or padded, so a write-back of a dirty line shared with adjacent cacheable data can overwrite the saved LR during __kvm_init_el2_state()."
+    },
+    {
+        "Commit": "e728e705802fec20f65d974a5d5eb91217ac618d",
+        "Fixed-by": "8531d5a83d8eb8affb5c0249b466c28d94192603",
+        "subsystem": "kvm/arm64",
+        "problem_description": "host_stage2_adjust_range() no longer falls back to a PAGE_SIZE granule: if no level's granule fits inside the memblock range (sub-page or non-aligned region) it returns -EINVAL with a WARN, the host stage-2 is never mapped and the faulting access loops forever."
+    },
+    {
+        "Commit": "07aeb70707b1d52968f4959a5dba321ea4219c8a",
+        "Fixed-by": "5e66f723d4de432a5acb481293d81dc88c7f61a4",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_arch_init_vm() calls pkvm_init_host_vm() after kvm_init_stage2_mmu() succeeded, but on failure jumps to err_free_cpumask, never calling kvm_uninit_stage2_mmu(), leaking the stage-2 page-table."
+    },
+    {
+        "Commit": "0c4762e26879acc101790269382f230f22fd6905",
+        "Fixed-by": "ec197dca8735f7627e5cff7e3fa8839b53a28514",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_arch_flush_shadow_all() returns early when nested_mmus_size is 0, skipping the trailing kvm_uninit_stage2_mmu(kvm) for every non-nested VM; the stage-2 is never torn down and, under pKVM, guest pages stay shared with EL2."
+    },
+    {
+        "Commit": "50f77dc87f133b09db44a5bbfdd64b1ca83a8d8e",
+        "Fixed-by": "f2ca45b50d4216c9cc7ffabf50d9ad1932209251",
+        "subsystem": "kvm/arm64",
+        "problem_description": "inject_abt64() now calls __kvm_find_s1_desc_level() to rewalk the guest's stage-1 tables, which reads guest memory via memslots, but kvm_inject_sea() callers do not hold kvm->srcu and neither function takes it, racing against memslot updates."
+    },
+    {
+        "Commit": "281c6c06e2a7bc331cbe02ad21f1390820d28d59",
+        "Fixed-by": "6da5e537f5afe091658e846da1949d7e557d2ade",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_v2_fold_lr_state() replays EOIcount deactivations from the head of ap_list, but EOIcount covers only interrupts not in an LR; interrupts activated from the LRs before exit are deactivated in their place, losing interrupts."
+    },
+    {
+        "Commit": "b7f345fbc32afab0f0b03c71c7eaf48b9a0ad7ed",
+        "Fixed-by": "ebbcaece84738f71b35f32339bdeb8776004e641",
+        "subsystem": "kvm/arm64",
+        "problem_description": "pkvm_init_features_from_host() copies KVM_ARCH_FLAG_MTE_ENABLED from host_kvm->arch.flags for every VM, so protected VMs get MTE (and HCR_ATA) though MTE is not an allowed pVM feature; it also re-reads host memory instead of the host_arch_flags snapshot."
+    },
+    {
+        "Commit": "3669ddd8fa8b5a46d96b9c54a6fa519a17e4a4fa",
+        "Fixed-by": "c243222701690da30c010d6b98545684f5d78b15",
+        "subsystem": "kvm/arm64",
+        "problem_description": "pkvm_pgtable_stage2_map() WARNs on any __pkvm_host_share_guest() failure, but that hypercall rejects device mappings (PROT_DEVICE, non-memblock pfns), all reachable from a guest fault on a VMM-provided memslot, so host input splats a WARN."
+    },
+    {
+        "Commit": "62a89c44954f09072bf07a714c8f68bda14ab87e",
+        "Fixed-by": "47746d4b7436ba802f6d7627118649ae108ee24a",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_handle_cp15_64() writes Rt2 = Rt >> 32 for every MRRC after emulate_cp15(), including when no handler matched and an UNDEF was injected; the guest then takes the UNDEF with Rt2 corrupted, though an UNDEFINED instruction must not modify registers."
+    },
+    {
+        "Commit": "2a359e072596fcb2e9e85017a865e3618a2fe5b5",
+        "Fixed-by": "4bd7dbe0b2243e6aa735cae4d5e1ff988b30b2a6",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_map_l1_vncr() maps the page backing the L1's VNCR_EL2 with cacheable PAGE_KERNEL attributes without checking it is normal memory; if the L1 points VNCR_EL2 at a device-backed IPA, KVM creates a cacheable mapping of MMIO, which can raise an SError on writeback."
+    },
+    {
+        "Commit": "3aed038aac8d897016a2b6e1935f16c7640918d4",
+        "Fixed-by": "0f7abb6eaa3c3965f925e231c18409dac4f5a0c1",
+        "subsystem": "kvm/arm64",
+        "problem_description": "hyp_trace_buffer_unshare_hyp() calls __share_page() instead of __unshare_page() on each per-CPU meta page, so under pKVM the meta pages stay shared with the hypervisor after unload or on error and are freed to the host while still hyp-shared, leaking that state."
+    },
+    {
+        "Commit": "2937aeec9dc5d25a02c1415a56d88ee4cc17ad83",
+        "Fixed-by": "e07fc9e2da91f6d9eeafa2961be9dc09d65ed633",
+        "subsystem": "kvm/arm64",
+        "problem_description": "user_mem_abort()'s new esr_fsc_is_excl_atomic_fault() path injects the data abort and returns 1 without releasing the page reference from __kvm_faultin_pfn(); a guest repeating the fault leaks host page references until memory is exhausted."
+    },
+    {
+        "Commit": "7270cc9157f474dfc46750a34c9d7defc686b2eb",
+        "Fixed-by": "4c74e233cdedd11592775fae2a6243e67ca3f891",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_nested_s2_unmap() and kvm_nested_s2_wp() read kvm->arch.mmu.pgt->ia_bits after nested S2 walks that can drop mmu_lock; a concurrent kvm_arch_flush_shadow_all() can free the canonical pgt and set it NULL meanwhile, causing a host NULL dereference."
+    },
+    {
+        "Commit": "03b3d00a70b55857439511c1b558ca00a99f4126",
+        "Fixed-by": "f19c354dbd457759dfcf1195ab4bdba2bb568323",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_vgic_vcpu_init() allocates vgic_cpu->private_irqs and then returns the vgic_register_redist_iodev() error without freeing them; kvm_arch_vcpu_create() propagates the error without vgic teardown, so each failed vCPU creation leaks the private IRQ array."
+    },
+    {
+        "Commit": "4f128f8e1aaac189f83d0f828bcdb2986d8d2e51",
+        "Fixed-by": "33346f8960c7bb6a3b4e273b5cfe25c5a8be349f",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_vcpu_init_nested() grows kvm->arch.nested_mmus with kvrealloc(); if another vCPU is running an L2 with vcpu->arch.hw_mmu pointing into the old array, that pointer is left dangling and the vCPU keeps using freed kvm_s2_mmu memory."
+    },
+    {
+        "Commit": "1d6f83f60f79ff0118823d904dc1f04ba89f9428",
+        "Fixed-by": "21f12496fdd357ad4e1fcdd07dc80ab7378f7d24",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_add_lpi() reserves the lpi_xa slot before taking lpi_list_lock; if the slot is still populated, nothing is allocated, a concurrent __vgic_put_lpi_locked() can erase it and free the node, and the xa_store(..., 0) under the lock then fails with -ENOMEM."
+    },
+    {
+        "Commit": "256b4668cd890b741c54f83dbbef76ba847c23be",
+        "Fixed-by": "20d2753295b1cd3c766199b5990119ca514e1302",
+        "subsystem": "kvm/arm64",
+        "problem_description": "In __pkvm_init_vm(), insert_vm_table_entry() can now fail on a host-chosen unreserved handle after kvm_guest_prepare_stage2() set up the guest stage-2; the error path returns the donated PGD pages to the host without destroying the page table, leaving hyp page references behind."
+    },
+    {
+        "Commit": "61e30b9eef7ffc7f88ffd95e969cfb662e41bb05",
+        "Fixed-by": "4c2264ecdf39ddbdb62e37b156015aacf05d0dcb",
+        "subsystem": "kvm/arm64",
+        "problem_description": "check_base_s2_limits() checks the starting level and input size against get_ia_size(wi), the input size itself, instead of the implemented PA size, so valid guest S2 configurations (4K granule, 40-bit input, level 0 on a 48-bit PA system) are rejected and the nested walk fails."
+    },
+    {
+        "Commit": "4ffa72ad8f37e73bbb6c0baa88557bcb4fd39929",
+        "Fixed-by": "4be6cbeb93d26994bd1827ddbce391e3c4395c8f",
+        "subsystem": "kvm/arm64",
+        "problem_description": "invalidate_vncr_va() walks all vCPUs and reads vcpu->arch.vncr_tlb->valid without a NULL check, but vncr_tlb is only allocated on a vCPU's first run; a TLBI S1E2 from one vCPU while another has not yet run dereferences NULL in the host."
+    },
+    {
+        "Commit": "1e579adca1774b3713d1efa67d92a88ec86c04fa",
+        "Fixed-by": "effc0a39b8e0f30670fe24f51e44329d4324e566",
+        "subsystem": "kvm/arm64",
+        "problem_description": "__pkvm_host_donate_guest() transfers host ownership and then WARN_ON()s kvm_pgtable_stage2_map(), which can fail with -ENOMEM when the host under-provisions the vCPU memcache; at nVHE EL2 the WARN is a hyp panic, so the host can crash the hypervisor."
+    },
+    {
+        "Commit": "6da5e537f5afe091658e846da1949d7e557d2ade",
+        "Fixed-by": "19bc5d79ece613f242b5ec03921a3b465321bfed",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_flush_lr_state() records an unreferenced vgic_irq pointer in last_lr_irq; if that LPI is removed from the ap_list and freed while the vCPU runs, vgic_v{2,3}_fold_lr_state() continues the ap_list walk from freed memory."
+    },
+    {
+        "Commit": "d54594accf732d17891d276aa1f545ef25606555",
+        "Fixed-by": "cbfe2b24a1ea9de35032dbdd100fdc700f5be92d",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_put_irq_norelease() leaves a refcount-0 LPI in lpi_xa for vgic_release_deleted_lpis() to free later; a concurrent vgic_add_lpi() for the same INTID overwrites that entry with __xa_store(), orphaning the old vgic_irq (memory leak)."
+    },
+    {
+        "Commit": "4f128f8e1aaac189f83d0f828bcdb2986d8d2e51",
+        "Fixed-by": "70543358fa08e0f7cebc3447c3b70fe97ad7aaa8",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_vcpu_init_nested() reallocates kvm->arch.nested_mmus with kvrealloc() holding only config_lock, while get_s2_mmu_nested() and lookup_s2_mmu() walk the array under kvm->mmu_lock, so a concurrent walker can read the freed array."
+    },
+    {
+        "Commit": "be097997a273259f1723baac5463cf19d8564efa",
+        "Fixed-by": "100baf0184896f859290a684f864b8200d8ac872",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_pgtable_stage2_relax_perms() now issues the TLBI on -EAGAIN using the local level, which stage2_update_leaf_attrs() leaves unwritten on a walk error; an uninitialised value becomes the TTL hint, so the invalidation can target the wrong level and miss the stale entry."
+    },
+    {
+        "Commit": "3669ddd8fa8b5a46d96b9c54a6fa519a17e4a4fa",
+        "Fixed-by": "08f97454b7fa39bfcf82524955c771d2d693d6fe",
+        "subsystem": "kvm/arm64",
+        "problem_description": "pkvm_pgtable_stage2_map() looks for existing mappings with the unaligned addr; with pages larger than 4kB the fault IPA carries offset bits, the range overlaps the next page's mapping, -EAGAIN is returned and the guest refaults forever."
+    },
+    {
+        "Commit": "5db1bef933427aa467ad89c7b695a84a6b4afe16",
+        "Fixed-by": "a1b3c788ad31837e348075e93dbba3f447492776",
+        "subsystem": "kvm/arm64",
+        "problem_description": "On failure, pkvm_vcpu_init_sve() clears KVM_ARM_VCPU_SVE in the VM-wide kvm->arch.vcpu_features, but vcpu_has_sve() tests KVM_ARCH_FLAG_GUEST_HAS_SVE, which stays set. Later vCPUs skip SVE setup and run with a NULL sve_state that the hyp FP/SVE restore dereferences."
+    },
+    {
+        "Commit": "3aed038aac8d897016a2b6e1935f16c7640918d4",
+        "Fixed-by": "ca28278d10ec234592989ad370d58294b9d43e0f",
+        "subsystem": "kvm/arm64",
+        "problem_description": "hyp_trace_load() sizes the struct hyp_trace_desc allocation as PAGE_ALIGN(trace_buffer_desc_size()), ignoring the 16-byte header before trace_buffer_desc, and passes that size to trace_remote_alloc_buffer(). When the size is a page multiple, the descriptor is written past the allocation."
+    },
+    {
+        "Commit": "3aed038aac8d897016a2b6e1935f16c7640918d4",
+        "Fixed-by": "a23780ea9db3f3cadbb52ff6151384bff89d95d2",
+        "subsystem": "kvm/arm64",
+        "problem_description": "On a share failure, hyp_trace_buffer_share_hyp() leaves the failing CPU's meta_va shared with the hypervisor. The post-decrement cpu-- also makes hyp_trace_buffer_unshare_hyp() unshare that CPU's pages again, including pages never shared (WARN, refcount imbalance)."
+    },
+    {
+        "Commit": "f50758260bfff393f2a800469b37c45a7ef50376",
+        "Fixed-by": "e913c7ce9e6f62038a486218f43f699fc443e3e1",
+        "subsystem": "kvm/arm64",
+        "problem_description": "pvm_init_traps_mdcr() sets MDCR_EL2.E2TB when the protected guest lacks the trace buffer feature, but E2TB clear is what traps TRB register accesses to EL2, so the guest gets untrapped access to trace buffer registers."
+    },
+    {
+        "Commit": "7270cc9157f474dfc46750a34c9d7defc686b2eb",
+        "Fixed-by": "8053393680d4fa3eb962667d2be95dd39f0940e5",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_invalidate_vncr_ipa() sizes the VNCR mapping through pgshift_level_to_ttl(vt->wi.pgshift, vt->wr.level), which takes a u8 level. With the guest's EL2 S1 MMU off (level S1_MMU_DISABLED, -127, pgshift unset), it truncates the level and can BUG() or yield a size of 0, mis-scoping the invalidation."
+    },
+    {
+        "Commit": "2de451a329cf662beeba71f63c7f83ee24ca6642",
+        "Fixed-by": "ff1022c3de46753eb7eba2f6efd990569e66ff95",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_hyp_handle_mops() writes *vcpu_cpsr(vcpu) straight into SPSR_EL2. For a guest hypervisor at vEL2, early_exit_filter() has turned vcpu_cpsr() into the synthetic EL2 PSTATE, so the ERET uses an untranslated EL2 mode instead of the hardware EL1 mode."
+    },
+    {
+        "Commit": "680a04c333fa29bf92007efe11431be005e8c4bb",
+        "Fixed-by": "1702da76e017ae0fbe1a92b07bc332972c293e89",
+        "subsystem": "kvm/arm64",
+        "problem_description": "In __tracing_load(), a descriptor rejected by hyp_trace_desc_validate() jumps to err_release_desc with ret still 0, so the __tracing_load hypercall tells the host the trace buffer was loaded when it was not."
+    },
+    {
+        "Commit": "41b87599c74300027f305d7b34368ec558978ff2",
+        "Fixed-by": "93cfad8da7164b095b2402ec9b2067fa15d6f250",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_get_irq() applies array_index_nospec() to the absolute intid and only then indexes spis[intid - VGIC_NR_PRIVATE_IRQS]. On a speculative bypass of the private-IRQ branch, an intid < 32 survives the clamp and the subtraction underflows into an out-of-bounds speculative read."
+    },
+    {
+        "Commit": "f6927b41d57390c597a126063e2e518911976878",
+        "Fixed-by": "0496acc42fb51eee040b5170cec05cec41385540",
+        "subsystem": "kvm/arm64",
+        "problem_description": "__kvm_at_swap_desc() computes ptep = (u64 __user *)hva + offset, where offset is a byte offset from offset_in_page(ipa). Pointer arithmetic scales it by 8, so the CAS hits the wrong guest address (possibly past the page) instead of the descriptor."
+    },
+    {
+        "Commit": "57a9a117154c93539e33161dd318e6aeb8c04efa",
+        "Fixed-by": "9ce754ed8e7ab4e3999767ce1505f85c449ccb07",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_its_restore_dte() takes num_eventid_bits from the userspace-supplied DTE Size field (up to 32) and allocates the device without the VITS_TYPER_IDBITS bound that MAPD enforces. A restored device then accepts EventIDs beyond what the virtual ITS advertises."
+    },
+    {
+        "Commit": "7270cc9157f474dfc46750a34c9d7defc686b2eb",
+        "Fixed-by": "0c4762e26879acc101790269382f230f22fd6905",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_nested_s2_wp() and kvm_nested_s2_unmap() compute BIT(kvm->arch.mmu.pgt->ia_bits) for every VM. Under pKVM, ia_bits aliases the pkvm_mappings rb_root in struct kvm_pgtable, so the shift amount is made of pointer bits: undefined behaviour (UBSAN shift-out-of-bounds)."
+    },
+    {
+        "Commit": "4ffa72ad8f37e73bbb6c0baa88557bcb4fd39929",
+        "Fixed-by": "2b7324f3a0c1072b9d578b8d42f199506753f26e",
+        "subsystem": "kvm/arm64",
+        "problem_description": "invalidate_vncr_va() drops VNCR pseudo-TLB entries for a TLBI S1E2 under mmu_lock but does not bump kvm->mmu_invalidate_seq. A concurrent kvm_translate_vncr() that walked S1 before the TLBI therefore still installs its now-stale translation."
+    },
+    {
+        "Commit": "1a919b17ef012ca0572bae759c27e5ea02bfb47f",
+        "Fixed-by": "3a8c562892b96f35bba1e00d5e455a15963bbb92",
+        "subsystem": "kvm/arm64",
+        "problem_description": "recreate_hyp_mappings() now maps each hyp stack only in the private VA range, but finalize_host_mappings() walks only the linear-map alias of hyp_memory. The stack pages are never transferred to the hypervisor in host stage-2, so the host keeps read/write access to the EL2 stacks."
+    },
+    {
+        "Commit": "b30070862edbdb252f9d0d3a1e61b8dc4c68e3d2",
+        "Fixed-by": "85f56708a443ec02a290878f00d79a1ff5110e41",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vcpu_data_host_to_guest() now masks little-endian guest data to the access width, but kvm_handle_mmio_return() sign-extends before calling it. Sign-extending MMIO loads (LDRSB/LDRSH/LDRSW) therefore return a zero-extended value to the guest."
+    },
+    {
+        "Commit": "7c4f73548ed15476daf1101f66648085eda65067",
+        "Fixed-by": "beca1b97a21d81eae9cbd267ecc44b5d2193e60a",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_ptdump_guest_show() calls note_page() only from the leaf visitor. note_page() emits a range only when level/prot changes, and nothing flushes after kvm_pgtable_walk(), so the last contiguous region of the guest stage-2 is missing from the dump."
+    },
+    {
+        "Commit": "06c85b58e0b13e67f4e56cbba346201bfe95ad00",
+        "Fixed-by": "302f94dc3f8c21c97d5e91a61a8987810803be6f",
+        "subsystem": "kvm/arm64",
+        "problem_description": "timer_irqs_are_valid() calls kvm_vgic_set_owner() on the userspace-chosen timer PPI before the GICv5 architected-ID check. A configuration it then rejects still claims ownership of that PPI, and a later corrected configuration can fail with -EEXIST."
+    },
+    {
+        "Commit": "4d591252bacb2d004b7c7f5db439bfa23b552ee7",
+        "Fixed-by": "2962174fdfa63e272082ea7ae989a8fdef29bd0e",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_get_vcpu_irq() accepts any GICv5 intid passing __irq_is_ppi() (type check only); an ID >= VGIC_V5_NR_PRIVATE_IRQS is clamped by array_index_nospec() to 0 and silently aliases PPI 0 instead of returning NULL."
+    },
+    {
+        "Commit": "9019e82c7e46c03c37e8b108473d02b543222d9f",
+        "Fixed-by": "373452ac0649846431ca0f88574a2fa6382d2045",
+        "subsystem": "kvm/arm64",
+        "problem_description": "__hyp_do_panic tests '#ifdef PKVM_DISABLE_STAGE2_ON_PANIC' (missing CONFIG_ prefix), so the host stage-2 is never disabled on hyp panic even with the option set, while nvhe_hyp_panic_handler() then reads bug tables and stacktraces as if it were."
+    },
+    {
+        "Commit": "b56680de9c6489f2aed707fad2811e714b52fe4c",
+        "Fixed-by": "04447b95c62bef2b3591486c66244c49591a3dbd",
+        "subsystem": "kvm/arm64",
+        "problem_description": "flush_hyp_vcpu() copies only HCR_TWI/TWE from the host vcpu's hcr_el2, also for non-protected VMs; host-set VI/VF (userspace irqchip IRQ/FIQ lines) and TVM (set/way emulation on non-FWB CPUs) never reach the running vcpu, so injected interrupts and the TVM trap are lost."
+    },
+    {
+        "Commit": "3aed038aac8d897016a2b6e1935f16c7640918d4",
+        "Fixed-by": "df7a9d376f7a388ecfacf8dfe0b5819ddfba6972",
+        "subsystem": "kvm/arm64",
+        "problem_description": "When __map_hyp() fails in hyp_trace_buffer_alloc_bpages_backing(), hyp_trace_load() jumps to err_free_desc, which never frees the bpages backing just allocated with alloc_pages_exact(), leaking it."
+    },
+    {
+        "Commit": "b57de4ffd7c6d1247fdaef8437450ab7c1dd4ed0",
+        "Fixed-by": "4ce98bf0865c349e7026ad9c14f48da264920953",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_cpu_has_pending_timer() now always returns 0, assuming vgic pending-IRQ checks cover timer interrupts; without an in-kernel irqchip nothing evaluates the timers on the block path, so an expiring timer no longer wakes a vcpu blocked in WFI."
+    },
+    {
+        "Commit": "9d52612690985fc0ee1ae1fbad61530a4f6bbb53",
+        "Fixed-by": "288eb55483c05bc37379a781d0d18b8e6c280f92",
+        "subsystem": "kvm/arm64",
+        "problem_description": "pvm_init_traps_aa64dfr0() decides whether to trap the trace buffer registers (MDCR_EL2.E2TB) from ID_AA64DFR0_EL1.ExtTrcBuff, but those registers belong to FEAT_TRBE (the TraceBuffer field), so where the two fields differ a pVM can reach TRBE registers it was not given."
+    },
+    {
+        "Commit": "4ffa72ad8f37e73bbb6c0baa88557bcb4fd39929",
+        "Fixed-by": "c55bc773b6e814406658fae7dc5c15f639ed816e",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_hyp_handle_tlbi_el2() defers to kvm_handle_s1e2_tlbi() only when kvm->arch.vncr_map_count is non-zero, but that counts live fixmap mappings, not valid vncr_tlb entries; a valid but unmapped VNCR pseudo-TLB entry survives a guest TLBI and keeps a stale translation."
+    },
+    {
+        "Commit": "61e30b9eef7ffc7f88ffd95e969cfb662e41bb05",
+        "Fixed-by": "99a339377f3c1bdf6edd5614d36893ab1806f9e6",
+        "subsystem": "kvm/arm64",
+        "problem_description": "walk_nested_s2_pgd() reports a VTTBR_EL2.BADDR with bits above the output size as compute_fsc(level, ESR_ELx_FSC_ADDRSZ) at the starting lookup level; R_BFHQH requires a TTBR-sourced Address size fault to be reported at level 0, so the L1 hypervisor sees the wrong FSC."
+    },
+    {
+        "Commit": "0e5cb7770684b4c81bcc63f4675e488f9a0e31eb",
+        "Fixed-by": "d3a1b28ea25d4c1899a05833e1a9bc79d7c642c3",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_set_kvm_info() kmalloc()s gic_kvm_info, but kvm_vgic_hyp_init() frees it only after the probe switch; its early 'No vgic maintenance irq' return -ENXIO skips the kfree, leaking the allocation and leaving the global pointer set."
+    },
+    {
+        "Commit": "bff8aa213dee742b09151a34494418050afed948",
+        "Fixed-by": "efa871f4a2517385295de2e3f786e4ae4ffa6e77",
+        "subsystem": "kvm/arm64",
+        "problem_description": "When the AF update in walk_s1() fails for a reason other than a race (read-only memslot -EPERM, bad HVA -EINVAL), the error is returned without fail_s1_walk(), so the walk is not marked failed and no SEA on translation table walk is reported to the guest."
+    },
+    {
+        "Commit": "cbd8c958be54abdf2c0f9b9c3eac971428b9d4b1",
+        "Fixed-by": "d82d09d5ba4be0b5eb053b2ba2bc0e82c49cf2c8",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_finalize_sys_regs() now returns early once the VM has run, so a vcpu that first runs after another one never reaches kvm_init_nv_sysregs(), whose per-vcpu RES0/RES1 sanitisation of the NV system registers is then skipped for it."
+    },
+    {
+        "Commit": "96c2f03311de1a9363a7b4cee28776ac9cec8109",
+        "Fixed-by": "a342faadc5acbd5d9fd894fd4499d4fd614dfcf6",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_compute_mi_state() treats an LR in pending-and-active state as pending because it tests only ICH_LR_PENDING_BIT, so ICH_MISR_EL2.NP (no LR in state 0b01) is not reported to the L1 hypervisor when the only pending LRs are also active."
+    },
+    {
+        "Commit": "213b3d1ea1612c6d26153be446923831c4534689",
+        "Fixed-by": "a52d6d68ad30374dd794bff300d8538e35ee49a8",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_emulate_nested_eret() builds the injected FPAC syndrome as esr & ESR_ELx_ERET_ISS_ERETA, clearing ESR_ELx.IL; ERETAA/ERETAB are 32-bit A64 instructions, so the guest hypervisor gets an FPAC syndrome with the wrong instruction length."
+    },
+    {
+        "Commit": "a258a383b91774ac646517ec1003a442964d8946",
+        "Fixed-by": "ecc7f02499544ae879716be837af78260a6a10f7",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_vgic_finalize_idregs(), now also called from kvm_finalize_sys_regs() before first run, resets vgic_cpu_base to VGIC_ADDR_UNDEF (GICv2) and re-initialises rd_regions (GICv3), discarding the CPU interface and redistributor addresses userspace configured."
+    },
+    {
+        "Commit": "6ccf9cb557bd32073b0d68baed97f1bd8a40ff1d",
+        "Fixed-by": "2ad524c5e257ea1054422da26d646dd777c2a08d",
+        "subsystem": "kvm/arm64",
+        "problem_description": "nvhe_hyp_panic_handler() prints panic_addr with %pB, which walks kallsyms; under pKVM the host stage-2 is still active and lazily mapped, so the access can fault, and if hyp panicked holding the host stage-2 lock the panic path deadlocks. find_bug() is guarded for this, %pB is not."
+    },
+    {
+        "Commit": "3cfd59f81e0f3fbdf8a1b2f576bdc63ab6cc3277",
+        "Fixed-by": "6da5e537f5afe091658e846da1949d7e557d2ade",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_v3_fold_lr_state() replays EOIcount deactivations starting from the head of ap_list; EOIcount counts only EOIs of interrupts not held in an LR, so active interrupts that were in LRs can be deactivated instead, losing interrupts."
+    },
+    {
+        "Commit": "9435c1e1431003e23aa34ef8e46c30d09c3dbcb5",
+        "Fixed-by": "43347154e7ab642474c886bc54ad090166c0d9c9",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_vgic_create() now sets vgic.in_kernel and vgic_model before allocating private IRQs; on allocation failure only private_irqs are freed, leaving irqchip_in_kernel() true with no private IRQs or vgic setup, and every retry fails with -EEXIST."
+    },
+    {
+        "Commit": "77ee70a073575977b403e9add25f185d614217d8",
+        "Fixed-by": "e2cb1f4578625e71f461d5c1ce70984193389cbb",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_inject_el2_exception() handles except_type_serror by pending EXCEPT_AA64_EL2_SERR without writing esr_el2 to ESR_EL2, and exception entry does not set it either, so the syndrome from kvm_inject_nested_serror() is dropped and the guest hypervisor reads a stale ESR_EL2."
+    },
+    {
+        "Commit": "a7b57e0995927cc5fb8629594e2abf2a6f1000e9",
+        "Fixed-by": "9be19df816dea9eb7dfe1661b3690bed6a2cb146",
+        "subsystem": "kvm/arm64",
+        "problem_description": "gmem_abort() takes is_perm but always calls kvm_pgtable_stage2_map(), which returns -EAGAIN for a permission-only change to a valid PTE; on a non-DIC CPU an exec fault on a page first mapped RW (no X) is retried forever."
+    },
+    {
+        "Commit": "b12b3b04f6ba072ca5a618a75e546c996be94bd1",
+        "Fixed-by": "49d9d295d69d07e850cae35933ba8519e2915f26",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_pkvm_ioctl_allowed() wraps kvm_get_cap_for_kvm_ioctl() in WARN_ON_ONCE(), but kvm_arch_vm_ioctl() feeds it every unrecognised userspace ioctl number, so ioctl(vm_fd, <unknown>) taints a pKVM host and panics it with panic_on_warn."
+    },
+    {
+        "Commit": "c9c012625e12699a4c6c4d4cdd17cbe600e01cd2",
+        "Fixed-by": "2bd3c6c702f3a9e2bcb3b536b0fbbaa645005d71",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_host_ffa_handler() leaves res uninitialised on the EL2 stack; for FFA_VERSION, do_ffa_version() sets only res->a0, yet ffa_set_retval() copies res->a1..a3 into the host's x1-x3, leaking hypervisor stack contents to the host."
+    },
+    {
+        "Commit": "8201d1028caa4fae88e222c4e8cf541fdf45b821",
+        "Fixed-by": "13031fb6b8357fbbcded2a7f4cba73e4781ee594",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_its_invalidate_cache() calls vgic_put_irq() on each iterated irq after xa_erase() without checking that this context removed it; concurrent invalidations (ITS command, GITS_CTLR, GICR_CTLR paths under different or no locks) can drop the cache's reference twice and free a still-mapped irq."
+    },
+    {
+        "Commit": "8f1fbe2fd279240d6999e3a975d0a51d816e080a",
+        "Fixed-by": "e63d0a32e7368f3eb935755db87add1bf000ea90",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_v5_finalize_ppi_state() runs on every vcpu's first KVM_RUN and bitmap_zero()s then rebuilds the VM-wide gicv5_vm.vgic_ppi_mask/vgic_ppi_hmr with no lock, so concurrently starting vcpus can clear the mask while another builds or uses it."
+    },
+    {
+        "Commit": "b56680de9c6489f2aed707fad2811e714b52fe4c",
+        "Fixed-by": "80ae56184b57176b908cd6a7ececf274a7e4b3c7",
+        "subsystem": "kvm/arm64",
+        "problem_description": "pkvm_vcpu_reset_hcr() initialises the hyp vCPU's HCR_EL2 from HCR_GUEST_FLAGS (RW=1) and never clears RW for a non-protected vCPU created with KVM_ARM_VCPU_EL1_32BIT, and flush_hyp_vcpu() no longer takes the host's value, so entering it is an illegal exception return."
+    },
+    {
+        "Commit": "b22888917fa411d100339ef9d418b4eb86aba962",
+        "Fixed-by": "bbece712cfc7f286b2908ac120dcf700279d87eb",
+        "subsystem": "kvm/arm64",
+        "problem_description": "In hyp_trace_clock_enable(), the !enable branch calls cancel_delayed_work_sync() and clears running but falls through into the enable path, re-arming __hyp_clock_work and setting running = true; disabling hyp tracing leaves the clock update work running indefinitely."
+    },
+    {
+        "Commit": "ea1ad53e1e31a32dcbeae61b8d3d01cccedcffc5",
+        "Fixed-by": "9b10fb74e4b661543d188701bd4d024fc5c18f58",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_its_save_collection_table() derives max_size from GITS_BASER but writes a CTE for every collection on its->collection_list without bounding gpa, so with more collections than the table holds the save writes past the table into guest memory and saves entries restore cannot hold."
+    },
+    {
+        "Commit": "a258a383b91774ac646517ec1003a442964d8946",
+        "Fixed-by": "76efe94b1c5cc9b5fac7c5c1096d03f1596c7267",
+        "subsystem": "kvm/arm64",
+        "problem_description": "The ID_FILTERED(ID_AA64PFR2_EL1, ...) writable mask is ~(FPMR | MTEFAR | MTESTOREONLY | GCIE): userspace can no longer change FPMR/MTEFAR/MTESTOREONLY (previously writable) and every other field is advertised as writable, the inverse of the intended policy."
+    },
+    {
+        "Commit": "11f4f8f3e6e0697fb640d5c6c79b27c2233bc3da",
+        "Fixed-by": "751f4641560be8568dcc5af400c0e55a283abf51",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_its_cmd_handle_movall() now walks every LPI in dist->lpi_xa and calls update_affinity(irq, vcpu2) without checking irq->target_vcpu == vcpu1, so a guest MOVALL retargets all LPIs in the VM, not only those on the source redistributor."
+    },
+    {
+        "Commit": "f6e2262dfa1a01b981dc394be39bd022e9ecaebd",
+        "Fixed-by": "7514f1785d526207af8512cc6ccb1c35c5c61767",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_inject_serror_esr()'s emulated injection sets ESR_ELx.EC to SERROR but leaves IL clear, although the architecture reports IL=1 for an SError exception, so the guest reads an architecturally wrong ESR_ELx."
+    },
+    {
+        "Commit": "cb31632c44529048c052a2961b3adf62a2c89b17",
+        "Fixed-by": "9d46e83a72392a644604458448a72d7c45977f0f",
+        "subsystem": "kvm/arm64",
+        "problem_description": "encoding_to_cgt[] lists DBGWVRn_EL1(0..15) and DBGWCRn_EL1(0..14) under CGT_MDCR_TDE_TDA but omits DBGWCRn_EL1(15), so an L2 access to DBGWCR15_EL1 is not forwarded to the L1 hypervisor when its MDCR_EL2.TDE/TDA asks for the trap."
+    },
+    {
+        "Commit": "eff484e0298da5a4d18ca82f5454c557fd942af5",
+        "Fixed-by": "c6c156d931c33b92362383cf76f6d6e1291dcbfe",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_its_save_ite() dereferences ite->collection->collection_id unconditionally, but MAPC with V=0 sets ite->collection to NULL while leaving the ITE mapped; a guest doing MAPD, MAPTI, MAPC(V=0) oopses the host when the VMM saves the ITS tables."
+    },
+    {
+        "Commit": "47f3a2fc765ae2719e6daf39c0a1c757934b152e",
+        "Fixed-by": "0e8e955b9bcf84a70f20079390e19971fec1586d",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_check_illegal_exception_return() builds the PSTATE for an illegal exception return from the current PSTATE's NZCV and DAIF; the architecture (R_VWJHB) takes flags and masks from the SPSR and keeps only EL, SP and nRW, so vEL2 resumes with wrong flags and masks."
+    },
+    {
+        "Commit": "7270cc9157f474dfc46750a34c9d7defc686b2eb",
+        "Fixed-by": "38640bc32be3fcf9526d477155bc19d3f146231f",
+        "subsystem": "kvm/arm64",
+        "problem_description": "invalidate_vncr() tests vt->cpu != -1 and then calls clear_fixmap(vncr_fixmap(vt->cpu)) under mmu_lock, while kvm_vcpu_put_hw_mmu() unmaps and sets vt->cpu = -1 without it: a TOCTOU that can unmap vncr_fixmap(-1) or trip the put path's BUG_ON()."
+    },
+    {
+        "Commit": "5a98d0e17e59210b400734f2359c4453aab3af21",
+        "Fixed-by": "2427e8c1cd4f467770cb52e5e723adf88cc61ae0",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_v5_set_ppi_dvi() updates the per-vcpu cpu_if->vgic_ppi_dvir bitmap with non-atomic __assign_bit() while holding only the individual irq's irq_lock, so concurrent DVI updates for two PPIs of one vcpu can lose a bit."
+    },
+    {
+        "Commit": "4ffa72ad8f37e73bbb6c0baa88557bcb4fd39929",
+        "Fixed-by": "34af2c3e31f91a739dc175459fdbd99ed952b457",
+        "subsystem": "kvm/arm64",
+        "problem_description": "invalidate_vncr_va() compares exclusive ends va_start + va_size and scope->va + scope->size; for the last page or block of the TTBR1 range both wrap to 0, so the overlap test fails and the TLBI leaves the VNCR pseudo-TLB entry valid."
+    },
+    {
+        "Commit": "2a359e072596fcb2e9e85017a865e3618a2fe5b5",
+        "Fixed-by": "8c774604b6ecaca495fa3d27c21593269627f48f",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_map_l1_vncr() reuses a VNCR pseudo-TLB entry filled while the L1's SCTLR_EL2.M was 0 (VA==PA) after L1 enables its MMU with the same VNCR_EL2 VA, so the fixmap maps the stale PA and VNCR accesses hit the wrong page."
+    },
+    {
+        "Commit": "be04cebf3e78874627dc1042991d5d504464a5cc",
+        "Fixed-by": "f2ca45b50d4216c9cc7ffabf50d9ad1932209251",
+        "subsystem": "kvm/arm64",
+        "problem_description": "__kvm_at_s12() calls kvm_walk_nested_s2(), which reads the guest's stage-2 tables via kvm_read_guest() and must run under kvm->srcu, without taking kvm->srcu, so the walk races with memslot updates."
+    },
+    {
+        "Commit": "4d591252bacb2d004b7c7f5db439bfa23b552ee7",
+        "Fixed-by": "170a77b4185a87cc7e02e404d22b9bf3f9923884",
+        "subsystem": "kvm/arm64",
+        "problem_description": "vgic_v5_flush_ppi_state() copies irq_is_pending() into ICH_PPI_PENDR but leaves an edge PPI's pending_latch set, so after the guest takes the interrupt the fold/flush re-injects it and the edge PPI stays pending forever."
+    },
+    {
+        "Commit": "5db1bef933427aa467ad89c7b695a84a6b4afe16",
+        "Fixed-by": "2a2eb10795a1e495aebc7f829ccecb72c05b4fd9",
+        "subsystem": "kvm/arm64",
+        "problem_description": "pkvm_vcpu_init_sve() takes sve_max_vl from the untrusted host vcpu, clamps only its upper bound, and passes it to sve_state_size_from_vl(), whose WARN_ON(!sve_vl_valid()) panics the hypervisor before the !sve_state_size check can reject it."
+    },
+    {
+        "Commit": "4e6e03f9eaddb6be5ca8477dc5642e94ddece47e",
+        "Fixed-by": "d098bb75d14fde2f12155f1a95ec0168160867ce",
+        "subsystem": "kvm/arm64",
+        "problem_description": "__pkvm_pgtable_stage2_reclaim() uncharges each reclaimed pinned page with account_locked_vm(current->mm, ...), but VM teardown can run from file release in a task whose mm is not kvm->mm (or has none), so kvm->mm's locked_vm is never decremented."
+    },
+    {
+        "Commit": "2417218f2f234fd7880fb193ebf3ae5fcccfa29b",
+        "Fixed-by": "2e30447b233a8e7a561bb51995b8d4944282bf62",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_init_host_debug_data() reads the unsigned ID_AA64DFR0_EL1.PMUVer as signed, so PMUv3p8 and later (0x8+) look negative and nr_event_counters stays 0; kvm_arm_setup_mdcr_el2() then programs the guest's MDCR_EL2.HPMN as 0 counters."
+    },
+    {
+        "Commit": "26d2d0594d7016dbcbce4038aa202c2858d5a944",
+        "Fixed-by": "1750ad1388e03fb27068cd1f22c9c8b4590fe936",
+        "subsystem": "kvm/arm64",
+        "problem_description": "In kvm_pmu_set_counter(), the AArch32 non-cycle path overwrites val with the old high half before OR-ing lower_32_bits(val), which is then zero, so every AArch32 event-counter write discards the guest-written low 32 bits."
+    },
+    {
+        "Commit": "db14091d8f75852d960b18834c7bdb1b7c2bb74f",
+        "Fixed-by": "6bf0215c565ee122ffff7241b297a7b88f71005f",
+        "subsystem": "kvm/arm64",
+        "problem_description": "With pKVM block mappings, a permission fault can collapse pages into a PMD via pkvm_pgtable_stage2_map(), but user_mem_abort() skips the memcache top-up for permission faults, so cache->mapping is unset (host NULL/garbage deref under mmu_lock) and min pages are missing."
+    },
+    {
+        "Commit": "80cbfd7174f31010982f065e8ae73bf337992105",
+        "Fixed-by": "5a8b505ede133fb30ca3b3a19d0db00c08237615",
+        "subsystem": "kvm/arm64",
+        "problem_description": "On non-hVHE, kvm_pgtable_hyp_pte_prot() now returns R|PX for hyp text, never PAGE_HYP_EXEC (R|PX|UX), so fix_host_ownership_walker() donates hyp text instead of leaving it RO to the host and nvhe_hyp_panic_handler()'s instruction dump faults on a hyp page."
+    },
+    {
+        "Commit": "2a359e072596fcb2e9e85017a865e3618a2fe5b5",
+        "Fixed-by": "2684e02bac41c5220f6c1ab2bdcc957b71812977",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_map_l1_vncr() maps the L1 VNCR page PAGE_KERNEL whenever the guest S1 grants write, but the cached PFN may be read-only (RO memslot faulted in on a read), so the per-CPU fixmap lets VNCR accesses write memory KVM may not write."
+    },
+    {
+        "Commit": "256b4668cd890b741c54f83dbbef76ba847c23be",
+        "Fixed-by": "6835fbed39bb329744a3f44e8e6a39e24079af10",
+        "subsystem": "kvm/arm64",
+        "problem_description": "__pkvm_init_vm() can now fail in insert_vm_table_entry() (host-chosen handle) after kvm_guest_prepare_stage2() built vm->pool on the PGD; err_remove_mappings returns the PGD without resetting its hyp_page order/refcount, which a later hyp_pool admitting those pages trusts."
+    },
+    {
+        "Commit": "4ad3a0b87f2ec4714fdfa6bd5de57b4c30e15753",
+        "Fixed-by": "119a9a23fbae4fefbb5cd4776547b3b6803a7eaa",
+        "subsystem": "kvm/arm64",
+        "problem_description": "setup_external_mdscr() puts the host-forced MDSCR_EL1 SS/MDE/KDE bits in vcpu->arch.external_mdscr_el1 instead of the guest ctxt, but the pKVM hyp vCPU is never given that field, so under pKVM the world switch loads MDSCR_EL1 without them and guest debugging silently stops working."
+    },
+    {
+        "Commit": "d0bd3e6570aee42766e7bd884734ae078667ea1e",
+        "Fixed-by": "8234409ffb656970e2f5b29e416f041419980bef",
+        "subsystem": "kvm/arm64",
+        "problem_description": "__pkvm_host_share_guest() wraps kvm_pgtable_stage2_map() in WARN_ON() after changing host page state; the map can fail -ENOMEM when the host-filled pkvm_memcache is short, and WARN at nVHE EL2 panics, so the host can crash the hypervisor."
+    },
+    {
+        "Commit": "69c19e047dfee63f3e5b06b4ad288bbad32fe8f0",
+        "Fixed-by": "2eb80a2eee18762a33aa770d742d64fe47852c7e",
+        "subsystem": "kvm/arm64",
+        "problem_description": "Inserting TCR2_EL2 after __SANITISED_REG_START__ shifts sysreg_masks->mask[] by one relative to __VNCR_START__, and kvm_get_sysreg_res0() still indexes by sr - __VNCR_START__, so check_fgt_bit() evaluates negative-polarity FGT bits against another register's RES0 mask."
+    },
+    {
+        "Commit": "32e200bd6e4407c31aef0392be041274bfa3f20e",
+        "Fixed-by": "679d7201c1f09e37fa1c12ce28d84079c17fc87f",
+        "subsystem": "kvm/arm64",
+        "problem_description": "kvm_arch_prepare_memory_region() admits guest_memfd-only memslots without checking kvm_has_mte(); the VMA-walk MTE check is bypassed when userspace_addr is unmapped or unrelated, so an MTE VM gets guest_memfd memory whose tags gmem_abort() never sanitises."
+    },
+    {
+        "Commit": "3ce9f3357e9e099f02feaa002769eb99ef1138cd",
+        "Fixed-by": "6b1bca1b1ab77f60a62087337bfe6e2f0efb9e6d",
+        "subsystem": "kvm/arm64",
+        "problem_description": "demux_wb_reg() selects storage only for Op2 0b100-0b111, yet the AArch32 DBGBXVR<n> descriptor (Op2 1) now uses trap_dbg_wb_reg(); a guest access falls to KVM_BUG_ON(), WARNing in the host and killing the VM instead of reaching dbg_bvr[n][63:32]."
+    },
+    {
+        "Commit": "3aed038aac8d897016a2b6e1935f16c7640918d4",
+        "Fixed-by": "adae9996c04fea3b1791099b6d79e1df76d50849",
+        "subsystem": "kvm/arm64",
+        "problem_description": "hyp_trace_load() allocates the descriptor with alloc_pages_exact(desc_size) and records trace_buffer->desc but not desc_size, so hyp_trace_unload() calls free_pages_exact(desc, 0) and the descriptor pages leak on every unload."
+    }
+]
