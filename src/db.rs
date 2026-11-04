@@ -398,6 +398,66 @@ pub struct ReleaseReview {
     pub findings: Vec<serde_json::Value>,
 }
 
+/// A completed review whose patch shares a Git patch ID with the patch
+/// under review. The patch ID is only the index: the caller compares `diff`
+/// byte for byte before trusting the match, because git patch-id ignores
+/// whitespace. Reviews with findings are included so the caller can see
+/// when the newest review of a diff was not clean.
+#[derive(Debug, Clone)]
+pub struct CleanReviewCandidate {
+    pub review_id: i64,
+    pub has_findings: bool,
+    pub patch_id: i64,
+    pub patchset_id: i64,
+    pub patchset_subject: String,
+    pub patchset_version: Option<u32>,
+    pub part_index: i64,
+    pub diff: String,
+    pub model: Option<String>,
+    pub prompts_hash: Option<String>,
+    pub baseline_commit: Option<String>,
+    pub coverage: ReviewCoverage,
+    /// Message-ID of the reviewed patch mail, for finding replies to it.
+    pub patch_message_id: String,
+}
+
+/// How much of the analysis pipeline a review ran.
+///
+/// `review.cheap` and `--stages` both narrow a review without changing
+/// the model or the prompts, so a clean verdict is only as strong as the
+/// coverage of the review that produced it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewCoverage {
+    /// The exploratory analysis stages ran as one combined pass.
+    pub cheap: bool,
+    /// The analysis stages the review was limited to, sorted and
+    /// comma-separated. `None` when it ran them all.
+    pub stages: Option<String>,
+}
+
+impl ReviewCoverage {
+    /// Builds the coverage a worker runs with from its review settings.
+    /// The stage names are sorted so that two spellings of one subset
+    /// compare equal.
+    pub fn new(cheap: bool, stages: Option<&[String]>) -> Self {
+        let stages = stages.map(|names| {
+            let mut names: Vec<&str> = names.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            names.dedup();
+            names.join(",")
+        });
+        Self { cheap, stages }
+    }
+
+    /// Whether a clean verdict from a review with this coverage can stand
+    /// in for a review that would run with `wanted`. A full pass covers a
+    /// cheap one and every stage subset; a cheap pass or a subset covers
+    /// only a review narrowed the same way.
+    pub fn covers(&self, wanted: &Self) -> bool {
+        (!self.cheap || wanted.cheap) && (self.stages.is_none() || self.stages == wanted.stages)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchsetReviewOutcome {
     Clean,
@@ -12238,6 +12298,146 @@ impl Database {
         Ok(diffs)
     }
 
+    /// Returns the Git patch ID stored for `patch_id`, if the ingest path
+    /// computed one.
+    pub async fn get_patch_git_patch_id(&self, patch_id: i64) -> Result<Option<String>> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT git_patch_id FROM patches WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => get_optional_text(&row, 0),
+            None => Ok(None),
+        }
+    }
+
+    /// Lists completed reviews of other patches that share `git_patch_id`,
+    /// newest first, created at or after `since`.
+    ///
+    /// Reviews that themselves inherited a verdict are left out so the
+    /// caller always lands on the review a model actually produced. Reviews
+    /// with findings are kept and flagged: a clean verdict is only reusable
+    /// when nothing newer disagreed with it. The limit keeps a patch
+    /// carried across many series from pulling every copy's diff out of the
+    /// database; the newest few are the ones worth comparing.
+    pub async fn find_clean_review_candidates(
+        &self,
+        git_patch_id: &str,
+        exclude_patch_id: i64,
+        since: i64,
+        limit: usize,
+    ) -> Result<Vec<CleanReviewCandidate>> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT r.id, p.id, p.patchset_id, ps.subject, ps.version, p.part_index,
+                        p.diff, r.model, r.prompts_hash, r.baseline_commit,
+                        EXISTS (SELECT 1 FROM findings f WHERE f.review_id = r.id),
+                        r.cheap, r.stages, p.message_id
+                 FROM patches p
+                 JOIN reviews r ON r.patch_id = p.id
+                 JOIN patchsets ps ON ps.id = p.patchset_id
+                 WHERE p.git_patch_id = ?
+                   AND p.id != ?
+                   AND r.status = 'Reviewed'
+                   AND r.created_at >= ?
+                   AND r.inherited_from_review_id IS NULL
+                 ORDER BY r.created_at DESC, r.id DESC
+                 LIMIT ?",
+                libsql::params![git_patch_id, exclude_patch_id, since, limit as i64],
+            )
+            .await?;
+
+        let mut candidates = Vec::new();
+        while let Some(row) = rows.next().await? {
+            candidates.push(CleanReviewCandidate {
+                review_id: row.get(0)?,
+                patch_id: row.get(1)?,
+                patchset_id: row.get(2)?,
+                patchset_subject: get_optional_text(&row, 3)?.unwrap_or_default(),
+                patchset_version: get_optional_integer(&row, 4)?
+                    .and_then(|v| u32::try_from(v).ok()),
+                part_index: get_optional_integer(&row, 5)?.unwrap_or(0),
+                diff: crate::compression::get_compressed_string(&row, 6)?,
+                model: get_optional_text(&row, 7)?,
+                prompts_hash: get_optional_text(&row, 8)?,
+                baseline_commit: get_optional_text(&row, 9)?,
+                has_findings: row.get::<i64>(10)? != 0,
+                coverage: ReviewCoverage {
+                    cheap: row.get::<i64>(11)? != 0,
+                    stages: get_optional_text(&row, 12)?,
+                },
+                patch_message_id: row.get(13)?,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// Records the commit a review's worktree was checked out at.
+    pub async fn set_review_baseline_commit(&self, review_id: i64, commit: &str) -> Result<()> {
+        self.execute(
+            "UPDATE reviews SET baseline_commit = ? WHERE id = ?",
+            libsql::params![commit, review_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Records how much of the pipeline a review is about to run. Both
+    /// columns are written, so a row reclaimed for another run does not
+    /// keep the coverage of the run before it.
+    pub async fn set_review_coverage(
+        &self,
+        review_id: i64,
+        coverage: &ReviewCoverage,
+    ) -> Result<()> {
+        self.execute(
+            "UPDATE reviews SET cheap = ?, stages = ? WHERE id = ?",
+            libsql::params![coverage.cheap as i64, coverage.stages.clone(), review_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Marks `review_id` as carrying the verdict of `from_review_id`.
+    pub async fn set_review_inherited_from(
+        &self,
+        review_id: i64,
+        from_review_id: i64,
+    ) -> Result<()> {
+        self.execute(
+            "UPDATE reviews SET inherited_from_review_id = ? WHERE id = ?",
+            libsql::params![from_review_id, review_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Lists the Message-IDs of the patches that inherited the verdict of
+    /// `review_id`. Each is a copy of the patch that review covered, and a
+    /// reply to any of them is a reply about the same diff.
+    pub async fn get_inheriting_patch_message_ids(&self, review_id: i64) -> Result<Vec<String>> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT DISTINCT p.message_id
+                 FROM reviews r
+                 JOIN patches p ON r.patch_id = p.id
+                 WHERE r.inherited_from_review_id = ? AND r.status = 'Skipped'
+                 ORDER BY p.id ASC",
+                libsql::params![review_id],
+            )
+            .await?;
+        let mut message_ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            message_ids.push(row.get(0)?);
+        }
+        Ok(message_ids)
+    }
+
     pub async fn get_patch_by_git_patch_id(
         &self,
         git_patch_id: &str,
@@ -17001,6 +17201,332 @@ mod tests {
         assert!(
             index.next().await?.is_some(),
             "the foreign key column is indexed"
+        );
+        Ok(())
+    }
+
+    /// Creates a single-patch series whose patch carries `git_patch_id`, and
+    /// returns the patchset and patch ids.
+    async fn create_series_with_patch_id(
+        db: &Database,
+        tag: &str,
+        version: Option<u32>,
+        diff: &str,
+        git_patch_id: &str,
+    ) -> Result<(i64, i64)> {
+        let msg_id = format!("<{tag}@example.org>");
+        let thread_id = db.create_thread(&msg_id, tag, 1_700_000_000).await?;
+        db.create_message(
+            &msg_id,
+            thread_id,
+            None,
+            "Author <a@example.org>",
+            tag,
+            1_700_000_000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                &msg_id,
+                tag,
+                "Author <a@example.org>",
+                1_700_000_000,
+                1,
+                1,
+                "",
+                "",
+                version,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .expect("patchset created");
+        let patch_id = db
+            .create_patch_with_git_patch_id(ps_id, &msg_id, 1, diff, Some(git_patch_id))
+            .await?;
+        Ok((ps_id, patch_id))
+    }
+
+    async fn complete_clean_review(
+        db: &Database,
+        ps_id: i64,
+        patch_id: i64,
+        model: &str,
+    ) -> Result<i64> {
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "gemini", model, None, Some("p1"))
+            .await?;
+        db.complete_review(review_id, "Reviewed", "done", None, None, None, None)
+            .await?;
+        Ok(review_id)
+    }
+
+    /// A full review covers every narrower one; a cheap pass or a stage
+    /// subset covers only a review narrowed the same way.
+    #[test]
+    fn test_review_coverage_covers() {
+        let stages =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|s| s.to_string()).collect() };
+        let full = ReviewCoverage::default();
+        let cheap = ReviewCoverage::new(true, None);
+        let subset = ReviewCoverage::new(false, Some(&stages(&["locking", "security"])));
+        let reordered = ReviewCoverage::new(false, Some(&stages(&["security", "locking"])));
+        let other = ReviewCoverage::new(false, Some(&stages(&["security"])));
+
+        for wanted in [&full, &cheap, &subset, &other] {
+            assert!(full.covers(wanted));
+        }
+        assert!(cheap.covers(&cheap));
+        assert!(!cheap.covers(&full));
+        assert!(!cheap.covers(&subset));
+        assert!(subset.covers(&reordered));
+        assert!(!subset.covers(&full));
+        assert!(!subset.covers(&other));
+        assert!(!other.covers(&subset));
+    }
+
+    /// The clean-review lookup returns finished reviews of other patches
+    /// that share a Git patch ID, newest first, flags the ones with
+    /// findings, and never returns a review that itself inherited its
+    /// verdict.
+    #[tokio::test]
+    async fn test_find_clean_review_candidates_filters_by_outcome() -> Result<()> {
+        let db = Database::new(&DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+        db.migrate().await?;
+
+        let diff = "diff --git a/f.c b/f.c\n--- a/f.c\n+++ b/f.c\n@@ -1 +1 @@\n-a\n+b\n";
+        let pid = "0123456789abcdef0123456789abcdef01234567";
+
+        // v1: clean, the review to inherit from.
+        let (v1_ps, v1_patch) = create_series_with_patch_id(&db, "v1", Some(1), diff, pid).await?;
+        let v1_review = complete_clean_review(&db, v1_ps, v1_patch, "pro").await?;
+        db.set_review_baseline_commit(v1_review, "abc123").await?;
+        db.conn
+            .execute(
+                "UPDATE reviews SET created_at = 1000 WHERE id = ?",
+                libsql::params![v1_review],
+            )
+            .await?;
+
+        // v2: reviewed, but with a finding.
+        let (v2_ps, v2_patch) = create_series_with_patch_id(&db, "v2", Some(2), diff, pid).await?;
+        let v2_review = complete_clean_review(&db, v2_ps, v2_patch, "pro").await?;
+        db.create_finding(Finding {
+            review_id: v2_review,
+            severity: Severity::Low,
+            severity_explanation: None,
+            problem: "nit".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await?;
+        db.conn
+            .execute(
+                "UPDATE reviews SET created_at = 1500 WHERE id = ?",
+                libsql::params![v2_review],
+            )
+            .await?;
+
+        // v3: still running.
+        let (v3_ps, v3_patch) = create_series_with_patch_id(&db, "v3", Some(3), diff, pid).await?;
+        db.create_review(v3_ps, Some(v3_patch), "gemini", "pro", None, None)
+            .await?;
+
+        // v4: skipped as an inherited copy of v1; must not be offered itself.
+        let (v4_ps, v4_patch) = create_series_with_patch_id(&db, "v4", Some(4), diff, pid).await?;
+        let v4_review = db
+            .create_review(v4_ps, Some(v4_patch), "gemini", "pro", None, Some("p1"))
+            .await?;
+        db.complete_review(v4_review, "Skipped", "inherited", None, None, None, None)
+            .await?;
+        db.set_review_inherited_from(v4_review, v1_review).await?;
+        assert_eq!(
+            db.get_inheriting_patch_message_ids(v1_review).await?,
+            vec!["<v4@example.org>".to_string()]
+        );
+
+        // v5: a newer clean review on another model.
+        let (v5_ps, v5_patch) = create_series_with_patch_id(&db, "v5", Some(5), diff, pid).await?;
+        let v5_review = complete_clean_review(&db, v5_ps, v5_patch, "flash").await?;
+        db.conn
+            .execute(
+                "UPDATE reviews SET created_at = 2000 WHERE id = ?",
+                libsql::params![v5_review],
+            )
+            .await?;
+
+        // Another series altogether with a different patch id.
+        let (o_ps, o_patch) = create_series_with_patch_id(
+            &db,
+            "other",
+            None,
+            "diff --git a/g.c b/g.c\n+x\n",
+            "fedcba9876543210fedcba9876543210fedcba98",
+        )
+        .await?;
+        complete_clean_review(&db, o_ps, o_patch, "pro").await?;
+
+        // v6 is the patch under review.
+        let (_, v6_patch) = create_series_with_patch_id(&db, "v6", Some(6), diff, pid).await?;
+
+        let found = db
+            .find_clean_review_candidates(pid, v6_patch, 0, 10)
+            .await?;
+        let ids: Vec<(i64, bool)> = found
+            .iter()
+            .map(|c| (c.review_id, c.has_findings))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![(v5_review, false), (v2_review, true), (v1_review, false)]
+        );
+
+        let v1 = found.iter().find(|c| c.review_id == v1_review).unwrap();
+        assert_eq!(v1.patch_id, v1_patch);
+        assert_eq!(v1.patchset_id, v1_ps);
+        assert_eq!(v1.patchset_subject, "v1");
+        assert_eq!(v1.patchset_version, Some(1));
+        assert_eq!(v1.part_index, 1);
+        assert_eq!(v1.diff, diff);
+        assert_eq!(v1.model.as_deref(), Some("pro"));
+        assert_eq!(v1.prompts_hash.as_deref(), Some("p1"));
+        assert_eq!(v1.baseline_commit.as_deref(), Some("abc123"));
+        assert_eq!(v1.patch_message_id, "<v1@example.org>");
+
+        // A reply from Sashiko itself is not discussion; a reply from
+        // anyone else is, however the In-Reply-To header spells the parent.
+        assert!(!db.patch_has_human_replies(&v1.patch_message_id).await?);
+        let v1_thread = db
+            .create_thread("<v1-replies@example.org>", "v1", 1)
+            .await?;
+        db.create_message(
+            "<bot-reply@example.org>",
+            v1_thread,
+            Some("<v1@example.org>"),
+            "Sashiko <sashiko-bot@kernel.org>",
+            "Re: v1",
+            2,
+            "no issues",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        assert!(!db.patch_has_human_replies(&v1.patch_message_id).await?);
+
+        // Neither is a patch threaded under this one, as the rest of a
+        // series sent without a cover letter is.
+        db.create_message(
+            "<threaded@example.org>",
+            v1_thread,
+            Some("<v1@example.org>"),
+            "Author <author@example.org>",
+            "[PATCH 2/2] next",
+            2,
+            "body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_patch(v2_ps, "<threaded@example.org>", 2, "diff")
+            .await?;
+        assert!(!db.patch_has_human_replies(&v1.patch_message_id).await?);
+
+        // An answer to Sashiko's review is discussion of the patch.
+        db.create_message(
+            "<answer-to-bot@example.org>",
+            v1_thread,
+            Some("<bot-reply@example.org>"),
+            "Reviewer <reviewer@example.org>",
+            "Re: v1",
+            3,
+            "you missed the leak",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        assert!(db.patch_has_human_replies(&v1.patch_message_id).await?);
+        db.conn
+            .execute(
+                "DELETE FROM messages WHERE message_id = '<answer-to-bot@example.org>'",
+                (),
+            )
+            .await?;
+        assert!(!db.patch_has_human_replies(&v1.patch_message_id).await?);
+
+        db.create_message(
+            "<human-reply@example.org>",
+            v1_thread,
+            Some("v1@example.org"),
+            "Reviewer <reviewer@example.org>",
+            "Re: v1",
+            3,
+            "this leaks",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        assert!(db.patch_has_human_replies(&v1.patch_message_id).await?);
+        assert!(!db.patch_has_human_replies("").await?);
+
+        // A review that never recorded its coverage reads as a full one,
+        // and a recorded coverage comes back as written.
+        assert_eq!(v1.coverage, ReviewCoverage::default());
+        let narrowed = ReviewCoverage::new(true, Some(&["security".into(), "locking".into()]));
+        db.set_review_coverage(v5_review, &narrowed).await?;
+        let reread = db
+            .find_clean_review_candidates(pid, v6_patch, 0, 10)
+            .await?;
+        assert_eq!(reread[0].review_id, v5_review);
+        assert_eq!(reread[0].coverage, narrowed);
+        assert_eq!(
+            reread[0].coverage.stages.as_deref(),
+            Some("locking,security")
+        );
+        db.set_review_coverage(v5_review, &ReviewCoverage::default())
+            .await?;
+
+        // The age bound and the limit both apply.
+        let recent = db
+            .find_clean_review_candidates(pid, v6_patch, 1500, 10)
+            .await?;
+        assert!(recent.iter().all(|c| c.review_id != v1_review));
+        let one = db.find_clean_review_candidates(pid, v6_patch, 0, 1).await?;
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].review_id, v5_review);
+
+        // The patch under review never matches itself.
+        assert!(
+            db.find_clean_review_candidates(pid, v1_patch, 0, 10)
+                .await?
+                .iter()
+                .all(|c| c.patch_id != v1_patch)
+        );
+
+        assert_eq!(
+            db.get_patch_git_patch_id(v6_patch).await?.as_deref(),
+            Some(pid)
         );
         Ok(())
     }

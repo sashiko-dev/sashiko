@@ -1022,6 +1022,96 @@ impl Database {
         Ok(out)
     }
 
+    /// Whether anyone other than Sashiko replied to the patch mail
+    /// `patch_message_id`.
+    ///
+    /// The prior-feedback audit finds such replies through patchset
+    /// lineage. This asks the same of one patch with no lineage to walk,
+    /// for a patch whose copy turned up in an unrelated series.
+    ///
+    /// Two kinds of reply are not discussion. A patch or cover letter that
+    /// replies to this one is another submission: the rest of a series
+    /// threaded under its first patch, or a later version sent in reply to
+    /// this one. Sashiko's own reply is its review, but a person may have
+    /// answered it, so the walk continues beneath it. Reading as many rows
+    /// as the bound allows without an answer counts as discussion, since
+    /// the rows past it were not read.
+    pub async fn patch_has_human_replies(&self, patch_message_id: &str) -> Result<bool> {
+        const REPLIES_READ: usize = 256;
+        let norm = normalize_msgid(patch_message_id);
+        if norm.is_empty() {
+            return Ok(false);
+        }
+        let mut seen: HashSet<String> = HashSet::from([norm.clone()]);
+        let mut frontier = vec![norm];
+        let mut read = 0;
+        while !frontier.is_empty() {
+            let parents: Vec<String> = frontier
+                .iter()
+                .flat_map(|norm| msgid_lookup_candidates(norm))
+                .collect();
+            let replies = self.query_replies_to(&parents, REPLIES_READ - read).await?;
+            read += replies.len();
+            let submissions = self.submission_message_norms(&replies).await?;
+            frontier.clear();
+            for reply in &replies {
+                if reply.norm_id.is_empty() || !seen.insert(reply.norm_id.clone()) {
+                    continue;
+                }
+                if submissions.contains(&reply.norm_id) {
+                    continue;
+                }
+                if !is_sashiko_review_message(&reply.message_id, &reply.author) {
+                    return Ok(true);
+                }
+                frontier.push(reply.norm_id.clone());
+            }
+            if read >= REPLIES_READ {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The normalized Message-IDs among `metas` that are themselves a
+    /// patch or a cover letter of some patchset.
+    async fn submission_message_norms(
+        &self,
+        metas: &[EmailMessageMeta],
+    ) -> Result<HashSet<String>> {
+        let mut norm_by_candidate: HashMap<String, String> = HashMap::new();
+        for m in metas.iter().filter(|m| !m.norm_id.is_empty()) {
+            for cand in msgid_lookup_candidates(&m.norm_id) {
+                norm_by_candidate.insert(cand, m.norm_id.clone());
+            }
+        }
+        let mut candidates: Vec<String> = norm_by_candidate.keys().cloned().collect();
+        candidates.sort();
+
+        let mut submissions = HashSet::new();
+        for chunk in candidates.chunks(SQL_IN_BATCH) {
+            let json = serde_json::to_string(chunk)?;
+            for sql in [
+                "SELECT cover_letter_message_id FROM patchsets
+                 WHERE cover_letter_message_id IN (SELECT value FROM json_each(?))",
+                "SELECT message_id FROM patches
+                 WHERE message_id IN (SELECT value FROM json_each(?))",
+            ] {
+                let mut rows = self
+                    .read_conn()
+                    .query(sql, libsql::params![json.as_str()])
+                    .await?;
+                while let Some(r) = rows.next().await? {
+                    let hit: Option<String> = r.get(0)?;
+                    if let Some(norm) = hit.and_then(|h| norm_by_candidate.get(&h)) {
+                        submissions.insert(norm.clone());
+                    }
+                }
+            }
+        }
+        Ok(submissions)
+    }
+
     async fn query_replies_to(
         &self,
         parent_candidates: &[String],
