@@ -12981,6 +12981,46 @@ impl Database {
             .await
     }
 
+    /// Lists the patches of `patchset_id` whose only finished pass
+    /// inherited a clean verdict, as Message-ID and part index. A patch
+    /// that a rerun has since reviewed is left to
+    /// get_completed_reviews_for_release.
+    pub async fn get_inherited_clean_patches(
+        &self,
+        patchset_id: i64,
+    ) -> Result<Vec<(String, i64)>> {
+        // Read on the write connection, as the release query below does:
+        // the shared read connection can sit on an older WAL snapshot and
+        // miss a row committed a moment ago.
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        let mut rows = self
+            .tx_conn
+            .query(
+                "SELECT DISTINCT p.message_id, p.part_index
+                 FROM reviews r
+                 JOIN patches p ON r.patch_id = p.id
+                 WHERE r.patchset_id = ?
+                   AND r.status = 'Skipped'
+                   AND r.inherited_from_review_id IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM reviews done
+                                    WHERE done.patchset_id = r.patchset_id
+                                      AND done.patch_id = r.patch_id
+                                      AND done.status = 'Reviewed')
+                 ORDER BY p.part_index ASC",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut patches = Vec::new();
+        while let Some(row) = rows.next().await? {
+            patches.push((row.get(0)?, get_optional_integer(&row, 1)?.unwrap_or(0)));
+        }
+        Ok(patches)
+    }
+
     pub async fn get_latest_completed_review_for_patch(
         &self,
         patchset_id: i64,

@@ -2192,6 +2192,7 @@ async fn get_stats(
     let patchsets = crate::metrics::get_patchsets();
     let repo_packs = crate::metrics::get_repo_packs();
     let repo_pack_bytes = crate::metrics::get_repo_pack_bytes();
+    let reviews_skipped_unchanged = crate::metrics::get_reviews_skipped_unchanged();
 
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -2201,7 +2202,8 @@ async fn get_stats(
         "messages": messages,
         "patchsets": patchsets,
         "repo_packs": repo_packs,
-        "repo_pack_bytes": repo_pack_bytes
+        "repo_pack_bytes": repo_pack_bytes,
+        "reviews_skipped_unchanged": reviews_skipped_unchanged
     })))
 }
 
