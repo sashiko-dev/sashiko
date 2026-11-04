@@ -30,11 +30,14 @@ QEMU's C error discipline: functions report failure through return values and
 
 ## `Error **errp` discipline
 
-- A function that can fail takes `Error **errp`, sets it via `error_setg`
-  (family) before returning failure, and callers pass either a local `Error
-  *local_err` they propagate with `error_propagate`, or `&error_abort` only
-  when the failure is genuinely unrecoverable — a guest-reachable failure is
-  never unrecoverable.
+- A function that can fail takes `Error **errp` and sets it via `error_setg`
+  (family) before returning failure. Callers either pass a local `Error
+  *local_err` they check and propagate with `error_propagate`, forward the
+  `Error **errp` their own caller gave them, or pass `&error_abort`.
+  - The return value should always be checked, but there is no need to propagate
+    the specific return value if using `errp`.
+  - `&error_abort` is appropriate only when the failure is genuinely
+    unrecoverable — a guest-reachable failure is never unrecoverable.
 - Returning failure without setting `*errp` turns the caller's error message
   into `NULL`; flag it.
 - Setting `*errp` and then returning success (or returning failure and then
