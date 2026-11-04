@@ -6,6 +6,8 @@ track = true
 # - "author": the patch author (From: header -> To:)
 # - "list": this block's mailing list address (-> To:/Cc:)
 # - "recipients": all individual (non-mailing-list) To:/Cc: recipients on the patch
+# Empty by default: each list opts in to outbound mail in its own block, so
+# a list nobody reviewed cannot start sending mail by accident.
 reply_to = []
 
 # When a review finds no issues, who receives the positive review email:
@@ -29,5 +31,10 @@ ignored_emails = []
 # --- Tracked for Web UI only (no outbound emails) ---
 
 ["qemu-devel@nongnu.org"]
+reply_to = []
 
+# Review emails go to the patch author and the individuals the patch was
+# To/Cc'd to, never to the list address itself. "author" must be listed:
+# the author is normally not among the recipients of their own patch.
 ["qemu-riscv@nongnu.org"]
+reply_to = ["author", "recipients"]
