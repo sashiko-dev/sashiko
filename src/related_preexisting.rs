@@ -326,6 +326,13 @@ mod reporting {
                 let relation: DisclosureRelation =
                     serde_json::from_value(item.get("relation")?.clone()).ok()?;
                 let key = BugKey::from_item(item);
+                let bug_id = item.get("bug_id").and_then(Value::as_i64);
+                let bugid = item
+                    .get("bugid")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
                 Some(NewPreexistingDisclosure {
                     fingerprint: key.fingerprint.clone(),
                     problem: problem_of(item).trim().to_string(),
@@ -342,6 +349,8 @@ mod reporting {
                     bug_key_json: serde_json::to_string(&key).ok()?,
                     report_text: report_text.to_string(),
                     files: key.files,
+                    bug_id,
+                    bugid,
                 })
             })
             .collect()
@@ -354,6 +363,11 @@ mod reporting {
         candidate: &NewPreexistingDisclosure,
         existing: &PreexistingDisclosure,
     ) -> bool {
+        if let (Some(a), Some(b)) = (candidate.bug_id, existing.bug_id)
+            && a == b
+        {
+            return true;
+        }
         let (Ok(a), Ok(b)) = (
             serde_json::from_str::<BugKey>(&candidate.bug_key_json),
             serde_json::from_str::<BugKey>(&existing.bug_key_json),
@@ -773,6 +787,8 @@ rename to mm/b.c
         let review = json!({
             "related_preexisting": [
                 {
+                    "bug_id": 42,
+                    "bugid": "linux-42-uuid",
                     "description": "lock held on the -EINVAL return",
                     "severity": "High",
                     "relation": "SamePattern",
@@ -790,6 +806,8 @@ rename to mm/b.c
         assert_eq!(c.severity, Severity::High);
         assert_eq!(c.files, vec!["mm/foo.c".to_string()]);
         assert_eq!(c.report_text, "> return -EINVAL;\n\nnote one");
+        assert_eq!(c.bug_id, Some(42));
+        assert_eq!(c.bugid.as_deref(), Some("linux-42-uuid"));
 
         let row = |key: &str| PreexistingDisclosure {
             id: 1,
@@ -804,6 +822,7 @@ rename to mm/b.c
             reserved_at: 0,
             disclosed_at: None,
             bug_id: None,
+            bugid: None,
             files: c.files.clone(),
         };
         assert!(same_disclosed_bug(c, &row(&c.bug_key_json)));
@@ -866,6 +885,7 @@ rename to mm/b.c
             reserved_at: 0,
             disclosed_at: None,
             bug_id: None,
+            bugid: None,
             files: Vec::new(),
         };
         let section = related_email_section(&[row]);

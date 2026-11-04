@@ -68,7 +68,7 @@ pub struct DismissedCandidate {
 
 const SELECTION_INSTRUCTION: &str = r#"# Pick related pre-existing bugs worth telling the author about
 
-While reviewing this patch, other reviewers verified the pre-existing bugs listed under "Candidates". None of them was introduced by this patch. The patch author will only be told about a candidate if it is clearly worth their attention in the context of THIS patch. Mentioning an unrelated bug is noise and wastes the author's time, so the default answer for every candidate is to dismiss it.
+The pre-existing bugs listed under "Candidates" are verified open bugs tracked in the database for the files this patch touches. None of them was introduced by this patch. The patch author will only be told about a candidate if it is clearly worth their attention in the context of THIS patch. Mentioning an unrelated bug is noise and wastes the author's time, so the default answer for every candidate is to dismiss it.
 
 Select a candidate only when one of these holds, and you can cite the code that shows it:
 - "SameCode": the bug sits in code the patch modifies, or in the same function right next to the modified lines, so the author is already working there.
@@ -123,12 +123,25 @@ No repository exploration tools are available in this stage; do not attempt to c
 
 /// The pre-filtered candidates for the current state, or none when the
 /// review does not report related bugs.
+///
+/// Daemon reviews (`ps_id` > 0) select strictly from verified open database
+/// bugs (`candidate_bugs`) so unverified or duplicate concerns from the
+/// current review are never disclosed prematurely. Standalone local CLI
+/// reviews (`ps_id == "0"`, `sashiko review --report-related-preexisting`)
+/// have no daemon bug pipeline and fall back to `state.concerns` when
+/// `candidate_bugs` is empty.
 pub fn selection_candidates(state: &LinuxPatchReviewState) -> Vec<Value> {
     let Some(min_severity) = state.related_preexisting.min_severity() else {
         return Vec::new();
     };
+    let is_daemon_review = state.ps_id.parse::<i64>().is_ok_and(|id| id > 0);
+    let source = if is_daemon_review || !state.candidate_bugs.is_empty() {
+        &state.candidate_bugs
+    } else {
+        &state.concerns
+    };
     prefilter_candidates(
-        &state.concerns,
+        source,
         &state.target_commit_diff_only,
         min_severity,
         &state.known_disclosures,
@@ -575,7 +588,7 @@ diff --git a/mm/foo.c b/mm/foo.c
                 min_severity: SeverityFloor::High,
             },
             target_commit_diff_only: DIFF.to_string(),
-            concerns: vec![
+            candidate_bugs: vec![
                 concern("lock held on the -EINVAL return", "mm/foo.c", "foo_probe"),
                 concern("leak in foo_remove", "mm/foo.c", "foo_remove"),
                 concern("unrelated file", "mm/bar.c", "bar"),
@@ -610,8 +623,21 @@ diff --git a/mm/foo.c b/mm/foo.c
         assert!(resolve_selection_stage(&s, 0.0).is_empty());
 
         let mut s = state();
-        s.concerns.truncate(0);
+        s.candidate_bugs.truncate(0);
         assert!(resolve_selection_stage(&s, 0.0).is_empty());
+
+        // Daemon review (ps_id > 0) strictly uses candidate_bugs and ignores
+        // raw concerns from the current review, whereas local CLI review
+        // (ps_id == "0") falls back to concerns when candidate_bugs is empty.
+        s.concerns = vec![concern(
+            "lock held on the -EINVAL return",
+            "mm/foo.c",
+            "foo_probe",
+        )];
+        s.ps_id = "42".to_string();
+        assert!(selection_candidates(&s).is_empty());
+        s.ps_id = "0".to_string();
+        assert_eq!(selection_candidates(&s).len(), 1);
     }
 
     #[test]

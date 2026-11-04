@@ -18365,6 +18365,8 @@ mod tests {
                 bug_key_json: "{}".to_string(),
                 report_text: "note".to_string(),
                 files: vec!["mm/foo.c".to_string()],
+                bug_id: None,
+                bugid: None,
             }],
             |_, _| false,
         )

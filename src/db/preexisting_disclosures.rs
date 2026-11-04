@@ -50,6 +50,8 @@ pub struct NewPreexistingDisclosure {
     pub locations_json: String,
     pub bug_key_json: String,
     pub report_text: String,
+    pub bug_id: Option<i64>,
+    pub bugid: Option<String>,
     /// Files the bug's locations point at; duplicate checks look here.
     pub files: Vec<String>,
 }
@@ -70,12 +72,13 @@ pub struct PreexistingDisclosure {
     /// When the review email carrying it was queued; `None` while reserved.
     pub disclosed_at: Option<i64>,
     pub bug_id: Option<i64>,
+    pub bugid: Option<String>,
     pub files: Vec<String>,
 }
 
 const DISCLOSURE_COLUMNS: &str = "d.id, d.patch_message_id, d.fingerprint, d.problem, d.severity, \
      d.relation, d.locations_json, d.bug_key_json, d.report_text, d.reserved_at, d.disclosed_at, \
-     d.bug_id";
+     d.bug_id, b.bugid";
 
 fn disclosure_from_row(row: &libsql::Row) -> Result<PreexistingDisclosure> {
     let relation: String = row.get(5)?;
@@ -92,8 +95,103 @@ fn disclosure_from_row(row: &libsql::Row) -> Result<PreexistingDisclosure> {
         reserved_at: row.get(9)?,
         disclosed_at: row.get(10)?,
         bug_id: row.get(11)?,
+        bugid: row.get(12)?,
         files: Vec::new(),
     })
+}
+
+fn bug_to_related_candidate(
+    bug: &super::Bug,
+    target_files: &BTreeSet<&str>,
+) -> Option<serde_json::Value> {
+    let severity = match bug.severity() {
+        Severity::Unknown => bug
+            .enrichments
+            .iter()
+            .rev()
+            .filter(|e| {
+                matches!(
+                    e.kind.as_str(),
+                    "verification" | "candidate" | "raw_candidate"
+                )
+            })
+            .find_map(|e| {
+                let data = e.data_json.as_ref()?;
+                data.get("severity")
+                    .and_then(serde_json::Value::as_str)
+                    .map(Severity::from_str)
+                    .filter(|&s| s != Severity::Unknown)
+            })
+            .unwrap_or(Severity::Unknown),
+        s => s,
+    };
+    if severity == Severity::Unknown {
+        return None;
+    }
+    let mut locations = bug
+        .locations()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let mut seen_files: BTreeSet<String> = locations
+        .iter()
+        .filter_map(|l| {
+            l.get("file")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .collect();
+    if let Some(attr_files) = bug.attributable_files() {
+        for f in attr_files {
+            let trimmed = f.trim();
+            if !trimmed.is_empty() && seen_files.insert(trimmed.to_string()) {
+                locations.push(serde_json::json!({ "file": trimmed }));
+            }
+        }
+    }
+    if !seen_files.iter().any(|f| target_files.contains(f.as_str())) {
+        return None;
+    }
+    let mut item = serde_json::json!({
+        "bug_id": bug.id,
+        "bugid": bug.bugid,
+        "description": bug.title,
+        "severity": severity.as_str(),
+        "preexisting": true,
+        "locations": locations,
+    });
+    let reasoning = bug
+        .description()
+        .or_else(|| bug.severity_explanation())
+        .or_else(|| {
+            bug.enrichments
+                .iter()
+                .rev()
+                .filter(|e| {
+                    matches!(
+                        e.kind.as_str(),
+                        "verification" | "candidate" | "raw_candidate"
+                    )
+                })
+                .find_map(|e| {
+                    let data = e.data_json.as_ref()?;
+                    data.get("severity_explanation")
+                        .or_else(|| data.get("reasoning"))
+                        .or_else(|| data.get("description"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+        });
+    if let Some(reasoning) = reasoning {
+        let trimmed = reasoning.trim();
+        if !trimmed.is_empty() {
+            item["reasoning"] = serde_json::json!(trimmed);
+        }
+    }
+    Some(item)
 }
 
 /// Fills `files` for each disclosure in `found`.
@@ -140,6 +238,7 @@ async fn disclosures_in_files_on(
             "SELECT DISTINCT {DISCLOSURE_COLUMNS}
                FROM preexisting_disclosures d
                JOIN preexisting_disclosure_files f ON f.disclosure_id = d.id
+               LEFT JOIN bugs b ON b.id = d.bug_id
               WHERE f.file IN ({placeholders}) AND {LIVE_ROW}"
         );
         let mut params: Vec<libsql::Value> = chunk
@@ -155,6 +254,50 @@ async fn disclosures_in_files_on(
     }
     attach_files(conn, &mut found).await?;
     Ok(found.into_values().collect())
+}
+
+async fn resolve_canonical_open_bug_on(
+    conn: &libsql::Connection,
+    mut bug_id: i64,
+) -> Result<Option<(i64, String)>> {
+    let mut seen = BTreeSet::new();
+    for _ in 0..8 {
+        if !seen.insert(bug_id) {
+            return Ok(None);
+        }
+        let mut rows = conn
+            .query(
+                "SELECT bugid, lifecycle_status, duplicate_of_id FROM bugs WHERE id = ?",
+                libsql::params![bug_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let bugid: String = row.get(0)?;
+        let status: String = row.get(1)?;
+        let dup_of: Option<i64> = row.get(2)?;
+        if let Some(next_id) = dup_of {
+            bug_id = next_id;
+            continue;
+        }
+        return Ok((status == "open").then_some((bug_id, bugid)));
+    }
+    Ok(None)
+}
+
+async fn has_live_disclosure_for_bug_on(
+    conn: &libsql::Connection,
+    bug_id: i64,
+    now: i64,
+) -> Result<bool> {
+    let sql = format!(
+        "SELECT 1 FROM preexisting_disclosures d WHERE d.bug_id = ? AND {LIVE_ROW} LIMIT 1"
+    );
+    let mut rows = conn
+        .query(&sql, libsql::params![bug_id, now - RESERVATION_TTL_SECS])
+        .await?;
+    Ok(rows.next().await?.is_some())
 }
 
 impl Database {
@@ -198,8 +341,25 @@ impl Database {
         let mut won = Vec::new();
         for candidate in candidates {
             let conn: &libsql::Connection = &tx;
-            let existing = disclosures_in_files_on(conn, &candidate.files, now).await?;
-            if existing.iter().any(|e| is_duplicate(candidate, e)) {
+            let (resolved_bug_id, resolved_bugid) = match candidate.bug_id {
+                Some(raw_bug_id) => {
+                    let Some((canon_id, canon_bugid)) =
+                        resolve_canonical_open_bug_on(conn, raw_bug_id).await?
+                    else {
+                        continue;
+                    };
+                    if has_live_disclosure_for_bug_on(conn, canon_id, now).await? {
+                        continue;
+                    }
+                    (Some(canon_id), Some(canon_bugid))
+                }
+                None => (None, candidate.bugid.clone()),
+            };
+            let mut effective = candidate.clone();
+            effective.bug_id = resolved_bug_id;
+            effective.bugid = resolved_bugid;
+            let existing = disclosures_in_files_on(conn, &effective.files, now).await?;
+            if existing.iter().any(|e| is_duplicate(&effective, e)) {
                 continue;
             }
             let id: i64 = {
@@ -207,20 +367,21 @@ impl Database {
                     .query(
                         "INSERT INTO preexisting_disclosures
                              (patch_message_id, fingerprint, problem, severity, relation,
-                              locations_json, bug_key_json, report_text, reserved_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                              locations_json, bug_key_json, report_text, reserved_at, bug_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                          ON CONFLICT(patch_message_id, fingerprint) DO NOTHING
                          RETURNING id",
                         libsql::params![
                             patch_message_id,
-                            candidate.fingerprint.as_str(),
-                            candidate.problem.as_str(),
-                            candidate.severity as i32,
-                            candidate.relation.as_db_str(),
-                            candidate.locations_json.as_str(),
-                            candidate.bug_key_json.as_str(),
-                            candidate.report_text.as_str(),
-                            now
+                            effective.fingerprint.as_str(),
+                            effective.problem.as_str(),
+                            effective.severity as i32,
+                            effective.relation.as_db_str(),
+                            effective.locations_json.as_str(),
+                            effective.bug_key_json.as_str(),
+                            effective.report_text.as_str(),
+                            now,
+                            effective.bug_id
                         ],
                     )
                     .await?;
@@ -230,7 +391,7 @@ impl Database {
                     None => continue,
                 }
             };
-            let files: BTreeSet<&str> = candidate.files.iter().map(String::as_str).collect();
+            let files: BTreeSet<&str> = effective.files.iter().map(String::as_str).collect();
             for file in &files {
                 tx.execute(
                     "INSERT INTO preexisting_disclosure_files (disclosure_id, file) VALUES (?, ?)",
@@ -241,21 +402,110 @@ impl Database {
             won.push(PreexistingDisclosure {
                 id,
                 patch_message_id: patch_message_id.to_string(),
-                fingerprint: candidate.fingerprint.clone(),
-                problem: candidate.problem.clone(),
-                severity: candidate.severity,
-                relation: candidate.relation,
-                locations_json: candidate.locations_json.clone(),
-                bug_key_json: candidate.bug_key_json.clone(),
-                report_text: candidate.report_text.clone(),
+                fingerprint: effective.fingerprint.clone(),
+                problem: effective.problem.clone(),
+                severity: effective.severity,
+                relation: effective.relation,
+                locations_json: effective.locations_json.clone(),
+                bug_key_json: effective.bug_key_json.clone(),
+                report_text: effective.report_text.clone(),
                 reserved_at: now,
                 disclosed_at: None,
-                bug_id: None,
+                bug_id: effective.bug_id,
+                bugid: effective.bugid,
                 files: files.into_iter().map(str::to_string).collect(),
             });
         }
         tx.commit().await?;
         Ok(won)
+    }
+
+    /// Canonical `bug_id`s that already have a live disclosure (mailed, or
+    /// reserved within `RESERVATION_TTL_SECS` by a patch not in
+    /// `own_patch_message_ids`), regardless of which files the disclosure was
+    /// originally indexed under.
+    pub async fn live_disclosed_bug_ids_excluding(
+        &self,
+        own_patch_message_ids: &std::collections::HashSet<&str>,
+    ) -> Result<std::collections::HashSet<i64>> {
+        let oldest_live = chrono::Utc::now().timestamp() - RESERVATION_TTL_SECS;
+        let sql = format!(
+            "SELECT d.bug_id, d.patch_message_id, d.disclosed_at
+               FROM preexisting_disclosures d
+              WHERE d.bug_id IS NOT NULL AND {LIVE_ROW}"
+        );
+        let mut rows = self.conn.query(&sql, libsql::params![oldest_live]).await?;
+        let mut out = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await? {
+            let bug_id: i64 = row.get(0)?;
+            let patch_msg_id: String = row.get(1)?;
+            let disclosed_at: Option<i64> = row.get(2)?;
+            if disclosed_at.is_some() || !own_patch_message_ids.contains(patch_msg_id.as_str()) {
+                out.insert(bug_id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Open canonical bugs (`lifecycle_status = 'open' AND duplicate_of_id IS NULL`)
+    /// whose verified or candidate locations touch any of `files`, formatted as
+    /// candidate items for the related pre-existing bug selection stage.
+    pub async fn open_bugs_in_files(&self, files: &[String]) -> Result<Vec<serde_json::Value>> {
+        let unique_files: BTreeSet<&str> = files
+            .iter()
+            .map(|f| f.trim())
+            .filter(|f| !f.is_empty())
+            .collect();
+        if unique_files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let file_list: Vec<&str> = unique_files.iter().copied().collect();
+        let mut found: BTreeMap<i64, super::Bug> = BTreeMap::new();
+        for chunk in file_list.chunks(FILE_CHUNK_SIZE) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT DISTINCT {cols}
+                   FROM bugs
+                  WHERE lifecycle_status = 'open'
+                    AND duplicate_of_id IS NULL
+                    AND EXISTS (
+                        SELECT 1 FROM bug_enrichments e
+                         WHERE e.bug_id = bugs.id
+                           AND e.kind IN ('verification', 'candidate', 'raw_candidate')
+                           AND json_valid(e.data_json) = 1
+                           AND (
+                               (json_type(e.data_json, '$.source_files') = 'array'
+                                AND EXISTS (
+                                    SELECT 1 FROM json_each(e.data_json, '$.source_files') sf
+                                     WHERE sf.value IN ({placeholders})
+                                ))
+                               OR (json_type(e.data_json, '$.locations') = 'array'
+                                   AND EXISTS (
+                                       SELECT 1 FROM json_each(e.data_json, '$.locations') loc
+                                        WHERE json_valid(loc.value) = 1
+                                          AND json_extract(loc.value, '$.file') IN ({placeholders})
+                                   ))
+                           )
+                    )
+                  ORDER BY id ASC",
+                cols = super::BUG_ROW_COLUMNS,
+            );
+            let mut params: Vec<libsql::Value> = Vec::with_capacity(chunk.len() * 2);
+            for _ in 0..2 {
+                params.extend(chunk.iter().map(|f| libsql::Value::Text((*f).to_string())));
+            }
+            let mut rows = self.conn.query(&sql, params).await?;
+            while let Some(row) = rows.next().await? {
+                let bug = Self::parse_bug_row_core(&row)?;
+                found.insert(bug.id, bug);
+            }
+        }
+        let mut bugs: Vec<super::Bug> = found.into_values().collect();
+        self.hydrate_bugs_batch(&mut bugs).await?;
+        Ok(bugs
+            .iter()
+            .filter_map(|bug| bug_to_related_candidate(bug, &unique_files))
+            .collect())
     }
 
     /// Disclosures pointing at any of `files`, for showing a review which
@@ -275,6 +525,7 @@ impl Database {
     ) -> Result<Vec<PreexistingDisclosure>> {
         let sql = format!(
             "SELECT {DISCLOSURE_COLUMNS} FROM preexisting_disclosures d
+               LEFT JOIN bugs b ON b.id = d.bug_id
               WHERE d.patch_message_id = ? AND {LIVE_ROW} ORDER BY d.id"
         );
         let oldest_live = chrono::Utc::now().timestamp() - RESERVATION_TTL_SECS;
@@ -382,6 +633,8 @@ mod tests {
             bug_key_json: "{}".to_string(),
             report_text: format!("report {fingerprint}"),
             files: files.iter().map(|f| f.to_string()).collect(),
+            bug_id: None,
+            bugid: None,
         }
     }
 
@@ -719,11 +972,13 @@ mod tests {
         );
         let rows = db.preexisting_disclosures_for_patch("p1@x").await.unwrap();
         assert_eq!(rows[0].bug_id, Some(7));
+        assert_eq!(rows[0].bugid.as_deref(), Some("linux-7"));
 
         // Folding the bug into another moves the disclosure along.
         db.migrate_review_bugs(7, 8).await.unwrap();
         let rows = db.preexisting_disclosures_for_patch("p1@x").await.unwrap();
         assert_eq!(rows[0].bug_id, Some(8));
+        assert_eq!(rows[0].bugid.as_deref(), Some("linux-8"));
 
         // The bug pipeline links the review and the disclosure in one
         // claim-checked write: without the bug's lease, neither changes.
@@ -759,5 +1014,82 @@ mod tests {
             unlinked(db.preexisting_disclosures_for_patch("p1@x").await.unwrap()),
             Some(7)
         );
+    }
+
+    #[tokio::test]
+    async fn test_open_bugs_in_files_and_reservation_bugid() {
+        let db = setup_db().await;
+        db.execute(
+            "INSERT INTO bugs (id, bugid, title, lifecycle_status, pipeline_state, reporter,
+                               reported_at, created_at, updated_at, duplicate_of_id)
+             VALUES (11, 'linux-open-11', 'Null deref in foo_init', 'open', 'succeeded', 'r', 0, 0, 0, NULL),
+                    (12, 'linux-dup-12', 'Duplicate bug', 'duplicate', 'succeeded', 'r', 0, 0, 0, 11),
+                    (13, 'linux-inv-13', 'Dismissed bug', 'dismissed', 'succeeded', 'r', 0, 0, 0, NULL),
+                    (14, 'linux-other-14', 'Unrelated file bug', 'open', 'succeeded', 'r', 0, 0, 0, NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            r#"INSERT INTO bug_enrichments (bug_id, kind, tool, created_at, data_json)
+               VALUES (11, 'verification', 'verify', 0, '{"description":"Detailed foo_init null deref","severity":"High","severity_explanation":"Kernel oops on boot","locations":[{"file":"mm/foo.c","function":"foo_init","line_range":{"start":10,"end":18}}]}'),
+                      (12, 'verification', 'verify', 0, '{"description":"dup","severity":"High","locations":[{"file":"mm/foo.c","function":"foo_init"}]}'),
+                      (13, 'verification', 'verify', 0, '{"description":"inv","severity":"High","locations":[{"file":"mm/foo.c","function":"foo_init"}]}'),
+                      (14, 'verification', 'verify', 0, '{"description":"other","severity":"High","locations":[{"file":"net/bar.c","function":"bar_init"}]}')"#,
+            (),
+        )
+        .await
+        .unwrap();
+
+        let bugs = db
+            .open_bugs_in_files(&["mm/foo.c".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(bugs.len(), 1);
+        assert_eq!(bugs[0]["bug_id"], serde_json::json!(11));
+        assert_eq!(bugs[0]["bugid"], serde_json::json!("linux-open-11"));
+        assert_eq!(
+            bugs[0]["description"],
+            serde_json::json!("Null deref in foo_init")
+        );
+        assert_eq!(bugs[0]["severity"], serde_json::json!("High"));
+        assert_eq!(
+            bugs[0]["reasoning"],
+            serde_json::json!("Kernel oops on boot")
+        );
+
+        let mut cand = candidate("fp-11", &["mm/foo.c"]);
+        cand.bug_id = Some(11);
+        cand.bugid = Some("linux-open-11".to_string());
+        let won = db
+            .reserve_preexisting_disclosures("p1@x", &[cand], same_fingerprint)
+            .await
+            .unwrap();
+        assert_eq!(won.len(), 1);
+        assert_eq!(won[0].bug_id, Some(11));
+        assert_eq!(won[0].bugid.as_deref(), Some("linux-open-11"));
+
+        let loaded = db.preexisting_disclosures_for_patch("p1@x").await.unwrap();
+        assert_eq!(loaded[0].bug_id, Some(11));
+        assert_eq!(loaded[0].bugid.as_deref(), Some("linux-open-11"));
+
+        // Reserving the same canonical bug_id (or a duplicate folded into it)
+        // from another file is blocked even when preexisting_disclosure_files
+        // has no overlap, and dismissed bugs cannot be reserved.
+        let mut cross_file = candidate("fp-cross", &["net/bar.c"]);
+        cross_file.bug_id = Some(12); // duplicate of 11
+        cross_file.bugid = Some("linux-dup-12".to_string());
+        let mut dismissed_cand = candidate("fp-dismissed", &["net/bar.c"]);
+        dismissed_cand.bug_id = Some(13); // dismissed
+        dismissed_cand.bugid = Some("linux-inv-13".to_string());
+        let won_cross = db
+            .reserve_preexisting_disclosures(
+                "p2@x",
+                &[cross_file, dismissed_cand],
+                same_fingerprint,
+            )
+            .await
+            .unwrap();
+        assert!(won_cross.is_empty());
     }
 }
