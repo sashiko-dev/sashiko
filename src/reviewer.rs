@@ -521,6 +521,165 @@ impl Reviewer {
         by_part.into_values().collect()
     }
 
+    /// The coverage a worker started with these settings gives a review;
+    /// run_review_tool_with_cmd_and_overrides passes the same two settings
+    /// to it as --cheap and --stages.
+    fn review_coverage(review: &crate::settings::ReviewSettings) -> crate::db::ReviewCoverage {
+        crate::db::ReviewCoverage::new(review.cheap, review.stages.as_deref())
+    }
+
+    /// How many clean reviews sharing a Git patch ID are compared byte for
+    /// byte before giving up. A patch carried across many series has many
+    /// copies, and the newest few are the ones a verdict should come from.
+    const CLEAN_REVIEW_CANDIDATES: usize = 8;
+
+    /// Picks the completed, finding-free review of an identical earlier copy
+    /// of this patch, if `[review] skip_unchanged_clean` allows one.
+    ///
+    /// The Git patch ID only narrows the search; the diffs must match
+    /// exactly, modulo rebase noise, because git patch-id ignores
+    /// whitespace. The model and prompt check is on by default so a change
+    /// to either re-reviews every patch, and the baseline check is off by
+    /// default because a repost nearly always lands on a newer tip. The
+    /// prior review must also have run at least the pipeline this one
+    /// would: a verdict from a `review.cheap` pass or a `--stages` subset
+    /// never stands in for a fuller review. And nobody may have replied to
+    /// the copy that was reviewed.
+    async fn find_inherited_clean_review(
+        ctx: &ReviewContext,
+        patchset_id: i64,
+        index: i64,
+        patch_id: i64,
+        diff: &str,
+        baseline_ref: &str,
+        prompts_hash: Option<&str>,
+    ) -> Result<Option<crate::db::CleanReviewCandidate>> {
+        let Some(git_patch_id) = ctx.db.get_patch_git_patch_id(patch_id).await? else {
+            return Ok(None);
+        };
+        let review = &ctx.settings.review;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let since = now.saturating_sub(
+            i64::try_from(
+                review
+                    .skip_unchanged_clean_max_age_days
+                    .saturating_mul(86_400),
+            )
+            .unwrap_or(i64::MAX),
+        );
+        let candidates = ctx
+            .db
+            .find_clean_review_candidates(
+                &git_patch_id,
+                patch_id,
+                since,
+                Self::CLEAN_REVIEW_CANDIDATES,
+            )
+            .await?;
+        let wanted = Self::review_coverage(review);
+        for c in candidates {
+            if !crate::prior_context::patch_diffs_equivalent(&c.diff, diff) {
+                continue;
+            }
+            // Newest first: a later review of this same diff that found
+            // something overrules every clean verdict before it.
+            if c.has_findings {
+                return Ok(None);
+            }
+            let same_model = c.model.as_deref() == Some(ctx.settings.ai.model.as_str())
+                && c.prompts_hash.as_deref() == prompts_hash;
+            // No setting waives the coverage check: any_model accepts
+            // another model's verdict, not a narrower review's.
+            if !c.coverage.covers(&wanted) || !(review.skip_unchanged_clean_any_model || same_model)
+            {
+                continue;
+            }
+            // The same tree means the same base commit and the same
+            // patches applied ahead of this one. A rewritten 1/5 changes
+            // what an untouched 3/5 is applied to.
+            if review.skip_unchanged_clean_require_same_baseline
+                && !(c.baseline_commit.as_deref() == Some(baseline_ref)
+                    && Self::earlier_patches_unchanged(ctx, patchset_id, index, &c).await?)
+            {
+                continue;
+            }
+            // A reply to the reviewed copy is feedback the prior-feedback
+            // audit exists to weigh. The audit finds it through lineage;
+            // this copy was found by its diff and may have none, so the
+            // gate in may_inherit_clean_verdict never saw the reply. The
+            // same goes for a reply to any copy that already inherited
+            // this verdict: v2 inherits from v1 and draws the criticism,
+            // and v3 still lands on v1's review.
+            let mut copies = vec![c.patch_message_id.clone()];
+            copies.extend(ctx.db.get_inheriting_patch_message_ids(c.review_id).await?);
+            for message_id in &copies {
+                if ctx.db.patch_has_human_replies(message_id).await? {
+                    return Ok(None);
+                }
+            }
+            return Ok(Some(c));
+        }
+        Ok(None)
+    }
+
+    /// Whether the patches ahead of `index` in `patchset_id` match, one for
+    /// one and in order, the patches ahead of the candidate in its series.
+    async fn earlier_patches_unchanged(
+        ctx: &ReviewContext,
+        patchset_id: i64,
+        index: i64,
+        candidate: &crate::db::CleanReviewCandidate,
+    ) -> Result<bool> {
+        let ahead_of = |mut diffs: Vec<(i64, i64, String, String, String, i64, String)>,
+                        part: i64| {
+            diffs.retain(|d| d.1 < part);
+            diffs.sort_by_key(|d| d.1);
+            diffs
+        };
+        let ours = ahead_of(ctx.db.get_patch_diffs(patchset_id).await?, index);
+        let theirs = ahead_of(
+            ctx.db.get_patch_diffs(candidate.patchset_id).await?,
+            candidate.part_index,
+        );
+        Ok(ours.len() == theirs.len()
+            && ours
+                .iter()
+                .zip(&theirs)
+                .all(|(a, b)| crate::prior_context::patch_diffs_equivalent(&a.2, &b.2)))
+    }
+
+    /// Whether this pass over `index` may reuse a clean verdict at all.
+    ///
+    /// A rerun raises the patchset's target review count to force a model
+    /// run, so the count must still be one. And a patch whose prior-version
+    /// context carries findings or human discussion needs the prior-feedback
+    /// audit that only a full review performs; `PriorVersionContext::
+    /// is_empty_for_audit` draws the same line.
+    fn may_inherit_clean_verdict(ctx: &ReviewContext, input_payload: &Value, index: i64) -> bool {
+        if !ctx.settings.review.skip_unchanged_clean || ctx.target_review_count > 1 {
+            return false;
+        }
+        let needs_audit = input_payload
+            .get("patches")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|p| p.get("index").and_then(Value::as_i64) == Some(index))
+            .and_then(|p| p.get("prior_version_context"))
+            .filter(|pvc| !pvc.is_null())
+            .is_some_and(|pvc| {
+                ["prior_findings", "discussion_threads"].iter().any(|key| {
+                    pvc.get(key)
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| !items.is_empty())
+                })
+            });
+        !needs_audit
+    }
+
     fn touches_only_ignored_files(diff: &str, ignore_files: &[String]) -> bool {
         let files = extract_files_from_diff(diff);
         !files.is_empty()
@@ -558,6 +717,13 @@ impl Reviewer {
                     &review.summary,
                 )
                 .await?;
+            }
+
+            // A patch that inherited its verdict has no Reviewed row for
+            // the loop above, and its Patchwork check was held back too.
+            for (patch_msg_id, index) in ctx.db.get_inherited_clean_patches(patchset.id).await? {
+                let ps_msg_id = patchset.message_id.as_deref().unwrap_or(&patch_msg_id);
+                Self::queue_inherited_patchwork_check(ctx, &patch_msg_id, ps_msg_id, index).await?;
             }
         }
 
@@ -941,13 +1107,11 @@ impl Reviewer {
             ctx.worker_overrides.related_preexisting =
                 Self::related_preexisting_gate(&ctx, &patchset).await;
 
-            let has_ancestor = ctx
-                .db
-                .get_previous_patchset_id(patchset_id)
-                .await
-                .ok()
-                .flatten()
-                .is_some();
+            let previous_patchset = ctx.db.get_previous_patchset_id(patchset_id).await;
+            // False once either lookup below fails. An empty context map
+            // then means "unknown", not "no prior feedback".
+            let mut prior_feedback_known = previous_patchset.is_ok();
+            let has_ancestor = previous_patchset.ok().flatten().is_some();
             let prior_contexts = if has_ancestor {
                 if ctx.settings.forge.enabled
                     && let Some(mr_url) = patchset.mr_url.as_deref()
@@ -965,6 +1129,9 @@ impl Reviewer {
                             "Best-effort GitHub PR feedback sync failed for {}#{}: {}",
                             repo, pr_number, e
                         );
+                        // The context below is then built without the
+                        // comments this sync would have stored.
+                        prior_feedback_known = false;
                     }
                 }
 
@@ -988,12 +1155,24 @@ impl Reviewer {
                             "Failed to build prior version contexts for patchset {}: {}",
                             patchset_id, e
                         );
+                        prior_feedback_known = false;
                         std::collections::HashMap::new()
                     }
                 }
             } else {
                 std::collections::HashMap::new()
             };
+            if !prior_feedback_known && ctx.settings.review.skip_unchanged_clean {
+                // may_inherit_clean_verdict reads a patch with no context
+                // as one that needs no prior-feedback audit. That is not
+                // known here, so no patch of this series inherits. The
+                // context holds this patchset's own copy of the settings.
+                warn!(
+                    "Prior feedback for patchset {} could not be read; reviewing every patch in full",
+                    patchset_id
+                );
+                ctx.settings.review.skip_unchanged_clean = false;
+            }
 
             // patches_json for input payload (contains all patches)
             let patches_json: Vec<_> = diffs
@@ -2537,11 +2716,12 @@ impl Reviewer {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64;
+            let completed = ctx
+                .db
+                .get_latest_completed_review_for_patch(patchset_id, patch_id)
+                .await?;
             if embargo_until.filter(|&u| u > now).is_none()
-                && let Some(review) = ctx
-                    .db
-                    .get_latest_completed_review_for_patch(patchset_id, patch_id)
-                    .await?
+                && let Some(review) = completed.as_ref()
                 && review.has_inline_review
             {
                 let patch_msg_id = input_payload["patches"]
@@ -2568,7 +2748,23 @@ impl Reviewer {
                 )
                 .await?;
             }
-            ctx.db.update_patch_status(patch_id, "Reviewed").await?;
+            // A patch whose only finished pass inherited a clean verdict has
+            // no Reviewed row, and stays Skipped.
+            if completed.is_none() {
+                Self::queue_inherited_check_unless_embargoed(
+                    ctx,
+                    input_payload,
+                    index,
+                    embargo_until,
+                )
+                .await?;
+            }
+            let status = if completed.is_some() {
+                "Reviewed"
+            } else {
+                "Skipped"
+            };
+            ctx.db.update_patch_status(patch_id, status).await?;
             return Ok(PatchResult::Success);
         }
 
@@ -2639,6 +2835,89 @@ impl Reviewer {
                 return Err(e);
             }
             ctx.db.update_patch_status(patch_id, "Skipped").await?;
+
+            return Ok(PatchResult::Success);
+        }
+
+        if Self::may_inherit_clean_verdict(ctx, input_payload, index)
+            && let Some(prior) = Self::find_inherited_clean_review(
+                ctx,
+                patchset_id,
+                index,
+                patch_id,
+                diff,
+                baseline_ref,
+                prompts_hash,
+            )
+            .await?
+        {
+            info!(
+                "Skipping review for patch {}/{} (ID: {}): unchanged since review {} of patchset {} part {} found no issues",
+                patchset_id, index, patch_id, prior.review_id, prior.patchset_id, prior.part_index
+            );
+            let review_id = match ctx
+                .db
+                .claim_or_create_in_review(
+                    patchset_id,
+                    Some(patch_id),
+                    &ctx.settings.ai.provider,
+                    &ctx.settings.ai.model,
+                    baseline_id,
+                    prompts_hash,
+                )
+                .await
+            {
+                Ok(id) => id,
+                Err(e) if Self::is_deleted_review_error(&e) => {
+                    info!(
+                        "Patchset {} was cancelled before skipping patch {}/{}, aborting worker",
+                        patchset_id, patchset_id, index
+                    );
+                    return Ok(PatchResult::Cancelled);
+                }
+                Err(e) => return Err(e),
+            };
+            // Provenance goes in while the row is still In Review, so a
+            // failure here leaves a row the orphan cleanup recognizes
+            // rather than a Skipped row with no source.
+            ctx.db
+                .set_review_inherited_from(review_id, prior.review_id)
+                .await?;
+            ctx.db
+                .set_review_baseline_commit(review_id, baseline_ref)
+                .await?;
+            let result = format!(
+                "Skipped: unchanged since review {} of \"{}\" (patch {}) found no issues",
+                prior.review_id, prior.patchset_subject, prior.part_index
+            );
+            if let Err(e) = Self::complete_review_with_retry(
+                ctx,
+                review_id,
+                ReviewStatus::Skipped.as_str(),
+                &result,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                if Self::is_deleted_review_error(&e) {
+                    info!(
+                        "Review {} for patch {}/{} was deleted by a concurrent rerun, aborting superseded worker",
+                        review_id, patchset_id, index
+                    );
+                    return Ok(PatchResult::Cancelled);
+                }
+                return Err(e);
+            }
+            // Queued before the patch reaches a terminal status, as a model
+            // review's notifications are, so a failure leaves the patch
+            // where a retry finds the finished row and queues the check.
+            Self::queue_inherited_check_unless_embargoed(ctx, input_payload, index, embargo_until)
+                .await?;
+            ctx.db.update_patch_status(patch_id, "Skipped").await?;
+            crate::metrics::inc_reviews_skipped_unchanged();
 
             return Ok(PatchResult::Success);
         }
@@ -2739,6 +3018,30 @@ impl Reviewer {
                     Err(e) => return Err(e),
                 }
             };
+
+            // Claiming the row left its coverage columns at a full review,
+            // so only a cheap or stage-limited run has anything to write.
+            // That write is not best effort: a narrowed run that failed to
+            // record itself would later lend its clean verdict to a full
+            // one, so the run does not start until the row says what it is.
+            let coverage = Self::review_coverage(&ctx.settings.review);
+            if coverage != crate::db::ReviewCoverage::default() {
+                ctx.db.set_review_coverage(review_id, &coverage).await?;
+            }
+
+            // Recorded so a later review of the same diff can tell whether
+            // it ran on the same tree. Best effort: the review itself does
+            // not depend on it.
+            if let Err(e) = ctx
+                .db
+                .set_review_baseline_commit(review_id, baseline_ref)
+                .await
+            {
+                warn!(
+                    "Failed to record baseline commit for review {} of patch {}/{}: {}",
+                    review_id, patchset_id, index, e
+                );
+            }
 
             let result = run_review_tool(
                 patchset_id,
@@ -4222,6 +4525,180 @@ async fn run_review_tool_with_cmd_and_overrides(
     }
 }
 impl Reviewer {
+    /// Whether `patch_author` is Sashiko itself or an author the policy
+    /// ignores, so that nothing is sent in answer to the patch.
+    fn is_bot_loop_author(
+        policy: &EmailPolicyConfig,
+        patch_author: &str,
+        sender_address: &str,
+    ) -> bool {
+        let sashiko_bare = crate::email_policy::extract_bare_email(sender_address);
+        let author_bare = crate::email_policy::extract_bare_email(patch_author);
+        EmailRouter::is_ignored_author(policy, patch_author)
+            || (!sashiko_bare.is_empty()
+                && !author_bare.is_empty()
+                && (author_bare == sashiko_bare
+                    || patch_author.to_ascii_lowercase().contains(&sashiko_bare)))
+    }
+
+    /// The dashboard link for part `index` of the patchset whose
+    /// Message-ID, without angle brackets, is `patchset_msg_id_clean`.
+    fn patch_target_url(ctx: &ReviewContext, patchset_msg_id_clean: &str, index: i64) -> String {
+        let domain = if ctx.settings.project.domain.is_empty() {
+            "sashiko.dev"
+        } else {
+            ctx.settings.project.domain.as_str()
+        };
+        format!(
+            "https://{}/#/patchset/{}?part={}",
+            domain, patchset_msg_id_clean, index
+        )
+    }
+
+    /// Queues one Patchwork check for the patch mail `msg_id`, through
+    /// whichever of the API and email modes `pw_policy` configures.
+    async fn queue_patchwork_check(
+        ctx: &ReviewContext,
+        pw_policy: &crate::email_policy::PatchworkPolicy,
+        check_result: &crate::patchwork::PatchworkCheckResult,
+        msg_id: &str,
+        patch_subject: &str,
+        target_url: &str,
+    ) -> Result<()> {
+        // API mode: insert into patchwork_outbox for retry-queued delivery
+        if let Some(api_url) = &pw_policy.api_url {
+            ctx.db
+                .insert_patchwork_outbox(
+                    msg_id,
+                    api_url,
+                    &check_result.state,
+                    &check_result.description,
+                    target_url,
+                    "sashiko",
+                )
+                .await?;
+        }
+
+        // Email mode: queue structured notification via email outbox
+        if let Some(email_addr) = &pw_policy.email {
+            let (pw_subject, pw_body) = crate::patchwork::compose_patchwork_email(
+                msg_id,
+                &check_result.state,
+                &check_result.description,
+                target_url,
+                patch_subject,
+            );
+            let pw_email_status = match &ctx.settings.smtp {
+                None => "Disabled",
+                Some(s) if s.dry_run => "Dry-Run",
+                _ => "Pending",
+            };
+            ctx.db
+                .insert_patchwork_notification(
+                    pw_email_status,
+                    email_addr,
+                    &pw_subject,
+                    msg_id.trim_matches(|c| c == '<' || c == '>'),
+                    msg_id.trim_matches(|c| c == '<' || c == '>'),
+                    &pw_body,
+                )
+                .await?;
+        }
+
+        // Neither mode configured but patchwork enabled
+        if pw_policy.api_url.is_none() && pw_policy.email.is_none() {
+            tracing::warn!("Patchwork enabled but no api_url or email provided");
+        }
+        Ok(())
+    }
+
+    /// Posts the Patchwork check for a patch that inherited a clean
+    /// verdict. A patch the model reviewed clean gets its check through
+    /// queue_notifications; without this one the inherited patch would
+    /// show no Sashiko check at all. No mail is queued: the verdict is
+    /// not news, and the author already has the earlier review.
+    async fn queue_inherited_patchwork_check(
+        ctx: &ReviewContext,
+        patch_message_id: &str,
+        patchset_message_id: &str,
+        index: i64,
+    ) -> Result<()> {
+        let Some(msg_details) = ctx
+            .db
+            .get_message_details_by_msgid(patch_message_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        let policy = EmailPolicyConfig::load_async(&ctx.settings.review.email_policy_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse email policy: {}", e))?;
+        let sender_address = ctx
+            .settings
+            .smtp
+            .as_ref()
+            .map(|s| s.sender_address.as_str())
+            .unwrap_or("sashiko-bot@localhost");
+        let patch_author = msg_details.author.unwrap_or_default();
+        if Self::is_bot_loop_author(&policy, &patch_author, sender_address) {
+            return Ok(());
+        }
+        let to_list =
+            crate::patch::split_address_list(msg_details.to.as_deref().unwrap_or_default());
+        let cc_list =
+            crate::patch::split_address_list(msg_details.cc.as_deref().unwrap_or_default());
+        let patch_subject = msg_details.subject.unwrap_or_default();
+        let target_url = Self::patch_target_url(
+            ctx,
+            patchset_message_id.trim_matches(|c| c == '<' || c == '>'),
+            index,
+        );
+        let check_result = crate::patchwork::PatchworkCheckResult::inherited_clean();
+        for pw_policy in &EmailRouter::resolve_patchwork(&policy, &to_list, &cc_list) {
+            Self::queue_patchwork_check(
+                ctx,
+                pw_policy,
+                &check_result,
+                patch_message_id,
+                &patch_subject,
+                &target_url,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Queues the Patchwork check for part `index` once its inherited
+    /// verdict is recorded. An embargoed patchset holds the check back with
+    /// everything else; queue_patchset_notifications sends it on release.
+    async fn queue_inherited_check_unless_embargoed(
+        ctx: &ReviewContext,
+        input_payload: &Value,
+        index: i64,
+        embargo_until: Option<i64>,
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if embargo_until.is_some_and(|until| until > now) {
+            return Ok(());
+        }
+        let Some(patch_msg_id) = input_payload["patches"]
+            .as_array()
+            .and_then(|arr| arr.iter().find(|p| p["index"] == index))
+            .and_then(|p| p["message_id"].as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(());
+        };
+        let patchset_msg_id = input_payload["message_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(patch_msg_id);
+        Self::queue_inherited_patchwork_check(ctx, patch_msg_id, patchset_msg_id, index).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn queue_notifications(
         ctx: &ReviewContext,
@@ -4292,14 +4769,7 @@ impl Reviewer {
         let patch_author = msg_details.author.unwrap_or_default();
         let patch_subject = msg_details.subject.unwrap_or_default();
 
-        let sashiko_bare = crate::email_policy::extract_bare_email(&sender_address);
-        let author_bare = crate::email_policy::extract_bare_email(&patch_author);
-        if EmailRouter::is_ignored_author(&policy, &patch_author)
-            || (!sashiko_bare.is_empty()
-                && !author_bare.is_empty()
-                && (author_bare == sashiko_bare
-                    || patch_author.to_ascii_lowercase().contains(&sashiko_bare)))
-        {
+        if Self::is_bot_loop_author(&policy, &patch_author, &sender_address) {
             debug!(
                 "Bot loop guard muted notifications for patch {}/{} (ID: {}) from {:?}",
                 patchset_id, index, patch_id, patch_author
@@ -4338,51 +4808,15 @@ impl Reviewer {
         for pw_policy in &patchwork_policies {
             let check_result =
                 crate::patchwork::PatchworkCheckResult::from_policy(pw_policy, findings_slice);
-
-            // API mode: insert into patchwork_outbox for retry-queued delivery
-            if let Some(api_url) = &pw_policy.api_url {
-                ctx.db
-                    .insert_patchwork_outbox(
-                        msg_id,
-                        api_url,
-                        &check_result.state,
-                        &check_result.description,
-                        &target_url,
-                        "sashiko",
-                    )
-                    .await?;
-            }
-
-            // Email mode: queue structured notification via email outbox
-            if let Some(email_addr) = &pw_policy.email {
-                let (pw_subject, pw_body) = crate::patchwork::compose_patchwork_email(
-                    msg_id,
-                    &check_result.state,
-                    &check_result.description,
-                    &target_url,
-                    &patch_subject,
-                );
-                let pw_email_status = match &ctx.settings.smtp {
-                    None => "Disabled",
-                    Some(s) if s.dry_run => "Dry-Run",
-                    _ => "Pending",
-                };
-                ctx.db
-                    .insert_patchwork_notification(
-                        pw_email_status,
-                        email_addr,
-                        &pw_subject,
-                        msg_id.trim_matches(|c| c == '<' || c == '>'),
-                        msg_id.trim_matches(|c| c == '<' || c == '>'),
-                        &pw_body,
-                    )
-                    .await?;
-            }
-
-            // Neither mode configured but patchwork enabled
-            if pw_policy.api_url.is_none() && pw_policy.email.is_none() {
-                tracing::warn!("Patchwork enabled but no api_url or email provided");
-            }
+            Self::queue_patchwork_check(
+                ctx,
+                pw_policy,
+                &check_result,
+                msg_id,
+                &patch_subject,
+                &target_url,
+            )
+            .await?;
         }
 
         let action = EmailRouter::resolve_recipients(
@@ -5711,6 +6145,645 @@ fi
                         +++ b/mainline.txt\n\
                         @@ -1 +1 @@\n-new\n+newer\n";
         assert_baseline_failure_log(&ctx, tip_diff, "Unrecognized patch application failure.").await
+    }
+
+    const CLEAN_DIFF: &str = "diff --git a/f.c b/f.c\nindex 1111111..2222222 100644\n--- a/f.c\n+++ b/f.c\n@@ -1 +1 @@\n-a\n+\tb\n";
+    const CLEAN_PATCH_ID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn reuse_test_ctx(settings: &Settings, db: &Arc<Database>) -> ReviewContext {
+        ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(56)),
+            db: db.clone(),
+            settings: settings.clone(),
+            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None, None).unwrap()),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+            worker_overrides: WorkerSubprocessOverrides::default(),
+        }
+    }
+
+    /// One single-patch series carrying `diff` under `git_patch_id`.
+    async fn reuse_test_series(
+        db: &Database,
+        tag: &str,
+        diff: &str,
+        git_patch_id: &str,
+    ) -> Result<(i64, i64)> {
+        let msg_id = format!("<{tag}@example.org>");
+        let thread_id = db.create_thread(&msg_id, tag, 1000).await?;
+        db.create_message(
+            &msg_id, thread_id, None, "Author", tag, 1000, "Body", "", "", None, None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, &msg_id, tag, "Author", 1000, 1, 1, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await?
+            .expect("patchset created");
+        let patch_id = db
+            .create_patch_with_git_patch_id(ps_id, &msg_id, 1, diff, Some(git_patch_id))
+            .await?;
+        Ok((ps_id, patch_id))
+    }
+
+    /// A finished review with no findings, on the given model and prompts,
+    /// recorded as having run on `baseline`.
+    async fn reuse_test_clean_review(
+        db: &Database,
+        ps_id: i64,
+        patch_id: i64,
+        model: &str,
+        prompts_hash: &str,
+        baseline: &str,
+    ) -> Result<i64> {
+        let review_id = db
+            .create_review(
+                ps_id,
+                Some(patch_id),
+                "mock",
+                model,
+                None,
+                Some(prompts_hash),
+            )
+            .await?;
+        db.complete_review(review_id, "Reviewed", "done", None, None, None, None)
+            .await?;
+        db.set_review_baseline_commit(review_id, baseline).await?;
+        Ok(review_id)
+    }
+
+    /// With skip_unchanged_clean on, a patch identical to one already
+    /// reviewed clean gets a Skipped review pointing at that review and no
+    /// model run.
+    #[tokio::test]
+    async fn test_unchanged_clean_patch_inherits_prior_review() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let policy_path = temp_dir.path().join("mailing_lists.toml");
+        std::fs::write(
+            &policy_path,
+            r#"
+            [defaults]
+            mute_all = false
+
+            [defaults.patchwork]
+            enabled = true
+            api_url = "https://patchwork.example.org/api/1.3"
+            "#,
+        )?;
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.skip_unchanged_clean = true;
+        settings.review.email_policy_path = policy_path.to_str().unwrap().to_string();
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let ctx = reuse_test_ctx(&settings, &db);
+        let payload = json!({
+            "message_id": "<v2@example.org>",
+            "patches": [{ "index": 1, "message_id": "<v2@example.org>" }],
+        });
+
+        let (v1_ps, v1_patch) = reuse_test_series(&db, "v1", CLEAN_DIFF, CLEAN_PATCH_ID).await?;
+        let prior = reuse_test_clean_review(
+            &db,
+            v1_ps,
+            v1_patch,
+            &settings.ai.model,
+            "prompts-a",
+            "base-1",
+        )
+        .await?;
+
+        // v2 is a rebase of v1: the index line changed, nothing else did.
+        let v2_diff = CLEAN_DIFF.replace("1111111..2222222", "3333333..4444444");
+        let (v2_ps, v2_patch) = reuse_test_series(&db, "v2", &v2_diff, CLEAN_PATCH_ID).await?;
+
+        let before = crate::metrics::get_reviews_skipped_unchanged();
+        let result = Reviewer::process_patch_review(
+            &ctx,
+            v2_ps,
+            v2_patch,
+            1,
+            "base-2",
+            None,
+            &payload,
+            None,
+            Some("prompts-a"),
+            None,
+            &v2_diff,
+            None,
+        )
+        .await?;
+        assert!(matches!(result, PatchResult::Success));
+        assert_eq!(crate::metrics::get_reviews_skipped_unchanged(), before + 1);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, result_description, inherited_from_review_id, baseline_commit
+                 FROM reviews WHERE patch_id = ?",
+                libsql::params![v2_patch],
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .expect("a review row for the skipped patch");
+        assert_eq!(row.get::<String>(0)?, "Skipped");
+        let description: String = row.get(1)?;
+        assert!(
+            description.contains(&format!("review {prior}")),
+            "{description}"
+        );
+        assert!(description.contains("v1"), "{description}");
+        assert_eq!(row.get::<i64>(2)?, prior);
+        assert_eq!(row.get::<String>(3)?, "base-2");
+        assert!(rows.next().await?.is_none(), "exactly one review row");
+
+        // A retry of the series reaches the patch again and adds nothing.
+        let again = Reviewer::process_patch_review(
+            &ctx,
+            v2_ps,
+            v2_patch,
+            1,
+            "base-2",
+            None,
+            &payload,
+            None,
+            Some("prompts-a"),
+            None,
+            &v2_diff,
+            None,
+        )
+        .await?;
+        assert!(matches!(again, PatchResult::Success));
+        let mut count = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM reviews WHERE patch_id = ?",
+                libsql::params![v2_patch],
+            )
+            .await?;
+        assert_eq!(count.next().await?.unwrap().get::<i64>(0)?, 1);
+
+        // Patchwork shows the inherited verdict as a check of its own, and
+        // the retry did not queue a second one. No mail was queued.
+        let mut checks = db
+            .conn
+            .query(
+                "SELECT check_state, description FROM patchwork_outbox WHERE patch_msg_id = ?",
+                libsql::params!["<v2@example.org>"],
+            )
+            .await?;
+        let check = checks.next().await?.expect("a Patchwork check");
+        assert_eq!(check.get::<String>(0)?, "success");
+        assert!(check.get::<String>(1)?.contains("unchanged"));
+        assert!(checks.next().await?.is_none(), "exactly one check");
+        let mut mail = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM email_outbox WHERE patch_id = ?",
+                libsql::params![v2_patch],
+            )
+            .await?;
+        assert_eq!(mail.next().await?.unwrap().get::<i64>(0)?, 0);
+        // An embargo release finds the patch through this listing.
+        assert_eq!(
+            db.get_inherited_clean_patches(v2_ps).await?,
+            vec![("<v2@example.org>".to_string(), 1)]
+        );
+
+        let mut status_rows = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![v2_patch],
+            )
+            .await?;
+        assert_eq!(
+            status_rows.next().await?.unwrap().get::<String>(0)?,
+            "Skipped"
+        );
+
+        // The inherited row is not itself a candidate: a v3 lands on v1.
+        let (v3_ps, v3_patch) = reuse_test_series(&db, "v3", CLEAN_DIFF, CLEAN_PATCH_ID).await?;
+        let picked = Reviewer::find_inherited_clean_review(
+            &ctx,
+            v3_ps,
+            1,
+            v3_patch,
+            CLEAN_DIFF,
+            "base-3",
+            Some("prompts-a"),
+        )
+        .await?
+        .expect("v3 inherits");
+        assert_eq!(picked.review_id, prior);
+
+        // Someone answers v2, the copy that inherited. v3 has no lineage
+        // to v2 and would land on v1's review again, so the reply to the
+        // inheriting copy has to count against that review.
+        let reply_thread = db
+            .create_thread("<v2-reply@example.org>", "v2", 1000)
+            .await?;
+        db.create_message(
+            "<v2-reply@example.org>",
+            reply_thread,
+            Some("<v2@example.org>"),
+            "Reviewer <reviewer@example.org>",
+            "Re: v2",
+            1001,
+            "this leaks",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let refused = Reviewer::find_inherited_clean_review(
+            &ctx,
+            v3_ps,
+            1,
+            v3_patch,
+            CLEAN_DIFF,
+            "base-3",
+            Some("prompts-a"),
+        )
+        .await?;
+        assert!(refused.is_none());
+        Ok(())
+    }
+
+    /// Each condition on reuse refuses on its own: a differing diff, a
+    /// finding on the prior review, a model or prompt change, a prior
+    /// review that ran less of the pipeline, an old
+    /// review, and the same-baseline rule when it is switched on.
+    #[tokio::test]
+    async fn test_unchanged_clean_reuse_refusals() -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.skip_unchanged_clean = true;
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let model = settings.ai.model.clone();
+
+        let (v1_ps, v1_patch) = reuse_test_series(&db, "v1", CLEAN_DIFF, CLEAN_PATCH_ID).await?;
+        let prior =
+            reuse_test_clean_review(&db, v1_ps, v1_patch, &model, "prompts-a", "base-1").await?;
+        let (cur_ps, cur_patch) = reuse_test_series(&db, "cur", CLEAN_DIFF, CLEAN_PATCH_ID).await?;
+
+        let ctx = reuse_test_ctx(&settings, &db);
+        let pick = |ctx: &ReviewContext, diff: &str, baseline: &str, prompts: &str| {
+            let ctx = ctx.clone();
+            let diff = diff.to_string();
+            let baseline = baseline.to_string();
+            let prompts = prompts.to_string();
+            async move {
+                Reviewer::find_inherited_clean_review(
+                    &ctx,
+                    cur_ps,
+                    1,
+                    cur_patch,
+                    &diff,
+                    &baseline,
+                    Some(&prompts),
+                )
+                .await
+                .map(|c| c.map(|c| c.review_id))
+            }
+        };
+
+        assert_eq!(
+            pick(&ctx, CLEAN_DIFF, "base-2", "prompts-a").await?,
+            Some(prior)
+        );
+
+        // git patch-id would call a reindented hunk the same patch; the
+        // byte comparison does not.
+        let reindented = CLEAN_DIFF.replace("+\tb", "+    b");
+        assert_eq!(pick(&ctx, &reindented, "base-2", "prompts-a").await?, None);
+
+        // Prompt or model change.
+        assert_eq!(pick(&ctx, CLEAN_DIFF, "base-2", "prompts-b").await?, None);
+        let mut other_model = settings.clone();
+        other_model.ai.model = format!("{model}-next");
+        assert_eq!(
+            pick(
+                &reuse_test_ctx(&other_model, &db),
+                CLEAN_DIFF,
+                "base-2",
+                "prompts-a"
+            )
+            .await?,
+            None
+        );
+        let mut any_model = other_model.clone();
+        any_model.review.skip_unchanged_clean_any_model = true;
+        assert_eq!(
+            pick(
+                &reuse_test_ctx(&any_model, &db),
+                CLEAN_DIFF,
+                "base-2",
+                "prompts-b"
+            )
+            .await?,
+            Some(prior)
+        );
+
+        // A cheap pass or a stage subset lends its verdict only to a
+        // review narrowed the same way, and any_model does not waive that.
+        let mut cheap = settings.clone();
+        cheap.review.cheap = true;
+        let mut subset = settings.clone();
+        subset.review.stages = Some(vec!["security".to_string(), "locking".to_string()]);
+        let mut subset_reordered = settings.clone();
+        subset_reordered.review.stages = Some(vec!["locking".to_string(), "security".to_string()]);
+        let mut full_any_model = settings.clone();
+        full_any_model.review.skip_unchanged_clean_any_model = true;
+        for narrowed in [&cheap, &subset] {
+            // The full review on record covers a narrower run.
+            db.set_review_coverage(prior, &crate::db::ReviewCoverage::default())
+                .await?;
+            assert_eq!(
+                pick(
+                    &reuse_test_ctx(narrowed, &db),
+                    CLEAN_DIFF,
+                    "base-2",
+                    "prompts-a"
+                )
+                .await?,
+                Some(prior)
+            );
+            db.set_review_coverage(prior, &Reviewer::review_coverage(&narrowed.review))
+                .await?;
+            for wants_more in [&settings, &full_any_model] {
+                assert_eq!(
+                    pick(
+                        &reuse_test_ctx(wants_more, &db),
+                        CLEAN_DIFF,
+                        "base-2",
+                        "prompts-a"
+                    )
+                    .await?,
+                    None
+                );
+            }
+            assert_eq!(
+                pick(
+                    &reuse_test_ctx(narrowed, &db),
+                    CLEAN_DIFF,
+                    "base-2",
+                    "prompts-a"
+                )
+                .await?,
+                Some(prior)
+            );
+        }
+        // The prior review is still the stage subset here.
+        assert_eq!(
+            pick(
+                &reuse_test_ctx(&subset_reordered, &db),
+                CLEAN_DIFF,
+                "base-2",
+                "prompts-a"
+            )
+            .await?,
+            Some(prior)
+        );
+        assert_eq!(
+            pick(
+                &reuse_test_ctx(&cheap, &db),
+                CLEAN_DIFF,
+                "base-2",
+                "prompts-a"
+            )
+            .await?,
+            None
+        );
+        db.set_review_coverage(prior, &crate::db::ReviewCoverage::default())
+            .await?;
+
+        // Same-baseline rule, when asked for.
+        let mut strict = settings.clone();
+        strict.review.skip_unchanged_clean_require_same_baseline = true;
+        let strict_ctx = reuse_test_ctx(&strict, &db);
+        assert_eq!(
+            pick(&strict_ctx, CLEAN_DIFF, "base-2", "prompts-a").await?,
+            None
+        );
+        assert_eq!(
+            pick(&strict_ctx, CLEAN_DIFF, "base-1", "prompts-a").await?,
+            Some(prior)
+        );
+
+        // Too old for a one-day bound, young enough for the default.
+        let mut recent_only = settings.clone();
+        recent_only.review.skip_unchanged_clean_max_age_days = 1;
+        let two_days_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64
+            - 2 * 86_400;
+        db.conn
+            .execute(
+                "UPDATE reviews SET created_at = ? WHERE id = ?",
+                libsql::params![two_days_ago, prior],
+            )
+            .await?;
+        assert_eq!(
+            pick(
+                &reuse_test_ctx(&recent_only, &db),
+                CLEAN_DIFF,
+                "base-2",
+                "prompts-a"
+            )
+            .await?,
+            None
+        );
+        assert_eq!(
+            pick(&ctx, CLEAN_DIFF, "base-2", "prompts-a").await?,
+            Some(prior)
+        );
+
+        // Someone replied to the copy that was reviewed. The current patch
+        // has no lineage to it, so only the lookup can notice.
+        let reply_thread = db
+            .create_thread("<v1-reply@example.org>", "v1", 1000)
+            .await?;
+        db.create_message(
+            "<v1-reply@example.org>",
+            reply_thread,
+            Some("<v1@example.org>"),
+            "Reviewer <reviewer@example.org>",
+            "Re: v1",
+            1001,
+            "this leaks",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(pick(&ctx, CLEAN_DIFF, "base-2", "prompts-a").await?, None);
+        db.conn
+            .execute(
+                "DELETE FROM messages WHERE message_id = '<v1-reply@example.org>'",
+                (),
+            )
+            .await?;
+        assert_eq!(
+            pick(&ctx, CLEAN_DIFF, "base-2", "prompts-a").await?,
+            Some(prior)
+        );
+
+        // A newer review of the same diff that found something overrules
+        // the older clean verdict, even on another model.
+        let (mid_ps, mid_patch) = reuse_test_series(&db, "mid", CLEAN_DIFF, CLEAN_PATCH_ID).await?;
+        let newer =
+            reuse_test_clean_review(&db, mid_ps, mid_patch, "other-model", "prompts-z", "base-9")
+                .await?;
+        db.create_finding(Finding {
+            review_id: newer,
+            severity: Severity::Low,
+            severity_explanation: None,
+            problem: "nit".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await?;
+        assert_eq!(pick(&ctx, CLEAN_DIFF, "base-2", "prompts-a").await?, None);
+        Ok(())
+    }
+
+    /// With the same-baseline rule on, an unchanged patch inherits only
+    /// when the patches ahead of it in the series are unchanged as well.
+    #[tokio::test]
+    async fn test_same_baseline_rule_covers_earlier_patches() -> Result<()> {
+        const FIRST: &str = "diff --git a/g.c b/g.c\n--- a/g.c\n+++ b/g.c\n@@ -1 +1 @@\n-x\n+y\n";
+        const FIRST_ID: &str = "1111111111111111111111111111111111111111";
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.skip_unchanged_clean = true;
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let model = settings.ai.model.clone();
+
+        // A two-patch series: `first` as 1/2 and CLEAN_DIFF as 2/2.
+        let series = |tag: &'static str, first: String| {
+            let db = db.clone();
+            async move {
+                let (ps, _) = reuse_test_series(&db, tag, &first, FIRST_ID).await?;
+                let msg_id = format!("<{tag}-2@example.org>");
+                let thread_id = db.create_thread(&msg_id, tag, 1000).await?;
+                db.create_message(
+                    &msg_id, thread_id, None, "Author", tag, 1000, "Body", "", "", None, None,
+                )
+                .await?;
+                let second = db
+                    .create_patch_with_git_patch_id(
+                        ps,
+                        &msg_id,
+                        2,
+                        CLEAN_DIFF,
+                        Some(CLEAN_PATCH_ID),
+                    )
+                    .await?;
+                anyhow::Ok((ps, second))
+            }
+        };
+
+        let (v1_ps, v1_second) = series("v1", FIRST.to_string()).await?;
+        let prior =
+            reuse_test_clean_review(&db, v1_ps, v1_second, &model, "prompts-a", "base-1").await?;
+        let (same_ps, same_second) = series("same", FIRST.to_string()).await?;
+        let (changed_ps, changed_second) = series("changed", FIRST.replace("+y", "+z")).await?;
+
+        let mut strict = settings.clone();
+        strict.review.skip_unchanged_clean_require_same_baseline = true;
+        let pick = |settings: &Settings, ps: i64, patch: i64| {
+            let ctx = reuse_test_ctx(settings, &db);
+            async move {
+                Reviewer::find_inherited_clean_review(
+                    &ctx,
+                    ps,
+                    2,
+                    patch,
+                    CLEAN_DIFF,
+                    "base-1",
+                    Some("prompts-a"),
+                )
+                .await
+                .map(|c| c.map(|c| c.review_id))
+            }
+        };
+
+        assert_eq!(pick(&strict, same_ps, same_second).await?, Some(prior));
+        assert_eq!(pick(&strict, changed_ps, changed_second).await?, None);
+        // The default accepts the drift, as it accepts a moved baseline.
+        assert_eq!(
+            pick(&settings, changed_ps, changed_second).await?,
+            Some(prior)
+        );
+        Ok(())
+    }
+
+    /// The gate in front of the lookup: the setting, a rerun's raised
+    /// review count, and prior-version context that needs the audit.
+    #[tokio::test]
+    async fn test_may_inherit_clean_verdict_gate() -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let off = reuse_test_ctx(&settings, &db);
+        assert!(!Reviewer::may_inherit_clean_verdict(&off, &json!({}), 1));
+
+        settings.review.skip_unchanged_clean = true;
+        let on = reuse_test_ctx(&settings, &db);
+        assert!(Reviewer::may_inherit_clean_verdict(&on, &json!({}), 1));
+
+        let mut rerun = reuse_test_ctx(&settings, &db);
+        rerun.target_review_count = 2;
+        assert!(!Reviewer::may_inherit_clean_verdict(&rerun, &json!({}), 1));
+
+        let payload = |pvc: Value| {
+            json!({ "patches": [
+                { "index": 1, "prior_version_context": pvc },
+                { "index": 2, "prior_version_context": { "prior_findings": [{}], "discussion_threads": [] } },
+            ] })
+        };
+        assert!(Reviewer::may_inherit_clean_verdict(
+            &on,
+            &payload(Value::Null),
+            1
+        ));
+        assert!(Reviewer::may_inherit_clean_verdict(
+            &on,
+            &payload(json!({ "prior_findings": [], "discussion_threads": [] })),
+            1
+        ));
+        assert!(!Reviewer::may_inherit_clean_verdict(
+            &on,
+            &payload(json!({ "prior_findings": [{}], "discussion_threads": [] })),
+            1
+        ));
+        assert!(!Reviewer::may_inherit_clean_verdict(
+            &on,
+            &payload(json!({ "prior_findings": [], "discussion_threads": [{}] })),
+            1
+        ));
+        // Patch 2 carries findings; patch 1 is judged on its own context.
+        assert!(!Reviewer::may_inherit_clean_verdict(
+            &on,
+            &payload(Value::Null),
+            2
+        ));
+        Ok(())
     }
 
     #[tokio::test]

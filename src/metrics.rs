@@ -6,6 +6,18 @@ pub static MESSAGES: AtomicUsize = AtomicUsize::new(0);
 pub static PATCHSETS: AtomicUsize = AtomicUsize::new(0);
 pub static REPO_PACKS: AtomicUsize = AtomicUsize::new(0);
 pub static REPO_PACK_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Reviews this process did not run because an identical diff had already
+/// been reviewed with no findings. Counts since startup; the database holds
+/// the durable record in reviews.inherited_from_review_id.
+pub static REVIEWS_SKIPPED_UNCHANGED: AtomicUsize = AtomicUsize::new(0);
+
+pub fn inc_reviews_skipped_unchanged() {
+    REVIEWS_SKIPPED_UNCHANGED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn get_reviews_skipped_unchanged() -> usize {
+    REVIEWS_SKIPPED_UNCHANGED.load(Ordering::Relaxed)
+}
 
 pub fn set_pending_patches(count: usize) {
     PENDING_PATCHES.store(count, Ordering::Relaxed);
