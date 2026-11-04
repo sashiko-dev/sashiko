@@ -625,6 +625,33 @@ pub fn attribution_line(attr: &PriorAttribution) -> String {
 // Batching and prompt rendering
 // ---------------------------------------------------------------------------
 
+/// Serializes `findings` for a `report` stage, dropping every
+/// `prior_attribution` that is not printable credit.
+///
+/// Linkage-only attributions (see [`PriorAttribution::is_credit`]) and
+/// attributions that fail to deserialize are removed so the report LLM never
+/// sees a Sashiko credit it could reproduce on its own initiative.
+pub fn report_findings_json(findings: &[Value]) -> String {
+    let filtered: Vec<Value> = findings
+        .iter()
+        .map(|finding| {
+            let mut finding = finding.clone();
+            if let Some(map) = finding.as_object_mut() {
+                let printable = map
+                    .get("prior_attribution")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value::<PriorAttribution>(v).ok())
+                    .is_some_and(|attr| attr.is_credit() && attr.attribution_line.is_some());
+                if !printable {
+                    map.remove("prior_attribution");
+                }
+            }
+            finding
+        })
+        .collect();
+    serde_json::to_string_pretty(&filtered).unwrap_or_default()
+}
+
 /// Returns `true` when the review has prior context worth citing.
 pub fn has_citable_prior_context(state: &LinuxPatchReviewState) -> bool {
     state
@@ -1391,6 +1418,50 @@ mod tests {
         assert_eq!(attr.evidence.len(), 2);
         assert_eq!(attr.evidence[0].source_ref, "PF1");
         assert_eq!(attribution_line(&attr), "As reported by Al Viro on v2");
+    }
+
+    #[test]
+    fn test_report_findings_json_keeps_only_printable_credit() {
+        let index = EvidenceIndex::build(&ctx());
+        let mut state = LinuxPatchReviewState {
+            prior_version_context: Some(ctx()),
+            findings: vec![
+                json!({"id": "VF1", "stages": ["resources"], "raw_source_ids": ["C1"]}),
+                json!({"id": "VF2", "stages": ["resources"], "raw_source_ids": ["C2"]}),
+                json!({
+                    "id": "VF3",
+                    "prior_attribution": {"originally_raised_by": "garbage"}
+                }),
+            ],
+            ..Default::default()
+        };
+        let batch = batch_findings_for_attribution(&state).remove(0);
+        let out = PriorAttributionOutput {
+            attributions: vec![
+                FindingAttributionSpec {
+                    finding_id: batch.findings[0].alias.clone(),
+                    evidence: vec![ev("HM2.1", LEAK)],
+                },
+                FindingAttributionSpec {
+                    finding_id: batch.findings[1].alias.clone(),
+                    evidence: vec![ev("PF1", "clock leak in foo_probe() on irq failure")],
+                },
+            ],
+        };
+        apply_prior_attribution_output(&mut state, &batch, &index, out);
+        // Restore the malformed attribution that stamping does not touch.
+        state.findings[2]["prior_attribution"] = json!({"originally_raised_by": "garbage"});
+
+        let rendered: Vec<Value> =
+            serde_json::from_str(&report_findings_json(&state.findings)).unwrap();
+        assert_eq!(
+            rendered[0]["prior_attribution"]["attribution_line"],
+            json!("As reported by Jan Kara on v1")
+        );
+        assert!(rendered[1].get("prior_attribution").is_none());
+        assert!(rendered[2].get("prior_attribution").is_none());
+        // The state itself keeps the linkage for the review map.
+        assert!(state.findings[1]["prior_attribution"].is_object());
     }
 
     #[test]

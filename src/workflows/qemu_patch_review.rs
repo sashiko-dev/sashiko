@@ -1052,7 +1052,7 @@ Return strictly plain text output (no markdown, no backticks, wrapped at 78 char
             ))
             .include_file("report-template.md")
             .with_var("findings", |s: &QemuPatchReviewState| {
-                serde_json::to_string_pretty(&s.findings).unwrap_or_default()
+                crate::workflows::prior_attribution::report_findings_json(&s.findings)
             }),
         )
         .output_format(OutputFormat::text_with_validator(

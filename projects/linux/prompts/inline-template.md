@@ -59,8 +59,9 @@ the author.
 
     [1] https://lore.kernel.org/r/e0846cd2-c03f-44a8-9f0b-6d78b241f093@stanley.mountain
 
-  Never credit earlier reviewers unless prior_attribution is present on that
-  finding.
+  Never credit earlier reviewers unless that finding has a prior_attribution
+  with an attribution_line, and never credit Sashiko or earlier Sashiko
+  reviews.
 
 - You MUST include every issue sent, even if the additional details explain the
   issue was fixed in a later commit.  Your job is to format issues, not decide
