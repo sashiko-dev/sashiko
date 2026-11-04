@@ -3276,7 +3276,9 @@ fn write_related_preexisting(out: &mut impl WriteColor, review: &Value) -> std::
         let problem = sashiko::related_preexisting::problem_of(item).trim();
         writeln!(out, "- [{severity}] {problem}")?;
         if let Some(note) = item.get("report_text").and_then(Value::as_str) {
-            for line in note.trim().lines() {
+            let rendered =
+                sashiko::related_preexisting::render_report_text_with_footnote(note, None);
+            for line in rendered.trim().lines() {
                 writeln!(out, "    {line}")?;
             }
         }

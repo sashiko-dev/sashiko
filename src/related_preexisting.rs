@@ -293,11 +293,111 @@ impl RelatedPreexistingMode {
     }
 }
 
+/// Placeholder in `report_text` that the mailer replaces with the footnote
+/// reference (`[N]`) of the disclosed bug, or strips when no link is emitted.
+pub const BUG_REF_PLACEHOLDER: &str = "[BUG_REF]";
+
+/// Replaces [`BUG_REF_PLACEHOLDER`] in `report_text` with `[n]` when a
+/// footnote number is present, or removes the placeholder when rendering
+/// without footnote links. If `report_text` lacks the placeholder and a
+/// footnote number is given, inserts `[n]` into the first prose line.
+pub fn render_report_text_with_footnote(report_text: &str, footnote: Option<usize>) -> String {
+    match footnote {
+        Some(n) => {
+            let marker = format!("[{n}]");
+            if report_text.contains(BUG_REF_PLACEHOLDER) {
+                return report_text.replace(BUG_REF_PLACEHOLDER, &marker);
+            }
+            let mut inserted = false;
+            let mut out = Vec::new();
+            for line in report_text.lines() {
+                let trimmed = line.trim();
+                if !inserted && !trimmed.is_empty() && !trimmed.starts_with('>') {
+                    inserted = true;
+                    if let Some(pos) = line.rfind([':', '.']) {
+                        let (head, tail) = line.split_at(pos);
+                        out.push(format!("{head} {marker}{tail}"));
+                    } else {
+                        out.push(format!("{line} {marker}"));
+                    }
+                } else {
+                    out.push(line.to_string());
+                }
+            }
+            out.join("\n")
+        }
+        None => report_text
+            .replace(&format!(" {BUG_REF_PLACEHOLDER}"), "")
+            .replace(&format!("{BUG_REF_PLACEHOLDER} "), "")
+            .replace(BUG_REF_PLACEHOLDER, ""),
+    }
+}
+
+fn parse_footnote_definition_line(line: &str) -> Option<usize> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix('[')?;
+    let (digits, after_bracket) = rest.split_once(']')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let num: usize = digits.parse().ok()?;
+    if num == 0 {
+        return None;
+    }
+    let url = after_bracket.trim_start();
+    if (url.starts_with("http://") || url.starts_with("https://"))
+        && !url.bytes().any(|b| b.is_ascii_whitespace())
+    {
+        Some(num)
+    } else {
+        None
+    }
+}
+
+/// Splits a trailing block of `[N] https://...` footnote definitions off the
+/// end of `inline_review`, returning `(body_without_footnotes, footnote_lines, next_ref_number)`.
+///
+/// Checking only the trailing footnote definition block avoids false matches on
+/// C array indexing such as `buf[1]` or `arr[256]` inside quoted diff hunks.
+pub fn split_inline_review_footnotes(inline_review: &str) -> (&str, Vec<&str>, usize) {
+    let trimmed = inline_review.trim_end();
+    if trimmed.is_empty() {
+        return ("", Vec::new(), 1);
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let mut footnote_start = lines.len();
+    let mut max_ref = 0usize;
+    let mut footnotes = Vec::new();
+    for (idx, &line) in lines.iter().enumerate().rev() {
+        if line.trim().is_empty() {
+            if !footnotes.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if let Some(n) = parse_footnote_definition_line(line) {
+            footnote_start = idx;
+            max_ref = max_ref.max(n);
+            footnotes.push(line.trim());
+        } else {
+            break;
+        }
+    }
+    if footnotes.is_empty() {
+        return (trimmed, Vec::new(), 1);
+    }
+    footnotes.reverse();
+    let footnote_offset = lines[footnote_start].as_ptr() as usize - trimmed.as_ptr() as usize;
+    let body = trimmed[..footnote_offset].trim_end();
+    (body, footnotes, max_ref + 1)
+}
+
 #[cfg(feature = "server")]
 pub use gate::{GateInputs, GateSkipReason, evaluate_gate};
 #[cfg(feature = "server")]
 pub use reporting::{
-    disclosure_candidates, related_email_divider, related_email_header, related_email_section,
+    disclosure_candidates, related_email_divider, related_email_footnotes, related_email_header,
+    related_email_header_from, related_email_section, related_email_section_from,
     same_disclosed_bug,
 };
 
@@ -377,11 +477,32 @@ mod reporting {
         a.is_same_bug(&b)
     }
 
+    use super::render_report_text_with_footnote;
     use crate::email_text::{bullet, count, wrap, wrap_prose};
 
-    fn summary_lines(rows: &[PreexistingDisclosure]) -> String {
+    fn footnote_numbers(rows: &[PreexistingDisclosure], start_ref: usize) -> Vec<Option<usize>> {
+        let mut next = start_ref.max(1);
         rows.iter()
-            .map(|d| bullet(d.severity.as_str(), &d.problem))
+            .map(|d| {
+                if d.bugid.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                    let cur = next;
+                    next += 1;
+                    Some(cur)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn summary_lines(rows: &[PreexistingDisclosure], start_ref: usize) -> String {
+        let refs = footnote_numbers(rows, start_ref);
+        rows.iter()
+            .zip(refs)
+            .map(|(d, r)| match r {
+                Some(n) => bullet(d.severity.as_str(), &format!("{} [{n}]", d.problem)),
+                None => bullet(d.severity.as_str(), &d.problem),
+            })
             .collect()
     }
 
@@ -404,34 +525,73 @@ mod reporting {
     }
 
     /// The opening lines of a review email that carries related bugs,
-    /// wrapped at 72 columns. `new_issues` is the number of findings
-    /// the patch introduces.
-    pub fn related_email_header(new_issues: usize, rows: &[PreexistingDisclosure]) -> String {
+    /// wrapped at 72 columns, numbering related bug footnotes from `start_ref`.
+    pub fn related_email_header_from(
+        new_issues: usize,
+        rows: &[PreexistingDisclosure],
+        start_ref: usize,
+    ) -> String {
         if rows.is_empty() {
             return String::new();
         }
+        let bullets = summary_lines(rows, start_ref);
         if new_issues == 0 {
             let sentence = format!(
                 "Thank you for your contribution! Sashiko AI review found no new issues in this patch, but noticed {} it does not introduce:",
                 issues(rows.len())
             );
-            format!("{}{}--\n\n", wrap(&sentence, "", ""), summary_lines(rows))
+            format!("{}{bullets}--\n\n", wrap(&sentence, "", ""))
         } else {
             let sentence = format!(
                 "It also noticed {} this patch does not introduce:",
                 issues(rows.len())
             );
-            format!("{}{}", wrap(&sentence, "", ""), summary_lines(rows))
+            format!("{}{bullets}", wrap(&sentence, "", ""))
         }
+    }
+
+    /// The opening lines of a review email that carries related bugs,
+    /// wrapped at 72 columns. `new_issues` is the number of findings
+    /// the patch introduces.
+    pub fn related_email_header(new_issues: usize, rows: &[PreexistingDisclosure]) -> String {
+        related_email_header_from(new_issues, rows, 1)
+    }
+
+    /// The notes for the related bugs, appended after the inline review,
+    /// with their footnote references substituted from `start_ref` and prose
+    /// wrapped at 72 columns.
+    pub fn related_email_section_from(rows: &[PreexistingDisclosure], start_ref: usize) -> String {
+        let refs = footnote_numbers(rows, start_ref);
+        rows.iter()
+            .zip(refs)
+            .map(|(d, r)| wrap_prose(&render_report_text_with_footnote(&d.report_text, r)))
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     /// The notes for the related bugs, appended after the inline review,
     /// with their prose wrapped at 72 columns.
     pub fn related_email_section(rows: &[PreexistingDisclosure]) -> String {
+        related_email_section_from(rows, 1)
+    }
+
+    /// Footnote link definitions (`[N] https://<domain>/#/bug/<bugid>`) for
+    /// disclosed related bugs that carry a canonical `bugid`, numbered from
+    /// `start_ref`.
+    pub fn related_email_footnotes(
+        rows: &[PreexistingDisclosure],
+        start_ref: usize,
+        domain: &str,
+    ) -> Vec<String> {
+        let refs = footnote_numbers(rows, start_ref);
         rows.iter()
-            .map(|d| wrap_prose(&d.report_text))
-            .collect::<Vec<_>>()
-            .join("\n\n")
+            .zip(refs)
+            .filter_map(|(d, r)| {
+                let n = r?;
+                let bugid = d.bugid.as_deref()?.trim();
+                Some(format!("[{n}] https://{domain}/#/bug/{bugid}"))
+            })
+            .collect()
     }
 }
 
@@ -900,6 +1060,73 @@ rename to mm/b.c
                  \n\
                  foo_probe() returns here with priv->lock still held."
             )
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_related_email_footnotes_and_inline_split() {
+        use crate::db::{DisclosureRelation, PreexistingDisclosure};
+
+        let inline = "> +buf[256] = 0;\n\nStill buggy (raised in v1 [4]).\n\n[4] https://lore.kernel.org/all/prior@example.com/\n";
+        let (body, refs, next_ref) = split_inline_review_footnotes(inline);
+        assert_eq!(body, "> +buf[256] = 0;\n\nStill buggy (raised in v1 [4]).");
+        assert_eq!(
+            refs,
+            vec!["[4] https://lore.kernel.org/all/prior@example.com/"]
+        );
+        assert_eq!(next_ref, 5);
+
+        let no_refs = "> +arr[9] = 1;\n\nPlain inline review.";
+        let (body2, refs2, next_ref2) = split_inline_review_footnotes(no_refs);
+        assert_eq!(body2, no_refs);
+        assert!(refs2.is_empty());
+        assert_eq!(next_ref2, 1);
+
+        let crlf_inline = "> +buf[256] = 0;\r\n\r\nStill buggy — see v1 [2].\r\n\r\n[2] https://lore.kernel.org/all/v1@example.com/\r\n";
+        let (body_crlf, refs_crlf, next_crlf) = split_inline_review_footnotes(crlf_inline);
+        assert_eq!(
+            body_crlf,
+            "> +buf[256] = 0;\r\n\r\nStill buggy — see v1 [2]."
+        );
+        assert_eq!(
+            refs_crlf,
+            vec!["[2] https://lore.kernel.org/all/v1@example.com/"]
+        );
+        assert_eq!(next_crlf, 3);
+
+        let row = PreexistingDisclosure {
+            id: 1,
+            patch_message_id: "p@x".to_string(),
+            fingerprint: "fp".to_string(),
+            problem: "mm: lock held on the -EINVAL return".to_string(),
+            severity: Severity::High,
+            relation: DisclosureRelation::SamePattern,
+            locations_json: "[]".to_string(),
+            bug_key_json: "{}".to_string(),
+            report_text: "This isn't a bug introduced by this patch, but the same missing unlock [BUG_REF] exists a few lines below the path you fixed:\n\n> \treturn -EINVAL;".to_string(),
+            reserved_at: 0,
+            disclosed_at: None,
+            bug_id: Some(7),
+            bugid: Some("linux-7f9a2c4b-3e1d-4a80-9b5c-1d2e3f4a5b6c".to_string()),
+            files: vec!["mm/foo.c".to_string()],
+        };
+
+        let header = related_email_header_from(1, std::slice::from_ref(&row), next_ref);
+        assert!(
+            header.contains("- [High] mm: lock held on the -EINVAL return [5]\n"),
+            "{header}"
+        );
+        let section = related_email_section_from(std::slice::from_ref(&row), next_ref);
+        assert!(
+            section.contains("same missing unlock\n[5] exists"),
+            "{section}"
+        );
+        assert!(!section.contains(BUG_REF_PLACEHOLDER), "{section}");
+        let footnotes = related_email_footnotes(&[row], next_ref, "sashiko.dev");
+        assert_eq!(
+            footnotes,
+            vec!["[5] https://sashiko.dev/#/bug/linux-7f9a2c4b-3e1d-4a80-9b5c-1d2e3f4a5b6c"]
         );
     }
 }
