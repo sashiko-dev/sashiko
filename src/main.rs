@@ -1779,8 +1779,15 @@ async fn run_daemon(
                 remote.name,
                 sashiko::utils::redact_secret(&remote.url)
             );
-            if let Err(e) =
-                sashiko::git_ops::ensure_remote(&repo_path, &remote.name, &remote.url, false).await
+            let refspecs = remote.refspecs();
+            if let Err(e) = sashiko::git_ops::ensure_remote_with_refspecs(
+                &repo_path,
+                &remote.name,
+                &remote.url,
+                false,
+                refspecs.as_deref(),
+            )
+            .await
             {
                 error!("Failed to ensure custom remote {}: {}", remote.name, e);
             }
