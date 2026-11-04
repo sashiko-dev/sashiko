@@ -366,7 +366,8 @@ Optional array of additional git remotes to track.
 | `name` | string | -- | Remote name. Required. |
 | `url` | string | -- | Remote URL. Required. |
 | `check_all_branches` | bool | -- | Try all branches as baselines. Required -- omitting it is a parse error, not a default of `false`. |
-| `only_branches` | list | -- | Additional specific branches to try (optional). Additive: when `check_all_branches` is also true, these are appended to the full branch list rather than replacing it. |
+| `only_branches` | list | -- | Additional specific branches to try (optional). Additive: when `check_all_branches` or `branch_patterns` is also configured, these are appended to candidate branches rather than replacing them. |
+| `branch_patterns` | list | -- | Optional wildcard glob patterns for selective refspec fetching and candidate matching (e.g. `["linux-*.y", "net-*"]`). Each pattern must contain exactly one `*` wildcard; exact branch names without wildcards (which cause `git fetch` to abort if absent on the remote) should be placed in `only_branches`. Refspecs with `?`, spaces, or multiple `*` wildcards are rejected. |
 
 Baselines are tried in order and the first one the series applies to wins.
 A tree taken from a MAINTAINERS `T:` entry without a branch resolves to the
@@ -390,6 +391,18 @@ name = "cel"
 url = "git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"
 check_all_branches = false
 only_branches = ["nfsd-next", "nfsd-testing"]
+```
+
+To selectively fetch only matching branches from large remotes without downloading
+the entire remote tree, specify `branch_patterns`:
+
+```toml
+[[git.custom_remotes]]
+name = "net-next"
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git"
+check_all_branches = true
+branch_patterns = ["linux-*.y", "net-*"]
+only_branches = ["main"]
 ```
 
 Match `name` and `url` to a remote already in the repository when one exists.

@@ -119,6 +119,7 @@ repository_path = "third_party/linux"
 # url = "git://my-custom.com/remote"
 # check_all_branches = true
 # only_branches = []
+# branch_patterns = ["linux-*.y", "net-*"]
 
 [review]
 concurrency = 16

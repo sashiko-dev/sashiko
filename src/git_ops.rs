@@ -536,6 +536,24 @@ impl GitWorktree {
     }
 }
 
+/// Matches a branch name against a list of branch patterns.
+/// Each pattern is either an exact branch name or contains at most one
+/// '*' wildcard (e.g. "linux-*.y", "v6.18/*").
+pub fn matches_branch_pattern(branch: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        if pattern == branch {
+            return true;
+        }
+        if let Some((prefix, suffix)) = pattern.split_once('*') {
+            branch.starts_with(prefix)
+                && branch.len() >= prefix.len() + suffix.len()
+                && branch[prefix.len()..].ends_with(suffix)
+        } else {
+            false
+        }
+    })
+}
+
 #[allow(dead_code)]
 pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
     let output = crate::git_cmd::in_dir_async(repo_path)
@@ -1269,7 +1287,20 @@ pub async fn ensure_remote(
     url: &str,
     force_fetch: bool,
 ) -> Result<()> {
-    match refresh_remote(repo_path, name, url, force_fetch).await? {
+    ensure_remote_with_refspecs(repo_path, name, url, force_fetch, None).await
+}
+
+/// Like ensure_remote, but optionally limits the fetch to specific
+/// refspecs. When refspecs is Some, only the listed refs are fetched
+/// instead of all remote branches.
+pub async fn ensure_remote_with_refspecs(
+    repo_path: &Path,
+    name: &str,
+    url: &str,
+    force_fetch: bool,
+    refspecs: Option<&[String]>,
+) -> Result<()> {
+    match refresh_remote_with_refspecs(repo_path, name, url, force_fetch, refspecs).await? {
         FetchOutcome::BackedOff => Err(anyhow::anyhow!(
             "Remote {} failed recently, backing off",
             name
@@ -1290,6 +1321,107 @@ pub async fn refresh_remote(
     url: &str,
     force_fetch: bool,
 ) -> Result<FetchOutcome> {
+    refresh_remote_with_refspecs(repo_path, name, url, force_fetch, None).await
+}
+
+/// Returns true if a branch pattern conforms to valid Git refspec syntax.
+///
+/// Refspec patterns must contain exactly one asterisk wildcard. Question mark
+/// wildcards, spaces, multiple asterisks, and invalid ref characters are rejected.
+pub fn is_valid_refspec_pattern(pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern.contains('?') {
+        return false;
+    }
+    if pattern.chars().filter(|&c| c == '*').count() != 1 {
+        return false;
+    }
+    if pattern.contains("..")
+        || pattern.contains('@')
+        || pattern.contains('\\')
+        || pattern.contains(':')
+        || pattern.contains('^')
+        || pattern.contains('~')
+        || pattern.contains('[')
+        || pattern.starts_with('/')
+        || pattern.ends_with('/')
+        || pattern.contains(".lock")
+    {
+        return false;
+    }
+    if pattern
+        .chars()
+        .any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
+    {
+        return false;
+    }
+    true
+}
+
+/// Returns true if a branch name conforms to valid Git branch naming rules.
+///
+/// Literal branch names must not contain wildcards ('*', '?'), spaces, or invalid ref characters.
+pub fn is_valid_branch_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if name.contains('*') || name.contains('?') {
+        return false;
+    }
+    if name.contains("..")
+        || name.contains('@')
+        || name.contains('\\')
+        || name.contains(':')
+        || name.contains('^')
+        || name.contains('~')
+        || name.contains('[')
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.contains(".lock")
+    {
+        return false;
+    }
+    if name
+        .chars()
+        .any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
+    {
+        return false;
+    }
+    true
+}
+
+/// Checks whether any ref exists under refs/remotes/<name>/.
+async fn has_remote_refs(repo_path: &Path, name: &str) -> bool {
+    let head_ref = format!("refs/remotes/{}/HEAD", name);
+    if let Ok(status) = crate::git_cmd::in_dir_async(repo_path)
+        .args(["show-ref", "--verify", "-q", &head_ref])
+        .status()
+        .await
+        && status.success()
+    {
+        return true;
+    }
+    let remote_pattern = format!("refs/remotes/{}/", name);
+    if let Ok(output) = crate::git_cmd::in_dir_async(repo_path)
+        .args(["for-each-ref", "--count=1", &remote_pattern])
+        .output()
+        .await
+    {
+        return output.status.success() && !output.stdout.is_empty();
+    }
+    false
+}
+
+/// Like refresh_remote, but optionally passes explicit refspecs to git fetch.
+pub async fn refresh_remote_with_refspecs(
+    repo_path: &Path,
+    name: &str,
+    url: &str,
+    force_fetch: bool,
+    refspecs: Option<&[String]>,
+) -> Result<FetchOutcome> {
     // 1. Validate repo_path to prevent git from traversing up to parent repos
     if !repo_path.join(".git").exists() && !repo_path.join("HEAD").exists() {
         return Err(anyhow::anyhow!(
@@ -1303,6 +1435,7 @@ pub async fn refresh_remote(
     let _guard = lock.lock().await;
 
     let mut just_added = false;
+    let mut refspecs_changed = false;
 
     // 2. Check if exists (requires global config lock)
     {
@@ -1352,7 +1485,85 @@ pub async fn refresh_remote(
             }
             just_added = true;
         }
+
+        // Configure fetch refspecs in .git/config. If selective refspecs are
+        // provided, configure them; otherwise ensure the default wildcard refspec
+        // is restored. Compare against current configuration to avoid unnecessary
+        // writes across await points.
+        let config_key = format!("remote.{}.fetch", name);
+        let current_out = crate::git_cmd::in_dir_async(repo_path)
+            .args(["config", "--get-all", &config_key])
+            .output()
+            .await?;
+
+        let current_refspecs: Vec<String> = if current_out.status.success() {
+            String::from_utf8_lossy(&current_out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let default_refspec = format!("+refs/heads/*:refs/remotes/{}/*", name);
+        let target_refspecs: Option<Vec<&str>> = match refspecs {
+            Some(specs) if !specs.is_empty() => Some(specs.iter().map(String::as_str).collect()),
+            Some(_) => Some(vec![default_refspec.as_str()]),
+            None => {
+                if current_refspecs.is_empty() {
+                    Some(vec![default_refspec.as_str()])
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(target) = target_refspecs {
+            let target_refspecs_owned: Vec<String> =
+                target.iter().map(|s| (*s).to_string()).collect();
+
+            if current_refspecs != target_refspecs_owned {
+                let unset = crate::git_cmd::in_dir_async(repo_path)
+                    .args(["config", "--unset-all", &config_key])
+                    .output()
+                    .await?;
+                if !unset.status.success()
+                    && unset.status.code() != Some(5)
+                    && unset.status.code() != Some(1)
+                {
+                    let stderr = String::from_utf8_lossy(&unset.stderr);
+                    return Err(anyhow!(
+                        "Failed to reset fetch refspecs for {}: {}",
+                        name,
+                        redact_secret(stderr.trim())
+                    ));
+                }
+                for spec in &target {
+                    let add_spec = crate::git_cmd::in_dir_async(repo_path)
+                        .args(["config", "--add", &config_key, spec])
+                        .output()
+                        .await?;
+                    if !add_spec.status.success() {
+                        let stderr = String::from_utf8_lossy(&add_spec.stderr);
+                        return Err(anyhow!(
+                            "Failed to configure fetch refspec for {}: {}",
+                            name,
+                            redact_secret(stderr.trim())
+                        ));
+                    }
+                }
+                refspecs_changed = true;
+            }
+        }
     } // Release global lock
+
+    if refspecs_changed {
+        let timestamp_dir = repo_path.join(".sashiko/fetch_timestamps");
+        let _ = std::fs::remove_file(timestamp_dir.join(name));
+        let _ = std::fs::remove_file(timestamp_dir.join(format!("{}.fail", name)));
+    }
 
     // 3. Lazy Fetch Check
     let timestamp_dir = repo_path.join(".sashiko/fetch_timestamps");
@@ -1377,19 +1588,14 @@ pub async fn refresh_remote(
         None => false,
     };
 
-    // Check if HEAD exists
-    let head_ref = format!("refs/remotes/{}/HEAD", name);
-    let head_exists = crate::git_cmd::in_dir_async(repo_path)
-        .args(["show-ref", "--verify", "-q", &head_ref])
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // Check if any remote refs exist locally
+    let has_refs = has_remote_refs(repo_path, name).await;
 
     // The local ref stands in for a fetch that fails, or is backed
-    // off, only while it is recent enough.
+    // off, only while it is recent enough and refspecs have not changed.
     let max_stale_age = std::time::Duration::from_secs(86400); // 24 hours
-    let can_fallback = head_exists
+    let can_fallback = has_refs
+        && !refspecs_changed
         && match age {
             Some(a) => a < max_stale_age,
             None => false,
@@ -1407,7 +1613,7 @@ pub async fn refresh_remote(
         return Ok(FetchOutcome::BackedOff);
     }
 
-    let should_fetch = if just_added || !head_exists || force_fetch {
+    let should_fetch = if just_added || !has_refs || force_fetch || refspecs_changed {
         true
     } else {
         let fetch_interval = if url.contains("akpm/mm") || url.contains("linux-next") {
@@ -1443,9 +1649,14 @@ pub async fn refresh_remote(
             fetch_args.push("--no-tags");
         }
         fetch_args.push(name);
+        if let Some(specs) = refspecs {
+            for spec in specs {
+                fetch_args.push(spec.as_str());
+            }
+        }
 
         // Dynamically scale timeout: 30 minutes for heavy initial fetches, 5 minutes for routine updates
-        let timeout_duration = if just_added || !head_exists {
+        let timeout_duration = if just_added || !has_refs {
             std::time::Duration::from_secs(1800)
         } else {
             std::time::Duration::from_secs(300)
@@ -2767,6 +2978,195 @@ mod tests {
             !set_url_err.contains("secret_token_123"),
             "leaked secret token in error: {set_url_err}"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_valid_refspec_pattern() {
+        // Valid patterns (must contain exactly one '*')
+        assert!(is_valid_refspec_pattern("linux-*.y"));
+        assert!(is_valid_refspec_pattern("v6.18/*"));
+        assert!(is_valid_refspec_pattern("*-next"));
+        assert!(is_valid_refspec_pattern("net-*"));
+
+        // Invalid patterns: no asterisk (exact branch names belong in only_branches)
+        assert!(!is_valid_refspec_pattern("main"));
+        assert!(!is_valid_refspec_pattern("for-next"));
+
+        // Invalid patterns: multiple asterisks
+        assert!(!is_valid_refspec_pattern("linux-*-*.y"));
+        assert!(!is_valid_refspec_pattern("*/*"));
+
+        // Invalid patterns: question mark
+        assert!(!is_valid_refspec_pattern("feat-?"));
+
+        // Invalid patterns: spaces and invalid git ref characters
+        assert!(!is_valid_refspec_pattern("feat branch*"));
+        assert!(!is_valid_refspec_pattern("feat..branch*"));
+        assert!(!is_valid_refspec_pattern("feat~1*"));
+        assert!(!is_valid_refspec_pattern("feat:branch*"));
+        assert!(!is_valid_refspec_pattern("/start-slash*"));
+        assert!(!is_valid_refspec_pattern("end-slash/*/"));
+        assert!(!is_valid_refspec_pattern("branch.lock*"));
+    }
+
+    #[test]
+    fn test_is_valid_branch_name() {
+        // Valid literal branch names
+        assert!(is_valid_branch_name("main"));
+        assert!(is_valid_branch_name("master"));
+        assert!(is_valid_branch_name("for-next"));
+        assert!(is_valid_branch_name("v6.18/dev"));
+
+        // Invalid branch names: wildcards
+        assert!(!is_valid_branch_name("linux-*.y"));
+        assert!(!is_valid_branch_name("feat-?"));
+
+        // Invalid branch names: spaces and invalid git ref characters
+        assert!(!is_valid_branch_name("feat branch"));
+        assert!(!is_valid_branch_name("feat..branch"));
+        assert!(!is_valid_branch_name("feat~1"));
+        assert!(!is_valid_branch_name("feat:branch"));
+        assert!(!is_valid_branch_name("/start-slash"));
+        assert!(!is_valid_branch_name("end-slash/"));
+        assert!(!is_valid_branch_name("branch.lock"));
+    }
+
+    #[test]
+    fn test_matches_branch_pattern() {
+        let patterns = vec![
+            "main".to_string(),
+            "linux-*.y".to_string(),
+            "v6.18/*".to_string(),
+            "*-next".to_string(),
+        ];
+
+        // Exact match
+        assert!(matches_branch_pattern("main", &patterns));
+        assert!(!matches_branch_pattern("master", &patterns));
+
+        // Wildcard prefix/suffix
+        assert!(matches_branch_pattern("linux-6.12.y", &patterns));
+        assert!(matches_branch_pattern("linux-6.6.y", &patterns));
+        assert!(!matches_branch_pattern("linux-6.12", &patterns));
+
+        // Prefix wildcard
+        assert!(matches_branch_pattern("v6.18/dev", &patterns));
+        assert!(matches_branch_pattern("v6.18/prod", &patterns));
+        assert!(!matches_branch_pattern("v6.19/dev", &patterns));
+
+        // Suffix wildcard
+        assert!(matches_branch_pattern("net-next", &patterns));
+        assert!(matches_branch_pattern("bpf-next", &patterns));
+        assert!(!matches_branch_pattern("net-fixes", &patterns));
+    }
+
+    #[tokio::test]
+    async fn test_ensure_remote_with_refspecs_limits_fetch() -> Result<()> {
+        let source_dir = tempfile::tempdir()?;
+        let source_path = source_dir.path();
+
+        crate::git_cmd::in_dir(source_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()?;
+        crate::git_cmd::in_dir(source_path)
+            .args(["config", "user.name", "Test"])
+            .output()?;
+        crate::git_cmd::in_dir(source_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()?;
+        std::fs::write(source_path.join("file.txt"), "hello")?;
+        crate::git_cmd::in_dir(source_path)
+            .args(["add", "file.txt"])
+            .output()?;
+        crate::git_cmd::in_dir(source_path)
+            .args(["commit", "-m", "init"])
+            .output()?;
+
+        for b in &["v6.18/dev", "v6.18/prod", "other/feature"] {
+            crate::git_cmd::in_dir(source_path)
+                .args(["branch", b])
+                .output()?;
+        }
+
+        let consumer_dir = tempfile::tempdir()?;
+        let consumer_path = consumer_dir.path();
+        crate::git_cmd::in_dir(consumer_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()?;
+
+        let source_url = source_path.to_str().unwrap();
+        let refspecs = vec!["+refs/heads/v6.18/*:refs/remotes/test_remote/v6.18/*".to_string()];
+
+        ensure_remote_with_refspecs(
+            consumer_path,
+            "test_remote",
+            source_url,
+            true,
+            Some(&refspecs),
+        )
+        .await?;
+
+        let branches = get_remote_branches(consumer_path, "test_remote").await?;
+        assert!(branches.contains(&"v6.18/dev".to_string()));
+        assert!(branches.contains(&"v6.18/prod".to_string()));
+        assert!(!branches.contains(&"other/feature".to_string()));
+        assert!(!branches.contains(&"main".to_string()));
+
+        let config_out = crate::git_cmd::in_dir(consumer_path)
+            .args(["config", "--get-all", "remote.test_remote.fetch"])
+            .output()?;
+        let config_str = String::from_utf8_lossy(&config_out.stdout);
+        assert!(config_str.contains("+refs/heads/v6.18/*:refs/remotes/test_remote/v6.18/*"));
+
+        // Updating refspecs forces a fetch and updates .git/config
+        let updated_refspecs =
+            vec!["+refs/heads/other/*:refs/remotes/test_remote/other/*".to_string()];
+        ensure_remote_with_refspecs(
+            consumer_path,
+            "test_remote",
+            source_url,
+            false,
+            Some(&updated_refspecs),
+        )
+        .await?;
+
+        let branches = get_remote_branches(consumer_path, "test_remote").await?;
+        assert!(branches.contains(&"other/feature".to_string()));
+
+        let config_out = crate::git_cmd::in_dir(consumer_path)
+            .args(["config", "--get-all", "remote.test_remote.fetch"])
+            .output()?;
+        let config_str = String::from_utf8_lossy(&config_out.stdout);
+        assert!(config_str.contains("+refs/heads/other/*:refs/remotes/test_remote/other/*"));
+        assert!(!config_str.contains("+refs/heads/v6.18/*"));
+
+        // Calling with refspecs = None preserves existing selective refspecs
+        ensure_remote_with_refspecs(consumer_path, "test_remote", source_url, false, None).await?;
+        let config_out = crate::git_cmd::in_dir(consumer_path)
+            .args(["config", "--get-all", "remote.test_remote.fetch"])
+            .output()?;
+        let config_str = String::from_utf8_lossy(&config_out.stdout);
+        assert!(config_str.contains("+refs/heads/other/*:refs/remotes/test_remote/other/*"));
+
+        // Setting refspecs to Some(&[]) restores default wildcard refspec
+        ensure_remote_with_refspecs(consumer_path, "test_remote", source_url, false, Some(&[]))
+            .await?;
+
+        let config_out = crate::git_cmd::in_dir(consumer_path)
+            .args(["config", "--get-all", "remote.test_remote.fetch"])
+            .output()?;
+        let config_str = String::from_utf8_lossy(&config_out.stdout);
+        assert_eq!(
+            config_str.trim(),
+            "+refs/heads/*:refs/remotes/test_remote/*"
+        );
+
+        let branches = get_remote_branches(consumer_path, "test_remote").await?;
+        assert!(branches.contains(&"main".to_string()));
+        assert!(branches.contains(&"v6.18/dev".to_string()));
+        assert!(branches.contains(&"other/feature".to_string()));
 
         Ok(())
     }
