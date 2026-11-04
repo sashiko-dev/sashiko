@@ -858,6 +858,42 @@ fn normalize_patch_diff_lines(diff: &str) -> Vec<&str> {
     out
 }
 
+/// Drops the line ranges from a hunk header, keeping the function context
+/// that follows them. A rebase onto a tree where earlier code grew or
+/// shrank rewrites `@@ -269,15 +267,13 @@` without touching the hunk.
+fn strip_hunk_ranges(line: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = line.strip_prefix("@@ ")
+        && let Some(end) = rest.find(" @@")
+    {
+        return std::borrow::Cow::Owned(format!("@@{}", &rest[end + 3..]));
+    }
+    std::borrow::Cow::Borrowed(line)
+}
+
+/// Reports whether two patch bodies carry the same change.
+///
+/// The comparison is exact on every diff line, including whitespace, and
+/// ignores only what a rebase rewrites: the mail text before the first
+/// `diff --git` header, the blob SHAs on `index` lines, and the line
+/// ranges on `@@` hunk headers. A body with no `diff --git` header is
+/// equivalent to nothing, itself included: without one there is no diff
+/// to compare, only text.
+pub fn patch_diffs_equivalent(a: &str, b: &str) -> bool {
+    let a = normalize_patch_diff_lines(a);
+    let b = normalize_patch_diff_lines(b);
+    // normalize_patch_diff_lines() starts at the first line that opens
+    // with the header. Given a body with no such line it returns every
+    // line, for callers that diff raw text, or none at all when the
+    // header is only mentioned mid-line. Neither result begins with the
+    // header, and `b` begins as `a` does once the lines below match.
+    a.first()
+        .is_some_and(|line| line.starts_with("diff --git "))
+        && a.len() == b.len()
+        && a.iter()
+            .zip(&b)
+            .all(|(x, y)| strip_hunk_ranges(x) == strip_hunk_ranges(y))
+}
+
 /// Computes an in-memory inter-version diff between `prev_diff` (`v_base`) and
 /// `curr_diff` (`vN`) without mutating any Git worktree.
 pub fn compute_inter_version_diff(prev_diff: &str, curr_diff: &str) -> Option<String> {
@@ -1473,6 +1509,55 @@ mod tests {
             compute_inter_version_diff(v1, &v1_rebased).as_deref(),
             Some("(patch diff unchanged)")
         );
+    }
+
+    #[test]
+    fn test_patch_diffs_equivalent_ignores_only_rebase_noise() {
+        let v1 = "From: A <a@example.org>\nSubject: [PATCH v1] foo\n\n---\ndiff --git a/net/foo.c b/net/foo.c\nindex 1111111..2222222 100644\n--- a/net/foo.c\n+++ b/net/foo.c\n@@ -1,3 +1,4 @@\n int f(void) {\n+\treturn 1;\n     return 0;\n }\n";
+        let rebased = v1
+            .replace("1111111..2222222", "aaaaaaa..bbbbbbb")
+            .replace("[PATCH v1]", "[PATCH v2]");
+        assert!(patch_diffs_equivalent(v1, &rebased));
+
+        // A hunk that moved because code above it changed keeps its
+        // content; only the @@ ranges differ.
+        let shifted = v1.replace("@@ -1,3 +1,4 @@", "@@ -41,3 +39,4 @@");
+        assert!(patch_diffs_equivalent(v1, &shifted));
+        let other_function = v1.replace(
+            "@@ -1,3 +1,4 @@\n int f(void)",
+            "@@ -1,3 +1,4 @@\n int g(void)",
+        );
+        assert!(!patch_diffs_equivalent(v1, &other_function));
+
+        // Whitespace is part of the change: a tab turned into spaces is a
+        // different patch, which is what sets this apart from git patch-id.
+        let reindented = v1.replace("+\treturn 1;", "+    return 1;");
+        assert!(!patch_diffs_equivalent(v1, &reindented));
+
+        let changed = v1.replace("return 1;", "return 2;");
+        assert!(!patch_diffs_equivalent(v1, &changed));
+
+        assert!(!patch_diffs_equivalent("", ""));
+        assert!(!patch_diffs_equivalent(v1, "   \n"));
+
+        // Two bodies that normalize to nothing are not the same change:
+        // one of index lines only, and one whose only mention of a diff
+        // header is mid-line, so no line ever starts the diff.
+        let index_only = "index 1111111..2222222 100644\n";
+        assert!(!patch_diffs_equivalent(index_only, index_only));
+        let prose = "See the hunk under diff --git a/f.c b/f.c above.\n";
+        assert!(!patch_diffs_equivalent(prose, prose));
+
+        // Nor are two bodies with no diff header at all, where the
+        // normalization keeps every line: mail text, blank lines, or a
+        // hunk that lost its header.
+        for headerless in [
+            "Hi,\n\nPlease apply.\n",
+            "   \n",
+            "--- a/f.c\n+++ b/f.c\n@@ -1 +1 @@\n-a\n+b\n",
+        ] {
+            assert!(!patch_diffs_equivalent(headerless, headerless));
+        }
     }
 
     #[test]
