@@ -487,16 +487,23 @@ pub fn compute_prior_attribution(
         })
         .collect();
     valid.sort_by_key(|(source, _)| source.chronology_key());
-    // Only the first person to raise the issue is credited; later evidence
-    // stays in `evidence` for auditing.
-    let (earliest, _) = valid.first()?;
+    // Only the first person (or third-party bot) to raise the issue is
+    // credited; Sashiko never credits itself. When every source is a prior
+    // Sashiko review, the earliest one still anchors the attribution so the
+    // review map keeps the lineage, and `PriorAttribution::is_credit()`
+    // reports that nothing may be printed or scored as credit. Later
+    // evidence stays in `evidence` for auditing.
+    let (anchor, _) = valid
+        .iter()
+        .find(|(source, _)| !matches!(source.speaker, SourceSpeaker::Sashiko))
+        .or_else(|| valid.first())?;
     Some(PriorAttribution {
-        originally_raised_by: credit_name(earliest.speaker.display()),
-        originally_raised_in_version: earliest.version,
+        originally_raised_by: credit_name(anchor.speaker.display()),
+        originally_raised_in_version: anchor.version,
         originally_raised_in_label: None,
-        origin_kind: earliest.speaker.origin_kind(),
-        reference_url: earliest.reference_url.clone(),
-        raised_by_identities: vec![earliest.speaker.identity().to_string()],
+        origin_kind: anchor.speaker.origin_kind(),
+        reference_url: anchor.reference_url.clone(),
+        raised_by_identities: vec![anchor.speaker.identity().to_string()],
         evidence: valid.into_iter().map(|(_, record)| record).collect(),
         found_by: None,
         attribution_line: None,
@@ -858,7 +865,7 @@ pub(crate) fn stamp_attribution(
                 .get(&attr.originally_raised_in_version)
                 .cloned()
         });
-        attr.attribution_line = Some(attribution_line(&attr));
+        attr.attribution_line = attr.is_credit().then(|| attribution_line(&attr));
         attr.found_by = Some(found);
         attr
     });
@@ -1319,16 +1326,71 @@ mod tests {
     }
 
     #[test]
-    fn test_sashiko_only_evidence_credits_sashiko() {
+    fn test_sashiko_only_evidence_links_without_credit() {
         let index = EvidenceIndex::build(&ctx());
         let attr = compute_prior_attribution(
             &[ev("PF1", "clock leak in foo_probe() on irq failure")],
             &index,
         )
-        .expect("attribution");
+        .expect("linkage-only attribution");
         assert_eq!(attr.origin_kind, OriginKind::SashikoReview);
         assert_eq!(attr.originally_raised_in_version, 2);
         assert_eq!(attr.raised_by_identities, vec!["sashiko".to_string()]);
+        assert!(!attr.is_credit());
+
+        // Stamping keeps the linkage but prints no credit line.
+        let mut state = LinuxPatchReviewState {
+            prior_version_context: Some(ctx()),
+            findings: vec![json!({
+                "id": "VF1",
+                "stages": ["resources", "prior-feedback", "verification"],
+                "raw_source_ids": ["C1", "PC1"]
+            })],
+            ..Default::default()
+        };
+        let batch = batch_findings_for_attribution(&state).remove(0);
+        apply_prior_attribution_output(
+            &mut state,
+            &batch,
+            &index,
+            output(vec![ev("PF1", "clock leak in foo_probe() on irq failure")]),
+        );
+        let stamped = &state.findings[0];
+        assert!(stamped.get("prior_attribution_cleared").is_none());
+        assert!(stamped["prior_attribution"].is_object());
+        assert!(
+            stamped["prior_attribution"]
+                .get("attribution_line")
+                .is_none()
+        );
+        assert_eq!(found_by(stamped), FoundBy::Both);
+    }
+
+    #[test]
+    fn test_earlier_sashiko_evidence_credits_the_first_person() {
+        let mut context = ctx();
+        context.prior_findings[0].reviewed_in_version = 1;
+        let index = EvidenceIndex::build(&context);
+        let attr = compute_prior_attribution(
+            &[
+                ev("PF1", "clock leak in foo_probe() on irq failure"),
+                ev("HM1.1", LEAK),
+            ],
+            &index,
+        )
+        .expect("attribution");
+        assert!(attr.is_credit());
+        assert_eq!(attr.originally_raised_by, "Al Viro");
+        assert_eq!(attr.originally_raised_in_version, 2);
+        assert_eq!(attr.origin_kind, OriginKind::HumanReviewer);
+        assert_eq!(
+            attr.reference_url.as_deref(),
+            Some("https://lore.kernel.org/r/al-v2@zeniv")
+        );
+        // The Sashiko evidence stays for auditing, earliest first.
+        assert_eq!(attr.evidence.len(), 2);
+        assert_eq!(attr.evidence[0].source_ref, "PF1");
+        assert_eq!(attribution_line(&attr), "As reported by Al Viro on v2");
     }
 
     #[test]

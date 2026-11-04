@@ -1603,6 +1603,52 @@ mod tests {
     }
 
     #[test]
+    fn test_enrich_prior_resolutions_keeps_sashiko_only_linkage_confirmed() {
+        let mut state = LinuxPatchReviewState {
+            project: "linux".to_string(),
+            prior_resolutions: vec![json!({
+                "stage": "prior-feedback",
+                "prior_id": "PF1",
+                "origin_kind": "sashiko_review",
+                "summary": "tracefs_apply_options() overwrites read-only eventfs inode ownership",
+                "verdict": "still_unaddressed",
+                "reasoning": "The root inode is still on tracefs_inodes without the flag.",
+                "version": 4,
+                "thread_participants": ["Sashiko"],
+            })],
+            verification_findings: vec![json!({
+                "id": "VF1",
+                "stages": ["resources", "prior-feedback"],
+                "raw_source_ids": ["C1", "PC1"],
+                "prior_source_ids": ["PF1"],
+                "prior_attribution": {
+                    "originally_raised_by": "Sashiko",
+                    "originally_raised_in_version": 4,
+                    "origin_kind": "sashiko_review",
+                    "raised_by_identities": ["sashiko"],
+                    "evidence": [{
+                        "source_ref": "PF1",
+                        "version": 4,
+                        "quote": "eventfs inodes are added to the global tracefs_inodes list"
+                    }],
+                    "found_by": "both"
+                },
+                "problem": "tracefs: root inode of read-only eventfs lacks TRACEFS_RO_EVENT_INODE",
+                "severity": "Medium",
+                "preexisting": false
+            })],
+            ..Default::default()
+        };
+
+        enrich_prior_resolutions(&mut state);
+        assert_eq!(
+            state.prior_resolutions[0]["v_n_outcome"], "confirmed_finding",
+            "A linkage-only Sashiko attribution must keep the PF* lineage even though it prints no credit"
+        );
+        assert_eq!(state.prior_resolutions[0]["also_found_by_sashiko"], true);
+    }
+
+    #[test]
     fn test_enrich_prior_resolutions_contested_pc_with_fresh_dismissal_not_also_found_by_sashiko() {
         let mut state = LinuxPatchReviewState {
             project: "linux".to_string(),

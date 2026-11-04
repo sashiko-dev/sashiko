@@ -83,7 +83,8 @@ impl FoundBy {
 /// copied from LLM output or inferred from text, file, or stage overlap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriorAttribution {
-    /// Display name of the first speaker who raised the issue.
+    /// Display name of the first person or third-party bot who raised the
+    /// issue, or `"Sashiko"` when only prior Sashiko reviews raised it.
     pub originally_raised_by: String,
     pub originally_raised_in_version: u32,
     /// The subject label of that revision as posted (`RFC v2`, `v1`).
@@ -105,9 +106,22 @@ pub struct PriorAttribution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub found_by: Option<FoundBy>,
     /// The exact credit line reports print under the finding, e.g.
-    /// "Also reported by: Dan Carpenter on v3".
+    /// "As reported by Dan Carpenter on v3". `None` when the attribution is
+    /// not credit (see [`PriorAttribution::is_credit`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribution_line: Option<String>,
+}
+
+impl PriorAttribution {
+    /// Returns whether this attribution credits someone other than Sashiko.
+    ///
+    /// An attribution anchored on a prior Sashiko review only links the
+    /// finding to earlier Sashiko findings (review map lineage, `found_by`);
+    /// reports never print it as credit and benchmarks never score it as
+    /// credit.
+    pub fn is_credit(&self) -> bool {
+        self.origin_kind != OriginKind::SashikoReview
+    }
 }
 
 /// One verbatim quote proving that a prior message raised an issue.
