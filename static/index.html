@@ -2303,7 +2303,13 @@
 
             const computeReviewSummaryStatus = (reviews, patch) => {
                 if (patch && (patch.status === 'error' || patch.status === 'failed')) return `<span class="text-error-bold">Apply Failed</span>`;
-                if (patch && patch.status === 'Skipped') return '<span style="color:var(--text-dim)">Skipped</span>';
+                if (patch && patch.status === 'Skipped') {
+                    // A skipped patch may carry a review row saying why: the
+                    // ignored-files rule, or a clean review it inherits from.
+                    const skipped = (reviews || []).find(r => r.status === 'Skipped' && r.result);
+                    const title = skipped ? ` title="${escapeHtml(skipped.result)}"` : '';
+                    return `<span style="color:var(--text-dim)"${title}>Skipped</span>`;
+                }
                 if (!reviews || reviews.length === 0) return '<span style="color:var(--text-dim)">No reviews</span>';
 
                 const maxCounts = { low: 0, medium: 0, high: 0, critical: 0 };
@@ -2394,7 +2400,10 @@
                 }
 
                 let listHtml = '';
-                if (patch && patch.status === 'Skipped') listHtml = `<p class="status-placeholder">Skipped.</p>`;
+                if (patch && patch.status === 'Skipped') {
+                    const skipped = (reviews || []).find(r => r.status === 'Skipped' && r.result);
+                    listHtml = `<p class="status-placeholder">${escapeHtml(skipped ? skipped.result : 'Skipped.')}</p>`;
+                }
                 else if (reviews && reviews.length > 0 && reviews.every(r => r.status === 'Skipped')) listHtml = `<p class="status-placeholder">${escapeHtml(reviews[0].result || 'Skipped.')}</p>`;
                 else listHtml = renderReviewList(reviews, emailHtml, patch ? patch.status : null);
 
