@@ -99,6 +99,10 @@ pub struct ReviewInput {
     /// touches, so the review does not pick them again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_disclosures: Vec<crate::related_preexisting::BugKey>,
+    /// Verified open canonical bugs from the database in the files this
+    /// series touches, eligible for related pre-existing bug selection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_bugs: Vec<Value>,
 }
 
 /// Selects the code notes for a review and renders their prompt block.
@@ -500,6 +504,8 @@ impl Worker {
             report_preexisting: self.report_preexisting,
             related_preexisting: self.related_preexisting,
             known_disclosures: serde_json::from_value(patchset["known_disclosures"].clone())
+                .unwrap_or_default(),
+            candidate_bugs: serde_json::from_value(patchset["candidate_bugs"].clone())
                 .unwrap_or_default(),
             related_preexisting_selected: Vec::new(),
             related_preexisting_dismissed: Vec::new(),

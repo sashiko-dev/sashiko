@@ -104,6 +104,9 @@ pub struct LinuxPatchReviewState {
     /// Bugs already reported near the code this patch touches; related
     /// pre-existing candidates matching one of them are never reported again.
     pub known_disclosures: Vec<crate::related_preexisting::BugKey>,
+    /// Verified open canonical bugs from the database in the files this
+    /// patchset touches, eligible for related pre-existing bug selection.
+    pub candidate_bugs: Vec<Value>,
     /// Related pre-existing candidates the selection stage picked, with how
     /// they relate to the patch.
     pub related_preexisting_selected: Vec<Value>,
@@ -3950,8 +3953,12 @@ pub fn build_linux_patch_review_workflow_with_effort(
             ParallelPolicy::BestEffort,
         )
         .early_exit_if(
-            |s| s.all_concerns.is_empty() && s.all_dismissed_concerns.is_empty(),
-            "No concerns or dismissed concerns raised in initial analysis stages",
+            |s| {
+                s.all_concerns.is_empty()
+                    && s.all_dismissed_concerns.is_empty()
+                    && crate::workflows::related_preexisting::selection_candidates(s).is_empty()
+            },
+            "No concerns, dismissed concerns, or related pre-existing bug candidates",
         )
         // Verification shards are the only path from a candidate cluster to
         // a finding, so a failed shard aborts the review instead of silently

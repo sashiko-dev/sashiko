@@ -959,12 +959,14 @@ impl Reviewer {
                 .unwrap_or_default();
 
             let known_disclosures = Self::known_related_disclosures(&ctx, &diffs).await;
+            let candidate_bugs = Self::candidate_related_bugs(&ctx, &diffs).await;
             let input_payload = json!({
                 "id": patchset_id,
                 "message_id": patchset_msg_id,
                 "subject": patchset.subject.clone().unwrap_or("Unknown".to_string()),
                 "patches": patches_json,
                 "known_disclosures": known_disclosures,
+                "candidate_bugs": candidate_bugs,
             });
 
             let skip_filters: Vec<String> = patchset
@@ -2198,6 +2200,48 @@ impl Reviewer {
                 .collect(),
             Err(e) => {
                 warn!("Failed to load recorded related pre-existing bugs: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Verified open canonical bugs from the database in the files `diffs`
+    /// touch, excluding bugs already disclosed or reserved by another patch.
+    async fn candidate_related_bugs(
+        ctx: &ReviewContext,
+        diffs: &[(i64, i64, String, String, String, i64, String)],
+    ) -> Vec<Value> {
+        if ctx
+            .worker_overrides
+            .related_preexisting
+            .min_severity()
+            .is_none()
+        {
+            return Vec::new();
+        }
+        let mut files = std::collections::BTreeSet::new();
+        for (_, _, diff, ..) in diffs {
+            files.extend(crate::related_preexisting::PatchFiles::from_diff(diff).surviving);
+        }
+        let files: Vec<String> = files.into_iter().collect();
+        let own: std::collections::HashSet<&str> =
+            diffs.iter().map(|(.., msg_id)| msg_id.as_str()).collect();
+        let disclosed_bug_ids = ctx
+            .db
+            .live_disclosed_bug_ids_excluding(&own)
+            .await
+            .unwrap_or_default();
+        match ctx.db.open_bugs_in_files(&files).await {
+            Ok(bugs) => bugs
+                .into_iter()
+                .filter(|b| {
+                    b.get("bug_id")
+                        .and_then(Value::as_i64)
+                        .is_none_or(|id| !disclosed_bug_ids.contains(&id))
+                })
+                .collect(),
+            Err(e) => {
+                warn!("Failed to load open candidate bugs for review: {}", e);
                 Vec::new()
             }
         }
@@ -5399,6 +5443,8 @@ fi
                 bug_key_json: serde_json::to_string(&key).unwrap(),
                 report_text: "note".to_string(),
                 files: key.files,
+                bug_id: None,
+                bugid: None,
             }
         };
         let any = |_: &NewPreexistingDisclosure, _: &crate::db::PreexistingDisclosure| false;
@@ -5441,6 +5487,32 @@ fi
             .collect();
         symbols.sort();
         assert_eq!(symbols, vec!["a", "b", "c"]);
+
+        db.execute(
+            "INSERT INTO bugs (id, bugid, title, lifecycle_status, pipeline_state, reporter,
+                               reported_at, created_at, updated_at)
+             VALUES (101, 'linux-bug-101', 'open bug', 'open', 'succeeded', 'r', 0, 0, 0),
+                    (102, 'linux-bug-102', 'already disclosed', 'open', 'succeeded', 'r', 0, 0, 0)",
+            (),
+        )
+        .await?;
+        db.execute(
+            r#"INSERT INTO bug_enrichments (bug_id, kind, tool, created_at, data_json)
+               VALUES (101, 'verification', 'verify', 0, '{"description":"open bug","severity":"High","locations":[{"file":"mm/foo.c","function":"foo"}]}'),
+                      (102, 'verification', 'verify', 0, '{"description":"already disclosed","severity":"High","locations":[{"file":"mm/foo.c","function":"bar"}]}')"#,
+            (),
+        )
+        .await?;
+        let mut disclosed = candidate("e");
+        disclosed.bug_id = Some(102);
+        disclosed.bugid = Some("linux-bug-102".to_string());
+        db.reserve_preexisting_disclosures("other-reserved-bug", &[disclosed], any)
+            .await?;
+
+        let candidates = Reviewer::candidate_related_bugs(&ctx, &diffs).await;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0]["bug_id"], json!(101));
+        assert_eq!(candidates[0]["bugid"], json!("linux-bug-101"));
         Ok(())
     }
 
@@ -5881,6 +5953,8 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
                 report_text: "> return -EINVAL;\n\nThis isn't introduced by this patch, but ..."
                     .to_string(),
                 files: vec!["mm/foo.c".to_string()],
+                bug_id: None,
+                bugid: None,
             }],
             |_, _| false,
         )
@@ -5945,6 +6019,8 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
                 bug_key_json: "{}".to_string(),
                 report_text: "note".to_string(),
                 files: vec!["mm/other.c".to_string()],
+                bug_id: None,
+                bugid: None,
             }],
             |_, _| false,
         )
@@ -5979,6 +6055,8 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
                     bug_key_json: "{}".to_string(),
                     report_text: "again".to_string(),
                     files: vec!["mm/foo.c".to_string()],
+                    bug_id: None,
+                    bugid: None,
                 }],
                 crate::related_preexisting::same_disclosed_bug,
             )
@@ -6013,6 +6091,8 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
                 bug_key_json: "{}".to_string(),
                 report_text: "The retry path also leaks the reference.".to_string(),
                 files: vec!["mm/bar.c".to_string()],
+                bug_id: None,
+                bugid: None,
             }],
             |_, _| false,
         )
