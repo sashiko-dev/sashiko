@@ -221,6 +221,7 @@ pub struct ClaudeClient {
     thinking: Option<String>,
     effort: Option<String>,
     extra_headers: std::collections::HashMap<String, String>,
+    request_timeout: Option<Duration>,
 }
 
 impl ClaudeClient {
@@ -249,7 +250,14 @@ impl ClaudeClient {
             thinking,
             effort,
             extra_headers,
+            request_timeout: None,
         }
+    }
+
+    /// Bounds an HTTP request through completion of its response body.
+    pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
     }
 
     pub fn default_base_url() -> String {
@@ -302,14 +310,12 @@ impl ClaudeClient {
             );
         }
 
-        let res = match self
-            .client
-            .post(&self.base_url)
-            .headers(headers)
-            .json(body)
-            .send()
-            .await
-        {
+        let mut request = self.client.post(&self.base_url).headers(headers).json(body);
+        if let Some(timeout) = self.request_timeout {
+            request = request.timeout(timeout);
+        }
+
+        let res = match request.send().await {
             Ok(res) => res,
             Err(e) => return Err(transport_error("Claude", e)),
         };
@@ -862,6 +868,7 @@ mod tests {
             thinking: None,
             effort: None,
             extra_headers: std::collections::HashMap::new(),
+            request_timeout: None,
         }
     }
 
@@ -886,7 +893,9 @@ mod tests {
     async fn post_to(url: &str) -> Result<ClaudeResponse> {
         tokio::time::timeout(
             test_http::TEST_TIMEOUT,
-            local_client(url).post_request(&hello_request()),
+            local_client(url)
+                .with_timeout(test_http::TEST_TIMEOUT)
+                .post_request(&hello_request()),
         )
         .await
         .expect("request did not complete in time")
@@ -906,6 +915,31 @@ mod tests {
                 msg
             }
             _ => panic!("expected ClaudeError::TransientError, got: {err:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_api_timeout_bounds_headers_and_body() {
+        for phase in [
+            test_http::ResponseStall::Headers,
+            test_http::ResponseStall::Body,
+        ] {
+            let server = test_http::StalledResponse::start(phase).await;
+            let client = local_client(server.url()).with_timeout(Duration::from_millis(200));
+            let err = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.post_request(&hello_request()),
+            )
+            .await
+            .expect("configured API timeout was not enforced")
+            .expect_err("stalled response must time out");
+            assert_eq!(
+                crate::ai::classify_ai_error(&err),
+                AiErrorClass::Transient {
+                    retry_after: TRANSPORT_RETRY_AFTER
+                },
+            );
+            assert!(transient_message(&err).contains("timed out"), "{err:#}");
         }
     }
 

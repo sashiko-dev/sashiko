@@ -70,6 +70,49 @@ pub(crate) async fn serve(bytes: Vec<u8>) -> TestServer {
     TestServer::start(Some(1), move |_| bytes.clone()).await
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ResponseStall {
+    Headers,
+    Body,
+}
+
+/// Keeps a local connection open without completing the selected response phase.
+pub(crate) struct StalledResponse(TestServer);
+
+impl StalledResponse {
+    pub(crate) async fn start(phase: ResponseStall) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            if matches!(phase, ResponseStall::Body) {
+                stream
+                    .write_all(&truncated("200 OK", "", "{"))
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+            }
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        Self(TestServer {
+            url: format!("http://{address}"),
+            handle,
+        })
+    }
+
+    pub(crate) fn url(&self) -> &str {
+        &self.0.url
+    }
+}
+
+impl Drop for StalledResponse {
+    fn drop(&mut self) {
+        self.0.handle.abort();
+    }
+}
+
 /// Answers one connection per response, in order, and records each request
 /// body it received.
 #[cfg(feature = "bedrock")]
