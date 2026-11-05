@@ -23,10 +23,12 @@ use crate::workflow::policy::{StagePolicy, ToolScope};
 use crate::workflow::prompt::PromptTemplate;
 use crate::workflow::stage::{ExecutableStage, Stage};
 use crate::workflows::linux_patch_review::{
-    AnalysisStage, LinuxPatchReviewState, SERIES_CONTEXT_PLACEHOLDER, VERIFICATION_STAGE_NAMES,
-    VerificationOutput, apply_verification_shard_output, batch_clusters_for_verification,
-    effective_clusters, extra_prompt_paths_for_clusters, format_verification_shard_feedback,
-    render_clusters_with_untrusted_prior_context, validate_verification_shard_output,
+    AnalysisStage, KERNEL_THREAT_MODEL_PLACEHOLDER, LinuxPatchReviewState,
+    SERIES_CONTEXT_PLACEHOLDER, VERIFICATION_STAGE_NAMES, VerificationOutput,
+    apply_verification_shard_output, batch_clusters_for_verification, effective_clusters,
+    extra_prompt_paths_for_clusters, format_verification_shard_feedback,
+    kernel_threat_model_severity_section, render_clusters_with_untrusted_prior_context,
+    validate_verification_shard_output,
 };
 
 /// Project-specific inputs of a verification shard stage.
@@ -70,7 +72,7 @@ fn shard_user_template(profile: &VerificationShardProfile) -> String {
     format!(
         "{instruction}\n\n\
          <false_positive_guide>\n@include(\"false-positive-guide.md\")\n</false_positive_guide>\n\n\
-         <severity_guidelines>\n@include(\"severity.md\")\n</severity_guidelines>@includes\n\n\
+         <severity_guidelines>\n@include(\"severity.md\")\n</severity_guidelines>@includes{KERNEL_THREAT_MODEL_PLACEHOLDER}\n\n\
          {CLUSTER_DIRECTIVE}{series_context}\n\n\
          Candidate Clusters to Verify:\n{{{{candidate_clusters}}}}\n\n\
          {LINEAGE_RULES}\n\
@@ -109,7 +111,11 @@ pub fn verification_shard_stage(
             })
             .with_var("candidate_clusters", move |_: &LinuxPatchReviewState| {
                 clusters_block.clone()
-            });
+            })
+            .with_var(
+                "kernel_threat_model_section",
+                kernel_threat_model_severity_section,
+            );
     if profile.wants_series_context {
         user_template =
             user_template.with_var("follow_up_series_section", |s: &LinuxPatchReviewState| {

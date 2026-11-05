@@ -469,6 +469,11 @@ impl Worker {
         };
         let maintainer_notes =
             select_maintainer_notes(&self.prompts.base_dir, &target_commit_diff_only);
+        let kernel_threat_model = if self.project == ProjectId::Linux {
+            crate::threat_model::KernelThreatModel::load(worktree_path).await
+        } else {
+            None
+        };
         let fixes_analysis = crate::worker::fixes_check::analyze_fixes_for_commit(
             self.project,
             worktree_path,
@@ -497,6 +502,7 @@ impl Worker {
             custom_prompt: self.custom_prompt.clone(),
             code_notes,
             maintainer_notes,
+            kernel_threat_model,
             planned_stages: Vec::new(),
             effort: self.effort,
             planned_efforts: std::collections::BTreeMap::new(),
