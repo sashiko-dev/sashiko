@@ -1243,7 +1243,12 @@ struct SeveritySession<'a> {
     project: ProjectId,
     canonical_title: &'a str,
     canonical_description: &'a str,
+    verification_reasoning: &'a str,
     locations: &'a str,
+    prefetched_context: &'a str,
+    master_sha: &'a str,
+    kernel_threat_model: Option<&'a crate::threat_model::KernelThreatModel>,
+    tools: Option<Arc<ToolBox>>,
     context_tag: Option<String>,
 }
 
@@ -1258,8 +1263,20 @@ impl LlmSession for SeveritySession<'_> {
             ProjectId::Gcc => "GCC",
             ProjectId::Qemu => "QEMU",
         };
+        let threat_model_section = if self.project == ProjectId::Linux {
+            let rendered = crate::threat_model::KernelThreatModel::render_for_severity(
+                self.kernel_threat_model,
+            );
+            if rendered.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n{rendered}")
+            }
+        } else {
+            String::new()
+        };
         format!(
-            "{}\n\nAssess the severity and impact of a verified defect in {} following the severity definitions and calibration guidance above.\n\
+            "{}{threat_model_section}\n\nAssess the severity and impact of a verified defect in {} following the severity definitions and calibration guidance above.\n\
             Output raw JSON only matching the schema.",
             crate::prompt_bundle::severity_guide(self.project),
             target_name
@@ -1273,31 +1290,74 @@ impl LlmSession for SeveritySession<'_> {
             ProjectId::Gcc => "Verified GCC Defect:",
             ProjectId::Qemu => "Verified QEMU Defect:",
         };
+        let verification_block = if self.verification_reasoning.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nVerification Proof:\n{}",
+                self.verification_reasoning.trim()
+            )
+        };
+        let code_block = if self.prefetched_context.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nRelevant Code Context (at commit {}):\n{}",
+                self.master_sha,
+                self.prefetched_context.trim()
+            )
+        };
+        let tool_hint = match (self.project, self.tools.is_some()) {
+            (ProjectId::Linux, true) => format!(
+                "\nIf caller privileges, file permissions (e.g. debugfs/sysfs modes), capability checks (e.g. capable(CAP_SYS_ADMIN)), or Kconfig dependencies are not already clear from the context above, inspect them at commit `{}` with git_read_files or git_grep before assigning High or Critical.\n",
+                self.master_sha
+            ),
+            (_, true) => format!(
+                "\nIf caller reachability or preconditions are not clear from the context above, inspect them at commit `{}` with git_read_files or git_grep before assigning High or Critical.\n",
+                self.master_sha
+            ),
+            (_, false) => String::new(),
+        };
         format!(
             "{stage_heading}
 
 {defect_header}
 Title: {title}
 Description:
-{description}
+{description}{verification_block}
 Code Locations:
-{locations}
+{locations}{code_block}
 
 Task:
-Assess the severity of this defect and provide an explanation following the severity levels and calibration guidance above.
-State your reasoning (consequence, triggering path, reachability) at the start of severity_explanation so the label is auditable.
+Assess the severity of this defect and provide an explanation following the severity levels and calibration guidance above.{tool_hint}
+State your reasoning (consequence and blast radius, actor/privilege and trust boundary, and trigger preconditions/likelihood) at the start of severity_explanation so the label is auditable.
 
 Return ONLY a valid JSON object matching:
 {{
   \"severity\": \"Low\" | \"Medium\" | \"High\" | \"Critical\" | \"Unknown\",
-  \"severity_explanation\": \"Explain consequence, triggering path, reachability, attack prerequisites, required privileges, and blast radius...\"
+  \"severity_explanation\": \"Explain consequence, actor/required privileges, trust boundary, triggering path, and likelihood...\"
 }}",
             stage_heading = BugStage::SeverityAssessment.heading(),
             defect_header = defect_header,
             title = self.canonical_title,
             description = self.canonical_description,
+            verification_block = verification_block,
             locations = self.locations,
+            code_block = code_block,
+            tool_hint = tool_hint,
         )
+    }
+
+    fn tools(&self) -> Option<Vec<AiTool>> {
+        self.tools.as_ref().map(|t| t.get_declarations_generic())
+    }
+
+    async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
+        if let Some(ref tools) = self.tools {
+            tools.call(name, args).await
+        } else {
+            bail!("Tool execution requested but no toolbox available");
+        }
     }
 
     fn response_format(&self) -> Option<AiResponseFormat> {
@@ -1843,28 +1903,12 @@ pub async fn process_issue_for_project(
 static BUG_DEDUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn get_master_sha(tools: Option<&Arc<ToolBox>>) -> String {
-    let tb = match tools {
-        Some(t) => t.clone(),
-        None => return "master".to_string(),
+    let Some(tb) = tools else {
+        return "master".to_string();
     };
-    tokio::task::spawn_blocking(move || {
-        let worktree = tb.get_worktree_path();
-        for ref_name in ["origin/master", "origin/main", "master", "main", "HEAD"] {
-            if let Ok(output) = crate::git_cmd::in_dir(worktree)
-                .args(["rev-parse", ref_name])
-                .output()
-                && output.status.success()
-            {
-                let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !sha.is_empty() {
-                    return sha;
-                }
-            }
-        }
-        "master".to_string()
-    })
-    .await
-    .unwrap_or_else(|_| "master".to_string())
+    resolve_linus_sha(tb.get_worktree_path())
+        .await
+        .unwrap_or_else(|| "master".to_string())
 }
 
 async fn format_commit(tools: Option<&Arc<ToolBox>>, sha: Option<String>) -> Option<String> {
@@ -2775,12 +2819,33 @@ pub async fn process_issue_worker_for_project(
     };
     let introduced_in_commit = format_commit(tools.as_ref(), introducing_commit_sha).await;
 
+    let verified_prefetched =
+        prefetch_bug_locations(tools.as_ref(), &master_sha, &verified_locations).await;
+    let effective_prefetched = if !verified_prefetched.is_empty() {
+        verified_prefetched
+    } else {
+        prefetched_context
+    };
+    let kernel_threat_model = if project == ProjectId::Linux {
+        match tools.as_ref() {
+            Some(tb) => crate::threat_model::KernelThreatModel::load(tb.get_worktree_path()).await,
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // Severity and impact estimation, recorded as an enrichment.
     info!("--- {} ---", BugStage::SeverityAssessment.title());
     let mut severity_session = SeveritySession {
         canonical_title: &norm.canonical_title,
         canonical_description: &norm.canonical_description,
+        verification_reasoning: &verification.verification_reasoning,
         locations: &verified_locations_str,
+        prefetched_context: &effective_prefetched,
+        master_sha: &master_sha,
+        kernel_threat_model: kernel_threat_model.as_ref(),
+        tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
         project,
     };
@@ -2799,14 +2864,6 @@ pub async fn process_issue_worker_for_project(
 
     // Standalone plaintext review generation, recorded as an enrichment.
     info!("--- {} ---", BugStage::ReportGeneration.title());
-    let verified_prefetched =
-        prefetch_bug_locations(tools.as_ref(), &master_sha, &verified_locations).await;
-    let effective_prefetched = if !verified_prefetched.is_empty() {
-        verified_prefetched
-    } else {
-        prefetched_context
-    };
-
     let mut report_session = ReportSession {
         problem: &norm.canonical_title,
         severity: severity.as_str(),
@@ -4865,7 +4922,12 @@ mod tests {
                 SeveritySession {
                     canonical_title: &input.problem,
                     canonical_description: &input.reasoning,
+                    verification_reasoning: "verified",
                     locations: "[]",
+                    prefetched_context: "",
+                    master_sha: "abc123",
+                    kernel_threat_model: None,
+                    tools: None,
                     context_tag: None,
                     project: ProjectId::Linux,
                 }
@@ -6692,5 +6754,70 @@ F:	drivers/net/ethernet/intel/e1000/
         assert!(is_bug_prefetch_source_file("gcc/fortran/resolve.f90"));
         assert!(!is_bug_prefetch_source_file("README.md"));
         assert!(!is_bug_prefetch_source_file("docs/configuration.md"));
+    }
+
+    #[test]
+    fn test_severity_session_includes_kernel_threat_model_and_context_for_linux_only() {
+        let model = crate::threat_model::KernelThreatModel {
+            text: "The Linux Kernel threat model\n=============================\n".to_string(),
+            commit: "05441d697f7f0000111122223333444455556666".to_string(),
+            git_ref: "linus/master".to_string(),
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tb = Arc::new(ToolBox::new(tmp.path().to_path_buf()));
+
+        let linux_with = SeveritySession {
+            project: ProjectId::Linux,
+            canonical_title: "fs/ocfs2: unlocked debugfs list walk",
+            canonical_description: "Walks reco.node_data without dlm_reco_state_lock.",
+            verification_reasoning: "Verified debug_state_print() holds only dlm->spinlock.",
+            locations: "[{\"file\":\"fs/ocfs2/dlm/dlmdebug.c\",\"line\":744}]",
+            prefetched_context: "static int debug_state_print(...) { ... }",
+            master_sha: "05441d697f7f",
+            kernel_threat_model: Some(&model),
+            tools: Some(tb),
+            context_tag: None,
+        };
+        let sys = linux_with.system_prompt();
+        assert!(sys.contains("<kernel_threat_model source="));
+        assert!(sys.contains("linus/master (05441d697f7f)"));
+        assert!(sys.contains("The Linux Kernel threat model"));
+        let user = linux_with.initial_user_prompt();
+        assert!(user.contains("Verification Proof:\nVerified debug_state_print()"));
+        assert!(user.contains("Relevant Code Context (at commit 05441d697f7f):"));
+        assert!(user.contains("capable(CAP_SYS_ADMIN)"));
+        assert!(linux_with.tools().is_some());
+
+        let linux_without = SeveritySession {
+            kernel_threat_model: None,
+            tools: None,
+            ..linux_with
+        };
+        assert!(
+            !linux_without
+                .system_prompt()
+                .contains("<kernel_threat_model source=")
+        );
+        assert!(
+            !linux_without
+                .initial_user_prompt()
+                .contains("git_read_files")
+        );
+
+        for other in [ProjectId::Sashiko, ProjectId::Gcc, ProjectId::Qemu] {
+            let non_linux = SeveritySession {
+                project: other,
+                kernel_threat_model: Some(&model),
+                tools: None,
+                context_tag: None,
+                ..linux_without
+            };
+            assert!(
+                !non_linux
+                    .system_prompt()
+                    .contains("<kernel_threat_model source="),
+                "{other:?} severity prompt must not include Linux threat model"
+            );
+        }
     }
 }
