@@ -4365,6 +4365,30 @@ async fn process_parsed_article(
         patch_opt = None;
     }
 
+    if source == MessageSource::Nntp
+        && (metadata.is_patch_or_cover || patch_opt.is_some())
+        && let Some(ingest_filter) = policy.ingest_filter_for_nntp_group(&group)
+    {
+        let subject_prefixes = sashiko::patch::get_subject_prefixes(&metadata.subject);
+        let touched_paths = match patch_opt.as_ref() {
+            Some(p) => sashiko::baseline::extract_files_from_diff(&p.diff),
+            None if metadata.index == 0 => {
+                sashiko::patch::extract_files_from_diffstat(&metadata.body)
+            }
+            None => Vec::new(),
+        };
+        if !ingest_filter.allows_submission(&subject_prefixes, &touched_paths) {
+            tracing::debug!(
+                "Skipping non-matching NNTP patch/cover {} in {} (subject: {:?})",
+                metadata.message_id,
+                group,
+                metadata.subject
+            );
+            metadata.is_patch_or_cover = false;
+            patch_opt = None;
+        }
+    }
+
     // Resolve baseline ID if provided.  A baseline that does not name an
     // object is dropped here rather than stored, so review never has to
     // decide what an unresolvable one means.
@@ -7400,5 +7424,181 @@ mod tests {
             assert!(daemon_msg.contains(&user_cfg.display().to_string()));
             assert!(daemon_msg.contains("sashiko review"));
         }
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_nntp_ingest_filter_skips_non_project_traffic_on_shared_list() {
+        let db = Database::new(&sashiko::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        db.ensure_mailing_list("linux-ext4", "org.kernel.vger.linux-ext4")
+            .await
+            .unwrap();
+
+        let policy = sashiko::email_policy::EmailPolicyConfig::parse_content(
+            r#"
+            ["linux-ext4@vger.kernel.org"]
+            reply_to = ["author", "list"]
+
+            ["linux-ext4@vger.kernel.org".ingest_filter]
+            allowed_subject_prefixes = ["e2fsprogs"]
+            ignored_subject_prefixes = ["fstests", "xfstests"]
+            allowed_paths = ["e2fsck/", "lib/ext2fs/"]
+            ignored_paths = ["fs/", "tests/ext4/"]
+            "#,
+        )
+        .unwrap();
+
+        let review_settings = Settings::new().unwrap().review;
+
+        let cover_body = concat!(
+            "Cover letter\n\n",
+            " fs/ext4/inode.c | 10 +++++-----\n",
+            " 1 file changed, 5 insertions(+), 5 deletions(-)\n",
+        );
+        let kernel_diff = concat!(
+            "diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c\n",
+            "--- a/fs/ext4/inode.c\n",
+            "+++ b/fs/ext4/inode.c\n",
+            "@@ -1 +1 @@\n-old\n+new\n",
+        );
+        let e2fs_diff = concat!(
+            "diff --git a/e2fsck/pass1.c b/e2fsck/pass1.c\n",
+            "--- a/e2fsck/pass1.c\n",
+            "+++ b/e2fsck/pass1.c\n",
+            "@@ -1 +1 @@\n-old\n+new\n",
+        );
+
+        let kernel_cover = ParsedArticle {
+            group: "org.kernel.vger.linux-ext4".to_string(),
+            article_id: "1".to_string(),
+            source: MessageSource::Nntp,
+            metadata: Some(sashiko::patch::PatchsetMetadata {
+                message_id: "kern-cover@example.com".to_string(),
+                subject: "[PATCH 0/2] ext4: fix delayed alloc".to_string(),
+                author: "Dev <dev@example.com>".to_string(),
+                date: 1000,
+                received_date: Some(1000),
+                in_reply_to: None,
+                references: vec![],
+                index: 0,
+                total: 2,
+                to: "linux-ext4@vger.kernel.org".to_string(),
+                cc: String::new(),
+                is_patch_or_cover: true,
+                version: None,
+                body: cover_body.to_string(),
+            }),
+            patch: None,
+            baseline: None,
+            failed_error: None,
+            skip_filters: None,
+            only_filters: None,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            receipt: None,
+        };
+        let kernel_patch = ParsedArticle {
+            group: "org.kernel.vger.linux-ext4".to_string(),
+            article_id: "2".to_string(),
+            source: MessageSource::Nntp,
+            metadata: Some(sashiko::patch::PatchsetMetadata {
+                message_id: "kern-p1@example.com".to_string(),
+                subject: "[PATCH 1/2] ext4: fix inode".to_string(),
+                author: "Dev <dev@example.com>".to_string(),
+                date: 1001,
+                received_date: Some(1001),
+                in_reply_to: Some("kern-cover@example.com".to_string()),
+                references: vec!["kern-cover@example.com".to_string()],
+                index: 1,
+                total: 2,
+                to: "linux-ext4@vger.kernel.org".to_string(),
+                cc: String::new(),
+                is_patch_or_cover: true,
+                version: None,
+                body: "commit msg".to_string(),
+            }),
+            patch: Some(sashiko::patch::Patch {
+                message_id: "kern-p1@example.com".to_string(),
+                body: "commit msg".to_string(),
+                diff: kernel_diff.to_string(),
+                part_index: 1,
+            }),
+            baseline: None,
+            failed_error: None,
+            skip_filters: None,
+            only_filters: None,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            receipt: None,
+        };
+        let e2fs_patch = ParsedArticle {
+            group: "org.kernel.vger.linux-ext4".to_string(),
+            article_id: "3".to_string(),
+            source: MessageSource::Nntp,
+            metadata: Some(sashiko::patch::PatchsetMetadata {
+                message_id: "e2fs-p1@example.com".to_string(),
+                subject: "[PATCH] e2fsck: fix extent check".to_string(),
+                author: "Dev <dev@example.com>".to_string(),
+                date: 1002,
+                received_date: Some(1002),
+                in_reply_to: None,
+                references: vec![],
+                index: 1,
+                total: 1,
+                to: "linux-ext4@vger.kernel.org".to_string(),
+                cc: String::new(),
+                is_patch_or_cover: true,
+                version: None,
+                body: "commit msg".to_string(),
+            }),
+            patch: Some(sashiko::patch::Patch {
+                message_id: "e2fs-p1@example.com".to_string(),
+                body: "commit msg".to_string(),
+                diff: e2fs_diff.to_string(),
+                part_index: 1,
+            }),
+            baseline: None,
+            failed_error: None,
+            skip_filters: None,
+            only_filters: None,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            receipt: None,
+        };
+
+        for article in [kernel_cover, kernel_patch, e2fs_patch] {
+            let status =
+                process_parsed_article(&db, article, None, &policy, &[], &review_settings).await;
+            assert_eq!(status, ProcessStatus::Ingested);
+        }
+
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].subject.as_deref(),
+            Some("[PATCH] e2fsck: fix extent check")
+        );
+        let skipped = db
+            .get_patchset_summary_by_msgid("kern-cover@example.com", None, None)
+            .await
+            .unwrap();
+        assert!(skipped.is_none());
+        let stored_msg = db
+            .get_message_id_by_msg_id("kern-cover@example.com")
+            .await
+            .unwrap();
+        assert!(
+            stored_msg.is_some(),
+            "filtered NNTP messages remain stored in messages for thread continuity"
+        );
     }
 }

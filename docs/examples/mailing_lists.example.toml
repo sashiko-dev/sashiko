@@ -85,3 +85,13 @@ report_preexisting_bugs = true
 #
 # The same keys in a [defaults.patchwork] table apply to patches that
 # match no list section above.
+
+# --- Shared mailing-list ingestion filter ---
+# Useful when a single list carries patches for several repositories
+# (for example linux-ext4@vger.kernel.org carrying kernel ext4, xfstests,
+# and e2fsprogs patches).
+# ["linux-ext4@vger.kernel.org".ingest_filter]
+# allowed_subject_prefixes = ["e2fsprogs"]
+# ignored_subject_prefixes = ["fstests", "xfstests"]
+# allowed_paths = ["e2fsck/", "lib/ext2fs/", "misc/"]
+# ignored_paths = ["fs/", "tests/ext4/"]

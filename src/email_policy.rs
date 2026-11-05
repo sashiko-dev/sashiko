@@ -254,6 +254,105 @@ impl Default for DefaultListPolicy {
     }
 }
 
+/// Per-mailing-list filter applied during NNTP ingestion so shared lists
+/// carrying patches for multiple trees only create patchsets for submissions
+/// belonging to the configured project.
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IngestFilterPolicy {
+    #[serde(default)]
+    pub allowed_subject_prefixes: Vec<String>,
+    #[serde(default)]
+    pub ignored_subject_prefixes: Vec<String>,
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+    #[serde(default)]
+    pub ignored_paths: Vec<String>,
+}
+
+fn path_matches_pattern(path: &str, pattern: &str) -> bool {
+    let norm_path = path.trim_start_matches("./").trim_start_matches('/');
+    let norm_pat = pattern
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches('/');
+    if norm_pat.is_empty() {
+        return false;
+    }
+    if norm_pat.ends_with('/') {
+        norm_path.starts_with(norm_pat)
+    } else if let Some(stem) = norm_pat.strip_suffix('*') {
+        norm_path.starts_with(stem)
+    } else {
+        norm_path == norm_pat
+    }
+}
+
+impl IngestFilterPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.allowed_subject_prefixes.is_empty()
+            && self.ignored_subject_prefixes.is_empty()
+            && self.allowed_paths.is_empty()
+            && self.ignored_paths.is_empty()
+    }
+
+    pub fn validate(&self, list_key: &str) -> Result<(), String> {
+        for (field, items) in [
+            ("allowed_subject_prefixes", &self.allowed_subject_prefixes),
+            ("ignored_subject_prefixes", &self.ignored_subject_prefixes),
+            ("allowed_paths", &self.allowed_paths),
+            ("ignored_paths", &self.ignored_paths),
+        ] {
+            if items.iter().any(|s| s.trim().is_empty()) {
+                return Err(format!(
+                    "Mailing list {:?} has an empty entry in `ingest_filter.{}`",
+                    list_key, field
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluates whether an NNTP submission with `subject_prefixes` and
+    /// `touched_paths` (from a unified diff or cover-letter diffstat) belongs
+    /// to this project.
+    pub fn allows_submission(&self, subject_prefixes: &[String], touched_paths: &[String]) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+        if subject_prefixes.iter().any(|prefix| {
+            self.ignored_subject_prefixes
+                .iter()
+                .any(|ignored| prefix.eq_ignore_ascii_case(ignored.trim()))
+        }) {
+            return false;
+        }
+        if touched_paths.iter().any(|path| {
+            self.ignored_paths
+                .iter()
+                .any(|pat| path_matches_pattern(path, pat))
+        }) {
+            return false;
+        }
+        if subject_prefixes.iter().any(|prefix| {
+            self.allowed_subject_prefixes
+                .iter()
+                .any(|allowed| prefix.eq_ignore_ascii_case(allowed.trim()))
+        }) {
+            return true;
+        }
+        if !self.allowed_paths.is_empty() {
+            return !touched_paths.is_empty()
+                && touched_paths.iter().any(|path| {
+                    self.allowed_paths
+                        .iter()
+                        .any(|pat| path_matches_pattern(path, pat))
+                });
+        }
+        self.allowed_subject_prefixes.is_empty()
+    }
+}
+
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MailingListPolicy {
@@ -273,6 +372,8 @@ pub struct MailingListPolicy {
     pub embargo_hours: Option<u32>,
     #[serde(default, alias = "related_preexisting")]
     pub report_preexisting_bugs: RelatedPreexistingOverride,
+    #[serde(default)]
+    pub ingest_filter: IngestFilterPolicy,
 }
 
 pub type SubsystemPolicy = MailingListPolicy;
@@ -393,8 +494,25 @@ impl EmailPolicyConfig {
                     ));
                 }
             }
+            policy.ingest_filter.validate(key)?;
         }
         Ok(())
+    }
+
+    /// Returns the NNTP ingestion filter configured for `nntp_group`, when the
+    /// group maps to a list with a non-empty `ingest_filter`.
+    pub fn ingest_filter_for_nntp_group(&self, nntp_group: &str) -> Option<&IngestFilterPolicy> {
+        self.lists.iter().find_map(|(email, policy)| {
+            if policy.ingest_filter.is_empty() {
+                return None;
+            }
+            let effective_group = policy
+                .nntp_group
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| derive_nntp_group(email));
+            (effective_group == nntp_group).then_some(&policy.ingest_filter)
+        })
     }
 
     /// Returns `(short_name, nntp_group)` pairs for all lists in this config
@@ -1023,5 +1141,79 @@ mod tests {
             .await
             .expect("Async load of missing policy file should return default");
         assert!(missing.lists.is_empty());
+    }
+
+    #[test]
+    fn test_ingest_filter_allows_and_rejects_shared_list_traffic() {
+        let toml_content = r#"
+            [defaults]
+            track = true
+
+            ["linux-ext4@vger.kernel.org"]
+            reply_to = ["author", "list"]
+            positive_review = "all"
+
+            ["linux-ext4@vger.kernel.org".ingest_filter]
+            allowed_subject_prefixes = ["e2fsprogs"]
+            ignored_subject_prefixes = ["fstests", "xfstests", "kernel", "linux"]
+            allowed_paths = [
+                "lib/ext2fs/",
+                "lib/e2p/",
+                "lib/Makefile*",
+                "e2fsck/",
+                "misc/",
+                "tests/",
+                "configure.ac",
+            ]
+            ignored_paths = [
+                "fs/",
+                "include/",
+                "tests/ext4/",
+                "tests/generic/",
+                "common/",
+            ]
+        "#;
+
+        let config = EmailPolicyConfig::parse_content(toml_content).unwrap();
+        let filter = config
+            .ingest_filter_for_nntp_group("org.kernel.vger.linux-ext4")
+            .expect("filter resolved for linux-ext4 NNTP group");
+        let bpf_filter = config.ingest_filter_for_nntp_group("org.kernel.vger.bpf");
+        assert!(bpf_filter.is_none());
+
+        let allows = |prefs: &[&str], paths: &[&str]| {
+            let pref_vec: Vec<String> = prefs.iter().map(|s| (*s).to_string()).collect();
+            let path_vec: Vec<String> = paths.iter().map(|s| (*s).to_string()).collect();
+            filter.allows_submission(&pref_vec, &path_vec)
+        };
+
+        // e2fsprogs patch touching e2fsck/ and e2fsprogs test dir is accepted.
+        assert!(allows(
+            &[],
+            &["e2fsck/pass1.c", "tests/f_bad_extent/expect.1"],
+        ));
+        // Glob pattern lib/Makefile* matches e2fsprogs shared-lib makefiles
+        // without matching Linux kernel lib/crc32.c.
+        assert!(allows(&[], &["lib/Makefile.elf-lib"]));
+        assert!(!allows(&[], &["lib/crc32.c"]));
+
+        // Linux kernel ext4 patch is rejected.
+        assert!(!allows(&[], &["fs/ext4/mballoc.c"]));
+
+        // xfstests patches (tagged [PATCH fstests] or touching tests/ext4/) are rejected.
+        assert!(!allows(&["fstests"], &["tests/f_something"]));
+        assert!(!allows(&[], &["tests/ext4/059"]));
+
+        // Cover letter with [PATCH e2fsprogs 0/3] and no diffstat is accepted,
+        // whereas an untagged cover letter with no diffstat is rejected.
+        assert!(allows(&["e2fsprogs"], &[]));
+        assert!(!allows(&[], &[]));
+
+        // Empty filter entry fails validation.
+        let invalid = r#"
+            ["linux-ext4@vger.kernel.org".ingest_filter]
+            allowed_paths = [""]
+        "#;
+        assert!(EmailPolicyConfig::parse_content(invalid).is_err());
     }
 }
