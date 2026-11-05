@@ -437,6 +437,75 @@ mod tests {
     }
 
     #[test]
+    fn test_git_grep_function_context() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path().to_path_buf();
+
+        let run_git = |args: &[&str]| {
+            let status = crate::git_cmd::in_dir(&repo_path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test User"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(
+            repo_path.join("sample.c"),
+            "int helper(void)\n{\n    return 1;\n}\n\nint target_caller(int arg)\n{\n    int x = arg + 1;\n    if (x > 10)\n        return special_sink(x);\n    return 0;\n}\n",
+        )
+        .unwrap();
+        run_git(&["add", "sample.c"]);
+        run_git(&["commit", "-m", "Add sample.c"]);
+
+        let toolbox = ToolBox::new(repo_path);
+        let rt = Runtime::new().unwrap();
+
+        let res = rt
+            .block_on(toolbox.call(
+                "git_grep",
+                json!({
+                    "revision": "HEAD",
+                    "pattern": "special_sink",
+                    "function_context": true
+                }),
+            ))
+            .unwrap();
+        let text = res.as_str().unwrap();
+        assert!(text.contains("[file: sample.c]"));
+        assert!(text.contains("6=int target_caller(int arg)"));
+        assert!(text.contains("10:        return special_sink(x);"));
+        assert!(!text.contains("int helper(void)"));
+
+        // Verify normalize_args cache-key parity for default function_context=false
+        let before = toolbox.cache.read().unwrap().len();
+        let _ = rt
+            .block_on(toolbox.call(
+                "git_grep",
+                json!({ "revision": "HEAD", "pattern": "special_sink" }),
+            ))
+            .unwrap();
+        let after_one = toolbox.cache.read().unwrap().len();
+        assert_eq!(after_one, before + 1);
+        let _ = rt
+            .block_on(toolbox.call(
+                "git_grep",
+                json!({
+                    "revision": "HEAD",
+                    "pattern": "special_sink",
+                    "context_lines": 0,
+                    "function_context": false,
+                    "count_only": false,
+                    "is_literal": false
+                }),
+            ))
+            .unwrap();
+        assert_eq!(toolbox.cache.read().unwrap().len(), after_one);
+    }
+
+    #[test]
     fn test_git_grep_invalid_revision() {
         let linux_path = get_test_paths();
         let toolbox = ToolBox::new(linux_path);

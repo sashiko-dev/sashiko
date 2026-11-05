@@ -119,7 +119,68 @@ pub fn glob_to_regex(glob: &str) -> Result<regex::Regex> {
 
 fn get_grep_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"^([a-zA-Z0-9_./-]+)(:|-)([0-9]+)(:|-)(.*)$").unwrap())
+    RE.get_or_init(|| regex::Regex::new(r"^([a-zA-Z0-9_./-]+)(:|-|=)([0-9]+)(:|-|=)(.*)$").unwrap())
+}
+
+const MAX_GREP_HUNK_LINES: usize = 200;
+const GREP_ANCHOR_RADIUS: usize = 25;
+
+#[derive(Default)]
+struct FileGrepBlock {
+    hunks: Vec<Vec<(bool, String)>>,
+    match_count: usize,
+}
+
+impl FileGrepBlock {
+    fn current_hunk_mut(&mut self) -> &mut Vec<(bool, String)> {
+        if self.hunks.is_empty() {
+            self.hunks.push(Vec::new());
+        }
+        self.hunks.last_mut().expect("non-empty hunks")
+    }
+
+    fn split_hunk(&mut self) {
+        if self.hunks.last().is_some_and(|h| !h.is_empty()) {
+            self.hunks.push(Vec::new());
+        }
+    }
+}
+
+fn cap_grep_hunk(hunk: &[(bool, String)]) -> Vec<String> {
+    if hunk.len() <= MAX_GREP_HUNK_LINES {
+        return hunk.iter().map(|(_, text)| text.clone()).collect();
+    }
+
+    let mut keep = vec![false; hunk.len()];
+    keep[0] = true;
+    for (idx, (anchor, _)) in hunk.iter().enumerate() {
+        if *anchor {
+            let lo = idx.saturating_sub(GREP_ANCHOR_RADIUS);
+            let hi = (idx + GREP_ANCHOR_RADIUS).min(hunk.len() - 1);
+            for slot in &mut keep[lo..=hi] {
+                *slot = true;
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while idx < hunk.len() {
+        if keep[idx] {
+            out.push(hunk[idx].1.clone());
+            idx += 1;
+        } else {
+            let start = idx;
+            while idx < hunk.len() && !keep[idx] {
+                idx += 1;
+            }
+            out.push(format!(
+                "  ... [{} lines of enclosing block omitted] ...",
+                idx - start
+            ));
+        }
+    }
+    out
 }
 
 /// Formats raw git grep output into a clean, grouped structure, sorting findings
@@ -129,24 +190,20 @@ pub fn format_git_grep_output(stdout: &str, revision: &str, active_files: &[Stri
     let re = get_grep_regex();
 
     use std::collections::BTreeMap;
-    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, FileGrepBlock> = BTreeMap::new();
     let mut current_file: Option<String> = None;
 
     for line in stdout.lines() {
         if line == "--" {
             if let Some(ref cur) = current_file
-                && let Some(list) = grouped.get_mut(cur)
+                && let Some(block) = grouped.get_mut(cur)
             {
-                list.push("  --".to_string());
+                block.split_hunk();
             }
             continue;
         }
 
-        let stripped = if line.starts_with(&prefix) {
-            &line[prefix.len()..]
-        } else {
-            line
-        };
+        let stripped = line.strip_prefix(&prefix).unwrap_or(line);
 
         if let Some(caps) = re.captures(stripped) {
             let path = &caps[1];
@@ -156,40 +213,45 @@ pub fn format_git_grep_output(stdout: &str, revision: &str, active_files: &[Stri
             let content = &caps[5];
 
             if sep1 == sep2 {
+                let is_match = sep1 == ":";
+                let is_anchor = is_match || sep1 == "=";
                 let formatted_line = format!("  {}{}{}", line_num, sep1, content);
                 let path_str = path.to_string();
                 current_file = Some(path_str.clone());
-                grouped.entry(path_str).or_default().push(formatted_line);
+                let block = grouped.entry(path_str).or_default();
+                if is_match {
+                    block.match_count += 1;
+                }
+                block.current_hunk_mut().push((is_anchor, formatted_line));
             } else if let Some(ref cur) = current_file {
                 grouped
                     .entry(cur.clone())
                     .or_default()
-                    .push(stripped.to_string());
+                    .current_hunk_mut()
+                    .push((false, stripped.to_string()));
             }
         } else if let Some(ref cur) = current_file {
             grouped
                 .entry(cur.clone())
                 .or_default()
-                .push(stripped.to_string());
+                .current_hunk_mut()
+                .push((false, stripped.to_string()));
         }
     }
 
-    // Proximity Ranking: sort matching files so that files closest to modified files appear first
-    let mut blocks: Vec<(String, Vec<String>)> = grouped.into_iter().collect();
+    // Proximity Ranking: sort matching files so that files closest to modified files appear first.
+    let mut blocks: Vec<(String, FileGrepBlock)> = grouped.into_iter().collect();
     blocks.sort_by_key(|(path, _)| (get_priority_score(path, active_files), path.clone()));
 
     let total_files = blocks.len();
-    let total_matches: usize = blocks
-        .iter()
-        .map(|(_, lines)| lines.iter().filter(|l| l.trim() != "--").count())
-        .sum();
+    let total_matches: usize = blocks.iter().map(|(_, b)| b.match_count.max(1)).sum();
 
     const MAX_SUMMARY_FILES: usize = 10;
     let file_summaries: Vec<String> = blocks
         .iter()
         .take(MAX_SUMMARY_FILES)
-        .map(|(path, lines)| {
-            let count = lines.iter().filter(|l| l.trim() != "--").count();
+        .map(|(path, b)| {
+            let count = b.match_count.max(1);
             format!(
                 "{} ({} {})",
                 path,
@@ -223,11 +285,18 @@ pub fn format_git_grep_output(stdout: &str, revision: &str, active_files: &[Stri
         ));
     }
 
-    for (path, lines) in blocks {
+    for (path, block) in blocks {
         result.push_str(&format!("[file: {}]\n", path));
-        for l in lines {
-            result.push_str(&l);
-            result.push('\n');
+        let non_empty_hunks: Vec<&Vec<(bool, String)>> =
+            block.hunks.iter().filter(|h| !h.is_empty()).collect();
+        for (h_idx, hunk) in non_empty_hunks.iter().enumerate() {
+            if h_idx > 0 {
+                result.push_str("  --\n");
+            }
+            for l in cap_grep_hunk(hunk) {
+                result.push_str(&l);
+                result.push('\n');
+            }
         }
         result.push('\n');
     }
@@ -704,7 +773,6 @@ mod tests {
                 .is_err()
         );
     }
-
     #[test]
     fn test_strip_tool_line_numbers() {
         // Multi-line git_read_files / git_show output preserves source indentation and blank lines.
@@ -734,5 +802,30 @@ mod tests {
         assert_eq!(strip_tool_line_numbers("0: tuple_field"), None);
         assert_eq!(strip_tool_line_numbers("let guard = m.lock();"), None);
         assert_eq!(strip_tool_line_numbers("..."), None);
+    }
+
+    #[test]
+    fn test_format_git_grep_function_context_and_hunk_cap() {
+        let mut raw = Vec::new();
+        raw.push("HEAD:mm/vmscan.c=100=static void shrink_node(pg_data_t *pgdat)".to_string());
+        for line_no in 101..=360 {
+            if line_no == 250 {
+                raw.push(format!(
+                    "HEAD:mm/vmscan.c:{line_no}:    target_call(pgdat);"
+                ));
+            } else {
+                raw.push(format!("HEAD:mm/vmscan.c-{line_no}-    step({line_no});"));
+            }
+        }
+        let formatted = format_git_grep_output(&raw.join("\n"), "HEAD", &[]);
+        // Summary counts the 1 actual ':' match rather than 261 context lines.
+        assert!(
+            formatted
+                .starts_with("Matches found across 1 file (1 total match): mm/vmscan.c (1 match)")
+        );
+        // Both the '=' function signature and ':' match line survive hunk capping.
+        assert!(formatted.contains("  100=static void shrink_node(pg_data_t *pgdat)"));
+        assert!(formatted.contains("  250:    target_call(pgdat);"));
+        assert!(formatted.contains("lines of enclosing block omitted"));
     }
 }

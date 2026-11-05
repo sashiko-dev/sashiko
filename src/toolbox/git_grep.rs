@@ -41,6 +41,7 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
                 "pattern": { "type": "string", "description": "Regex or literal pattern to search." },
                 "path": { "type": "string", "description": "Relative paths or pathspecs to restrict search (optional). Highly recommended to scope to the modified subsystem directory (e.g. 'net/mptcp/') to avoid extremely expensive tree-wide searches." },
                 "context_lines": { "type": "integer", "description": "Context lines to show. Default: 0." },
+                "function_context": { "type": "boolean", "description": "If true, show the entire enclosing function or block for each match (-W). Eliminates follow-up file reads when inspecting callers. Default: false." },
                 "count_only": { "type": "boolean", "description": "If true, returns file names and match counts only. Recommended for cheap broad searches." },
                 "is_literal": { "type": "boolean", "description": "If true, treats pattern as literal fixed string rather than PCRE regex." }
             },
@@ -54,13 +55,16 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
             if !obj.contains_key("path") {
                 obj.insert("path".to_string(), Value::Null);
             }
-            if !obj.contains_key("context_lines") {
+            if obj.get("context_lines").is_none_or(Value::is_null) {
                 obj.insert("context_lines".to_string(), json!(0));
             }
-            if !obj.contains_key("count_only") {
+            if obj.get("function_context").is_none_or(Value::is_null) {
+                obj.insert("function_context".to_string(), json!(false));
+            }
+            if obj.get("count_only").is_none_or(Value::is_null) {
                 obj.insert("count_only".to_string(), json!(false));
             }
-            if !obj.contains_key("is_literal") {
+            if obj.get("is_literal").is_none_or(Value::is_null) {
                 obj.insert("is_literal".to_string(), json!(false));
             }
         }
@@ -78,6 +82,7 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
             .ok_or_else(|| anyhow!("Missing pattern"))?;
         let path_str = args["path"].as_str();
         let context_lines = args["context_lines"].as_u64().unwrap_or(0) as usize;
+        let function_context = args["function_context"].as_bool().unwrap_or(false);
         let count_only = args["count_only"].as_bool().unwrap_or(false);
         let is_literal = args["is_literal"].as_bool().unwrap_or(false);
 
@@ -90,6 +95,11 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
 
         if count_only {
             cmd.arg("-c");
+        } else if function_context {
+            cmd.arg("-n").arg("-I").arg("-W");
+            if context_lines > 0 {
+                cmd.arg(format!("-C{}", context_lines));
+            }
         } else {
             cmd.arg("-n").arg("-I").arg(format!("-C{}", context_lines));
         }
