@@ -11927,11 +11927,26 @@ impl Database {
     }
 
     pub async fn complete_patchset_review_status(&self, id: i64, status: &str) -> Result<bool> {
+        self.complete_patchset_review(id, status, None).await
+    }
+
+    /// Moves a patchset to its final review status and records why it
+    /// failed, or clears a stale reason when `failed_reason` is `None`.
+    ///
+    /// Under a patchset claim the write only lands while the claim is still
+    /// the active generation, so a superseded worker cannot overwrite the
+    /// outcome of a newer run.
+    pub async fn complete_patchset_review(
+        &self,
+        id: i64,
+        status: &str,
+        failed_reason: Option<&str>,
+    ) -> Result<bool> {
         if status == ReviewStatus::Cancelled.as_str() {
             let updated = self
                 .execute(
-                    "UPDATE patchsets SET status = ? WHERE id = ?",
-                    libsql::params![status, id],
+                    "UPDATE patchsets SET status = ?, failed_reason = ? WHERE id = ?",
+                    libsql::params![status, failed_reason, id],
                 )
                 .await?;
             return Ok(updated > 0);
@@ -11943,7 +11958,7 @@ impl Database {
             let updated = self
                 .execute(
                     "UPDATE patchsets
-                        SET status = ?
+                        SET status = ?, failed_reason = ?
                       WHERE id = ?
                         AND status = 'In Review'
                         AND EXISTS (
@@ -11951,15 +11966,15 @@ impl Database {
                              WHERE m.key = 'patchset_active_gen:' || CAST(patchsets.id AS TEXT)
                                AND CAST(m.value AS INTEGER) = ?
                         )",
-                    libsql::params![status, id, claim.generation],
+                    libsql::params![status, failed_reason, id, claim.generation],
                 )
                 .await?;
             Ok(updated > 0)
         } else {
             let updated = self
                 .execute(
-                    "UPDATE patchsets SET status = ? WHERE id = ? AND status != 'Cancelled'",
-                    libsql::params![status, id],
+                    "UPDATE patchsets SET status = ?, failed_reason = ? WHERE id = ? AND status != 'Cancelled'",
+                    libsql::params![status, failed_reason, id],
                 )
                 .await?;
             Ok(updated > 0)
@@ -12001,7 +12016,7 @@ impl Database {
         let tx_db = self.with_connection((*tx).clone());
         let count = tx_db
             .execute(
-                "UPDATE patchsets SET status = 'In Review' WHERE id = ? AND status = 'Pending'",
+                "UPDATE patchsets SET status = 'In Review', failed_reason = NULL WHERE id = ? AND status = 'Pending'",
                 libsql::params![id],
             )
             .await?;
@@ -13541,10 +13556,11 @@ impl Database {
 
         let should_increment = current_status.as_deref() == Some("Reviewed");
 
-        // 2. Reset patchset status to Pending
+        // 2. Reset patchset status to Pending; the new attempt records its
+        // own failure reason, if any.
         tx_db
             .execute(
-                "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
+                "UPDATE patchsets SET status = 'Pending', failed_reason = NULL WHERE id = ?",
                 libsql::params![id],
             )
             .await?;
@@ -33223,6 +33239,99 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
         let p_status2: String = p_rows2.next().await?.unwrap().get(0)?;
         assert_eq!(p_status2, "Reviewed");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_patchset_review_failure_reason_lifecycle() -> Result<()> {
+        let db = setup_db().await;
+        let root = "failed_reason@kernel.org";
+        let thread_id = db.create_thread(root, "[PATCH] reason", 1000).await?;
+        db.create_message(
+            root,
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "[PATCH] reason",
+            1000,
+            "body",
+            "to@b.c",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some(root),
+                root,
+                "[PATCH] reason",
+                "Author <a@b.c>",
+                1000,
+                1,
+                1,
+                "to@b.c",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.create_patch(ps_id, root, 1, "diff --git a/r.c b/r.c")
+            .await?;
+        let read = |db: Arc<Database>| async move {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT status, failed_reason FROM patchsets WHERE id = ?",
+                    libsql::params![ps_id],
+                )
+                .await?;
+            let row = rows.next().await?.expect("patchset row");
+            Ok::<_, anyhow::Error>((row.get::<String>(0)?, row.get::<Option<String>>(1)?))
+        };
+
+        // A failed run records its reason under the active claim.
+        let gen1 = db.claim_patchset_for_review_with_gen(ps_id).await?.unwrap();
+        let worker1 = db.with_patchset_claim(ps_id, gen1);
+        assert!(
+            worker1
+                .complete_patchset_review(ps_id, "Failed", Some("1 of 1 patch reviews failed"))
+                .await?
+        );
+        assert_eq!(
+            read(db.clone()).await?,
+            (
+                "Failed".to_string(),
+                Some("1 of 1 patch reviews failed".to_string())
+            )
+        );
+
+        // A rerun clears the stale reason, and a superseded worker cannot
+        // write a reason over the new run.
+        db.rerun_patchset(ps_id).await?;
+        assert_eq!(read(db.clone()).await?, ("Pending".to_string(), None));
+        let gen2 = db.claim_patchset_for_review_with_gen(ps_id).await?.unwrap();
+        assert!(
+            !worker1
+                .complete_patchset_review(ps_id, "Failed", Some("stale worker"))
+                .await?
+        );
+        assert_eq!(read(db.clone()).await?, ("In Review".to_string(), None));
+
+        // A successful completion leaves no reason behind.
+        let worker2 = db.with_patchset_claim(ps_id, gen2);
+        assert!(
+            worker2
+                .complete_patchset_review_status(ps_id, "Reviewed")
+                .await?
+        );
+        assert_eq!(read(db.clone()).await?, ("Reviewed".to_string(), None));
         Ok(())
     }
 

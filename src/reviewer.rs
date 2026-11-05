@@ -79,6 +79,35 @@ struct ValidJob {
     diff: String,
 }
 
+/// Upper bound on a stored patchset failure reason, in bytes. The reason
+/// is shown in the web UI; the daemon log keeps the full errors.
+const MAX_FAILED_REASON_LEN: usize = 2000;
+
+/// Caps `reason` at [`MAX_FAILED_REASON_LEN`] on a character boundary.
+fn truncate_failed_reason(reason: &str) -> String {
+    if reason.len() <= MAX_FAILED_REASON_LEN {
+        return reason.to_string();
+    }
+    const ELLIPSIS: &str = "...";
+    let mut end = MAX_FAILED_REASON_LEN - ELLIPSIS.len();
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{ELLIPSIS}", &reason[..end])
+}
+
+/// The patchset failure reason for the patches that did not get a review,
+/// out of the `total` patches queued.
+fn summarize_patch_failures(failures: &[String], total: usize) -> String {
+    let total = total.max(failures.len());
+    truncate_failed_reason(&format!(
+        "{} of {} patch reviews failed: {}",
+        failures.len(),
+        total,
+        failures.join("; ")
+    ))
+}
+
 #[derive(Serialize)]
 struct BaselineAttempt {
     baseline: String,
@@ -336,13 +365,12 @@ impl Reviewer {
         Ok(claimed_count)
     }
 
-    async fn mark_patchset_failed_unless_cancelled(db: &Database, patchset_id: i64) {
-        if let Err(e) = Self::fail_orphaned_in_review_rows_with_retry(
-            db,
-            patchset_id,
-            "Review task terminated abnormally",
-        )
-        .await
+    /// Fails the patchset and its unfinished review rows with `reason`,
+    /// unless the run was cancelled or superseded meanwhile.
+    async fn mark_patchset_failed_unless_cancelled(db: &Database, patchset_id: i64, reason: &str) {
+        let reason = truncate_failed_reason(reason);
+        if let Err(e) =
+            Self::fail_orphaned_in_review_rows_with_retry(db, patchset_id, &reason).await
         {
             warn!(
                 "Failed to fail orphaned In Review rows for patchset {}: {}",
@@ -353,6 +381,7 @@ impl Reviewer {
             db,
             patchset_id,
             ReviewStatus::Failed.as_str(),
+            Some(&reason),
         )
         .await
         {
@@ -385,7 +414,12 @@ impl Reviewer {
                     "Review task for patchset {} terminated abnormally ({}); marking as Failed",
                     patchset_id, join_err
                 );
-                Self::mark_patchset_failed_unless_cancelled(&db, patchset_id).await;
+                Self::mark_patchset_failed_unless_cancelled(
+                    &db,
+                    patchset_id,
+                    &join_err.to_string(),
+                )
+                .await;
             }
         })
     }
@@ -668,7 +702,12 @@ impl Reviewer {
                         "Failed to verify active claim before starting review for patchset {}: {}",
                         patchset_id, e
                     );
-                    Self::mark_patchset_failed_unless_cancelled(&ctx.db, patchset_id).await;
+                    Self::mark_patchset_failed_unless_cancelled(
+                        &ctx.db,
+                        patchset_id,
+                        &format!("Failed to verify the review claim before starting: {e:#}"),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -715,7 +754,12 @@ impl Reviewer {
             Ok(d) => d,
             Err(e) => {
                 error!("Failed to fetch diffs for {}: {}", patchset_id, e);
-                Self::mark_patchset_failed_unless_cancelled(&ctx.db, patchset_id).await;
+                Self::mark_patchset_failed_unless_cancelled(
+                    &ctx.db,
+                    patchset_id,
+                    &format!("Failed to fetch patch diffs: {e:#}"),
+                )
+                .await;
                 return;
             }
         };
@@ -762,7 +806,12 @@ impl Reviewer {
                         "Failed to fetch message body {} for patchset {}: {}",
                         mid, patchset_id, e
                     );
-                    Self::mark_patchset_failed_unless_cancelled(&ctx.db, patchset_id).await;
+                    Self::mark_patchset_failed_unless_cancelled(
+                        &ctx.db,
+                        patchset_id,
+                        &format!("Failed to fetch message body {mid}: {e:#}"),
+                    )
+                    .await;
                     return;
                 }
             },
@@ -787,7 +836,12 @@ impl Reviewer {
                         "Failed to fetch baseline {} for patchset {}: {}",
                         bid, patchset_id, e
                     );
-                    Self::mark_patchset_failed_unless_cancelled(&ctx.db, patchset_id).await;
+                    Self::mark_patchset_failed_unless_cancelled(
+                        &ctx.db,
+                        patchset_id,
+                        &format!("Failed to fetch baseline {bid}: {e:#}"),
+                    )
+                    .await;
                     return;
                 }
             },
@@ -847,7 +901,14 @@ impl Reviewer {
                             patchset_id, rm_err
                         );
                     }
-                    Self::mark_patchset_failed_unless_cancelled(&ctx.db, patchset_id).await;
+                    Self::mark_patchset_failed_unless_cancelled(
+                        &ctx.db,
+                        patchset_id,
+                        &format!(
+                            "Failed to verify the review claim after baseline preparation: {e:#}"
+                        ),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -1010,7 +1071,7 @@ impl Reviewer {
 
             // 2. Run Reviews
             let mut review_success = true; // Optimistic
-            let mut failed_patches = 0;
+            let mut patch_failures: Vec<String> = Vec::new();
 
             let mut valid_jobs = Vec::new();
 
@@ -1113,7 +1174,7 @@ impl Reviewer {
                     let worktree_path_clone = worktree_path.clone();
 
                     let handle = tokio::spawn(async move {
-                        let failed = Self::drain_review_queue(
+                        let failures = Self::drain_review_queue(
                             &ctx_clone,
                             &queue,
                             &aborted_clone,
@@ -1127,7 +1188,7 @@ impl Reviewer {
                         )
                         .await;
                         drop(permit);
-                        failed
+                        failures
                     });
                     handles.push(handle);
 
@@ -1143,31 +1204,33 @@ impl Reviewer {
             }
 
             // Main worker loop uses the existing worktree
-            failed_patches += Self::drain_review_queue(
-                &ctx,
-                &valid_jobs_queue,
-                &aborted,
-                patchset_id,
-                &baseline_ref_str,
-                Some(baseline_id),
-                &input_payload,
-                prompts_hash,
-                &worktree.path,
-                patchset.embargo_until,
-            )
-            .await;
+            patch_failures.extend(
+                Self::drain_review_queue(
+                    &ctx,
+                    &valid_jobs_queue,
+                    &aborted,
+                    patchset_id,
+                    &baseline_ref_str,
+                    Some(baseline_id),
+                    &input_payload,
+                    prompts_hash,
+                    &worktree.path,
+                    patchset.embargo_until,
+                )
+                .await,
+            );
 
             for handle in handles {
                 match handle.await {
-                    Ok(failed) => failed_patches += failed,
+                    Ok(failures) => patch_failures.extend(failures),
                     Err(e) => {
                         error!("Review worker tokio task crashed/panicked: {}", e);
-                        failed_patches += 1;
+                        patch_failures.push(format!("review worker crashed: {e}"));
                     }
                 }
             }
 
-            if failed_patches > 0 {
+            if !patch_failures.is_empty() {
                 review_success = false;
             }
 
@@ -1205,11 +1268,14 @@ impl Reviewer {
                 } else {
                     ReviewStatus::Failed.as_str()
                 };
+                let failed_reason = (!patch_failures.is_empty())
+                    .then(|| summarize_patch_failures(&patch_failures, total_valid));
 
                 match Self::complete_patchset_review_status_with_retry(
                     &ctx.db,
                     patchset_id,
                     final_status,
+                    failed_reason.as_deref(),
                 )
                 .await
                 {
@@ -1271,6 +1337,7 @@ impl Reviewer {
                 &ctx.db,
                 patchset_id,
                 ReviewStatus::FailedToApply.as_str(),
+                None,
             )
             .await
             {
@@ -1875,11 +1942,12 @@ impl Reviewer {
         db: &Database,
         patchset_id: i64,
         status: &str,
+        failed_reason: Option<&str>,
     ) -> Result<bool> {
         let mut last_err = None;
         for attempt in 1..=Self::DB_WRITE_ATTEMPTS {
             match db
-                .complete_patchset_review_status(patchset_id, status)
+                .complete_patchset_review(patchset_id, status, failed_reason)
                 .await
             {
                 Ok(updated) => return Ok(updated),
@@ -2218,7 +2286,7 @@ impl Reviewer {
     }
 
     /// Reviews queued patches until the queue is empty or the run is
-    /// cancelled, and returns how many patches did not get a review.
+    /// cancelled, and returns one line per patch that did not get a review.
     ///
     /// The main loop and every extra worker drain the same queue, so they
     /// share this loop.
@@ -2234,8 +2302,8 @@ impl Reviewer {
         prompts_hash: Option<&str>,
         worktree_path: &Path,
         embargo_until: Option<i64>,
-    ) -> usize {
-        let mut failed = 0;
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
         loop {
             let Some(job) = queue.lock().await.pop() else {
                 break;
@@ -2252,13 +2320,11 @@ impl Reviewer {
                         "Failed to verify active claim before reviewing patch {}/{}: {}",
                         patchset_id, job.index, e
                     );
-                    let remaining = {
-                        let mut q = queue.lock().await;
-                        let n = q.len();
-                        q.clear();
-                        n
-                    };
-                    failed += 1 + remaining;
+                    failures.push(format!("patch {}: claim check failed: {e:#}", job.index));
+                    let skipped: Vec<ValidJob> = queue.lock().await.drain(..).collect();
+                    failures.extend(skipped.iter().rev().map(|j| {
+                        format!("patch {}: not reviewed after a failed claim check", j.index)
+                    }));
                     break;
                 }
             }
@@ -2284,17 +2350,20 @@ impl Reviewer {
                     queue.lock().await.clear();
                     break;
                 }
-                Ok(PatchResult::ReviewFailed) => failed += 1,
+                Ok(PatchResult::ReviewFailed) => failures.push(format!(
+                    "patch {}: review failed, see its review log",
+                    job.index
+                )),
                 Err(e) => {
                     error!(
                         "Failed to process review for patch {}/{}: {}",
                         patchset_id, job.index, e
                     );
-                    failed += 1;
+                    failures.push(format!("patch {}: {e:#}", job.index));
                 }
             }
         }
-        failed
+        failures
     }
 
     /// Runs one patch review and turns a panic into a failure of that patch.
@@ -2364,7 +2433,7 @@ impl Reviewer {
             "Review of patch {}/{} (ID: {}) panicked: {}",
             patchset_id, index, patch_id, message
         );
-        let reason = format!("Review task panicked: {message}");
+        let reason = truncate_failed_reason(&format!("Review task panicked: {message}"));
         match db
             .settle_panicked_patch_review(patchset_id, patch_id, &reason)
             .await
@@ -7399,20 +7468,41 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         db.conn
             .execute("ALTER TABLE meta_broken RENAME TO meta", ())
             .await?;
-        Reviewer::mark_patchset_failed_unless_cancelled(&claimed_db, ps_id).await;
+        let reason = "Review task terminated abnormally: task 7 panicked with message \"boom\"";
+        Reviewer::mark_patchset_failed_unless_cancelled(&claimed_db, ps_id, reason).await;
 
         assert_eq!(
             db.get_patchset_status(ps_id).await?.as_deref(),
             Some(ReviewStatus::Failed.as_str())
         );
+        let mut ps_rows = db
+            .conn
+            .query(
+                "SELECT failed_reason FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await?;
+        assert_eq!(
+            ps_rows
+                .next()
+                .await?
+                .unwrap()
+                .get::<Option<String>>(0)?
+                .as_deref(),
+            Some(reason)
+        );
+        drop(ps_rows);
         let mut rev_rows = db
             .conn
             .query(
-                "SELECT status FROM reviews WHERE id = ?",
+                "SELECT status, result_description FROM reviews WHERE id = ?",
                 libsql::params![orphan_rev_id],
             )
             .await?;
-        assert_eq!(rev_rows.next().await?.unwrap().get::<String>(0)?, "Failed");
+        let rev_row = rev_rows.next().await?.unwrap();
+        assert_eq!(rev_row.get::<String>(0)?, "Failed");
+        assert_eq!(rev_row.get::<Option<String>>(1)?.as_deref(), Some(reason));
+        drop(rev_row);
         let mut meta_rows = db
             .conn
             .query(
@@ -7917,5 +8007,41 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             Some(&ReviewStatus::Reviewed.as_str().to_string())
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_summarize_patch_failures_names_every_failed_patch() {
+        let failures = vec![
+            "patch 5: Review of patch 1/5 (ID: 9) panicked: boom".to_string(),
+            "patch 7: review failed, see its review log".to_string(),
+        ];
+        assert_eq!(
+            summarize_patch_failures(&failures, 9),
+            "2 of 9 patch reviews failed: patch 5: Review of patch 1/5 (ID: 9) panicked: boom; \
+             patch 7: review failed, see its review log"
+        );
+        // A crashed worker can add a failure that was never counted as queued.
+        assert!(summarize_patch_failures(&failures, 1).starts_with("2 of 2 "));
+    }
+
+    #[test]
+    fn test_truncate_failed_reason_respects_char_boundaries() {
+        let short = "fits";
+        assert_eq!(truncate_failed_reason(short), short);
+
+        let long = "\u{4e2d}".repeat(MAX_FAILED_REASON_LEN);
+        let truncated = truncate_failed_reason(&long);
+        assert!(
+            truncated.len() <= MAX_FAILED_REASON_LEN,
+            "{}",
+            truncated.len()
+        );
+        assert!(truncated.ends_with("..."));
+        assert!(
+            truncated
+                .trim_end_matches("...")
+                .chars()
+                .all(|c| c == '\u{4e2d}')
+        );
     }
 }
