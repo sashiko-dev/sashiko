@@ -70,6 +70,7 @@ pub mod server;
 pub mod settings;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod threat_model;
 pub mod toolbox;
 pub mod upstream_grants;
 pub mod utils;
