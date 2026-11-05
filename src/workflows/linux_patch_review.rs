@@ -360,7 +360,17 @@ You MUST consider the following categories of issues and report any violations:
 
 const STAGE_SECURITY_INSTRUCTION: &str = r#"# Security audit
 
-You are a Red Team security researcher auditing a Linux kernel patch. Look for security vulnerabilities such as buffer overflows, out-of-bounds reads/writes, integer overflows, privilege escalation vectors, time-of-check to time-of-use (TOCTOU) races, and information leaks (e.g., copying uninitialized kernel memory to user-space via copy_to_user). Scrutinize all points where untrusted user input reaches sensitive functions without validation. Ensure all length checks and bounds checks are robust against malicious input. Focus heavily on attack surfaces and data boundaries."#;
+You are a Red Team security researcher auditing a Linux kernel patch. Look for memory-safety and boundary defects such as buffer overflows, out-of-bounds reads/writes, integer overflows or sign/width truncations, privilege escalation vectors, time-of-check to time-of-use (TOCTOU) races, and kernel memory or cross-boundary information leaks (e.g., copying uninitialized kernel stack/heap bytes or sensitive state via copy_to_user, netlink, or ioctl).
+
+Scrutinize every trust boundary defined by the Linux kernel threat model (`Documentation/process/threat-model.rst`, provided below under `<kernel_threat_model>` when available):
+- Unprivileged userspace entry points (syscalls, ioctls, netlink, bpf, io_uring, proc/sysfs/cgroupfs files writable without root, mmap/fault handlers) and unprivileged user namespaces vs. the initial namespace.
+- Remote network peers (packet parsing, header length vs. skb/fragment bounds, protocol state machines).
+- Virtualization guest-to-host and hypervisor isolation boundaries (KVM, Xen, Hyper-V, vhost/virtio host-side rings, confidential computing guest input).
+- Untrusted hardware/DMA inputs on IOMMU paths or drivers explicitly documented as hardened against hostile external peripherals.
+
+For every concern you raise, explicitly state in `reasoning`: (1) the concrete actor and entry point, (2) the required capabilities or configuration (e.g., unprivileged local user, unprivileged userns, `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `debugfs`, administrator-mounted filesystem image), and (3) whether it crosses a guaranteed kernel security boundary.
+
+CRITICAL NON-DISMISSAL RULE: Never dismiss or omit a genuine memory-safety, bounds, integer-overflow, race, or information-leak bug merely because the threat model classifies it as a regular bug rather than a security vulnerability (for example, on a `CAP_SYS_ADMIN`, `debugfs`, staging, or mounted-image path). Report every real bug in `concerns` with accurate privilege and boundary details so downstream verification calibrates its severity properly."#;
 
 const STAGE_HARDWARE_INSTRUCTION: &str = r#"# Hardware engineer's review
 
@@ -2680,22 +2690,49 @@ pub fn is_known_stage(name: &str) -> bool {
         || matches!(normalized.as_str(), "pre-screen" | "planning")
 }
 
-fn analysis_stage(
+fn analysis_stage_user_prompt(
     def: &'static AnalysisStage,
-    max_turns: usize,
-    temperature: f32,
-    reasoning_effort: Option<crate::ai::ReasoningEffort>,
-) -> Box<dyn ExecutableStage<LinuxPatchReviewState>> {
+) -> PromptTemplate<LinuxPatchReviewState> {
+    let threat_model_placeholder = if def.name == "security" {
+        KERNEL_THREAT_MODEL_PLACEHOLDER
+    } else {
+        ""
+    };
     let mut user_template = PromptTemplate::<LinuxPatchReviewState>::new(format!(
-        "{}\n\n{}{}",
+        "{}{}\n\n{}{}",
         def.instruction,
+        threat_model_placeholder,
         STAGE_JSON_SCHEMA_EXAMPLE,
         series_context_placeholder(def.wants_series_context)
     ));
     for guide in def.guides {
         user_template = user_template.include_file(*guide);
     }
-    let user_template = with_series_context(user_template, def.wants_series_context);
+    if def.name == "security" {
+        user_template = user_template.with_var(
+            "kernel_threat_model_section",
+            |s: &LinuxPatchReviewState| {
+                let rendered = crate::threat_model::KernelThreatModel::render_for_security_stage(
+                    s.kernel_threat_model.as_ref(),
+                );
+                if rendered.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\n{rendered}")
+                }
+            },
+        );
+    }
+    with_series_context(user_template, def.wants_series_context)
+}
+
+fn analysis_stage(
+    def: &'static AnalysisStage,
+    max_turns: usize,
+    temperature: f32,
+    reasoning_effort: Option<crate::ai::ReasoningEffort>,
+) -> Box<dyn ExecutableStage<LinuxPatchReviewState>> {
+    let user_template = analysis_stage_user_prompt(def);
 
     Box::new(
         Stage::builder(def.name)
@@ -6378,6 +6415,72 @@ mod tests {
                 !without.contains("{{kernel_threat_model_section}}"),
                 "{label} must not leave unexpanded placeholder when None"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_security_stage_renders_kernel_threat_model_without_bloating_other_stages() {
+        let prompts_dir = std::path::Path::new("projects/linux/prompts");
+        let state_with_model = LinuxPatchReviewState {
+            project: "linux".to_string(),
+            kernel_threat_model: Some(crate::threat_model::KernelThreatModel {
+                text: "Remote network peer boundary.".to_string(),
+                commit: "05441d697f7fdeadbeefcafebabe1234567890ab".to_string(),
+                git_ref: "linus/master".to_string(),
+            }),
+            ..Default::default()
+        };
+        let state_without_model = LinuxPatchReviewState {
+            project: "linux".to_string(),
+            kernel_threat_model: None,
+            ..Default::default()
+        };
+
+        let sec_def = analysis_stage_by_name("security").expect("security stage");
+        let sec_prompt = analysis_stage_user_prompt(sec_def);
+        let rendered_sec = sec_prompt
+            .render_for_model(&state_with_model, prompts_dir)
+            .await
+            .unwrap();
+        let logged_sec = sec_prompt.render_for_log(&state_with_model);
+        for text in [&rendered_sec, &logged_sec] {
+            assert!(text.contains(
+                "<kernel_threat_model source=\"Documentation/process/threat-model.rst @ linus/master (05441d697f7f)\">"
+            ));
+            assert!(text.contains("Remote network peer boundary."));
+            assert!(
+                text.contains("Applying the Linux kernel threat model in this security audit:")
+            );
+            assert!(text.contains("CRITICAL NON-DISMISSAL RULE"));
+            assert!(!text.contains("{{kernel_threat_model_section}}"));
+        }
+
+        let sec_without = sec_prompt
+            .render_for_model(&state_without_model, prompts_dir)
+            .await
+            .unwrap();
+        assert!(!sec_without.contains("<kernel_threat_model source="));
+        assert!(!sec_without.contains("{{kernel_threat_model_section}}"));
+        assert!(sec_without.contains("CRITICAL NON-DISMISSAL RULE"));
+
+        for other_name in [
+            "goal",
+            "implementation",
+            "execution-flow",
+            "resources",
+            "locking",
+            "hardware",
+        ] {
+            let def = analysis_stage_by_name(other_name).expect(other_name);
+            let other_rendered = analysis_stage_user_prompt(def)
+                .render_for_model(&state_with_model, prompts_dir)
+                .await
+                .unwrap();
+            assert!(
+                !other_rendered.contains("<kernel_threat_model source="),
+                "{other_name} must not receive <kernel_threat_model>"
+            );
+            assert!(!other_rendered.contains("{{kernel_threat_model_section}}"));
         }
     }
 }
