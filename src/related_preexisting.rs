@@ -640,6 +640,77 @@ pub fn remove_inline_comment_with_placeholder(inline_review: &str, placeholder: 
     sections.join("\n\n")
 }
 
+/// Extracts the inline comment prose block containing `placeholder` from
+/// `inline_review`, stripping its leading `[Severity: ...]` tag line and
+/// normalizing `placeholder` to [`BUG_REF_PLACEHOLDER`].
+pub fn extract_inline_comment_with_placeholder(
+    inline_review: &str,
+    placeholder: &str,
+) -> Option<String> {
+    if !inline_review.contains(placeholder) {
+        return None;
+    }
+    let (raw_body, _, _) = split_inline_review_footnotes(inline_review);
+    let is_quote_or_snip = |line: &str| {
+        let trimmed = line.trim();
+        trimmed.starts_with('>') || trimmed == "[ ... ]"
+    };
+    let is_severity_line = |line: &str| {
+        let trimmed = line.trim();
+        trimmed.starts_with("[Severity:") && trimmed.ends_with(']')
+    };
+    let all_lines: Vec<&str> = raw_body.lines().collect();
+    let first_quote_idx = all_lines
+        .iter()
+        .position(|&l| is_quote_or_snip(l) || is_severity_line(l))?;
+
+    let mut cur_comment: Vec<&str> = Vec::new();
+    let mut in_comment = false;
+    let check_block = |lines: &[&str]| -> Option<String> {
+        if !lines.iter().any(|l| l.contains(placeholder)) {
+            return None;
+        }
+        let body: Vec<&str> = lines
+            .iter()
+            .copied()
+            .skip_while(|l| l.trim().is_empty() || is_severity_line(l))
+            .collect();
+        let joined = body.join("\n").trim().to_string();
+        if joined.is_empty() {
+            None
+        } else if placeholder != BUG_REF_PLACEHOLDER {
+            Some(joined.replace(placeholder, BUG_REF_PLACEHOLDER))
+        } else {
+            Some(joined)
+        }
+    };
+
+    for &line in &all_lines[first_quote_idx..] {
+        let trimmed = line.trim();
+        if !in_comment {
+            if !is_quote_or_snip(line) && !trimmed.is_empty() {
+                in_comment = true;
+                cur_comment.push(line);
+            }
+        } else if is_quote_or_snip(line) {
+            if let Some(found) = check_block(&cur_comment) {
+                return Some(found);
+            }
+            cur_comment.clear();
+            in_comment = false;
+        } else if is_severity_line(line) {
+            if let Some(found) = check_block(&cur_comment) {
+                return Some(found);
+            }
+            cur_comment.clear();
+            cur_comment.push(line);
+        } else {
+            cur_comment.push(line);
+        }
+    }
+    check_block(&cur_comment)
+}
+
 /// Replaces [`BUG_REF_PLACEHOLDER`] in `report_text` with `[n]` when a
 /// footnote number is present, or removes the placeholder when rendering
 /// without footnote links. If `report_text` lacks the placeholder and a
@@ -1750,6 +1821,14 @@ rename to mm/b.c
         row0_no_id.bugid = None;
         row0_no_id.fingerprint = "fp0".to_string();
         let two_inline = "> +a();\n\n[Severity: High]\nFirst pre-existing [BUG_REF] issue.\n\n> +b();\n\n[Severity: High]\nSecond pre-existing [BUG_REF:2] issue.";
+        assert_eq!(
+            extract_inline_comment_with_placeholder(two_inline, "[BUG_REF]").as_deref(),
+            Some("First pre-existing [BUG_REF] issue.")
+        );
+        assert_eq!(
+            extract_inline_comment_with_placeholder(two_inline, "[BUG_REF:2]").as_deref(),
+            Some("Second pre-existing [BUG_REF] issue.")
+        );
         let (_, composed_two) = compose_inline_review_with_related(
             two_inline,
             false,

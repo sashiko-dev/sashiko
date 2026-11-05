@@ -692,26 +692,18 @@ pub fn report_findings_with_related_json(
         if let Some(reasoning) = item.get("reasoning") {
             entry.insert("reasoning".to_string(), reasoning.clone());
         }
-        if let Some(note) = item
-            .get("report_text")
-            .or_else(|| item.get("severity_explanation"))
+        if let Some(exp) = item
+            .get("severity_explanation")
+            .or_else(|| item.get("reasoning"))
+            .or_else(|| item.get("relation_reason"))
             .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
         {
-            let prose_only: String = note
-                .lines()
-                .filter(|line| !line.trim_start().starts_with('>'))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let cleaned = crate::related_preexisting::render_report_text_with_footnote(
-                prose_only.trim(),
-                None,
+            entry.insert(
+                "severity_explanation".to_string(),
+                Value::String(exp.to_string()),
             );
-            if !cleaned.trim().is_empty() {
-                entry.insert(
-                    "severity_explanation".to_string(),
-                    Value::String(cleaned.trim().to_string()),
-                );
-            }
         }
         filtered.push(Value::Object(entry));
     }

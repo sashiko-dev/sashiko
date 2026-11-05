@@ -136,8 +136,7 @@ Output schema:
   "post_patch_status": "StillPresent | RemovedByPatch | FixedByPatch | MovedOrChanged | Unknown",
   "post_patch_evidence": "file:line + quoted post-image code",
   "decision": "Report | Drop",
-  "drop_reason": "...",
-  "report_text": "self-contained LKML-style note quoting the post-image code (only for Report)"
+  "drop_reason": "..."
 }
 ```
 - The candidate is reported **only** if it is `NotSecuritySensitive` **and** `StillPresent`.
@@ -151,11 +150,10 @@ Output schema:
   `src/workflows/related_preexisting.rs` as constants, not in the prompt bundle.
 - `StillPresent` requires quoting the defective code **from the post-image**.
   If the patch deletes or rewrites it, the result is `RemovedByPatch`/`FixedByPatch`, and the candidate is dropped.
-- Validator: `decision == Report` is only accepted when `post_patch_evidence` and `report_text` are filled in,
-  and `report_text` includes the `[BUG_REF]` placeholder integrated into its opening sentence.
-- Items that pass are emitted as a separate worker output array, `related_preexisting[]`, preserving `bug_id`
-  and `bugid` (`<project>-<uuid>`). **They are not added to `findings` and not written into the report stage's prose.**
-  If a later reservation loses, there is no stale text to remove.
+- Validator: `decision == Report` is only accepted when `post_patch_evidence` is filled in.
+- Items that pass are kept in `related_preexisting[]` (preserving `bug_id` and `bugid`) and passed into the
+  `report` stage alongside `findings` with `"preexisting": true` and indexed `"bug_ref"` placeholders
+  (`"[BUG_REF]"`, `"[BUG_REF:2]"`), so the `report` stage formats them inline under their diff hunks in a single pass.
 - Dropped candidates are logged as `dismissed_concerns`.
 
 ### 3.6 Step 4: reservation and reporting (R6: never twice)
@@ -167,13 +165,15 @@ Concurrent reviews, including other patches of the same series, are serialized b
   **and** a function/symbol with it, or reaches lexical vector similarity ≥ 0.5 in the same file.
   This is deliberately aggressive: two different bugs in one function means only the first is ever mentioned.
 - Non-duplicates are inserted as **reserved** rows (`disclosed_at` NULL, with `bug_id` set from the candidate)
-  in the same transaction. Duplicates are dropped and logged.
-- Email:
+  in the same transaction. Duplicates are dropped, logged, and pruned from `review_inline` / `inline_review` by
+  `retain_reserved_disclosures`.
+- Email and Web UI:
   - Each reserved disclosure with a `bugid` (`<project>-<uuid>`) is assigned a sequential footnote number `[N]`
     continuing after any `[1]..[k]` footnote definitions at the bottom of `inline_review`.
   - The top summary bullet renders `- [<Severity>] <problem> [N]`.
-  - The reviewer renders a "Related pre-existing issue(s)" section from the reserved rows' `report_text`,
-    replacing `[BUG_REF]` with `[N]`, after the inline review.
+  - `compose_inline_review_with_related` replaces each `[BUG_REF]` / `[BUG_REF:N]` placeholder in `inline_review`
+    with its `[N]` footnote number so both `reviews.inline_review` (shown in the Web UI card) and the outbound email
+    body display the related bug inline under its diff hunk.
   - All `[N] <url>` footnote definitions (both prior-discussion links from `inline_review` and
     `[N] https://<domain>/#/bug/<bugid>` links for the related pre-existing bugs) are emitted together at the
     very bottom of the review body, immediately above the `-- ` signature.
