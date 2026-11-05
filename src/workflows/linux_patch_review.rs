@@ -1440,33 +1440,45 @@ fn validate_inline_format(content: &str, state: &LinuxPatchReviewState) -> Resul
 }
 
 fn align_related_preexisting_to_report_order(related: &mut [Value], report: &mut String) {
-    if related.len() < 2 {
+    if related.is_empty() {
         return;
     }
-    let mut order: Vec<(usize, usize)> = (0..related.len())
-        .map(|idx| {
-            let ph = crate::related_preexisting::bug_ref_placeholder(idx);
-            let pos = report.find(&ph).unwrap_or(usize::MAX);
-            (pos, idx)
-        })
-        .collect();
-    order.sort_by_key(|&(pos, idx)| (pos, idx));
-    if order
-        .iter()
-        .enumerate()
-        .all(|(new_idx, &(_, old_idx))| new_idx == old_idx)
-    {
-        return;
+    if related.len() >= 2 {
+        let mut order: Vec<(usize, usize)> = (0..related.len())
+            .map(|idx| {
+                let ph = crate::related_preexisting::bug_ref_placeholder(idx);
+                let pos = report.find(&ph).unwrap_or(usize::MAX);
+                (pos, idx)
+            })
+            .collect();
+        order.sort_by_key(|&(pos, idx)| (pos, idx));
+        if !order
+            .iter()
+            .enumerate()
+            .all(|(new_idx, &(_, old_idx))| new_idx == old_idx)
+        {
+            let orig: Vec<Value> = related.to_vec();
+            for (new_idx, &(_, old_idx)) in order.iter().enumerate() {
+                related[new_idx] = orig[old_idx].clone();
+                let old_ph = crate::related_preexisting::bug_ref_placeholder(old_idx);
+                *report =
+                    report.replacen(&old_ph, &format!("__SASHIKO_BUG_REF_TMP_{new_idx}__"), 1);
+            }
+            for new_idx in 0..related.len() {
+                let new_ph = crate::related_preexisting::bug_ref_placeholder(new_idx);
+                *report =
+                    report.replacen(&format!("__SASHIKO_BUG_REF_TMP_{new_idx}__"), &new_ph, 1);
+            }
+        }
     }
-    let orig: Vec<Value> = related.to_vec();
-    for (new_idx, &(_, old_idx)) in order.iter().enumerate() {
-        related[new_idx] = orig[old_idx].clone();
-        let old_ph = crate::related_preexisting::bug_ref_placeholder(old_idx);
-        *report = report.replacen(&old_ph, &format!("__SASHIKO_BUG_REF_TMP_{new_idx}__"), 1);
-    }
-    for new_idx in 0..related.len() {
-        let new_ph = crate::related_preexisting::bug_ref_placeholder(new_idx);
-        *report = report.replacen(&format!("__SASHIKO_BUG_REF_TMP_{new_idx}__"), &new_ph, 1);
+    for (idx, item) in related.iter_mut().enumerate() {
+        let ph = crate::related_preexisting::bug_ref_placeholder(idx);
+        if let Some(comment) =
+            crate::related_preexisting::extract_inline_comment_with_placeholder(report, &ph)
+            && let Some(map) = item.as_object_mut()
+        {
+            map.insert("report_text".to_string(), json!(comment));
+        }
     }
 }
 

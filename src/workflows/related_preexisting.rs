@@ -402,21 +402,18 @@ pub struct DisclosureCheckOutput {
     pub decision: DisclosureDecision,
     #[serde(default)]
     pub drop_reason: String,
-    #[serde(default)]
-    pub report_text: String,
 }
 
 impl DisclosureCheckOutput {
     /// Whether the candidate may be reported: only a bug that is not
     /// security-sensitive and still present after the patch, with the
-    /// evidence and the note filled in. Anything else, including `Unknown`
-    /// on either question, is dropped.
+    /// evidence filled in. Anything else, including `Unknown` on either
+    /// question, is dropped.
     pub fn passes(&self) -> bool {
         self.decision == DisclosureDecision::Report
             && self.security_sensitivity == SecuritySensitivity::NotSecuritySensitive
             && self.post_patch_status == PostPatchStatus::StillPresent
             && !self.post_patch_evidence.trim().is_empty()
-            && !self.report_text.trim().is_empty()
     }
 }
 
@@ -428,9 +425,7 @@ The bug under "Candidate" already existed before this patch. An earlier stage ju
 
 2. Is it still present once this patch is applied? Read the affected code at the Target Commit SHA. Answer "StillPresent" only if the defective code is still there and still reachable, and quote it from the patched tree in "post_patch_evidence" with file and line. Answer "RemovedByPatch" if the patch deletes the code, "FixedByPatch" if the patch fixes it, "MovedOrChanged" if the patch reworks it so the report would no longer match, and "Unknown" if you cannot tell.
 
-Report the bug ("decision": "Report") only when it is "NotSecuritySensitive" and "StillPresent". Otherwise drop it and say why in "drop_reason". Do not give the candidate the benefit of the doubt: an unverified answer is "Unknown", and "Unknown" means drop.
-
-When reporting, write "report_text": a short, self-contained note to the patch author in the style of a Linux kernel mailing list reply. Integrate the literal placeholder [BUG_REF] naturally into the opening sentence where the pre-existing issue is introduced (the mailer replaces [BUG_REF] with a footnote number such as [5] pointing to the tracked bug report at the end of the review). Quote the relevant lines from the patched tree prefixed with "> ", explain the problem in plain sentences, say how it relates to their patch, and suggest a fix. State clearly that the issue was not introduced by this patch. Plain text only: no markdown, no backticks, no headings, at most about 25 lines."#;
+Report the bug ("decision": "Report") only when it is "NotSecuritySensitive" and "StillPresent" (the report stage will format it inline alongside any new findings). Otherwise drop it and say why in "drop_reason". Do not give the candidate the benefit of the doubt: an unverified answer is "Unknown", and "Unknown" means drop."#;
 
 const CHECK_SCHEMA: &str = r#"Return ONLY a JSON object with these keys:
 - "security_sensitivity": "NotSecuritySensitive", "SecuritySensitive" or "Unknown"
@@ -439,7 +434,6 @@ const CHECK_SCHEMA: &str = r#"Return ONLY a JSON object with these keys:
 - "post_patch_evidence": file:line and the verbatim code from the patched tree (required for "StillPresent")
 - "decision": "Report" or "Drop"
 - "drop_reason": why the bug is dropped (required for "Drop", empty for "Report")
-- "report_text": the note to the author, integrating [BUG_REF] naturally into the opening sentence (required for "Report", empty for "Drop")
 
 Example Output:
 ```json
@@ -449,8 +443,7 @@ Example Output:
   "post_patch_status": "StillPresent",
   "post_patch_evidence": "drivers/foo/foo.c:212: if (!buf)\n\treturn -EINVAL;",
   "decision": "Report",
-  "drop_reason": "",
-  "report_text": "This isn't a bug introduced by this patch, but the same missing unlock [BUG_REF] exists a few lines below the path you fixed:\n\n> \tif (!buf)\n> \t\treturn -EINVAL;\n\nfoo_probe() returns here with dev->lock still held. Would it make sense to route this through the same out_unlock label in this series?"
+  "drop_reason": ""
 }
 ```"#;
 
@@ -479,25 +472,6 @@ pub fn validate_disclosure_check(out: &DisclosureCheckOutput) -> Result<(), Stri
                     "\"StillPresent\" requires \"post_patch_evidence\" quoting the code from the patched tree."
                         .to_string(),
                 );
-            }
-            if out.report_text.trim().is_empty() {
-                return Err(
-                    "\"decision\": \"Report\" requires a non-empty \"report_text\".".to_string(),
-                );
-            }
-            if out.report_text.contains('`') {
-                return Err(
-                    "\"report_text\" must be plain text; remove every backtick.".to_string()
-                );
-            }
-            if !out
-                .report_text
-                .contains(crate::related_preexisting::BUG_REF_PLACEHOLDER)
-            {
-                return Err(format!(
-                    "\"report_text\" must include the {} placeholder integrated naturally into the opening sentence.",
-                    crate::related_preexisting::BUG_REF_PLACEHOLDER
-                ));
             }
         }
         DisclosureDecision::Drop => {
@@ -539,7 +513,23 @@ pub fn apply_disclosure_check(
             json!(out.post_patch_evidence),
         );
         if passes {
-            map.insert("report_text".to_string(), json!(out.report_text.trim()));
+            let fallback_note = map
+                .get("report_text")
+                .or_else(|| map.get("relation_reason"))
+                .or_else(|| map.get("reasoning"))
+                .or_else(|| map.get("severity_explanation"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    crate::related_preexisting::problem_of(&Value::Object(map.clone()))
+                        .trim()
+                        .to_string()
+                });
+            if !fallback_note.is_empty() {
+                map.insert("report_text".to_string(), json!(fallback_note));
+            }
         } else {
             map.insert("dismissed_by".to_string(), json!(stage_name));
             let reason = if out.drop_reason.trim().is_empty() {
@@ -857,9 +847,6 @@ diff --git a/mm/foo.c b/mm/foo.c
             post_patch_evidence: "mm/foo.c:20: return -EINVAL;".to_string(),
             decision,
             drop_reason: String::new(),
-            report_text:
-                "> return -EINVAL;\n\nThis isn't introduced by this patch, but the leak [BUG_REF] ..."
-                    .to_string(),
         }
     }
 
@@ -900,22 +887,6 @@ diff --git a/mm/foo.c b/mm/foo.c
                 .contains("post_patch_evidence")
         );
 
-        let mut ticks = check(DisclosureDecision::Report);
-        ticks.report_text = "use `foo()` [BUG_REF]".to_string();
-        assert!(
-            validate_disclosure_check(&ticks)
-                .unwrap_err()
-                .contains("backtick")
-        );
-
-        let mut no_bug_ref = check(DisclosureDecision::Report);
-        no_bug_ref.report_text = "This isn't introduced by this patch.".to_string();
-        assert!(
-            validate_disclosure_check(&no_bug_ref)
-                .unwrap_err()
-                .contains("[BUG_REF]")
-        );
-
         let drop_without_reason = check(DisclosureDecision::Drop);
         assert!(
             validate_disclosure_check(&drop_without_reason)
@@ -936,11 +907,11 @@ diff --git a/mm/foo.c b/mm/foo.c
             check(DisclosureDecision::Report),
         );
         assert_eq!(s.related_preexisting_reported.len(), 1);
-        assert!(
+        assert_eq!(
             s.related_preexisting_reported[0]["report_text"]
                 .as_str()
-                .unwrap()
-                .starts_with("> return")
+                .unwrap(),
+            "lock held on the -EINVAL return"
         );
 
         let mut unknown = check(DisclosureDecision::Drop);
