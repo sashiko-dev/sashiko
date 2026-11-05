@@ -1321,6 +1321,270 @@ Return ONLY a valid JSON object matching:
 // 6. Standalone Description Generation Session (Enrichment)
 // ---------------------------------------------------------------------------
 
+/// Writing rules shared by every project's report prompt. They adapt the
+/// governing rule of the Linux inline review template to a standalone bug
+/// report: every line either explains the bug or shows why it is worth
+/// fixing, and length follows how hard the bug is to explain.
+const REPORT_WRITING_RULES: &str = r#"# The governing rule
+
+Every line and every word you write must do one of two jobs:
+
+- help the reader understand the problem: what is wrong, where, what
+  triggers it, and what happens, or
+- show why it is worth fixing: the consequence that the verified analysis
+  establishes.
+
+Delete anything that does neither: restating the inputs, proof steps the
+reader does not need, generic remarks about a class of bug, alternative
+paths that add no new insight, and closing summaries.
+
+Earlier stages have already verified and rated this bug.  Do not re-judge
+it here: do not downplay it, upgrade it, or question whether it matters.
+Convey what the analysis established, clearly.
+
+The reader is a maintainer who knows this code better than you do.
+Following the rule above, an obvious bug gets two or three lines, and a
+subtle race gets a diagram and a couple of paragraphs.  Length follows
+from how hard the bug is to explain, never from its severity or from how
+much context you were given.
+
+# Writing the report
+
+- The first sentence says what is wrong, in which function, and what
+  triggers it.  When the bug only shows up under a narrowing condition
+  (an architecture, a configuration option, specific hardware), lead with
+  it: "On 32-bit architectures, ...".
+- Add a sentence only if the reader would otherwise have to work
+  something out: a trigger that is not obvious, or a consequence that
+  does not follow from the first sentence.
+- Give one trigger, the most likely or most convincing one, not a list of
+  every input that hits the bug.
+- Give the consequence that matters most, not every object or code path
+  affected.
+- Write statements, not questions.  This is a report on existing code,
+  not a reply to a patch author.
+- Describe the defect only.  Do not suggest a fix, recommend remediation
+  or write a patch; maintainers decide how to resolve it.
+- Start directly with the technical description: no greeting, no
+  preamble ("While reviewing ...", "I noticed ..."), no header ("Defect
+  Report:", "Description:") and no restated title.
+
+# Distill, do not transcribe
+
+The description, verification details and severity explanation you are
+given are working notes, not text for the report.  Take from them only
+what the reader needs.  They often list many triggers, affected objects
+and code paths; pick one of each and drop the rest.  Never copy their
+"Trigger:", "Failure Mechanism:", "Impact:" or step-by-step proof
+structure into the report.
+
+The title, severity and introducing commit are displayed next to the
+report.  Do not restate them.
+
+# Evidence
+
+## Code snippets
+
+Quote code only when it shows something prose cannot say as briefly.
+Never quote code to show a fact that fits in one sentence, such as that a
+call is absent or that an object lives on the stack.  Never quote a whole
+function when two lines carry the point.  A snippet supports the prose:
+state the consequence in words, and never end the report on a snippet
+left to speak for itself.
+
+When a snippet is needed, label it with the file and function, copy only
+the lines that matter verbatim (including their indentation), and elide
+the rest with "...":
+
+path/to/file.c:func_name() {
+    ...
+	the_line_that_matters();
+    ...
+}
+
+Carets (^^^^) are rarely needed.  Use them only under an existing
+defective token or operator, never to point at a missing call.
+
+## Scenario diagrams
+
+Show every race, deadlock or reentrancy bug where the order of events
+across contexts matters as a scenario diagram.  Prose alone ("Meanwhile,
+... while concurrently ...") is hard to follow.
+
+- Time flows downward, one step per line.
+- Each CPU, thread or task gets its own column, labelled with the actual
+  context (CPU0, CPU1, kworker, <hardirq>, or a task name).
+- When everything happens in one context (an interrupt or a reentrant
+  call nesting into the same code), use a single column with no label and
+  mark where the nesting happens.
+- Keep only the steps a reader needs: the entry point of each context,
+  the key steps (lock, publish, clear, free) and the bad access.
+  Collapse intermediate callers with "...".
+- One diagram shows one concrete interleaving.  Describe other outcomes
+  in the prose.
+- Mark the failing step with a short arrow note such as
+  "<-- use-after-free".  Explanations go in the prose below the diagram.
+- Separate columns with whitespace only: no table borders, pipes or plus
+  signs.
+- Every line fits in 75 columns.  Elide arguments with "...".
+
+Skip the diagram when one sentence says the same: a hang where one side
+waits for a stuck peer, a symmetric race where every context runs the
+same code ("two concurrent callers both reach X"), or a single-context
+problem where a call chain (func_a() -> func_b()) is enough.
+
+# Paragraphs and wording
+
+- Short sentences, one idea each.  Paragraphs of at most four lines, with
+  a blank line between them.
+- Use the established terms of the project named above.  Avoid "can lead
+  to a potential situation in which".
+- One "can" or "could" is enough; state the explanation as facts and do
+  not stack hedges.
+- Refer to each code element by one name and keep using it.
+- No generic security hyperbole ("may allow an attacker to ...").
+
+# Format
+
+- Plain text, fit for a mailing list: no markdown, no code fences, no
+  "> " quote marks and no backticks.  Name functions as func().
+- Wrap your own text at 75 columns.  Never wrap quoted code.
+- Never use ALL CAPS, except in quoted code and diagram labels.
+- Never mention line numbers.  They go stale as soon as the tree moves.
+  Use function names, call chains and short snippets instead.
+- Cite a commit as its 12 character short sha followed by the subject in
+  parentheses and double quotes: 1a2b3c4d5e6f ("foo: fix bar handling").
+  Never write a bare sha, and never guess a subject.
+- End the report after the last sentence that does one of the two jobs."#;
+
+/// The parts of the report prompt that differ between projects.
+struct ReportPromptParts {
+    /// Who writes the report, and for which codebase.
+    role: &'static str,
+    /// What the reader already knows, and the project's established terms.
+    audience: &'static str,
+    /// Made-up sample reports. They are invented so that they can never
+    /// match a benchmark expectation.
+    examples: &'static str,
+}
+
+fn report_prompt_parts(project: ProjectId) -> ReportPromptParts {
+    match project {
+        ProjectId::Linux => ReportPromptParts {
+            role: "You are an experienced Linux kernel maintainer writing a standalone report of a verified defect in the current kernel tree, fit for the Linux kernel mailing list (LKML).",
+            audience: "Do not explain basic kernel mechanisms such as RCU, spinlocks, workqueues, slab caches or refcounts. Established terms: use-after-free, double free, leak, ABBA deadlock, NULL pointer dereference, data race, sleeping in atomic context.",
+            examples: LINUX_REPORT_EXAMPLES,
+        },
+        ProjectId::Sashiko => ReportPromptParts {
+            role: "You are an experienced Sashiko maintainer writing a standalone report of a verified defect in the Sashiko Rust codebase.",
+            audience: "Do not explain generic Rust, Tokio or SQLite concepts. Established terms: leak, deadlock, blocking call in async context, SQLITE_BUSY stall, panic, lost update, data race.",
+            examples: SASHIKO_REPORT_EXAMPLES,
+        },
+        ProjectId::Gcc => ReportPromptParts {
+            role: "You are an experienced GCC maintainer writing a standalone report of a verified defect in the GCC codebase.",
+            audience: "Do not explain generic compiler concepts such as GIMPLE, RTL, SSA form or the pass manager. Established terms: wrong-code, ICE, rejects-valid, accepts-invalid, GGC memory corruption, missed optimization.",
+            examples: GCC_REPORT_EXAMPLES,
+        },
+        ProjectId::Qemu => ReportPromptParts {
+            role: "You are an experienced QEMU maintainer writing a standalone report of a verified defect in the QEMU codebase.",
+            audience: "Do not explain generic QEMU mechanics such as the QOM property system, MemoryRegions, bottom halves or iothreads. When the guest can trigger the bug, say how. Established terms: out-of-bounds read or write, use-after-free, leak on the unrealize path, assertion failure, abort, incorrect guest-visible behavior.",
+            examples: QEMU_REPORT_EXAMPLES,
+        },
+    }
+}
+
+const LINUX_REPORT_EXAMPLES: &str = r#"## An obvious bug, prose only
+
+foo_probe() leaks the DMA buffer when foo_hw_init() fails: the error path
+returns without calling dma_free_coherent().  Every deferred probe retry
+leaks another buffer.
+
+## An ordering bug, where a snippet is shorter than prose
+
+baz_get_stats() dereferences priv->ring before the NULL check that guards
+it:
+
+drivers/net/ethernet/baz/baz_main.c:baz_get_stats() {
+	struct baz_priv *priv = netdev_priv(dev);
+	u64 drops = priv->ring->drops;
+    ...
+	if (!priv->ring)
+		return;
+    ...
+}
+
+priv->ring stays NULL until baz_open() runs, so reading the statistics of
+an interface that was never brought up causes a NULL pointer dereference.
+
+## A race, with a scenario diagram
+
+qux_remove() can free the device while its interrupt handler still queues
+work that uses it:
+
+CPU0                              CPU1
+qux_remove()
+  cancel_work_sync(&qux->work)
+                                  qux_irq()
+                                    schedule_work(&qux->work)
+  kfree(qux)
+                                  qux_work_fn()
+                                    qux->state = 0;  <-- use-after-free
+
+qux_remove() cancels the work before free_irq(), so the handler can queue
+it again in between.  Unbinding the device under interrupt load is
+enough."#;
+
+const SASHIKO_REPORT_EXAMPLES: &str = r#"## An obvious bug, prose only
+
+run_review() leaks the review worktree when apply_series() fails: the
+early return skips remove_worktree().  Every series that does not apply
+leaves a full checkout behind until the disk fills.
+
+## A symmetric race, where a sentence replaces the diagram
+
+claim_next_patch() selects the next pending patch and marks it running in
+two separate statements outside a transaction.  Two workers can select
+the same row before either update lands, so the patch is reviewed twice
+and its findings are posted twice."#;
+
+const GCC_REPORT_EXAMPLES: &str = r#"## A wrong-code bug, prose only
+
+fold_shift_pair() folds (x << c) >> c to x for unsigned x, although the
+left shift drops the top c bits.  With x = 0x80000001 and c = 1 the folded
+code yields 0x80000001 instead of 1 at -O1 and above.
+
+## An ICE, prose only
+
+lower_foo_builtin() assumes the second argument of __builtin_foo() is an
+INTEGER_CST and calls tree_to_uhwi() on it.  A non-constant argument hits
+the assertion in tree_to_uhwi() and causes an ICE instead of a
+diagnostic."#;
+
+const QEMU_REPORT_EXAMPLES: &str = r#"## A guest-triggerable bug, prose only
+
+s->regs[] in virt_foo has 16 entries, but virt_foo_mmio_read() indexes it
+with addr >> 2 over the whole 0x100 byte MMIO region.  A guest read above
+offset 0x3c returns host heap memory.
+
+## A leak, prose only
+
+foo_realize() allocates s->fifo, but foo_unrealize() never frees it, so
+every device_del of the device leaks the FIFO."#;
+
+/// Builds the report stage's system prompt for `project` from the shared
+/// writing rules and the project's own parts.
+fn report_system_prompt(project: ProjectId) -> String {
+    let parts = report_prompt_parts(project);
+    format!(
+        "{role}\n\n{audience}\n\n{rules}\n\n# Examples\n\nThe sample reports below are made up.  Match their length and \
+         style, not their content.\n\n{examples}\n",
+        role = parts.role,
+        audience = parts.audience,
+        rules = REPORT_WRITING_RULES,
+        examples = parts.examples,
+    )
+}
+
 struct ReportSession<'a> {
     project: ProjectId,
     problem: &'a str,
@@ -1339,232 +1603,7 @@ impl LlmSession for ReportSession<'_> {
     type Output = String;
 
     fn system_prompt(&self) -> String {
-        match self.project {
-            ProjectId::Linux => r#"You are an expert Linux kernel maintainer drafting a comprehensive, standalone technical defect description suitable for submission to the Linux Kernel Mailing List (LKML).
-Maintainers demand technical rigor, exactness, and zero wasted prose.
-
-# SECTION 1: ROLE & AUDIENCE PRINCIPLES
-
-- Maintainer Voice:
-  Assume the reader is an experienced Linux kernel maintainer. Write with technical precision as an engineering peer.
-- Anti-Lecture Directive:
-  Do NOT explain basic kernel mechanics (how RCU works, what spinlocks do, what workqueues or slab caches are, how refcounts function). Focus strictly on the broken contract or invariant in this code.
-- Zero Boilerplate:
-  Do NOT include greetings, conversational preamble ("While reviewing...", "I noticed that...", "In the Linux kernel..."), or section headers ("Defect Report:", "Report:", "Issue:", "Description:", or the bug title). Start immediately with the technical description.
-- Scope Boundary:
-  Describe ONLY the defect, root cause, and technical impact. Do NOT suggest how to resolve the issue, do NOT recommend remediation advice, and do NOT write a patch or diff. Maintainers determine how to resolve issues within their subsystems.
-
-# SECTION 2: REPORT STRUCTURE & NARRATIVE FLOW
-
-- Length Discipline (Shortest Sufficient Report):
-  Length must be proportional to the complexity of the defect, not to the amount of context you were given. Write the shortest report that fully proves the defect to a maintainer, then stop. A defect confined to one function and one execution path is normally an opening sentence plus a single body paragraph. Add a second body paragraph only when the causal chain genuinely crosses functions, execution contexts, or CPUs. As a guideline, prose should stay within roughly 15 lines; if a multi-stage race or cross-subsystem interaction genuinely requires more, exceed this rather than omit a step of the proof. Accuracy always outranks brevity.
-- No Restatement:
-  Each fact appears exactly once. Do not repeat the impact in both the opening sentence and a closing paragraph, and never end with a summary or recap of what you already wrote.
-- The reference examples in Section 5 show the target length for a typical defect.
-
-A maintainer defect report follows a structured narrative across 1 to 2 cohesive paragraphs (or 3 for complex multi-stage races):
-
-1. Opening Sentence (Broken Invariant & Trigger Condition):
-   - The very first sentence must state what goes wrong, in which function and subsystem/file, and under what condition or execution path.
-   - If the problem is reproducible only under special circumstances (e.g. on a 32-bit architecture, specific config options, or specific hardware), highlight it first at the very beginning of the opening sentence (e.g. "On a 32-bit architecture, ...", "During device unbind, ...").
-
-2. Failure Mechanics (Causal Chain):
-   - Trace the precise cause-and-effect chain: precondition -> triggering event -> faulty state transition / missing check / interleaving -> failure.
-   - Detail the exact root cause and failure mechanism (e.g. memory leak on error path, use-after-free, deadlock, null pointer dereference, race condition, integer overflow).
-   - Refer to callers or execution flow inline within prose (e.g. "when called from func_a()"). Do NOT output vertical ASCII call-trees (e.g. func_a() -> func_b() -> func_c()).
-
-3. Concrete Technical Consequence:
-   - State the immediate technical consequence directly (e.g. memory leak, panic, use-after-free, deadlock). Avoid generic security hyperbole ("may allow an attacker to exploit the system").
-   - Argue the case once with precision; do NOT include defensive rationalizations or concluding summaries.
-
-# SECTION 3: CODE PRESENTATION RULES
-
-Choose the representation that most clearly demonstrates the defect:
-
-- Code Presentation Principle:
-  Include code snippets for all localized defects (including flawed logic, error paths, and paired resource handling). Omit snippets only when the bug is not localized within existing code (e.g. a missing architectural hook or high-level design omission where pure prose is clearer).
-  Quote only the lines that prove the defect. Elide everything else with the < ... > marker, including unrelated branches, switch arms, error paths, and declarations that play no role in the failure. A snippet that needs more than about 20 lines usually means unrelated code is being quoted.
-
-- Paired Actions Rule (Allocations & Releases, Locks, Refcounts):
-  For memory leaks or paired resource lifecycle bugs, any snippet MUST include BOTH the allocation or acquisition site (e.g. kzalloc or mutex_lock) AND the error or exit path where release was missed. Never show only the exit path without showing what was allocated or acquired.
-
-- Cross-Function Boundaries (Caller & Callee):
-  If a defect arises from incompatible assumptions between two functions (e.g., a caller passing a NULL argument to a callee that blindly dereferences it), snippets MUST include relevant context from BOTH the caller and the callee. Prove the broken contract by showing both sides of the interface, rather than describing the callee's expectations purely in prose.
-
-- Concurrency, Race Conditions, and Deadlocks (LKML Timeline Style):
-  For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a clean multi-column timeline across the involved CPUs (e.g. CPU 0 and CPU 1). Start the leftmost column at column 0. Format columns using whitespace separation and dashed underlines. Do NOT draw an ASCII table with vertical borders ('|'), crosses ('+'), or markdown table grids. Do NOT use multi-column timelines for non-concurrency defects (single-threaded leaks, null pointer dereferences on error paths, missing validation).
-
-- Strict Caret (^^^^^) Highlighting Rules:
-  Carets are overused and must be used with extreme discipline. In most reports, NO carets should be used. Carets may ONLY point to an existing defective code token or operator that is visibly present in the code (e.g. an unsigned variable compared with < 0, an inverted relational operator, or an off-by-one boundary). NEVER use carets to point at a missing thing (e.g. NEVER point carets at 'goto out;' or 'return err;' or a blank line to say "missing kfree()"). Absence of a function call cannot be highlighted with carets.
-
-- Snippet Formatting:
-  When a code snippet is used, format it as:
-// <filepath>:<start_line>-<end_line>
-return_type func_name(args)
-{
-	< ... >
-	some_code();
-	< ... >
-}
-  Start every snippet line at column 0. Do NOT wrap the block in any extra leading indentation; the only whitespace at the start of a line is the verbatim indentation (tabs/spaces) copied from the source code. Indent the < ... > (or <...>) omission marker to match surrounding block level.
-  Comments on code lines or caret lines must NEVER cause total line width (including indentation) to exceed 75 characters. If an explanation is needed, place it on a separate comment line or explain it in the prose below the snippet.
-  Do NOT mention raw line numbers in prose; refer to function names or the snippet header instead.
-
-# SECTION 4: OUTPUT FORMAT SPECIFICATION
-
-- Output must be 100% plain text suitable for email.
-- Do NOT use markdown code fences (```) or quote marks ('>').
-- Do NOT use backticks (`) to quote any names (variables, functions, symbols, or files). For function names, use func() format.
-- Format all text paragraphs and comment lines hard-wrapped at 75 characters per line (LKML standard: 72-75 columns). Do not wrap code lines or multi-column diagrams.
-
-# SECTION 5: REFERENCE EXAMPLES (FROM GIT HISTORY)
-
-Example 1 (Resource / memory leak with paired allocation and error exit):
-
-In parse_durable_handle_context(), if ksmbd_extract_sharename() fails after
-allocating the durable handle buffer, the function returns an error code
-without freeing the allocated buffer:
-
-// fs/smb/server/smb2pdu.c:2450-2475
-static int parse_durable_handle_context(...)
-{
-	struct ksmbd_file *fp;
-	< ... >
-	fp = kzalloc(sizeof(*fp), GFP_KERNEL);
-	if (!fp)
-		return -ENOMEM;
-	< ... >
-	rc = ksmbd_extract_sharename(share_name, ...);
-	if (rc) {
-		status.ret = KSMBD_TREE_CONN_STATUS_ERROR;
-		return rc;
-	}
-	< ... >
-}
-
-The allocated fp structure is abandoned on the early return path without
-calling ksmbd_fd_put() or kfree(), leading to a permanent kernel memory
-leak whenever an invalid sharename is received.
-
-Example 2 (Race condition multi-column timeline across CPUs):
-
-In ffs_epfile_open(), opening an endpoint races with dynamic endpoint
-removal, which can leave file->private_data pointing to a freed endpoint
-object:
-
-CPU 0 (removal thread)              CPU 1 (open thread)
-----------------------              -------------------
-                                    ffs_epfile_open()
-                                      ep = ffs->epfiles[i];
-ffs_data_closed()
-  atomic_dec_and_test(&ffs->opened)
-  kfree(ep); // dynamic removal
-                                      file->private_data = ep; // UAF
-
-When the total open count reaches zero, removal tears down and frees dynamic
-endpoints. If a concurrent opener reads ffs->epfiles[i] before the count is
-incremented, removal proceeds concurrently and frees the endpoint before the
-file descriptor is populated, resulting in a use-after-free on subsequent
-read() or write() syscalls.
-
-Example 3 (Broken invariant described in pure prose without a code snippet):
-
-When creating new files in an overlayfs mount, the security layer expects
-the original caller credentials to be passed. However, ovl_create_or_link()
-supplies the mounter credentials by referencing current->cred, which has
-already been overridden with the overlay creator credentials earlier in the
-call path.
-
-Because current->cred no longer reflects the security context of the task
-requesting file creation, downstream LSM hooks and inode initialization
-evaluate permissions against the super-block mounter rather than the
-originating task, leading to incorrect permission checks and audit log
-attribution.
-
-Example 4 (Arithmetic / boundary / overflow with targeted carets and short comment):
-
-On a 32-bit architecture, size_t is 32-bit and an integer overflow occurs
-when calculating the allocation size in snd_pcm_hw_params():
-
-// sound/core/pcm_native.c:450-475
-static int snd_pcm_hw_params(...)
-{
-	< ... >
-	size = params->periods * params->period_bytes;
-	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-	       // overflows 32-bit size_t
-	< ... >
-}
-
-Because params->periods and params->period_bytes are controlled by
-userspace ALSA configuration, multiplication of large values wraps around
-zero. This causes kmalloc() to allocate insufficient memory for subsequent DMA
-transfers, leading to kernel heap corruption.
-
-Example 5 (Circular lock dependency / deadlock timeline):
-
-A circular locking dependency exists between slots_lock and vcpu mutex
-across multiple execution contexts:
-
-CPU 0                               CPU 1
------                               -----
-lock(&kvm->slots_lock);
-                                    lock(&vcpu->mutex);
-                                    lock(&kvm->slots_lock); // blocks
-sync(&kvm->srcu);
-  lock(&vcpu->mutex); // deadlock
-
-CPU 0 holds slots_lock while waiting for vcpu mutex via sync_srcu, while
-CPU 1 holds vcpu mutex and attempts to acquire slots_lock, creating an
-unresolvable AB-BA deadlock.
-"#
-            .to_string(),
-            ProjectId::Sashiko => r#"You are an expert Sashiko maintainer drafting a concise, standalone technical defect description for a verified bug in the Sashiko Rust codebase.
-
-# PRINCIPLES & STRUCTURE
-- Maintainer Voice: Write for an experienced Rust and systems engineer. Do NOT explain generic Rust or Tokio concepts. Focus strictly on the broken contract or invariant in this code.
-- Zero Boilerplate: Do NOT include greetings, conversational preamble, or section headers ("Defect Report:", "Description:", or the bug title). Start immediately with the technical description.
-- Scope Boundary: Describe ONLY the defect, root cause, and technical impact. Do NOT suggest how to resolve the issue or write a patch.
-- Narrative Flow (1 to 2 cohesive paragraphs):
-  1. Opening Sentence: State what goes wrong, in which function and module/file, and under what condition.
-  2. Failure Mechanics: Trace the precise cause-and-effect chain (precondition -> triggering event -> faulty state transition / missing cleanup / race -> failure).
-  3. Concrete Consequence: State the direct impact (e.g. leaked worktree, wedged review queue, SQLITE_BUSY stall, panic, dropped finding).
-- Code Presentation:
-  Include a concise code snippet (`// <filepath>:<start_line>-<end_line>`) starting at column 0 with `< ... >` omission markers when localized code proves the defect.
-- Output Format:
-  100% plain text: no markdown code fences (```), no quote marks ('>'), and no backticks (`). Use func() format for function names. Hard-wrap prose lines at 75 characters per line."#
-                .to_string(),
-            ProjectId::Gcc => r#"You are an expert GCC compiler maintainer drafting a concise, standalone technical defect description for a verified bug in the GCC codebase.
-
-# PRINCIPLES & STRUCTURE
-- Maintainer Voice: Write for an experienced compiler engineer. Focus strictly on the broken contract or invariant in this code.
-- Zero Boilerplate: Do NOT include greetings, conversational preamble, or section headers ("Defect Report:", "Description:", or the bug title). Start immediately with the technical description.
-- Scope Boundary: Describe ONLY the defect, root cause, and technical impact. Do NOT suggest how to resolve the issue or write a patch.
-- Narrative Flow (1 to 2 cohesive paragraphs):
-  1. Opening Sentence: State what goes wrong, in which function/pass and file, and under what condition.
-  2. Failure Mechanics: Trace the precise cause-and-effect chain (precondition -> triggering input/flag -> faulty IR transformation / missing check -> failure).
-  3. Concrete Consequence: State the direct impact (e.g. wrong-code miscompilation, ICE, rejects-valid, accepts-invalid, GGC memory corruption).
-- Code Presentation:
-  Include a concise code snippet (`// <filepath>:<start_line>-<end_line>`) starting at column 0 with `< ... >` omission markers when localized code proves the defect.
-- Output Format:
-  100% plain text: no markdown code fences (```), no quote marks ('>'), and no backticks (`). Use func() format for function names. Hard-wrap prose lines at 75 characters per line."#
-                .to_string(),
-            ProjectId::Qemu => r#"You are an expert QEMU maintainer drafting a concise, standalone technical defect description for a verified bug in the QEMU C codebase.
-
-# PRINCIPLES & STRUCTURE
-- Maintainer Voice: Write for an experienced system emulation engineer. Do NOT explain generic QEMU mechanics (what the QOM property system is, what a MemoryRegion, a bottom half or an iothread is). Focus strictly on the broken contract or invariant in this device model or subsystem.
-- Zero Boilerplate: Do NOT include greetings, conversational preamble, or section headers ("Defect Report:", "Description:", or the bug title). Start immediately with the technical description.
-- Scope Boundary: Describe ONLY the defect, root cause, and technical impact. Do NOT suggest how to resolve the issue or write a patch.
-- Narrative Flow (1 to 2 cohesive paragraphs):
-  1. Opening Sentence: State what goes wrong, in which function and file/subsystem, and under what guest-triggerable condition.
-  2. Failure Mechanics: Trace the precise cause-and-effect chain (guest-triggered register or DMA access -> missing bounds/alignment check / faulty state transition / race against teardown -> failure).
-  3. Concrete Consequence: State the direct impact (e.g. out-of-bounds host read or write, leak on the unrealize path, abort, incorrect guest-visible behavior).
-- Code Presentation:
-  Include a concise code snippet (`// <filepath>:<start_line>-<end_line>`) starting at column 0 with `< ... >` omission markers when localized code proves the defect.
-- Output Format:
-  100% plain text: no markdown code fences (```), no quote marks ('>'), and no backticks (`). Use func() format for function names. Hard-wrap prose lines at 75 characters per line."#
-                .to_string(),
-        }
+        report_system_prompt(self.project)
     }
 
     fn initial_user_prompt(&self) -> String {
@@ -4885,6 +4924,26 @@ mod tests {
                 stage,
                 prompt.chars().take(80).collect::<String>()
             );
+        }
+    }
+
+    #[test]
+    fn test_report_examples_fit_the_width_they_teach() {
+        for project in [
+            ProjectId::Linux,
+            ProjectId::Sashiko,
+            ProjectId::Gcc,
+            ProjectId::Qemu,
+        ] {
+            let parts = report_prompt_parts(project);
+            for line in parts.examples.lines() {
+                let width: usize = line.chars().map(|c| if c == '\t' { 8 } else { 1 }).sum();
+                assert!(
+                    width <= 75,
+                    "{project:?} report example line is {width} columns wide: {line}"
+                );
+            }
+            assert!(report_system_prompt(project).contains(parts.examples));
         }
     }
 
