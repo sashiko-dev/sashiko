@@ -2865,7 +2865,10 @@ pub async fn process_issue_worker_for_project(
         return Ok(dup_outcome);
     }
 
-    let saved_bug = db.get_bug(bug_row.id).await?.expect("Saved bug must exist");
+    let saved_bug = db
+        .get_bug_on_write_conn(bug_row.id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Bug {} vanished after saving its outcome", bug_row.id))?;
     if let Some(r_id) = input.review_id {
         let disclosure_fingerprint =
             crate::related_preexisting::BugKey::new(&input.problem, input.locations.as_ref())
