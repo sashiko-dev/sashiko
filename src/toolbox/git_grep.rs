@@ -122,15 +122,9 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
         if !output.is_usable() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
-                return Ok(json!({
-                    "content": "",
-                    "truncated": false,
-                    "metadata": { "total_items": 0, "returned_items": 0 },
-                    "matches": [],
-                    "message": "No matches found."
-                }));
+                return Ok(Value::String("No matches found.".to_string()));
             }
-            return Ok(json!({ "error": format!("git grep failed: {}", stderr) }));
+            return Ok(Value::String(format!("Error: git grep failed: {}", stderr)));
         }
 
         let content = String::from_utf8_lossy(&output.stdout).to_string();
@@ -152,30 +146,14 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
             format_git_grep_output(&content, revision, &active_files)
         };
 
-        let total_grep_lines = formatted.lines().count();
         let res = Truncator::truncate_sequential(&formatted, 10_000);
-        let truncated_grep = res.content;
-        let lines_kept = res.lines_kept;
-        let is_truncated = res.truncated;
+        let mut out = res.content;
+        if res.truncated {
+            out.push_str(
+                "\n[Truncated: grep matches exceeded token budget. Narrow your search with path or a more specific pattern.]",
+            );
+        }
 
-        let returned_items = if is_truncated && lines_kept > 0 {
-            lines_kept
-        } else {
-            total_grep_lines
-        };
-
-        Ok(json!({
-            "content": truncated_grep,
-            "truncated": is_truncated,
-            "metadata": {
-                "total_items": total_grep_lines,
-                "returned_items": returned_items
-            },
-            "next_page_hint": if is_truncated {
-                Some("Grep matches were truncated. Narrow your search using a pathspec or a more specific regex pattern.".to_string())
-            } else {
-                None
-            }
-        }))
+        Ok(Value::String(out))
     }
 }

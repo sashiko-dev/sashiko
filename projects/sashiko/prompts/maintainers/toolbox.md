@@ -23,7 +23,7 @@ symbols = [
   `git_grep`, `read_file` at virtual head), always spawn via `git_cmd` and pass
   `--end-of-options` or `--` before user/model-supplied paths or regexes so
   leading `-` arguments cannot inject git flags.
-- Every tool must bound its captured stdout/stderr and returned JSON payload size
+- Every tool must bound its captured stdout/stderr and returned payload size
   (`MAX_CAPTURED_STDOUT` / `capped_output`) and enforce `TOOL_COMMAND_TIMEOUT`
   so a runaway search or huge file cannot stall the review stage or blow out the
   LLM context window.

@@ -76,13 +76,13 @@ impl LlmTool<SashikoToolContext> for GitLsTool {
                 let filename = split_tab[1];
                 let metadata: Vec<&str> = split_tab[0].split_whitespace().collect();
                 if metadata.len() >= 2 {
-                    let ty = match metadata[1] {
-                        "tree" => "dir",
-                        _ => "file",
-                    };
                     total_entries += 1;
                     if entries.len() < 1000 {
-                        entries.push(json!({ "name": filename, "type": ty }));
+                        let formatted = match metadata[1] {
+                            "tree" => format!("{filename}/"),
+                            _ => filename.to_string(),
+                        };
+                        entries.push(formatted);
                     }
                 }
             }
@@ -91,22 +91,23 @@ impl LlmTool<SashikoToolContext> for GitLsTool {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Ok(
-                json!({ "error": format!("git ls-tree failed for {}: {}", tree_spec, stderr) }),
-            );
+            return Ok(Value::String(format!(
+                "Error: git ls-tree failed for {}: {}",
+                tree_spec, stderr
+            )));
         }
 
-        let truncated = total_entries > 1000;
+        if total_entries == 0 {
+            return Ok(Value::String("Directory is empty.".to_string()));
+        }
 
-        Ok(json!({
-            "entries": entries,
-            "truncated": truncated,
-            "total_entries": total_entries,
-            "next_page_hint": if truncated {
-                Some("Directory listing truncated to 1000 entries. Please call git_ls with a specific subdirectory path (e.g., 'src/worker/') to see more files.".to_string())
-            } else {
-                None
-            }
-        }))
+        let mut out = entries.join("\n");
+        if total_entries > 1000 {
+            out.push_str(&format!(
+                "\n[Truncated: showing 1000 of {total_entries} entries. Call git_ls with a specific subdirectory path.]"
+            ));
+        }
+
+        Ok(Value::String(out))
     }
 }
