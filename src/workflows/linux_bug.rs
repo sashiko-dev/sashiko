@@ -1649,34 +1649,7 @@ Locations:
 {code_section}
 
 Task:
-Draft the standalone technical defect description for upstream submission following this structured narrative:
-
-1. Opening Sentence:
-   - State what goes wrong, in which function and subsystem, and under what condition.
-   - If reproducible only under special circumstances (e.g. on a 32-bit machine or specific configuration), highlight it first upfront in sentence 1 (e.g. 'On a 32-bit architecture...').
-   - Do NOT include headers like 'Defect Report:' or 'Description:'. Start directly with the technical description.
-
-2. Technical Analysis (1 to 2 cohesive paragraphs):
-   - Explain the precise root cause, execution flow, and failure mechanism using the fewest words that fully prove the defect. One body paragraph is the default; add a second only if the causal chain crosses functions, execution contexts, or CPUs. Do not restate the impact twice and do not end with a recap.
-   - Anti-Lecture: Write for expert kernel maintainers. Do NOT explain generic kernel concepts (RCU, spinlocks, workqueues, refcounts). Focus strictly on the broken invariant in this code.
-   - Refer to callers inline within prose; avoid vertical call-trees (e.g. func_a() -> func_b() -> func_c()).
-   - State concrete technical consequences (e.g. memory leak, panic, use-after-free, deadlock); avoid generic security hyperbole.
-   - Do NOT provide fix recommendations, patches, or remediation advice. Describe ONLY the bug itself.
-
-3. Code Presentation:
-   - Include code snippets for all localized defects (including flawed logic, error paths, and paired resource handling). Omit snippets only when the bug is not localized within existing code (e.g. a missing architectural hook or high-level design omission where pure prose is clearer).
-   - For paired actions (memory allocations, lock acquisitions, refcounts), the snippet MUST include BOTH the allocation/acquisition site AND the error exit where release was missed.
-   - For cross-function mismatches (e.g., a caller passing a NULL argument to a callee that expects non-NULL), snippets MUST show the relevant code from BOTH the caller and the callee to prove the disconnect.
-   - For race conditions or deadlocks across CPUs, format the temporal sequence using whitespace-separated columns and dashed underlines (LKML style multi-CPU timeline diagram). Do NOT draw tables with vertical borders ('|'), crosses ('+'), or markdown table grids.
-   - Strict Carets: Do NOT overuse carets (^^^^^). Carets may ONLY point to an existing defective expression. NEVER use carets to highlight a missing call (e.g. do not point carets at 'goto out;' or 'return err;' to denote missing kfree()).
-   - Comments on code lines or caret lines must never exceed 75 characters per line.
-   - Format snippets with // <filepath>:<start_line>-<end_line>, verbatim tabs, and < ... > (or <...>) omission markers.
-   - Start every snippet and timeline line at column 0. Do NOT wrap the block in any extra leading indentation; the only leading whitespace is the verbatim indentation copied from the source code.
-
-4. Formatting Constraints:
-   - Raw plain text only: no markdown fences (```), no quote marks ('>'), no backticks (`).
-   - For function names, ALWAYS use func() format.
-   - Hard-wrap all prose and comment lines at 75 characters per line (LKML standard: 72-75 columns).",
+Write the report for this bug following the system prompt. Distill the description and verification details instead of transcribing them, never mention line numbers from the locations or code context, and keep the report as short as the bug allows.",
             stage_heading = BugStage::ReportGeneration.heading(),
             details_header = details_header,
             problem = self.problem,
