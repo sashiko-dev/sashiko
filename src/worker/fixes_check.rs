@@ -1209,13 +1209,6 @@ pub async fn analyze_fixes_for_commit(
     target_commit_diff: &str,
     target_commit_diff_only: &str,
 ) -> FixesAnalysis {
-    if !matches!(
-        project,
-        ProjectId::Linux | ProjectId::Sashiko | ProjectId::Qemu
-    ) {
-        return FixesAnalysis::default();
-    }
-
     let trailers = extract_fixes_trailers(target_commit_diff);
     let mut analysis = FixesAnalysis::default();
     for t in &trailers {
@@ -1239,11 +1232,20 @@ pub async fn analyze_fixes_for_commit(
         }
     }
 
-    let (modified_files, blame_targets) = extract_diff_blame_targets(target_commit_diff_only);
     analysis.series_commit_shas =
         collect_series_commit_shas(worktree_path, baseline_sha, target_commit_sha, series_range)
             .await;
 
+    // The sanitizer needs series and author evidence even when a project has
+    // no proactive trailer checks.
+    if !matches!(
+        project,
+        ProjectId::Linux | ProjectId::Sashiko | ProjectId::Qemu
+    ) {
+        return analysis;
+    }
+
+    let (modified_files, blame_targets) = extract_diff_blame_targets(target_commit_diff_only);
     let mut sections = Vec::new();
     if trailers.is_empty() {
         sections.push("Existing Fixes Trailers in Commit Message: none".to_string());
@@ -1753,6 +1755,69 @@ diff --git a/drivers/net/foo.c b/drivers/net/foo.c
             "context was: {}",
             analysis.prompt_context
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_projects_still_guard_same_series_fixes() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        run_git_test(repo, &["init"]);
+        run_git_test(repo, &["config", "user.name", "Test User"]);
+        run_git_test(repo, &["config", "user.email", "test@example.com"]);
+        run_git_test(repo, &["commit", "--allow-empty", "-m", "baseline"]);
+        let baseline = run_git_test(repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        run_git_test(repo, &["commit", "--allow-empty", "-m", "first patch"]);
+        let first = run_git_test(repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        run_git_test(repo, &["commit", "--allow-empty", "-m", "second patch"]);
+        let target = run_git_test(repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let range = format!("{baseline}..{target}");
+        for project in [ProjectId::Gcc, ProjectId::Zephyr] {
+            let analysis =
+                analyze_fixes_for_commit(project, repo, &baseline, &target, Some(&range), "", "")
+                    .await;
+            assert!(analysis.prompt_context.is_empty());
+            let mut findings = vec![json!({
+                "problem": "Missing Fixes trailer",
+                "severity_explanation": format!("Add Fixes: {} (\"first patch\").", &first[..12]),
+                "source_ids": ["C1"]
+            })];
+            let mut dismissed = Vec::new();
+            sanitize_fixes_findings_with_dismissals(
+                &analysis,
+                Some(repo),
+                &mut findings,
+                &mut dismissed,
+            );
+            assert!(
+                findings.is_empty(),
+                "{project}: same-series suggestion survived"
+            );
+            assert_eq!(dismissed.len(), 1);
+            assert_eq!(dismissed[0]["source_ids"], json!(["C1"]));
+
+            // An author's own bad trailer remains available for an explanation.
+            let author = format!(
+                "commit {target}\nAuthor: Test User <test@example.com>\n\n    second patch\n\n    Fixes: {} (\"first patch\")\n",
+                &first[..12]
+            );
+            let analysis = analyze_fixes_for_commit(
+                project,
+                repo,
+                &baseline,
+                &target,
+                Some(&range),
+                &author,
+                "",
+            )
+            .await;
+            assert!(analysis.is_author_fixes_sha(&first[..12]));
+        }
     }
 
     #[test]
