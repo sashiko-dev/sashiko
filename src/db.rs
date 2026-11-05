@@ -5405,6 +5405,20 @@ impl Database {
         self.get_bug_logs_by_bugid(slug).await
     }
 
+    /// Reads a bug on the write connection.
+    ///
+    /// Use this to read back a bug just written through `tx_conn`. The
+    /// shared read connection can be pinned to an older WAL snapshot by an
+    /// open cursor in any other task, and then does not see the write.
+    pub async fn get_bug_on_write_conn(&self, id: i64) -> Result<Option<Bug>> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        self.with_connection(self.tx_conn.clone()).get_bug(id).await
+    }
+
     /// Claims the oldest bug awaiting analysis, taking a lease on it.
     ///
     /// The claim is a single statement so that two workers racing for the same
@@ -5422,15 +5436,6 @@ impl Database {
     ///
     /// `worker_id` identifies the holder so that a stuck lease can be traced
     /// back to a process.
-    async fn get_bug_on_write_conn(&self, id: i64) -> Result<Option<Bug>> {
-        let _guard = if self.in_transaction {
-            None
-        } else {
-            Some(self.tx_lock.lock().await)
-        };
-        self.with_connection(self.tx_conn.clone()).get_bug(id).await
-    }
-
     pub async fn claim_pending_bug(
         &self,
         worker_id: &str,
@@ -29040,6 +29045,10 @@ mod tests {
             .await
             .unwrap();
         assert!(db.get_bug(id).await.unwrap().is_none());
+        assert!(
+            db.get_bug_on_write_conn(id).await.unwrap().is_some(),
+            "the write connection must see its own commit"
+        );
 
         let bug = db
             .create_bug_with_enrichment_returning(&new_bug("linux-fresh"), Some(&enrichment))
