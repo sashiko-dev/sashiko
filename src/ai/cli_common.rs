@@ -506,6 +506,7 @@ pub fn parse_inner_response(
     // separate tool_calls objects per line instead of one combined object)
     let mut merged_tool_calls: Vec<ToolCall> = Vec::new();
     let mut had_json = false;
+    let mut contents: Vec<String> = Vec::new();
     for line in json_str.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -519,6 +520,9 @@ pub fn parse_inner_response(
                         merged_tool_calls.push(tc);
                     }
                 }
+            }
+            if let Some(content) = v.get("content").and_then(Value::as_str) {
+                contents.push(content.to_string());
             }
         }
     }
@@ -539,6 +543,19 @@ pub fn parse_inner_response(
             thought: None,
             thought_signature: None,
             tool_calls: Some(merged_tool_calls),
+            usage,
+            truncated: false,
+        });
+    }
+
+    // Prose ahead of a lone {"content": ...} envelope. Returning the original
+    // text would leave the answer JSON-escaped, every newline a literal \n.
+    if contents.len() == 1 {
+        return Ok(AiResponse {
+            content: contents.pop(),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
             usage,
             truncated: false,
         });
@@ -1027,6 +1044,18 @@ mod tests {
             .unwrap();
         assert_eq!(calls.len(), 2);
         assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    #[test]
+    fn test_parse_content_envelope_after_prose() {
+        let text = "I will keep the quote prefixes.\n\
+                    {\"content\":\"commit abc\\nAuthor: A <a@b>\\n\\n> +\\tfoo();\\n\\nComment.\"}";
+        let content = parse_inner_response("test-cli", text, None)
+            .unwrap()
+            .content
+            .unwrap();
+        assert!(content.starts_with("commit abc\n"));
+        assert!(content.lines().any(|l| l.starts_with("> +\tfoo();")));
     }
 
     #[test]
