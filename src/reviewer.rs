@@ -71,6 +71,14 @@ enum PatchResult {
     Cancelled,
 }
 
+/// A patch waiting in a patchset's review queue.
+struct ValidJob {
+    patch_id: i64,
+    index: i64,
+    commit_sha: Option<String>,
+    diff: String,
+}
+
 #[derive(Serialize)]
 struct BaselineAttempt {
     baseline: String,
@@ -1000,13 +1008,6 @@ impl Reviewer {
             let skip_regexes: Vec<_> = skip_filters.iter().map(|f| compile_glob(f)).collect();
             let only_regexes: Vec<_> = only_filters.iter().map(|f| compile_glob(f)).collect();
 
-            struct ValidJob {
-                patch_id: i64,
-                index: i64,
-                commit_sha: Option<String>,
-                diff: String,
-            }
-
             // 2. Run Reviews
             let mut review_success = true; // Optimistic
             let mut failed_patches = 0;
@@ -1112,73 +1113,19 @@ impl Reviewer {
                     let worktree_path_clone = worktree_path.clone();
 
                     let handle = tokio::spawn(async move {
-                        let mut failed = 0;
-                        loop {
-                            let Some(job) = ({
-                                let mut q = queue.lock().await;
-                                q.pop()
-                            }) else {
-                                break;
-                            };
-                            match Self::check_patchset_claim_active_with_retry(
-                                &ctx_clone.db,
-                                patchset_id,
-                            )
-                            .await
-                            {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    aborted_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    queue.lock().await.clear();
-                                    break;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to verify active claim before reviewing patch {}/{}: {}",
-                                        patchset_id, job.index, e
-                                    );
-                                    let remaining = {
-                                        let mut q = queue.lock().await;
-                                        let n = q.len();
-                                        q.clear();
-                                        n
-                                    };
-                                    failed += 1 + remaining;
-                                    break;
-                                }
-                            }
-                            match Self::process_patch_review_contained(
-                                &ctx_clone,
-                                patchset_id,
-                                job.patch_id,
-                                job.index,
-                                &baseline_ref_clone,
-                                Some(baseline_id_clone),
-                                &input_payload_clone,
-                                job.commit_sha,
-                                prompts_hash_clone.as_deref(),
-                                Some(&worktree_path_clone), // Reuse the single worktree!
-                                &job.diff,
-                                embargo_until_clone,
-                            )
-                            .await
-                            {
-                                Ok(PatchResult::Success) => {}
-                                Ok(PatchResult::Cancelled) => {
-                                    aborted_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    queue.lock().await.clear();
-                                    break;
-                                }
-                                Ok(PatchResult::ReviewFailed) => failed += 1,
-                                Err(e) => {
-                                    error!(
-                                        "Failed to process review for patch {}/{}: {}",
-                                        patchset_id, job.index, e
-                                    );
-                                    failed += 1;
-                                }
-                            }
-                        }
+                        let failed = Self::drain_review_queue(
+                            &ctx_clone,
+                            &queue,
+                            &aborted_clone,
+                            patchset_id,
+                            &baseline_ref_clone,
+                            Some(baseline_id_clone),
+                            &input_payload_clone,
+                            prompts_hash_clone.as_deref(),
+                            &worktree_path_clone, // Reuse the single worktree!
+                            embargo_until_clone,
+                        )
+                        .await;
                         drop(permit);
                         failed
                     });
@@ -1196,69 +1143,19 @@ impl Reviewer {
             }
 
             // Main worker loop uses the existing worktree
-            let mut main_failed = 0;
-            loop {
-                let Some(job) = ({
-                    let mut q = valid_jobs_queue.lock().await;
-                    q.pop()
-                }) else {
-                    break;
-                };
-                match Self::check_patchset_claim_active_with_retry(&ctx.db, patchset_id).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        aborted.store(true, std::sync::atomic::Ordering::SeqCst);
-                        valid_jobs_queue.lock().await.clear();
-                        break;
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to verify active claim before reviewing patch {}/{}: {}",
-                            patchset_id, job.index, e
-                        );
-                        let remaining = {
-                            let mut q = valid_jobs_queue.lock().await;
-                            let n = q.len();
-                            q.clear();
-                            n
-                        };
-                        main_failed += 1 + remaining;
-                        break;
-                    }
-                }
-                match Self::process_patch_review_contained(
-                    &ctx,
-                    patchset_id,
-                    job.patch_id,
-                    job.index,
-                    &baseline_ref_str,
-                    Some(baseline_id),
-                    &input_payload,
-                    job.commit_sha,
-                    prompts_hash,
-                    Some(&worktree.path),
-                    &job.diff,
-                    patchset.embargo_until,
-                )
-                .await
-                {
-                    Ok(PatchResult::Success) => {}
-                    Ok(PatchResult::Cancelled) => {
-                        aborted.store(true, std::sync::atomic::Ordering::SeqCst);
-                        valid_jobs_queue.lock().await.clear();
-                        break;
-                    }
-                    Ok(PatchResult::ReviewFailed) => main_failed += 1,
-                    Err(e) => {
-                        error!(
-                            "Failed to process review for patch {}/{}: {}",
-                            patchset_id, job.index, e
-                        );
-                        main_failed += 1;
-                    }
-                }
-            }
-            failed_patches += main_failed;
+            failed_patches += Self::drain_review_queue(
+                &ctx,
+                &valid_jobs_queue,
+                &aborted,
+                patchset_id,
+                &baseline_ref_str,
+                Some(baseline_id),
+                &input_payload,
+                prompts_hash,
+                &worktree.path,
+                patchset.embargo_until,
+            )
+            .await;
 
             for handle in handles {
                 match handle.await {
@@ -2318,6 +2215,86 @@ impl Reviewer {
                 RelatedPreexistingMode::Disabled
             }
         }
+    }
+
+    /// Reviews queued patches until the queue is empty or the run is
+    /// cancelled, and returns how many patches did not get a review.
+    ///
+    /// The main loop and every extra worker drain the same queue, so they
+    /// share this loop.
+    #[allow(clippy::too_many_arguments)]
+    async fn drain_review_queue(
+        ctx: &ReviewContext,
+        queue: &tokio::sync::Mutex<Vec<ValidJob>>,
+        aborted: &std::sync::atomic::AtomicBool,
+        patchset_id: i64,
+        baseline_ref: &str,
+        baseline_id: Option<i64>,
+        input_payload: &Value,
+        prompts_hash: Option<&str>,
+        worktree_path: &Path,
+        embargo_until: Option<i64>,
+    ) -> usize {
+        let mut failed = 0;
+        loop {
+            let Some(job) = queue.lock().await.pop() else {
+                break;
+            };
+            match Self::check_patchset_claim_active_with_retry(&ctx.db, patchset_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    aborted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    queue.lock().await.clear();
+                    break;
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to verify active claim before reviewing patch {}/{}: {}",
+                        patchset_id, job.index, e
+                    );
+                    let remaining = {
+                        let mut q = queue.lock().await;
+                        let n = q.len();
+                        q.clear();
+                        n
+                    };
+                    failed += 1 + remaining;
+                    break;
+                }
+            }
+            match Self::process_patch_review_contained(
+                ctx,
+                patchset_id,
+                job.patch_id,
+                job.index,
+                baseline_ref,
+                baseline_id,
+                input_payload,
+                job.commit_sha,
+                prompts_hash,
+                Some(worktree_path),
+                &job.diff,
+                embargo_until,
+            )
+            .await
+            {
+                Ok(PatchResult::Success) => {}
+                Ok(PatchResult::Cancelled) => {
+                    aborted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    queue.lock().await.clear();
+                    break;
+                }
+                Ok(PatchResult::ReviewFailed) => failed += 1,
+                Err(e) => {
+                    error!(
+                        "Failed to process review for patch {}/{}: {}",
+                        patchset_id, job.index, e
+                    );
+                    failed += 1;
+                }
+            }
+        }
+        failed
     }
 
     /// Runs one patch review and turns a panic into a failure of that patch.
