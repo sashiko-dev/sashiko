@@ -133,20 +133,22 @@
         .controls button:disabled, button:disabled, select:disabled { opacity: 0.5; cursor: not-allowed; }
         .controls button.active { background: var(--selected); font-weight: bold; }
 
-        /* Bugs Button & Bug Copy Link Highlight & Popup Hint */
-        #btn-bugs, #btn-copy-bug-link {
+        /* Bugs Button & Bug Copy Link / Markdown Highlight & Popup Hint */
+        #btn-bugs, #btn-copy-bug-link, #btn-bug-markdown {
             position: relative; background: var(--bugs-btn-bg); color: var(--bugs-btn-text);
-            border-color: var(--bugs-btn-border); font-weight: 600;
+            border-color: var(--bugs-btn-border); font-weight: 600; text-decoration: none;
             box-shadow: 0 0 0 1px var(--bugs-btn-glow), 0 1px 4px var(--bugs-btn-glow);
             transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease, color 0.15s ease;
         }
         #btn-bugs:hover, #btn-bugs:focus-visible, #btn-bugs.active,
-        #btn-copy-bug-link:hover, #btn-copy-bug-link:focus-visible {
+        #btn-copy-bug-link:hover, #btn-copy-bug-link:focus-visible,
+        #btn-bug-markdown:hover, #btn-bug-markdown:focus-visible {
             background: var(--bugs-btn-bg-hover); border-color: var(--bugs-btn-border-hover);
             box-shadow: 0 0 0 2px var(--bugs-btn-glow-hover), 0 2px 6px var(--bugs-btn-glow);
+            text-decoration: none;
         }
         #btn-bugs.active { font-weight: 700; }
-        #btn-bugs[data-hint]::after, #btn-copy-bug-link[data-hint]::after {
+        #btn-bugs[data-hint]::after, #btn-copy-bug-link[data-hint]::after, #btn-bug-markdown[data-hint]::after {
             content: attr(data-hint); position: absolute; top: calc(100% + 8px); right: 0;
             width: max-content; max-width: 260px; padding: 6px 10px;
             background: var(--card-bg); color: var(--text); border: 1px solid var(--bugs-btn-border);
@@ -155,28 +157,30 @@
             z-index: 1000; opacity: 0; visibility: hidden; transform: translateY(-3px);
             transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s ease; pointer-events: none;
         }
-        #btn-bugs[data-hint]::before, #btn-copy-bug-link[data-hint]::before {
+        #btn-bugs[data-hint]::before, #btn-copy-bug-link[data-hint]::before, #btn-bug-markdown[data-hint]::before {
             content: ""; position: absolute; top: calc(100% + 3px); right: 16px; width: 8px; height: 8px;
             background: var(--card-bg); border-top: 1px solid var(--bugs-btn-border); border-left: 1px solid var(--bugs-btn-border);
             transform: rotate(45deg); z-index: 1001; opacity: 0; visibility: hidden;
             transition: opacity 0.15s ease, visibility 0.15s ease; pointer-events: none;
         }
         #btn-bugs[data-hint]:hover::after, #btn-bugs[data-hint]:focus-visible::after,
-        #btn-copy-bug-link[data-hint]:hover::after, #btn-copy-bug-link[data-hint]:focus-visible::after {
+        #btn-copy-bug-link[data-hint]:hover::after, #btn-copy-bug-link[data-hint]:focus-visible::after,
+        #btn-bug-markdown[data-hint]:hover::after, #btn-bug-markdown[data-hint]:focus-visible::after {
             opacity: 1; visibility: visible; transform: translateY(0);
         }
         #btn-bugs[data-hint]:hover::before, #btn-bugs[data-hint]:focus-visible::before,
-        #btn-copy-bug-link[data-hint]:hover::before, #btn-copy-bug-link[data-hint]:focus-visible::before {
+        #btn-copy-bug-link[data-hint]:hover::before, #btn-copy-bug-link[data-hint]:focus-visible::before,
+        #btn-bug-markdown[data-hint]:hover::before, #btn-bug-markdown[data-hint]:focus-visible::before {
             opacity: 1; visibility: visible;
         }
-        #btn-copy-bug-link[data-hint]::after { right: auto; left: 0; }
-        #btn-copy-bug-link[data-hint]::before { right: auto; left: 16px; }
+        #btn-copy-bug-link[data-hint]::after, #btn-bug-markdown[data-hint]::after { right: auto; left: 0; }
+        #btn-copy-bug-link[data-hint]::before, #btn-bug-markdown[data-hint]::before { right: auto; left: 16px; }
         @media (max-width: 768px) {
-            #btn-copy-bug-link[data-hint]::after {
+            #btn-copy-bug-link[data-hint]::after, #btn-bug-markdown[data-hint]::after {
                 position: fixed; top: auto; bottom: 12px; left: 12px; right: 12px;
                 width: auto; max-width: none; transform: none;
             }
-            #btn-copy-bug-link[data-hint]::before { display: none; }
+            #btn-copy-bug-link[data-hint]::before, #btn-bug-markdown[data-hint]::before { display: none; }
         }
 
         /* Subsystem Multi-select Dropdown */
@@ -269,8 +273,8 @@
 
         /* Sections, Copy, Permalink & Review Cards */
         .section { margin-bottom: 16px; }
-        .copy-btn { cursor: pointer; border: 1px solid var(--border); background: var(--btn-bg); padding: 1px 5px; border-radius: 3px; font-size: 11px; margin-left: 6px; }
-        .copy-btn:hover { background: var(--hover); }
+        .copy-btn { display: inline-block; cursor: pointer; border: 1px solid var(--border); background: var(--btn-bg); color: var(--text); padding: 1px 5px; border-radius: 3px; font-size: 11px; line-height: normal; margin-left: 6px; text-decoration: none; }
+        .copy-btn:hover { background: var(--hover); text-decoration: none; }
         .permalink-icon { display: inline-flex; align-items: center; color: var(--text-muted); opacity: 0.3; transition: opacity 0.2s, color 0.2s; margin-left: 8px; text-decoration: none; vertical-align: middle; }
         .permalink-icon:hover { opacity: 1; color: var(--link); }
         .review-card { border: 1px solid var(--border-light); padding: 10px; margin-bottom: 10px; border-radius: 4px; background: var(--btn-bg); }
@@ -2855,6 +2859,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             `;
 
             const bugUrl = `${window.location.origin}${window.location.pathname}#/bug/${encodeURIComponent(bugid)}`;
+            const bugMarkdownUrl = `/bug/${encodeURIComponent(bugid)}.md`;
 
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
@@ -2864,7 +2869,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 </h1>
                 ${data.duplicate_of ? `<div class="section" style="margin-bottom: 16px;"><div class="review-card" style="border-left: 3px solid var(--status-inreview);">This discovery belongs to <a href="#/bug/${encodeURIComponent(data.duplicate_of.bugid)}"><strong>${escapeHtml(data.duplicate_of.problem || data.duplicate_of.bugid)}</strong></a>. Evidence below includes the linked discoveries.</div></div>` : ''}
                 <div class="section">
-                    <div class="kv"><div class="label">Bug ID:</div><div><code>${escapeHtml(bugid)}</code> <button class="copy-btn" data-copy="${escapeHtml(bugid)}" title="Copy bug ID">Copy</button><button id="btn-copy-bug-link" class="copy-btn" data-copy="${escapeHtml(bugUrl)}" data-hint="Public link to this bug report — safe to share and use for Fixes: tags" aria-label="Copy Link — Public link to this bug report, safe to share and use for Fixes: tags">Copy Link</button></div></div>
+                    <div class="kv"><div class="label">Bug ID:</div><div><code>${escapeHtml(bugid)}</code> <button class="copy-btn" data-copy="${escapeHtml(bugid)}" title="Copy bug ID">Copy</button><button id="btn-copy-bug-link" class="copy-btn" data-copy="${escapeHtml(bugUrl)}" data-hint="Public link to this bug report — safe to share and use for Fixes: tags" aria-label="Copy Link — Public link to this bug report, safe to share and use for Fixes: tags">Copy Link</button><a id="btn-bug-markdown" class="copy-btn" href="${escapeHtml(bugMarkdownUrl)}" target="_blank" rel="noopener noreferrer" data-hint="Raw bug report and patch trailer guidance in Markdown — ready to use as an AI agent prompt" aria-label="Markdown — Raw bug report and patch trailer guidance in Markdown, ready to use as an AI agent prompt">Markdown</a></div></div>
                     <div class="kv"><div class="label">Severity:</div><div><span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold; background:transparent;">${escapeHtml(severity)}</span></div></div>
                     <div class="kv"><div class="label">Status:</div><div><span class="status-badge ${status.cls}">${status.label}</span></div></div>
                     <div class="kv"><div class="label">Assignee:</div><div>${data.assignee ? `${escapeHtml(data.assignee)}${data.assigned_at ? ` <span class="text-muted-sm">since ${formatDate(data.assigned_at, true)}</span>` : ''}` : '<span class="text-muted-sm">Unassigned</span>'}</div></div>
