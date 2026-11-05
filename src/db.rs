@@ -3983,6 +3983,32 @@ impl Database {
         Ok(id)
     }
 
+    /// Creates a bug like [`Self::create_bug_with_enrichment`] and returns
+    /// the stored row.
+    ///
+    /// The row is read inside the inserting transaction. Reading it back
+    /// through `conn` after the commit is unsafe: an open cursor held by
+    /// any other task keeps `conn` on an older WAL snapshot, in which the
+    /// new bug does not exist yet.
+    pub async fn create_bug_with_enrichment_returning(
+        &self,
+        bug: &NewBug,
+        enrichment: Option<&NewBugEnrichment>,
+    ) -> Result<Bug> {
+        let tx = self.begin_transaction().await?;
+        let scoped = self.with_connection((*tx).clone());
+        let id = scoped.insert_bug(bug).await?;
+        if let Some(enrichment) = enrichment {
+            scoped.insert_bug_enrichment(id, enrichment).await?;
+        }
+        let stored = scoped
+            .get_bug(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Bug {id} is missing inside its own transaction"))?;
+        tx.commit().await?;
+        Ok(stored)
+    }
+
     async fn insert_bug(&self, bug: &NewBug) -> Result<i64> {
         let now = if bug.reported_at > 0 {
             bug.reported_at
@@ -28869,6 +28895,75 @@ mod tests {
             row.get::<String>(1).unwrap(),
             "Cancelled because sign-in link expired before delivery"
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_bug_returning_with_open_read_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bug_read_back.db");
+        let settings = DatabaseSettings {
+            url: db_path.to_string_lossy().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+        for i in 0..3 {
+            db.execute(
+                "INSERT INTO email_outbox (kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES ('review_notification', 'Pending', '[]', '[]', ?, ?, '', 'body', 1700000000)",
+                libsql::params![format!("Subject {i}"), format!("<msg-{i}>")],
+            )
+            .await
+            .unwrap();
+        }
+
+        // Another task holding a stepped cursor keeps `conn` on the WAL
+        // snapshot taken before the bug is committed on `tx_conn`.
+        let mut cursor = db
+            .conn
+            .query("SELECT id FROM email_outbox ORDER BY id ASC", ())
+            .await
+            .unwrap();
+        assert!(cursor.next().await.unwrap().is_some());
+
+        let new_bug = |bugid: &str| NewBug {
+            bugid: bugid.to_string(),
+            title: "Read back after insert".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 1,
+            discovered_in_patchset_id: None,
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![],
+        };
+        let enrichment = NewBugEnrichment {
+            kind: "candidate".to_string(),
+            content: Some("reasoning".to_string()),
+            ..Default::default()
+        };
+
+        // The stale snapshot is what made the old read-back return None.
+        let id = db
+            .create_bug_with_enrichment(&new_bug("linux-stale"), Some(&enrichment))
+            .await
+            .unwrap();
+        assert!(db.get_bug(id).await.unwrap().is_none());
+
+        let bug = db
+            .create_bug_with_enrichment_returning(&new_bug("linux-fresh"), Some(&enrichment))
+            .await
+            .expect("the created bug must be returned despite the open cursor");
+        assert_eq!(bug.bugid, "linux-fresh");
+        assert!(bug.enrichments.iter().any(|e| e.kind == "candidate"));
+
+        drop(cursor);
+        assert!(db.get_bug(bug.id).await.unwrap().is_some());
     }
 
     #[tokio::test]
