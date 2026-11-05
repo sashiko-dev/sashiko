@@ -490,9 +490,13 @@ impl<'a> SessionRunner<'a> {
                         }
                     };
                     for (call_id, result) in results {
+                        let content = match result {
+                            Value::String(s) => s,
+                            other => other.to_string(),
+                        };
                         let tool_msg = AiMessage {
                             role: AiRole::Tool,
-                            content: Some(result.to_string()),
+                            content: Some(content),
                             thought: None,
                             thought_signature: None,
                             tool_calls: None,
@@ -620,6 +624,11 @@ mod tests {
             if name == "fail" {
                 anyhow::bail!("Tool execution failed");
             }
+            if name == "plain_text" {
+                return Ok(Value::String(
+                    "1: int main(void) {\n2:     return 0;\n3: }".to_string(),
+                ));
+            }
             Ok(serde_json::json!({"result": "success"}))
         }
 
@@ -699,6 +708,44 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .contains("Tool execution failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_preserves_plain_text_tool_output_unescaped() {
+        let responses = vec![
+            AiResponse {
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_txt".to_string(),
+                    function_name: "plain_text".to_string(),
+                    arguments: serde_json::json!({}),
+                    thought_signature: None,
+                }]),
+                usage: None,
+                truncated: false,
+            },
+            AiResponse {
+                content: Some("Done".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+        ];
+
+        let provider = MockProvider::new(responses);
+        let runner = SessionRunner::new(&provider);
+        let mut session = DummySession;
+
+        let res = runner.run(&mut session).await.unwrap();
+        let tool_msg = res.history.iter().find(|m| m.role == AiRole::Tool).unwrap();
+        assert_eq!(
+            tool_msg.content.as_deref(),
+            Some("1: int main(void) {\n2:     return 0;\n3: }")
         );
     }
 

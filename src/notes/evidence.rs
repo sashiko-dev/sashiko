@@ -31,7 +31,7 @@ use crate::notes::facts::Evidence;
 /// How many lines around the cited range a snippet may be found in.
 const LINE_TOLERANCE: usize = 5;
 /// Snippet lines that only elide code and are not matched.
-const ELISIONS: &[&str] = &["...", "…", "// ...", "/* ... */"];
+const ELISIONS: &[&str] = &["...", "…", "// ...", "/* ... */", "--"];
 
 /// The outcome of checking one piece of evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,12 +110,7 @@ impl<'a> RevisionFiles<'a> {
 
     /// Checks one piece of evidence.
     pub async fn check(&mut self, evidence: &Evidence) -> Result<EvidenceCheck> {
-        let wanted: Vec<String> = evidence
-            .snippet
-            .lines()
-            .map(normalize)
-            .filter(|l| !l.is_empty() && !ELISIONS.contains(&l.as_str()))
-            .collect();
+        let wanted = wanted_lines(&evidence.snippet);
         if wanted.is_empty() {
             return Ok(EvidenceCheck::EmptySnippet);
         }
@@ -130,23 +125,49 @@ impl<'a> RevisionFiles<'a> {
                 file_lines: lines.len(),
             });
         }
+        let first = Self::check_wanted(&wanted, lines, start, end);
+        if first.is_ok() {
+            return Ok(first);
+        }
+        if let Some(stripped) = crate::toolbox::utils::strip_tool_line_numbers(&evidence.snippet) {
+            let stripped_wanted = wanted_lines(&stripped);
+            if stripped_wanted.is_empty() {
+                return Ok(EvidenceCheck::EmptySnippet);
+            }
+            return Ok(Self::check_wanted(&stripped_wanted, lines, start, end));
+        }
+        Ok(first)
+    }
+
+    fn check_wanted(
+        wanted: &[String],
+        lines: &[String],
+        start: usize,
+        end: usize,
+    ) -> EvidenceCheck {
         let window_start = start.saturating_sub(1 + LINE_TOLERANCE);
         let window_end = end.saturating_add(LINE_TOLERANCE).min(lines.len());
-        let check = match_in_order(&wanted, &lines[window_start..window_end]);
+        let check = match_in_order(wanted, &lines[window_start..window_end]);
         if check.is_ok() {
-            return Ok(check);
+            return check;
         }
         // Explorers often copy code verbatim but misremember where it is.
         // Verbatim code elsewhere in the file still backs the claim.
-        Ok(
-            relocate(&wanted, lines, start, end).map_or(check, |(start_line, end_line)| {
-                EvidenceCheck::Relocated {
-                    start_line,
-                    end_line,
-                }
-            }),
-        )
+        relocate(wanted, lines, start, end).map_or(check, |(start_line, end_line)| {
+            EvidenceCheck::Relocated {
+                start_line,
+                end_line,
+            }
+        })
     }
+}
+
+fn wanted_lines(snippet: &str) -> Vec<String> {
+    snippet
+        .lines()
+        .map(normalize)
+        .filter(|l| !l.is_empty() && !ELISIONS.contains(&l.as_str()))
+        .collect()
 }
 
 /// Every wanted line must occur in the window, in order. A snippet line may
@@ -337,5 +358,77 @@ mod tests {
                 .unwrap(),
             EvidenceCheck::MissingFile
         );
+    }
+
+    #[tokio::test]
+    async fn test_check_evidence_strips_tool_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let long: String = (0..20)
+            .map(|i| format!("// line {i}\n"))
+            .collect::<String>()
+            + "fn twenty() {\n    20\n}\n";
+        let sha = test_repo::commit_files(
+            dir.path(),
+            &[
+                (
+                    "src/cache.rs",
+                    "use std::sync::Mutex;\n\npub fn get(m: &Mutex<u8>) -> u8 {\n    let guard = m.lock().unwrap();\n    *guard\n}\n",
+                ),
+                ("src/long.rs", &long),
+                ("arch/entry.S", "1: bne 1b\n2: ret\n"),
+            ],
+        );
+        let mut files = RevisionFiles::new(dir.path(), &sha);
+
+        // Numbered git_read_files / git_show snippet matches cleanly.
+        let numbered = ev(
+            "src/cache.rs",
+            3,
+            4,
+            "3: pub fn get(m: &Mutex<u8>) -> u8 {\n4:     let guard = m.lock().unwrap();",
+        );
+        assert_eq!(files.check(&numbered).await.unwrap(), EvidenceCheck::Ok);
+
+        // Numbered snippet with elision lines matches cleanly.
+        let elided = ev(
+            "src/cache.rs",
+            3,
+            5,
+            "3: pub fn get(m: &Mutex<u8>) -> u8 {\n...\n5:     *guard",
+        );
+        assert_eq!(files.check(&elided).await.unwrap(), EvidenceCheck::Ok);
+
+        // Numbered git_grep snippet matches cleanly.
+        let grep_numbered = ev(
+            "src/cache.rs",
+            3,
+            4,
+            "  3:pub fn get(m: &Mutex<u8>) -> u8 {\n  4-    let guard = m.lock().unwrap();",
+        );
+        assert_eq!(
+            files.check(&grep_numbered).await.unwrap(),
+            EvidenceCheck::Ok
+        );
+
+        // Relocated numbered snippet reports the real file lines.
+        let relocated = ev("src/long.rs", 1, 2, "21: fn twenty() {\n22:     20\n23: }");
+        assert_eq!(
+            files.check(&relocated).await.unwrap(),
+            EvidenceCheck::Relocated {
+                start_line: 21,
+                end_line: 23,
+            }
+        );
+
+        // Numbered blank-only snippet is treated as empty.
+        let blank_numbered = ev("src/cache.rs", 2, 2, "2:   \n...");
+        assert_eq!(
+            files.check(&blank_numbered).await.unwrap(),
+            EvidenceCheck::EmptySnippet
+        );
+
+        // Real assembly local labels starting with "1: " match verbatim on the first pass.
+        let asm = ev("arch/entry.S", 1, 2, "1: bne 1b\n2: ret");
+        assert_eq!(files.check(&asm).await.unwrap(), EvidenceCheck::Ok);
     }
 }

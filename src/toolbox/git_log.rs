@@ -73,35 +73,22 @@ impl LlmTool<SashikoToolContext> for GitLogTool {
         let output = capped_output(&mut cmd).await?;
         if !output.is_usable() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Ok(json!({ "error": format!("git log failed: {}", stderr) }));
+            return Ok(Value::String(format!("Error: git log failed: {}", stderr)));
         }
 
         let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let total_log_lines = raw_stdout.lines().count();
+        if raw_stdout.trim().is_empty() {
+            return Ok(Value::String("No commits found.".to_string()));
+        }
+
         let res = Truncator::truncate_sequential(&raw_stdout, 10_000);
-        let truncated_log = res.content;
-        let lines_kept = res.lines_kept;
-        let is_truncated = res.truncated;
+        let mut out = res.content;
+        if res.truncated {
+            out.push_str(
+                "\n[Truncated: log output exceeded token budget. Use a smaller commit range or set a lower limit.]",
+            );
+        }
 
-        let returned_items = if is_truncated && lines_kept > 0 {
-            lines_kept
-        } else {
-            total_log_lines
-        };
-
-        Ok(json!({
-            "content": truncated_log,
-            "truncated": is_truncated,
-            "metadata": {
-                "total_items": total_log_lines,
-                "returned_items": returned_items
-            },
-            "next_page_hint": if is_truncated {
-                Some("The log output was truncated. Use a smaller commit range or set a lower 'limit' parameter.".to_string())
-            } else {
-                None
-            },
-            "output": truncated_log
-        }))
+        Ok(Value::String(out))
     }
 }

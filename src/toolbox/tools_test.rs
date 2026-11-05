@@ -80,10 +80,12 @@ mod tests {
 
         let args = json!({ "revision": "HEAD", "path": "." });
         let result = rt.block_on(toolbox.call("git_ls", args)).unwrap();
-        let entries = result["entries"].as_array().unwrap();
+        let text = result.as_str().unwrap();
+        let entries: Vec<&str> = text.lines().collect();
 
-        assert!(entries.iter().any(|e| e["name"] == "README.md"));
-        assert!(entries.iter().any(|e| e["name"] == "Cargo.toml"));
+        assert!(entries.contains(&"README.md"));
+        assert!(entries.contains(&"Cargo.toml"));
+        assert!(entries.contains(&"src/"));
     }
 
     #[test]
@@ -99,12 +101,11 @@ mod tests {
             ]
         });
         let result = rt.block_on(toolbox.call("git_read_files", args)).unwrap();
-        let results = result["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1);
+        let content = result.as_str().unwrap();
 
-        let content = results[0]["content"].as_str().unwrap();
-
-        assert!(!content.is_empty());
+        assert!(content.starts_with("=== README.md (lines 1-5 of "));
+        assert!(content.contains("\n1: "));
+        assert!(content.contains("\n5: "));
         assert!(content.contains("Sashiko"));
     }
 
@@ -116,10 +117,35 @@ mod tests {
 
         let args = json!({ "range": "HEAD", "limit": 1 });
         let result = rt.block_on(toolbox.call("git_log", args)).unwrap();
-        let output = result["output"].as_str().unwrap();
+        let output = result.as_str().unwrap();
 
         assert!(output.contains("commit"));
         assert!(output.contains("Author:"));
+    }
+
+    #[test]
+    fn test_git_find_files_and_git_diff_plain_text() {
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
+        let rt = Runtime::new().unwrap();
+
+        let find_res = rt
+            .block_on(toolbox.call(
+                "git_find_files",
+                json!({ "revision": "HEAD", "pattern": "*.rs", "path": "src/toolbox" }),
+            ))
+            .unwrap();
+        let find_text = find_res.as_str().unwrap();
+        assert!(find_text.starts_with("Found "));
+        assert!(find_text.contains("src/toolbox/mod.rs"));
+
+        let empty_diff = rt
+            .block_on(toolbox.call(
+                "git_diff",
+                json!({ "base_revision": "HEAD", "target_revision": "HEAD" }),
+            ))
+            .unwrap();
+        assert_eq!(empty_diff.as_str().unwrap(), "No differences found.");
     }
 
     #[test]
@@ -130,7 +156,7 @@ mod tests {
 
         let args = json!({ "object": "HEAD" });
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
+        let content = result.as_str().unwrap();
 
         assert!(content.contains("commit"));
         assert!(content.contains("Author:"));
@@ -176,7 +202,7 @@ mod tests {
         // Call git_show with "HEAD"
         let args = json!({ "object": "HEAD" });
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
+        let content = result.as_str().unwrap();
 
         // The content should match the commit info of HEAD~1 (which is head_minus_1)
         assert!(content.contains(&head_minus_1));
@@ -200,8 +226,10 @@ mod tests {
 
         let args = json!({ "object": "HEAD:README.md" });
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
+        let content = result.as_str().unwrap();
 
+        assert!(content.starts_with("=== HEAD:README.md (lines 1-"));
+        assert!(content.contains("\n1: "));
         assert!(content.contains("Sashiko"));
     }
 
@@ -217,14 +245,13 @@ mod tests {
             "end_line": 5
         });
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
-        let end_line = result["end_line"].as_u64().unwrap();
-        let start_line = result["start_line"].as_u64().unwrap();
+        let content = result.as_str().unwrap();
+        let (header, body) = content.split_once('\n').unwrap();
 
-        assert_eq!(start_line, 1);
-        assert_eq!(end_line, 5);
-        let lines_count = page_line_count(content);
+        assert!(header.starts_with("=== HEAD:README.md (lines 1-5 of "));
+        let lines_count = page_line_count(body);
         assert_eq!(lines_count, 5);
+        assert!(body.starts_with("1: "));
     }
 
     #[test]
@@ -238,14 +265,13 @@ mod tests {
             "start_line": 10
         });
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
-        let end_line = result["end_line"].as_u64().unwrap();
-        let start_line = result["start_line"].as_u64().unwrap();
+        let content = result.as_str().unwrap();
+        let (header, body) = content.split_once('\n').unwrap();
 
-        assert_eq!(start_line, 10);
-        assert_eq!(end_line, 110);
-        let lines_count = page_line_count(content);
+        assert!(header.starts_with("=== HEAD:README.md (lines 10-110 of "));
+        let lines_count = page_line_count(body);
         assert_eq!(lines_count, 101); // 10 to 110 inclusive is 101 lines
+        assert!(body.starts_with("10: "));
     }
 
     #[test]
@@ -264,8 +290,12 @@ mod tests {
             "end_line": 5
         });
         let result1 = rt.block_on(toolbox.call("git_show", args1)).unwrap();
-        assert_eq!(result1["start_line"].as_u64().unwrap(), 1);
-        assert_eq!(result1["end_line"].as_u64().unwrap(), 5);
+        assert!(
+            result1
+                .as_str()
+                .unwrap()
+                .starts_with("=== HEAD:README.md (lines 1-5 of ")
+        );
 
         // Verify raw cache was populated
         let raw_key = "git_show_raw:HEAD:README.md:false:None";
@@ -289,8 +319,12 @@ mod tests {
             "end_line": 15
         });
         let result2 = rt.block_on(toolbox.call("git_show", args2)).unwrap();
-        assert_eq!(result2["start_line"].as_u64().unwrap(), 10);
-        assert_eq!(result2["end_line"].as_u64().unwrap(), 15);
+        assert!(
+            result2
+                .as_str()
+                .unwrap()
+                .starts_with("=== HEAD:README.md (lines 10-15 of ")
+        );
 
         // Verify that no extra git_show raw keys were created
         {
@@ -312,11 +346,10 @@ mod tests {
         let args =
             json!({ "revision": "HEAD", "path": "README.md", "start_line": 1, "end_line": 3 });
         let result = rt.block_on(toolbox.call("git_blame", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
+        let content = result.as_str().unwrap();
 
-        assert!(!content.is_empty());
-        // Typical git blame output starts with hash or (
-        // e.g. ^1da177e4c3f (Linus Torvalds 2005-04-16 15:20:36 -0700 1) Linux kernel release 2.6.xx
+        assert!(content.starts_with("=== README.md blame (lines 1-3 of 3) ==="));
+        assert_eq!(content.lines().count(), 4);
     }
 
     #[test]
@@ -332,32 +365,29 @@ mod tests {
             "end_line": 3000
         });
         let result = rt.block_on(toolbox.call("git_blame", args)).unwrap();
-        assert_eq!(result["truncated"].as_bool(), Some(true));
+        let text = result.as_str().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
 
-        let content = result["content"].as_str().unwrap();
-        let returned_items = result["metadata"]["returned_items"].as_u64().unwrap() as usize;
-        let actual_lines = content.lines().count();
+        let header = lines[0];
+        let footer = *lines.last().unwrap();
+        assert!(header.starts_with("=== src/worker/prompts.rs blame (lines 1-"));
+        assert!(footer.starts_with("[Truncated: "));
 
-        println!("git_blame returned_items metadata: {}", returned_items);
-        println!("git_blame actual returned content lines: {}", actual_lines);
+        // Parse end_idx from "=== src/worker/prompts.rs blame (lines 1-<end_idx> of ..."
+        let after_prefix = header
+            .strip_prefix("=== src/worker/prompts.rs blame (lines 1-")
+            .unwrap();
+        let end_idx: usize = after_prefix
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
 
-        assert!(actual_lines < 2400, "Blame was not truncated!");
-        // returned_items should match the actual lines returned excluding the warning line.
-        assert_eq!(
-            returned_items + 1,
-            actual_lines,
-            "returned_items metadata does not match actual lines returned (accounting for warning line)!"
-        );
-
-        // Verify end_index calculation is start_index + returned_items - 1
-        let start_index = result["metadata"]["start_index"].as_u64().unwrap();
-        let end_index = result["metadata"]["end_index"].as_u64().unwrap();
-        assert_eq!(end_index, start_index + returned_items as u64 - 1);
-
-        // Verify next_page_hint suggests end_index + 1
-        let hint = result["next_page_hint"].as_str().unwrap();
-        let expected_next_start = end_index + 1;
-        assert!(hint.contains(&format!("start_line={}", expected_next_start)));
+        // Total lines = 1 header + end_idx blame lines + 1 Truncator warning + 1 continuation footer.
+        assert!(lines.len() < 2400, "Blame was not truncated!");
+        assert_eq!(lines.len(), end_idx + 3);
+        assert!(footer.contains(&format!("start_line={}", end_idx + 1)));
     }
 
     #[test]
@@ -374,20 +404,17 @@ mod tests {
         });
 
         let result = rt.block_on(toolbox.call("git_grep", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
+        let content = result.as_str().unwrap();
 
         assert!(!content.is_empty());
-        // Verify path is relative (does not start with /)
-        // Check that no line starts with /
         for line in content.lines() {
             assert!(
-                !line.starts_with("/"),
+                !line.starts_with('/'),
                 "Line starts with absolute path: {}",
                 line
             );
         }
 
-        // Check if README.md matches are found (it might not be the first match)
         assert!(content.contains("README.md") || content.contains("./README.md"));
     }
 
@@ -405,12 +432,8 @@ mod tests {
         });
 
         let result = rt.block_on(toolbox.call("git_grep", args)).unwrap();
-        // Should succeed without error even if no matches found
-        assert!(
-            result.get("content").is_some()
-                || result.get("matches").is_some()
-                || result.get("message").is_some()
-        );
+        let text = result.as_str().unwrap();
+        assert!(!text.starts_with("Error:"), "unexpected grep error: {text}");
     }
 
     #[test]
@@ -442,25 +465,28 @@ mod tests {
         });
 
         let result = rt.block_on(toolbox.call("git_read_files", args)).unwrap();
-        let results = result["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1);
+        let text = result.as_str().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
 
-        let res = &results[0];
-        assert_eq!(res["truncated"].as_bool(), Some(true));
+        let header = lines[0];
+        let footer = *lines.last().unwrap();
+        assert!(header.starts_with("=== Cargo.lock (lines 1-"));
+        assert!(footer.starts_with("[Truncated: lines 1-"));
 
-        let content = res["content"].as_str().unwrap();
-        let returned_items = res["metadata"]["returned_items"].as_u64().unwrap() as usize;
-        let actual_lines = content.lines().count();
+        let after_prefix = header.strip_prefix("=== Cargo.lock (lines 1-").unwrap();
+        let end_idx: usize = after_prefix
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
 
-        println!("returned_items metadata: {}", returned_items);
-        println!("actual returned content lines: {}", actual_lines);
-
-        assert!(actual_lines < 3200, "Content was not truncated!");
-        assert_eq!(
-            returned_items + 1,
-            actual_lines,
-            "returned_items metadata does not match actual lines returned (accounting for warning line)!"
-        );
+        // 1 header + end_idx numbered lines + 1 Truncator warning + 1 continuation footer.
+        assert!(lines.len() < 3200, "Content was not truncated!");
+        assert_eq!(lines.len(), end_idx + 3);
+        assert!(lines[1].starts_with("1: "));
+        assert!(lines[end_idx].starts_with(&format!("{end_idx}: ")));
+        assert!(footer.contains(&format!("start_line={}", end_idx + 1)));
     }
 
     #[test]
@@ -476,21 +502,27 @@ mod tests {
         });
 
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
-        assert_eq!(result["truncated"].as_bool(), Some(true));
+        let text = result.as_str().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
 
-        let content = result["content"].as_str().unwrap();
-        let returned_items = result["metadata"]["returned_items"].as_u64().unwrap() as usize;
-        let actual_lines = content.lines().count();
+        let header = lines[0];
+        let footer = *lines.last().unwrap();
+        assert!(header.starts_with("=== HEAD:Cargo.lock (lines 1-"));
+        assert!(footer.starts_with("[Truncated: lines 1-"));
 
-        println!("git_show returned_items metadata: {}", returned_items);
-        println!("git_show actual returned content lines: {}", actual_lines);
+        let after_prefix = header
+            .strip_prefix("=== HEAD:Cargo.lock (lines 1-")
+            .unwrap();
+        let end_idx: usize = after_prefix
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
 
-        assert!(actual_lines < 3200, "Content was not truncated!");
-        assert_eq!(
-            returned_items + 1,
-            actual_lines,
-            "git_show returned_items metadata does not match actual lines returned (accounting for warning line)!"
-        );
+        assert!(lines.len() < 3200, "Content was not truncated!");
+        assert_eq!(lines.len(), end_idx + 3);
+        assert!(footer.contains(&format!("start_line={}", end_idx + 1)));
     }
 
     #[test]
@@ -526,13 +558,10 @@ mod tests {
             ]
         });
         let result = rt.block_on(toolbox.call("git_read_files", args)).unwrap();
-        let results = result["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1);
-
-        let res = &results[0];
-        assert!(res.get("error").is_none(), "unexpected error: {res:?}");
-        assert_eq!(res["content"].as_str().unwrap(), "");
-        assert_eq!(res["total_lines"].as_u64().unwrap(), 0);
+        assert_eq!(
+            result.as_str().unwrap(),
+            "=== empty.txt (empty, 0 lines) ==="
+        );
     }
 
     #[test]
@@ -553,10 +582,10 @@ mod tests {
         });
 
         let result = rt.block_on(toolbox.call("git_read_files", args)).unwrap();
-        let results = result["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["start_line"].as_u64().unwrap(), 3);
-        assert_eq!(results[0]["end_line"].as_u64().unwrap(), 6);
+        let text = result.as_str().unwrap();
+        assert!(text.starts_with("=== README.md (lines 3-6 of "));
+        assert!(text.contains("\n3: "));
+        assert!(text.contains("\n6: "));
     }
 
     #[test]
@@ -620,10 +649,10 @@ mod tests {
                     }),
                 ))
                 .unwrap();
-            let file_res = &res["results"][0];
+            let file_text = res.as_str().unwrap();
             assert!(
-                file_res["error"].is_string() && file_res.get("content").is_none(),
-                "git_read_files should report error for {bad_path}: {file_res:?}"
+                file_text.contains(": ERROR:"),
+                "git_read_files should report error for {bad_path}: {file_text}"
             );
 
             // 7a. git_show with object rev:path
@@ -687,12 +716,7 @@ mod tests {
                 }),
             ))
             .unwrap();
-        assert!(
-            read_res["results"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("old_func")
-        );
+        assert!(read_res.as_str().unwrap().contains("1: int old_func"));
 
         // git_show on historical deleted path in HEAD~1
         let show_res = rt
@@ -701,7 +725,7 @@ mod tests {
                 json!({ "object": "HEAD~1:deleted_dir/sub/file.c" }),
             ))
             .unwrap();
-        assert!(show_res["content"].as_str().unwrap().contains("old_func"));
+        assert!(show_res.as_str().unwrap().contains("1: int old_func"));
     }
 
     #[test]

@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Context, Result, anyhow};
+use crate::ai::truncator::Truncator;
+use anyhow::{Context, Result, anyhow, ensure};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -306,6 +307,181 @@ pub fn normalize_json_numbers(val: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Formats a slice of source text with 1-based line numbers, a section header,
+/// and sequential token-budget truncation.
+///
+/// Line numbers are prepended prior to calling [`Truncator::truncate_sequential`]
+/// so the byte budget accounts for the line-number prefixes and `lines_kept`
+/// tracks the exact count of source lines retained.
+pub fn format_numbered_slice(
+    label: &str,
+    tool_name: &str,
+    content: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    max_tokens: usize,
+) -> Result<String> {
+    if let (Some(s), Some(e)) = (start_line, end_line) {
+        ensure!(s <= e, "Invalid range: start_line ({s}) > end_line ({e})");
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    if total_lines == 0 {
+        return Ok(format!("=== {label} (empty, 0 lines) ==="));
+    }
+
+    // Empty files return early above, so 0-based start/end bounds are safe without clamp.
+    let (start, end) = match (start_line, end_line) {
+        (Some(s), Some(e)) => (s.max(1) - 1, e.min(total_lines)),
+        (Some(s), None) => (s.max(1) - 1, total_lines),
+        (None, Some(e)) => (0, e.min(total_lines)),
+        (None, None) => (0, total_lines),
+    };
+
+    if start >= total_lines {
+        return Ok(format!("=== {label} (0 lines shown of {total_lines}) ==="));
+    }
+    let end = end.clamp(start, total_lines);
+
+    let numbered = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| format!("{}: {}", start + idx + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let res = Truncator::truncate_sequential(&numbered, max_tokens);
+    let start_idx = start + 1;
+    let end_idx = if res.truncated {
+        start + res.lines_kept.max(1)
+    } else {
+        end
+    };
+
+    let mut out = format!(
+        "=== {label} (lines {start_idx}-{end_idx} of {total_lines}) ===\n{}",
+        res.content.trim_end_matches('\n')
+    );
+    if res.truncated {
+        out.push_str(&format!(
+            "\n[Truncated: lines {start_idx}-{end_idx} of {total_lines} shown. Call {tool_name} with start_line={} to read more.]",
+            end_idx + 1
+        ));
+    }
+    Ok(out)
+}
+
+const SNIPPET_ELISIONS: &[&str] = &["...", "…", "// ...", "/* ... */", "--"];
+
+enum ParsedSnippetLine<'a> {
+    Passthrough(&'a str),
+    Numbered {
+        line_no: usize,
+        sep: char,
+        rest: &'a str,
+    },
+}
+
+fn parse_numbered_tool_line(line: &str) -> Option<ParsedSnippetLine<'_>> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return Some(ParsedSnippetLine::Passthrough(""));
+    }
+    if SNIPPET_ELISIONS.contains(&trimmed) {
+        return Some(ParsedSnippetLine::Passthrough(trimmed));
+    }
+    if trimmed.starts_with("... [") && trimmed.ends_with("] ...") {
+        return Some(ParsedSnippetLine::Passthrough("..."));
+    }
+
+    let digit_len = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if !(1..=7).contains(&digit_len) {
+        return None;
+    }
+    let line_no: usize = trimmed[..digit_len].parse().ok()?;
+    if line_no == 0 {
+        return None;
+    }
+
+    let after = &trimmed[digit_len..];
+    if let Some(rest) = after.strip_prefix(':') {
+        if rest.starts_with(':') {
+            return None;
+        }
+        Some(ParsedSnippetLine::Numbered {
+            line_no,
+            sep: ':',
+            rest,
+        })
+    } else if let Some(rest) = after.strip_prefix('-') {
+        if rest.starts_with(['-', '>', '=']) {
+            return None;
+        }
+        Some(ParsedSnippetLine::Numbered {
+            line_no,
+            sep: '-',
+            rest,
+        })
+    } else if let Some(rest) = after.strip_prefix('=') {
+        if rest.starts_with(['=', '>']) {
+            return None;
+        }
+        Some(ParsedSnippetLine::Numbered {
+            line_no,
+            sep: '=',
+            rest,
+        })
+    } else {
+        None
+    }
+}
+
+/// Strips 1-based tool line-number prefixes (from `git_read_files`, `git_show`,
+/// or `git_grep`) when every non-empty, non-elision line carries a strictly
+/// increasing line number.
+pub fn strip_tool_line_numbers(raw: &str) -> Option<String> {
+    let mut parsed = Vec::new();
+    let mut prev_line_no: Option<usize> = None;
+    let mut numbered_count = 0usize;
+    let mut has_grep_context_sep = false;
+
+    for line in raw.lines() {
+        let item = parse_numbered_tool_line(line)?;
+        if let ParsedSnippetLine::Numbered { line_no, sep, .. } = item {
+            if prev_line_no.is_some_and(|prev| line_no <= prev) {
+                return None;
+            }
+            prev_line_no = Some(line_no);
+            numbered_count += 1;
+            if sep != ':' {
+                has_grep_context_sep = true;
+            }
+        }
+        parsed.push(item);
+    }
+
+    if numbered_count == 0 {
+        return None;
+    }
+
+    let stripped: Vec<&str> = parsed
+        .into_iter()
+        .map(|item| match item {
+            ParsedSnippetLine::Passthrough(text) => text,
+            ParsedSnippetLine::Numbered { sep, rest, .. } => {
+                if sep == ':' && !has_grep_context_sep {
+                    rest.strip_prefix(' ').unwrap_or(rest)
+                } else {
+                    rest
+                }
+            }
+        })
+        .collect();
+
+    Some(stripped.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +677,62 @@ mod tests {
             assert!(validate_path("dangling_link", &base).is_err());
             assert!(validate_path("dangling_link/sub/file.c", &base).is_err());
         }
+    }
+
+    #[test]
+    fn test_format_numbered_slice_basic_and_edge_cases() {
+        let src = "alpha\n\ngamma\ndelta\n";
+        let out = format_numbered_slice("foo.c", "git_read_files", src, Some(1), Some(3), 20_000)
+            .unwrap();
+        assert_eq!(
+            out,
+            "=== foo.c (lines 1-3 of 4) ===\n1: alpha\n2: \n3: gamma"
+        );
+
+        let empty =
+            format_numbered_slice("empty.c", "git_read_files", "", Some(1), Some(5), 20_000)
+                .unwrap();
+        assert_eq!(empty, "=== empty.c (empty, 0 lines) ===");
+
+        let past_eof =
+            format_numbered_slice("foo.c", "git_read_files", src, Some(10), Some(20), 20_000)
+                .unwrap();
+        assert_eq!(past_eof, "=== foo.c (0 lines shown of 4) ===");
+
+        assert!(
+            format_numbered_slice("foo.c", "git_read_files", src, Some(5), Some(2), 20_000)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_strip_tool_line_numbers() {
+        // Multi-line git_read_files / git_show output preserves source indentation and blank lines.
+        let read_snip = "10: pub fn get(m: &Mutex<u8>) -> u8 {\n11:\n12:     let guard = m.lock().unwrap();\n...\n15:     *guard";
+        assert_eq!(
+            strip_tool_line_numbers(read_snip).as_deref(),
+            Some(
+                "pub fn get(m: &Mutex<u8>) -> u8 {\n\n    let guard = m.lock().unwrap();\n...\n    *guard"
+            )
+        );
+
+        // git_grep output with '=', '-', and ':' prefixes preserves relative indentation.
+        let grep_snip = "  100=static void shrink_node(pg_data_t *pgdat)\n  ... [50 lines of enclosing block omitted] ...\n  151-    int x = 1;\n  152:    target_call(pgdat);";
+        assert_eq!(
+            strip_tool_line_numbers(grep_snip).as_deref(),
+            Some(
+                "static void shrink_node(pg_data_t *pgdat)\n...\n    int x = 1;\n    target_call(pgdat);"
+            )
+        );
+
+        // Non-increasing line numbers, 0-based tuple fields, and plain code return None.
+        assert_eq!(
+            strip_tool_line_numbers("10: first();\n10: duplicate();"),
+            None
+        );
+        assert_eq!(strip_tool_line_numbers("12: later();\n9: earlier();"), None);
+        assert_eq!(strip_tool_line_numbers("0: tuple_field"), None);
+        assert_eq!(strip_tool_line_numbers("let guard = m.lock();"), None);
+        assert_eq!(strip_tool_line_numbers("..."), None);
     }
 }

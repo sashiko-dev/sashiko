@@ -3913,7 +3913,20 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         }
 
         function formatJsonExpandable(obj, id) {
-            if (typeof obj === 'string') { try { obj = JSON.parse(obj); } catch (e) {} }
+            if (typeof obj === 'string') {
+                try {
+                    const parsed = JSON.parse(obj);
+                    if (parsed !== null && typeof parsed === 'object') obj = parsed;
+                } catch (e) {}
+            }
+            if (typeof obj === 'string') {
+                const sizeHtml = `<span class="json-size">(${formatSize(obj.length)})</span>`;
+                if (obj.length <= 100 && !obj.includes('\n') && !obj.includes('\t')) return `${sizeHtml}${escapeHtml(obj)}`;
+                const singleLine = obj.replace(/\s+/g, ' ').trim();
+                const preview = singleLine.length > 100 ? singleLine.substring(0, 97) + '...' : singleLine;
+                const expandId = `json-resp-${id}`;
+                return `${sizeHtml}<span class="json-expandable" onclick="toggleJsonExpand('${expandId}')"><span class="json-preview">${escapeHtml(preview)}</span><pre id="${expandId}" class="json-formatted" style="display:none">${formatJsonPretty(obj)}</pre></span>`;
+            }
             const jsonStr = JSON.stringify(obj ?? null) || '';
             const sizeHtml = `<span class="json-size">(${formatSize(jsonStr.length)})</span>`;
             const preview = jsonStr.length > 100 ? jsonStr.substring(0, 97) + '...' : jsonStr;
@@ -3923,7 +3936,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         }
 
         function formatSize(bytes) { return bytes < 1024 ? bytes + 'B' : (bytes / 1024).toFixed(1) + 'KB'; }
-        function formatJsonPretty(obj) { return escapeHtml(JSON.stringify(obj ?? null, null, 2) || '').replace(/\\n/g, '\n').replace(/\\t/g, '    '); }
+        function formatJsonPretty(obj) {
+            if (typeof obj === 'string') return escapeHtml(obj).replace(/\t/g, '    ');
+            return escapeHtml(JSON.stringify(obj ?? null, null, 2) || '').replace(/\\n/g, '\n').replace(/\\t/g, '    ');
+        }
         function toggleJsonExpand(id) {
             const el = document.getElementById(id);
             if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';

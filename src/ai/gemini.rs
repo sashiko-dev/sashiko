@@ -1101,14 +1101,21 @@ pub(crate) fn translate_ai_request_with_options(
                 } else {
                     (None, raw_id)
                 };
+                // Gemini's FunctionResponse.response maps to google.protobuf.Struct,
+                // which requires a JSON Object. Plain-text tool outputs wrap under
+                // "output" while JSON Object responses pass through unchanged.
+                let response_payload = match msg.content {
+                    Some(raw) => match serde_json::from_str::<Value>(&raw) {
+                        Ok(Value::Object(map)) => Value::Object(map),
+                        _ => json!({ "output": raw }),
+                    },
+                    None => json!({}),
+                };
                 let part = Part::FunctionResponse {
                     function_response: FunctionResponse {
                         id: resp_id,
                         name: resp_name,
-                        response: serde_json::from_str(
-                            &msg.content.unwrap_or_else(|| "{}".to_string()),
-                        )
-                        .unwrap_or(json!({})),
+                        response: response_payload,
                     },
                 };
                 if let Some(last) = contents.last_mut()
@@ -2202,6 +2209,37 @@ mod tests {
         if let Part::FunctionResponse { function_response } = &gemini_req.contents[0].parts[0] {
             assert_eq!(function_response.name, "call_123");
             assert_eq!(function_response.response["result"], "success");
+        } else {
+            panic!("Expected FunctionResponse part");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_ai_request_plain_text_tool_response_wraps_as_struct() -> Result<()> {
+        let plain = "=== README.md (lines 1-2 of 10) ===\n1: # Sashiko\n2: Overview";
+        let request = AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::Tool,
+                content: Some(plain.to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: Some("call_plain".to_string()),
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+            reasoning_effort: None,
+        };
+
+        let gemini_req = translate_ai_request(request)?;
+        if let Part::FunctionResponse { function_response } = &gemini_req.contents[0].parts[0] {
+            assert_eq!(function_response.name, "call_plain");
+            assert_eq!(function_response.response["output"], plain);
         } else {
             panic!("Expected FunctionResponse part");
         }
