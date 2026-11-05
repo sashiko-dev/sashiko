@@ -136,9 +136,12 @@ Output schema:
 ```
 - The candidate is reported **only** if it is `NotSecuritySensitive` **and** `StillPresent`.
   `Unknown` on either field means it is dropped (fail-closed).
-- Security-sensitive means memory-safety bugs reachable from an unprivileged or remote context,
-  privilege escalation, info leaks, or anything a reasonable maintainer would send to
-  security@kernel.org instead of a public list. The prompt text lives in
+- Security-sensitive follows the kernel security policy: a bug plausibly exploitable by an
+  unprivileged local user, a remote peer, a malicious device or image, or a guest, giving memory
+  corruption, privilege escalation, or a leak across a privilege boundary. Bugs only root or
+  CAP_SYS_ADMIN can trigger, local denial of service (leaks, hangs, WARNs, NULL pointer oopses),
+  races without an attacker-controlled trigger, and functional bugs are not security-sensitive
+  and may be reported. The prompt text lives in
   `projects/linux/prompts/` (with a bundle test, because a missing include renders as empty).
 - `StillPresent` requires quoting the defective code **from the post-image**.
   If the patch deletes or rewrites it, the result is `RemovedByPatch`/`FixedByPatch`, and the candidate is dropped.
