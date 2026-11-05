@@ -524,6 +524,10 @@ Each mailing list is configured as a `["<list-email>"]` table (e.g. `["bpf@vger.
 | `patchwork.min_severity` | string | -- | Minimum finding severity to include in patchwork checks. Findings below this threshold are excluded. Accepts: `Low`, `Medium`, `High`, `Critical` (case-insensitive). Default: all findings included. |
 | `patchwork.fail_severity` | string | `High` | Minimum severity of NEW findings that triggers the `fail` check state instead of `warning`. New findings at or above this threshold produce `fail`; below it produce `warning`. Pre-existing findings never affect the check state. |
 | `report_preexisting_bugs` | bool or string | `defaults.report_preexisting_bugs` | Turns related pre-existing bug mentions off (`false` or `"none"`), on (`true`), or sets the minimum severity floor (`"low"`, `"medium"`, `"high"`, `"critical"`) for patches sent to this list. For a patch sent to several lists, any matched list that sets `false` (or `"none"`) turns them off; otherwise the strictest matched floor wins. Also accepted as `related_preexisting.enabled` and `related_preexisting.min_severity`. |
+| `ingest_filter.allowed_subject_prefixes` | list | `[]` | Subject prefix tags (e.g. `["e2fsprogs"]`, case-insensitive) that explicitly mark an NNTP patch or cover letter on a shared mailing list as belonging to this project unless `ignored_paths` matches. |
+| `ingest_filter.ignored_subject_prefixes` | list | `[]` | Subject prefix tags (e.g. `["fstests", "xfstests"]`, case-insensitive) whose NNTP patches and cover letters are skipped at ingestion on this list. |
+| `ingest_filter.allowed_paths` | list | `[]` | Repository path patterns (directory prefixes ending in `/`, narrow prefix globs ending in `*`, or exact file paths) used on shared NNTP lists. When non-empty and no `allowed_subject_prefixes` tag matched, only patches or cover-letter diffstats touching at least one matching path (and no `ignored_paths`) create patchsets. |
+| `ingest_filter.ignored_paths` | list | `[]` | Repository path patterns whose NNTP patches or cover-letter diffstats are skipped at ingestion on this list. |
 
 ### Author-only delivery
 

@@ -107,6 +107,84 @@ pub fn has_unquoted_diff(text: &str) -> bool {
     false
 }
 
+fn is_diffstat_summary_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some((count, rest)) = trimmed.split_once(' ') else {
+        return false;
+    };
+    !count.is_empty()
+        && count.bytes().all(|b| b.is_ascii_digit())
+        && (rest.starts_with("file changed") || rest.starts_with("files changed"))
+}
+
+fn normalize_diffstat_path(raw: &str) -> Option<String> {
+    let unquoted = raw.trim().trim_matches('"');
+    let expanded = if let Some(open) = unquoted.find('{')
+        && let Some(close_rel) = unquoted[open + 1..].find('}')
+        && let inner = &unquoted[open + 1..open + 1 + close_rel]
+        && let Some((_, new_part)) = inner.split_once(" => ")
+    {
+        let suffix = &unquoted[open + 1 + close_rel + 1..];
+        let joined = format!("{}{}{}", &unquoted[..open], new_part.trim(), suffix);
+        joined.replace("//", "/")
+    } else if let Some((_, new_part)) = unquoted.split_once(" => ") {
+        new_part.trim().to_string()
+    } else {
+        unquoted.to_string()
+    };
+    let normalized = expanded
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .trim();
+    (!normalized.is_empty()).then(|| normalized.to_string())
+}
+
+fn parse_diffstat_entry_path(line: &str) -> Option<String> {
+    if !line.starts_with(' ') {
+        return None;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('|') {
+        return None;
+    }
+    let idx = line.rfind(" | ")?;
+    let (before, after) = (&line[..idx], &line[idx + 3..]);
+    let rhs = after.trim();
+    let looks_like_stat = rhs.bytes().next().is_some_and(|b| b.is_ascii_digit())
+        || rhs.starts_with("Bin ")
+        || rhs.starts_with("Unmerged");
+    if !looks_like_stat {
+        return None;
+    }
+    normalize_diffstat_path(before)
+}
+
+/// Extracts touched file paths from a `git diff --stat` block in an email body
+/// (such as a `git format-patch --cover-letter` message that carries no unified
+/// diff). Anchors on the trailing `<N> file(s) changed` summary line so prose
+/// pipes or Markdown tables are ignored.
+pub fn extract_files_from_diffstat(body: &str) -> Vec<String> {
+    let lines: Vec<&str> = body.lines().map(|l| l.trim_end_matches('\r')).collect();
+    let mut paths = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if !is_diffstat_summary_line(line) {
+            continue;
+        }
+        let mut cursor = idx;
+        while cursor > 0 {
+            if let Some(path) = parse_diffstat_entry_path(lines[cursor - 1]) {
+                paths.push(path);
+                cursor -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 /// Returns true if `line` is a `git format-patch` mbox separator line of the
 /// form `From <hex-sha> <ctime-timestamp>` (e.g.
 /// `From 0123456789abcdef0123456789abcdef01234567 Mon Sep 17 00:00:00 2001`).
@@ -1904,6 +1982,33 @@ Body";
             vec!["bpf", "net-next"]
         ); // sorted
         assert_eq!(get_subject_prefixes("[PATCH]"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_extract_files_from_diffstat() {
+        let cover = "\
+Hi all,
+
+This series cleans up extent handling in e2fsprogs:
+  foo | bar in prose should not match
+| col1 | 42 |
+
+ e2fsck/pass1.c                | 24 ++++++++++++++++--------
+ lib/ext2fs/{old_ext.c => ext.c} |  6 +++---
+ tests/f_bad_ext/image.gz      | Bin 0 -> 2048 bytes
+ 3 files changed, 19 insertions(+), 11 deletions(-)
+";
+        assert_eq!(
+            extract_files_from_diffstat(cover),
+            vec![
+                "e2fsck/pass1.c",
+                "lib/ext2fs/ext.c",
+                "tests/f_bad_ext/image.gz",
+            ]
+        );
+
+        let no_stat = "Cover letter without diffstat\n| table | 10 |\n";
+        assert!(extract_files_from_diffstat(no_stat).is_empty());
     }
 
     #[test]
