@@ -162,6 +162,9 @@ mod tests {
         assert!(guide.contains("# Severity Levels"));
         assert!(guide.contains("## Critical"));
         assert!(guide.contains("## High"));
+        assert!(guide.contains("Documentation/process/threat-model.rst"));
+        assert!(guide.contains("kselftests"));
+        assert!(guide.contains("debugfs"));
     }
 
     #[test]
