@@ -701,7 +701,7 @@ mod gate {
             let none: Vec<String> = Vec::new();
             assert_eq!(
                 evaluate_gate(&inputs("[PATCH] mm: fix a leak", &none), &policy()),
-                Ok(SeverityFloor::High)
+                Ok(SeverityFloor::Medium)
             );
             let mm = vec!["linux-mm@kvack.org".to_string()];
             assert_eq!(
@@ -756,7 +756,7 @@ mod gate {
             after_rfc.predecessor_titles = &rfcs;
             assert_eq!(
                 evaluate_gate(&after_rfc, &policy()),
-                Ok(SeverityFloor::High)
+                Ok(SeverityFloor::Medium)
             );
 
             // The tag does not matter after RFCs: RFC v3 -> PATCH v4.
@@ -765,7 +765,7 @@ mod gate {
             renumbered.predecessor_titles = &rfcs;
             assert_eq!(
                 evaluate_gate(&renumbered, &policy()),
-                Ok(SeverityFloor::High)
+                Ok(SeverityFloor::Medium)
             );
 
             // A non-RFC posting anywhere earlier in the chain disqualifies it.
@@ -791,7 +791,7 @@ mod gate {
 
             let mut pr = inputs("#514: fix the queue", &none);
             pr.mr_title = Some("fix the queue");
-            assert_eq!(evaluate_gate(&pr, &policy()), Ok(SeverityFloor::High));
+            assert_eq!(evaluate_gate(&pr, &policy()), Ok(SeverityFloor::Medium));
         }
     }
 }

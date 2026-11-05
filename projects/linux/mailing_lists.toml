@@ -46,7 +46,7 @@ ignored_emails = ["patchwork@emeril.freedesktop.org"]
 # the strictest min_severity among the matched lists wins.
 [defaults.related_preexisting]
 enabled = true
-min_severity = "high"
+min_severity = "medium"
 
 # --- Tracked for Web UI only (no outbound emails) ---
 
