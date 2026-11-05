@@ -141,13 +141,22 @@ Output schema:
 ```
 - The candidate is reported **only** if it is `NotSecuritySensitive` **and** `StillPresent`.
   `Unknown` on either field means it is dropped (fail-closed).
-- Security-sensitive follows the kernel security policy: a bug plausibly exploitable by an
-  unprivileged local user, a remote peer, a malicious device or image, or a guest, giving memory
-  corruption, privilege escalation, or a leak across a privilege boundary. Bugs only root or
-  CAP_SYS_ADMIN can trigger, local denial of service (leaks, hangs, WARNs, NULL pointer oopses),
-  races without an attacker-controlled trigger, and functional bugs are not security-sensitive
-  and may be reported. The prompt text of both the selection and the check stages lives in
-  `src/workflows/related_preexisting.rs` as constants, not in the prompt bundle.
+- Security-sensitive follows the Linux kernel security policy and threat model
+  (`Documentation/process/threat-model.rst`, loaded from the mainline ref at run time when
+  available): a bug plausibly exploitable across a guaranteed kernel security boundary (an
+  unprivileged local user or unprivileged user namespace, a remote network peer, a virtualization
+  guest crossing a guest-to-host/hypervisor boundary, or untrusted hardware on an IOMMU/driver path
+  explicitly documented as hardened against hostile peripherals) to gain memory corruption,
+  privilege escalation, a leak across a privilege boundary, or remote/guest-to-host denial of
+  service. Classes excluded by `threat-model.rst`—bugs requiring root or elevated capabilities
+  (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, etc.), `debugfs`/staging/experimental Kconfigs,
+  administrator-mounted crafted filesystem images (unless `FS_USERNS_MOUNT` allows unprivileged
+  userns mounts), non-conforming/emulated hardware outside explicitly hardened paths, local
+  non-exploitable denial of service (leaks, hangs, `WARN`s, clean NULL-pointer oopses), races
+  without an attacker-controlled trigger, and functional bugs—are not security-sensitive and may be
+  reported. The prompt text of both the selection and the check stages lives in
+  `src/workflows/related_preexisting.rs` as constants, with `<kernel_threat_model>` injected from
+  `LinuxPatchReviewState`.
 - `StillPresent` requires quoting the defective code **from the post-image**.
   If the patch deletes or rewrites it, the result is `RemovedByPatch`/`FixedByPatch`, and the candidate is dropped.
 - Validator: `decision == Report` is only accepted when `post_patch_evidence` is filled in.
