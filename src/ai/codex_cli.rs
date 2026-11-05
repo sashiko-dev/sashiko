@@ -102,10 +102,10 @@ impl AiProvider for CodexCliProvider {
         let raw = String::from_utf8_lossy(&output.stdout);
 
         // Codex outputs line-delimited JSON events:
-        //   {"type": "item.completed", "item": {"text": "..."}}
+        //   {"type": "item.completed", "item": {"type": "agent_message", "text": "..."}}
         //   {"type": "turn.completed", "usage": {"input_tokens": N, "output_tokens": N}}
         //   {"type": "error", "message": "..."}
-        let mut text_parts = Vec::new();
+        let mut final_message: Option<String> = None;
         let mut usage: Option<AiUsage> = None;
 
         for line in raw.lines() {
@@ -119,8 +119,11 @@ impl AiProvider for CodexCliProvider {
                 }
                 match event["type"].as_str() {
                     Some("item.completed") => {
-                        if let Some(text) = event["item"]["text"].as_str() {
-                            text_parts.push(text.to_string());
+                        // Earlier messages are commentary between codex's own
+                        // tool runs, and reasoning items carry text too. Only
+                        // the last message is the answer.
+                        if let Some(text) = agent_message_text(&event) {
+                            final_message = Some(text.to_string());
                         }
                     }
                     Some("turn.completed") => {
@@ -142,12 +145,11 @@ impl AiProvider for CodexCliProvider {
             }
         }
 
-        let response_text = text_parts.join("\n");
-        if response_text.is_empty() {
+        let Some(response_text) = final_message.filter(|t| !t.is_empty()) else {
             // Fall back to raw output if no events parsed
-            warn!("codex-cli: no item.completed events found, using raw output");
+            warn!("codex-cli: no agent_message events found, using raw output");
             return parse_inner_response("codex-cli", &raw, usage);
-        }
+        };
 
         parse_inner_response("codex-cli", &response_text, usage)
     }
@@ -181,6 +183,13 @@ impl CodexCliProvider {
         }
         Ok(())
     }
+}
+
+fn agent_message_text(event: &Value) -> Option<&str> {
+    let item = &event["item"];
+    (item["type"] == "agent_message")
+        .then(|| item["text"].as_str())
+        .flatten()
 }
 
 /// Returns the explanation an error event carries. A rejected invocation
@@ -325,6 +334,20 @@ mod tests {
         assert!(!err.contains("sk-secret"));
         assert!(!err.contains("tok-123"));
         assert!(!err.contains("user:pass"));
+    }
+
+    #[test]
+    fn only_agent_messages_carry_the_answer() {
+        let message: Value = serde_json::from_str(
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"answer"}}"#,
+        )
+        .unwrap();
+        let reasoning: Value = serde_json::from_str(
+            r#"{"type":"item.completed","item":{"type":"reasoning","text":"thinking"}}"#,
+        )
+        .unwrap();
+        assert_eq!(agent_message_text(&message), Some("answer"));
+        assert_eq!(agent_message_text(&reasoning), None);
     }
 
     #[test]
