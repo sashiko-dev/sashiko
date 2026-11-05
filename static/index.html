@@ -2212,7 +2212,8 @@
             const threadHtml = isGitSubmission ? '' : renderThreadTree(data.thread);
             const mailingLists = data.mailing_lists || data.subsystems;
             const mailingListsHtml = mailingLists?.length > 0 ? mailingLists.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : '-';
-            const failureHtml = data.failed_reason ? `<div class="section error-banner" style="margin-bottom:16px;"><h3 style="margin-top:0; color:var(--error-title);">Ingestion Failed</h3><div>${escapeHtml(data.failed_reason)}</div></div>` : '';
+            const failureTitle = data.reviews?.length > 0 ? 'Review Failed' : 'Ingestion Failed';
+            const failureHtml = data.failed_reason ? `<div class="section error-banner" style="margin-bottom:16px;"><h3 style="margin-top:0; color:var(--error-title);">${failureTitle}</h3><div>${escapeHtml(data.failed_reason)}</div></div>` : '';
 
             const modelName = data.model_name || '-';
             const providerModel = data.provider ? `${data.provider}/${modelName}` : modelName;
