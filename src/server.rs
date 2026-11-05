@@ -355,6 +355,7 @@ pub fn build_router(
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
         .route("/api/bug", get(get_bug))
+        .route("/api/bug/markdown", get(get_bug_markdown))
         .route("/api/bugs", get(list_bugs))
         .route("/api/bugs/subsystems", get(list_bug_subsystems))
         .route("/api/subsystems", get(list_bug_subsystems))
@@ -364,7 +365,7 @@ pub fn build_router(
         .route("/api/bug/enrichments", get(get_bug_enrichments))
         .route("/api/bug/analyze", post(analyze_bug))
         .route("/api/bug/action", post(bug_action))
-        .route("/bug/{bugid}", get(redirect_bug))
+        .route("/bug/{bugid}", get(bug_path_handler))
         .route(
             "/api/webhook/{provider}",
             post(forge_webhook).layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024)),
@@ -1569,9 +1570,32 @@ async fn get_bug(
     attach_duplicate_relations(&state, &principal, &bug, &mut val).await?;
     val["can_comment"] = serde_json::Value::Bool(!state.read_only && access.can_comment());
     val["can_manage"] = serde_json::Value::Bool(!state.read_only && access.can_manage());
+    val["evidence"] = load_redacted_bug_evidence(&state, &principal, bug.id).await?;
+    if let Some(obj) = val.as_object_mut() {
+        for key in [
+            "raw_input",
+            "vector_json",
+            "enrichments",
+            "tokens_in",
+            "tokens_out",
+            "tokens_cached",
+        ] {
+            obj.remove(key);
+        }
+    }
+    Ok(Json(val))
+}
+
+/// Loads a bug's deduplicated family evidence with interaction logs omitted and
+/// inaccessible duplicate counterparts redacted.
+async fn load_redacted_bug_evidence(
+    state: &AppState,
+    principal: &Principal,
+    bug_id: i64,
+) -> Result<serde_json::Value, StatusCode> {
     let mut family = state
         .db
-        .bug_family(bug.id, false)
+        .bug_family(bug_id, false)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut check_ids: Vec<i64> = family.iter().map(|member| member.id).collect();
@@ -1580,9 +1604,9 @@ async fn get_bug(
     }
     check_ids.sort_unstable();
     check_ids.dedup();
-    let readable_by_principal = readable_bug_ids(&state, &principal, &check_ids).await?;
+    let readable_by_principal = readable_bug_ids(state, principal, &check_ids).await?;
     let mut readable_family = readable_by_principal.clone();
-    readable_family.insert(bug.id);
+    readable_family.insert(bug_id);
     family.retain(|member| readable_family.contains(&member.id));
     for member in &mut family {
         redact_inaccessible_duplicate_enrichments(member, &readable_by_principal);
@@ -1602,20 +1626,35 @@ async fn get_bug(
             )
         });
     }
-    val["evidence"] = evidence;
-    if let Some(obj) = val.as_object_mut() {
-        for key in [
-            "raw_input",
-            "vector_json",
-            "enrichments",
-            "tokens_in",
-            "tokens_out",
-            "tokens_cached",
-        ] {
-            obj.remove(key);
-        }
+    Ok(evidence)
+}
+
+/// Resolves the canonical target of a duplicate bug when the caller has read
+/// authority over that canonical counterpart.
+async fn readable_canonical_target(
+    state: &AppState,
+    principal: &Principal,
+    bug: &crate::db::Bug,
+) -> Result<Option<(i64, crate::bug_markdown::CanonicalDuplicate)>, StatusCode> {
+    if bug.lifecycle_status != crate::db::BugLifecycleStatus::Duplicate {
+        return Ok(None);
     }
-    Ok(Json(val))
+    let Some(canonical_id) = bug.duplicate_of_id else {
+        return Ok(None);
+    };
+    if !bug_access(state, principal, canonical_id).await?.can_read() {
+        return Ok(None);
+    }
+    let Some(canonical) = state.db.get_bug(canonical_id).await.ok().flatten() else {
+        return Ok(None);
+    };
+    Ok(Some((
+        canonical.id,
+        crate::bug_markdown::CanonicalDuplicate {
+            bugid: canonical.bugid.clone(),
+            problem: canonical.problem().to_string(),
+        },
+    )))
 }
 
 /// Attaches the bug's duplicate relations, omitting any counterpart the caller
@@ -1628,21 +1667,19 @@ async fn attach_duplicate_relations(
     val: &mut serde_json::Value,
 ) -> Result<(), StatusCode> {
     if bug.lifecycle_status == crate::db::BugLifecycleStatus::Duplicate {
-        let Some(canonical_id) = bug.duplicate_of_id else {
-            return Ok(());
-        };
-        if !bug_access(state, principal, canonical_id).await?.can_read() {
-            if let Some(obj) = val.as_object_mut() {
-                obj.remove("duplicate_of_id");
+        match readable_canonical_target(state, principal, bug).await? {
+            Some((canonical_id, canon)) => {
+                val["duplicate_of"] = serde_json::json!({
+                    "id": canonical_id,
+                    "bugid": canon.bugid,
+                    "problem": canon.problem,
+                });
             }
-            return Ok(());
-        }
-        if let Some(canonical) = state.db.get_bug(canonical_id).await.ok().flatten() {
-            val["duplicate_of"] = serde_json::json!({
-                "id": canonical.id,
-                "bugid": canonical.bugid,
-                "problem": canonical.problem(),
-            });
+            None => {
+                if let Some(obj) = val.as_object_mut() {
+                    obj.remove("duplicate_of_id");
+                }
+            }
         }
         return Ok(());
     }
@@ -1893,8 +1930,77 @@ async fn analyze_bug(
     }
 }
 
-async fn redirect_bug(Path(bugid): Path<String>) -> impl IntoResponse {
-    Redirect::temporary(&format!("/#/bug/{}", bugid))
+async fn render_bug_markdown_response(
+    principal: Result<Principal, (StatusCode, &'static str)>,
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    query: &BugQuery,
+) -> Result<axum::response::Response, StatusCode> {
+    let principal = resolve_bug_read_principal(principal, query)?;
+    let (bug, _) = readable_bug_for_view(state, &principal, query).await?;
+    let canonical = readable_canonical_target(state, &principal, &bug)
+        .await?
+        .map(|(_, canon)| canon);
+    let evidence = load_redacted_bug_evidence(state, &principal, bug.id).await?;
+    let activity = evidence
+        .get("activity")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    let base_url = crate::bug_markdown::resolve_public_base_url(&state.settings, headers);
+    let reported_by = crate::bug_markdown::resolve_reported_by(&state.settings, &bug.reporter);
+    let project = crate::bug_markdown::target_project_for_bug(&state.settings, &bug.bugid);
+
+    let body = crate::bug_markdown::render_bug_markdown(&crate::bug_markdown::BugMarkdownContext {
+        bug: &bug,
+        base_url: &base_url,
+        reported_by: &reported_by,
+        project,
+        canonical_duplicate: canonical.as_ref(),
+        activity,
+    });
+
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            ),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+async fn get_bug_markdown(
+    principal: Result<Principal, (StatusCode, &'static str)>,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<BugQuery>,
+) -> Result<axum::response::Response, StatusCode> {
+    render_bug_markdown_response(principal, &state, &headers, &query).await
+}
+
+async fn bug_path_handler(
+    principal: Result<Principal, (StatusCode, &'static str)>,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(bugid): Path<String>,
+) -> Result<axum::response::Response, StatusCode> {
+    if let Some(stem) = bugid.strip_suffix(".md") {
+        if stem.trim().is_empty() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let query = BugQuery {
+            id: None,
+            bugid: Some(stem.to_string()),
+            slug: None,
+        };
+        return render_bug_markdown_response(principal, &state, &headers, &query).await;
+    }
+    Ok(Redirect::temporary(&format!("/#/bug/{}", bugid)).into_response())
 }
 
 async fn get_message(
@@ -4093,7 +4199,7 @@ mod tests {
         assert_eq!(canon_resp["duplicates"].as_array().unwrap().len(), 1);
         assert_eq!(canon_resp["duplicates"][0]["id"], dup_id);
 
-        // Test 4: redirect_bug
+        // Test 4: redirect_bug and /bug/<bugid>.md markdown prompt
         let no_redirect = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -4108,6 +4214,43 @@ mod tests {
             res.headers().get("location").unwrap().to_str().unwrap(),
             "/#/bug/pb-12345678"
         );
+
+        let md_res = no_redirect
+            .get(format!("http://{}/bug/linux-12345678.md", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(md_res.status(), 200);
+        assert_eq!(
+            md_res
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            md_res
+                .headers()
+                .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "nosniff"
+        );
+        let md_body = md_res.text().await.unwrap();
+        assert!(md_body.contains("# Fix Linux Kernel Bug:"));
+        assert!(md_body.contains("- **Bug ID**: `linux-12345678`"));
+        assert!(md_body.contains(&format!("Link: http://{}/#/bug/linux-12345678", addr)));
+        assert!(md_body.contains("Reported-by: Sashiko <sashiko@sashiko.dev>"));
+
+        let empty_stem = no_redirect
+            .get(format!("http://{}/bug/.md", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(empty_stem.status(), 404);
 
         // Test 5: bug_action. The security list may comment on any bug.
         let action_res = client
@@ -5279,6 +5422,30 @@ mod tests {
                     "{email} learned about {name}: {evidence}"
                 );
             }
+            let md_resp = get_bug_markdown(
+                Ok(principal.clone()),
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Query(BugQuery {
+                    id: Some(id),
+                    bugid: None,
+                    slug: None,
+                }),
+            )
+            .await
+            .unwrap();
+            let md_bytes = axum::body::to_bytes(md_resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let md_str = String::from_utf8(md_bytes.to_vec()).unwrap();
+            for name in &excluded {
+                assert!(
+                    !md_str.contains(name),
+                    "{email} learned about {name} from markdown: {md_str}"
+                );
+            }
+            assert!(!md_str.contains("candidate confidential content"));
+
             if email == "a@example.org" && id == ids[0] {
                 assert!(evidence.contains("Deduplication Check completed"));
                 let Json(enrichments) = get_bug_enrichments(
@@ -5523,6 +5690,11 @@ mod tests {
             .unwrap();
         assert_eq!(garbage.status(), 401);
 
+        let anon_md_id = get(format!("/api/bug/markdown?id={}", bug_id), None)
+            .await
+            .unwrap();
+        assert_eq!(anon_md_id.status(), 401);
+
         let anon_enrich_id = get(format!("/api/bug/enrichments?id={}", bug_id), None)
             .await
             .unwrap();
@@ -5535,6 +5707,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(denied.status(), 404);
+        let denied_md_id = get(
+            format!("/api/bug/markdown?id={}", bug_id),
+            Some(stranger.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied_md_id.status(), 404);
         let denied_enrich_id = get(
             format!("/api/bug/enrichments?id={}", bug_id),
             Some(stranger.clone()),
@@ -5574,13 +5753,26 @@ mod tests {
             };
             assert_eq!(enrich_res.status(), expected_enrich_status);
 
-            let missing_bugid = get(
-                "/api/bug?bugid=linux-does-not-exist".to_string(),
-                bearer.clone(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(missing_bugid.status(), 404);
+            for md_path in [
+                "/bug/linux-authz01.md",
+                "/api/bug/markdown?bugid=linux-authz01",
+                "/api/bug/markdown?slug=linux-authz01",
+            ] {
+                let md_res = get(md_path.to_string(), bearer.clone()).await.unwrap();
+                assert_eq!(md_res.status(), 200, "{} failed capability read", md_path);
+                let md_text = md_res.text().await.unwrap();
+                assert!(md_text.contains("`linux-authz01`"));
+                assert!(md_text.contains("Reported-by:"));
+                assert!(md_text.contains("Link:"));
+            }
+            for missing_md in [
+                "/api/bug?bugid=linux-does-not-exist",
+                "/bug/linux-does-not-exist.md",
+                "/api/bug/markdown?bugid=linux-does-not-exist",
+            ] {
+                let missing = get(missing_md.to_string(), bearer.clone()).await.unwrap();
+                assert_eq!(missing.status(), 404);
+            }
         }
 
         // Raw transcript routes remain restricted even when bugid is known.

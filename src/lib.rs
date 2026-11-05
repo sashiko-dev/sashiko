@@ -25,6 +25,8 @@ pub mod baseline;
 #[cfg(feature = "server")]
 pub mod benchmark;
 #[cfg(feature = "server")]
+pub mod bug_markdown;
+#[cfg(feature = "server")]
 pub mod compression;
 pub mod db;
 #[cfg(feature = "server")]
