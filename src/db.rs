@@ -293,6 +293,22 @@ struct BugAnalysisClaim {
     owner: String,
 }
 
+/// What [`Database::settle_panicked_patch_review`] did with the patch.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanickedPatchOutcome {
+    /// The in-flight review row was failed with the panic message.
+    FailedInFlightReview,
+    /// The review had already completed; it is kept and the patch is
+    /// marked Reviewed.
+    KeptCompletedReview,
+    /// The latest review row is missing or already ended without a
+    /// result; the patch is marked Failed.
+    NoUsableReview,
+    /// The claim was superseded by a rerun or cancellation; nothing changed.
+    Superseded,
+}
+
 /// Ownership of one patchset review attempt, fencing out stale writes if a
 /// concurrent `rerun_patchset` or `cancel_patchset` supersedes the worker.
 #[cfg(feature = "server")]
@@ -13915,6 +13931,76 @@ impl Database {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Settles a patch whose review task panicked, under the active claim.
+    ///
+    /// A panic can strike before the review row is completed or after it,
+    /// for example while queueing pre-existing bugs or notifications. An
+    /// in-flight row is failed with `reason` and the patch marked Failed; a
+    /// completed review is kept and the patch marked Reviewed so its result
+    /// is still shown and posted. Nothing changes once the claim has been
+    /// superseded.
+    pub async fn settle_panicked_patch_review(
+        &self,
+        patchset_id: i64,
+        patch_id: i64,
+        reason: &str,
+    ) -> Result<PanickedPatchOutcome> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db.is_patchset_claim_active(patchset_id).await? {
+            tx.commit().await?;
+            return Ok(PanickedPatchOutcome::Superseded);
+        }
+        let latest = {
+            let mut rows = tx_db
+                .conn
+                .query(
+                    "SELECT id, status FROM reviews
+                      WHERE patchset_id = ? AND patch_id = ?
+                      ORDER BY id DESC
+                      LIMIT 1",
+                    libsql::params![patchset_id, patch_id],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Some((row.get::<i64>(0)?, row.get::<Option<String>>(1)?)),
+                None => None,
+            }
+        };
+        let outcome = match latest {
+            Some((_, Some(status))) if status == ReviewStatus::Reviewed.as_str() => {
+                PanickedPatchOutcome::KeptCompletedReview
+            }
+            Some((review_id, Some(status))) if status == ReviewStatus::InReview.as_str() => {
+                tx_db
+                    .delete_aborted_review_children_in_tx(review_id)
+                    .await?;
+                tx_db
+                    .execute(
+                        "UPDATE reviews
+                            SET status = 'Failed',
+                                result_description = ?,
+                                interaction_id = NULL
+                          WHERE id = ?
+                            AND status = 'In Review'",
+                        libsql::params![reason, review_id],
+                    )
+                    .await?;
+                PanickedPatchOutcome::FailedInFlightReview
+            }
+            _ => PanickedPatchOutcome::NoUsableReview,
+        };
+        let patch_status = match outcome {
+            PanickedPatchOutcome::KeptCompletedReview => ReviewStatus::Reviewed,
+            _ => ReviewStatus::Failed,
+        };
+        tx_db
+            .update_patch_status(patch_id, patch_status.as_str())
+            .await?;
+        tx.commit().await?;
+        Ok(outcome)
     }
 
     pub async fn rerun_patch(&self, patchset_id: i64, _patch_id: i64) -> Result<()> {

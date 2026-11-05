@@ -1147,7 +1147,7 @@ impl Reviewer {
                                     break;
                                 }
                             }
-                            match Self::process_patch_review(
+                            match Self::process_patch_review_contained(
                                 &ctx_clone,
                                 patchset_id,
                                 job.patch_id,
@@ -1226,7 +1226,7 @@ impl Reviewer {
                         break;
                     }
                 }
-                match Self::process_patch_review(
+                match Self::process_patch_review_contained(
                     &ctx,
                     patchset_id,
                     job.patch_id,
@@ -2318,6 +2318,103 @@ impl Reviewer {
                 RelatedPreexistingMode::Disabled
             }
         }
+    }
+
+    /// Runs one patch review and turns a panic into a failure of that patch.
+    ///
+    /// The worker loops review queued patches one after another, and the
+    /// main loop runs inside the supervised patchset task. An uncontained
+    /// panic therefore abandons every patch queued behind it, and the
+    /// supervisor then fails review rows that detached workers are still
+    /// processing, with no reason recorded beyond "terminated abnormally".
+    #[allow(clippy::too_many_arguments)]
+    async fn process_patch_review_contained(
+        ctx: &ReviewContext,
+        patchset_id: i64,
+        patch_id: i64,
+        index: i64,
+        baseline_ref: &str,
+        baseline_id: Option<i64>,
+        input_payload: &Value,
+        commit_sha: Option<String>,
+        prompts_hash: Option<&str>,
+        worktree_path: Option<&Path>,
+        diff: &str,
+        embargo_until: Option<i64>,
+    ) -> Result<PatchResult> {
+        let review = Self::process_patch_review(
+            ctx,
+            patchset_id,
+            patch_id,
+            index,
+            baseline_ref,
+            baseline_id,
+            input_payload,
+            commit_sha,
+            prompts_hash,
+            worktree_path,
+            diff,
+            embargo_until,
+        );
+        Self::contain_patch_panic(&ctx.db, patchset_id, patch_id, index, review).await
+    }
+
+    /// Awaits `review`; if it panics, settles the patch's review row and
+    /// returns the panic message as an error instead of unwinding into the
+    /// caller.
+    async fn contain_patch_panic<F>(
+        db: &Database,
+        patchset_id: i64,
+        patch_id: i64,
+        index: i64,
+        review: F,
+    ) -> Result<PatchResult>
+    where
+        F: std::future::Future<Output = Result<PatchResult>>,
+    {
+        let review = std::panic::AssertUnwindSafe(review);
+        let payload = match futures_util::FutureExt::catch_unwind(review).await {
+            Ok(result) => return result,
+            Err(payload) => payload,
+        };
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "non-string panic payload".to_string());
+        drop(payload);
+        error!(
+            "Review of patch {}/{} (ID: {}) panicked: {}",
+            patchset_id, index, patch_id, message
+        );
+        let reason = format!("Review task panicked: {message}");
+        match db
+            .settle_panicked_patch_review(patchset_id, patch_id, &reason)
+            .await
+        {
+            Ok(crate::db::PanickedPatchOutcome::Superseded) => {
+                info!(
+                    "Patchset {} was cancelled or superseded before panicked patch {} was settled",
+                    patchset_id, index
+                );
+                return Ok(PatchResult::Cancelled);
+            }
+            Ok(outcome) => info!(
+                "Settled panicked patch {}/{}: {:?}",
+                patchset_id, index, outcome
+            ),
+            Err(e) => warn!(
+                "Failed to settle panicked patch {}/{}: {}",
+                patchset_id, index, e
+            ),
+        }
+        Err(anyhow::anyhow!(
+            "Review of patch {}/{} (ID: {}) panicked: {}",
+            patchset_id,
+            index,
+            patch_id,
+            message
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7693,6 +7790,155 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             &rerun_claimed.body
         ));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_contain_patch_panic_fails_only_that_patch() -> Result<()> {
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await?;
+        db.migrate().await?;
+
+        let root = "<contain-panic@example.com>";
+        let thread_id = db
+            .create_thread(root, "[PATCH] contain panic", 1000)
+            .await?;
+        db.create_message(
+            root,
+            thread_id,
+            None,
+            "Test Author <author@example.com>",
+            "[PATCH] contain panic",
+            1000,
+            "Body.",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some(root),
+                root,
+                "[PATCH] contain panic",
+                "Test Author <author@example.com>",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                Some(1),
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, root, 1, "diff --git a/a b/a")
+            .await?;
+        db.update_patch_status(patch_id, "applied").await?;
+
+        let ok = Reviewer::contain_patch_panic(&db, ps_id, patch_id, 1, async {
+            Ok(PatchResult::Success)
+        })
+        .await?;
+        assert!(matches!(ok, PatchResult::Success));
+        assert_eq!(
+            db.get_patch_statuses_for_patchset(ps_id)
+                .await?
+                .get(&patch_id),
+            Some(&"applied".to_string())
+        );
+
+        let Err(err) = Reviewer::contain_patch_panic(&db, ps_id, patch_id, 1, async {
+            panic!("bug row vanished");
+        })
+        .await
+        else {
+            panic!("a panicking review must surface as an error");
+        };
+        assert!(err.to_string().contains("bug row vanished"), "{err}");
+        assert_eq!(
+            db.get_patch_statuses_for_patchset(ps_id)
+                .await?
+                .get(&patch_id),
+            Some(&ReviewStatus::Failed.as_str().to_string())
+        );
+
+        let review_row = |id: i64| {
+            let db = &db;
+            async move {
+                let mut rows = db
+                    .conn
+                    .query(
+                        "SELECT status, result_description FROM reviews WHERE id = ?",
+                        libsql::params![id],
+                    )
+                    .await?;
+                let row = rows.next().await?.expect("review row");
+                Ok::<_, anyhow::Error>((row.get::<String>(0)?, row.get::<Option<String>>(1)?))
+            }
+        };
+
+        // A panic mid-review fails the in-flight row with the panic message.
+        let in_flight = db
+            .create_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        db.update_review_status(in_flight, ReviewStatus::InReview.as_str(), None)
+            .await?;
+        let result = Reviewer::contain_patch_panic(&db, ps_id, patch_id, 1, async {
+            panic!("mid-review");
+        })
+        .await;
+        assert!(result.is_err());
+        let (status, reason) = review_row(in_flight).await?;
+        assert_eq!(status, ReviewStatus::Failed.as_str());
+        assert_eq!(reason.as_deref(), Some("Review task panicked: mid-review"));
+        assert_eq!(
+            db.get_patch_statuses_for_patchset(ps_id)
+                .await?
+                .get(&patch_id),
+            Some(&ReviewStatus::Failed.as_str().to_string())
+        );
+
+        // A panic after the review completed keeps the review and marks the
+        // patch Reviewed, so the result is still shown and posted.
+        let completed = db
+            .create_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        db.complete_review(
+            completed,
+            ReviewStatus::Reviewed.as_str(),
+            "Review completed successfully.",
+            Some("summary"),
+            None,
+            Some("inline"),
+            None,
+        )
+        .await?;
+        let result = Reviewer::contain_patch_panic(&db, ps_id, patch_id, 1, async {
+            panic!("after completion");
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            review_row(completed).await?.0,
+            ReviewStatus::Reviewed.as_str()
+        );
+        assert_eq!(
+            db.get_patch_statuses_for_patchset(ps_id)
+                .await?
+                .get(&patch_id),
+            Some(&ReviewStatus::Reviewed.as_str().to_string())
+        );
         Ok(())
     }
 }
