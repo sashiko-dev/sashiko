@@ -1,6 +1,8 @@
 +++
 title = "Maintainer Notes and Code Notes Architecture Policy"
 paths = [
+    "projects/e2fsprogs/prompts/maintainers/",
+    "projects/e2fsprogs/prompts/notes/",
     "projects/gcc/prompts/maintainers/",
     "projects/linux/prompts/maintainers/",
     "projects/linux/prompts/notes/",
