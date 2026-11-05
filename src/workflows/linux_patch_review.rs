@@ -425,7 +425,7 @@ DISTILL, DO NOT TRANSCRIBE: The `severity_explanation`, `reasoning` and step-by-
 
 EXPLANATION SIZE: How much text a finding gets depends on how hard it is to explain, not on its severity. A critical bug can need one line; a minor race can need a diagram.
 
-PRE-EXISTING ISSUES: If any finding has `"preexisting": true`, include it in the report and state explicitly at the start of its comment that the problem was not introduced by this patch (for example: "This problem wasn't introduced by this patch, but...").
+PRE-EXISTING ISSUES: If any finding has `"preexisting": true`, place its `[Severity: <level>]` tag and comment inline right below the relevant quoted diff hunk in natural diff order (never in a separate section at the end, never with a "Related pre-existing issue" heading, and never with `> ` quoted lines inside the comment body), and state explicitly at the start of its comment that the problem was not introduced by this patch (for example: "This problem wasn't introduced by this patch, but..."). When a pre-existing finding also includes a `"bug_ref"` field (such as `"[BUG_REF]"` or `"[BUG_REF:2]"`), integrate that finding's exact `"bug_ref"` placeholder string verbatim into its opening sentence (for example: "This problem wasn't introduced by this patch, but nothing serializes [BUG_REF] ..."); do not add a footnote definition line for it at the bottom, as the mailer replaces each `"bug_ref"` placeholder and appends the bug links automatically.
 
 PRIOR-VERSION ATTRIBUTION: If a finding includes `"prior_attribution"` with an `"attribution_line"` (for example `"As reported by Dan Carpenter on v2"`), begin that finding's comment with `<attribution_line> [N], ...` integrated naturally into the opening sentence (or `<attribution_line>, ...` when `reference_url` is absent). If the finding is also pre-existing, the attribution comes first. Number footnotes sequentially (`[1]`, `[2]`, ...) across the review and list all `[N] <reference_url>` entries together at the very bottom of the entire review email after all inline comments. Print only the reviewer's display name—never include their email address (`<...>`) in the comment text. Never distinguish between findings raised by fresh analysis vs prior-feedback in the email, never credit anyone else, never credit Sashiko or earlier Sashiko reviews, and use no backticks or markdown."#;
 
@@ -1383,7 +1383,7 @@ pub fn format_post_verification_feedback(violation: &str) -> String {
     )
 }
 
-fn validate_inline_format(content: &str, _state: &LinuxPatchReviewState) -> Result<(), String> {
+fn validate_inline_format(content: &str, state: &LinuxPatchReviewState) -> Result<(), String> {
     if content.lines().any(|l| l.trim_start().starts_with("```")) {
         return Err("The output contains Markdown code blocks ('```'). It must be plain text as per `inline-template.md`.".to_string());
     }
@@ -1418,7 +1418,56 @@ fn validate_inline_format(content: &str, _state: &LinuxPatchReviewState) -> Resu
     if !has_comments {
         return Err("The output appears to lack any comments or summary. You must include a summary and interspersed comments explaining the findings.".to_string());
     }
+    for idx in 0..state.related_preexisting_reported.len() {
+        let ph = crate::related_preexisting::bug_ref_placeholder(idx);
+        let actual = content.matches(&ph).count();
+        if actual != 1 {
+            return Err(format!(
+                "The report must include the literal {} placeholder from bug_ref exactly once, integrated into the opening sentence of that related pre-existing finding (found {}).",
+                ph, actual
+            ));
+        }
+    }
+    let total_refs = content.matches("[BUG_REF").count();
+    if total_refs != state.related_preexisting_reported.len() {
+        return Err(format!(
+            "The report must contain exactly {} [BUG_REF...] placeholder(s) matching the reported related pre-existing findings (found {}).",
+            state.related_preexisting_reported.len(),
+            total_refs
+        ));
+    }
     Ok(())
+}
+
+fn align_related_preexisting_to_report_order(related: &mut [Value], report: &mut String) {
+    if related.len() < 2 {
+        return;
+    }
+    let mut order: Vec<(usize, usize)> = (0..related.len())
+        .map(|idx| {
+            let ph = crate::related_preexisting::bug_ref_placeholder(idx);
+            let pos = report.find(&ph).unwrap_or(usize::MAX);
+            (pos, idx)
+        })
+        .collect();
+    order.sort_by_key(|&(pos, idx)| (pos, idx));
+    if order
+        .iter()
+        .enumerate()
+        .all(|(new_idx, &(_, old_idx))| new_idx == old_idx)
+    {
+        return;
+    }
+    let orig: Vec<Value> = related.to_vec();
+    for (new_idx, &(_, old_idx)) in order.iter().enumerate() {
+        related[new_idx] = orig[old_idx].clone();
+        let old_ph = crate::related_preexisting::bug_ref_placeholder(old_idx);
+        *report = report.replacen(&old_ph, &format!("__SASHIKO_BUG_REF_TMP_{new_idx}__"), 1);
+    }
+    for new_idx in 0..related.len() {
+        let new_ph = crate::related_preexisting::bug_ref_placeholder(new_idx);
+        *report = report.replacen(&format!("__SASHIKO_BUG_REF_TMP_{new_idx}__"), &new_ph, 1);
+    }
 }
 
 fn format_inline_feedback(violation: &str) -> String {
@@ -3899,7 +3948,10 @@ Return raw text output, not JSON."#
             ))
             .include_file("inline-template.md")
             .with_var("findings", |s: &LinuxPatchReviewState| {
-                crate::workflows::prior_attribution::report_findings_json(&s.findings)
+                crate::workflows::prior_attribution::report_findings_with_related_json(
+                    &s.findings,
+                    &s.related_preexisting_reported,
+                )
             }),
         )
         .output_format(OutputFormat::text_with_validator(
@@ -3917,7 +3969,11 @@ Return raw text output, not JSON."#
             ..Default::default()
         })
         .skip_if(|s| s.skip_report)
-        .reduce(|state, out: String| {
+        .reduce(|state, mut out: String| {
+            align_related_preexisting_to_report_order(
+                &mut state.related_preexisting_reported,
+                &mut out,
+            );
             state.review_inline = out;
         })
         .build()
@@ -3993,7 +4049,7 @@ pub fn build_linux_patch_review_workflow_with_effort(
             ParallelPolicy::BestEffort,
         )
         .early_exit_if(
-            |s| s.findings.is_empty(),
+            |s| s.findings.is_empty() && s.related_preexisting_reported.is_empty(),
             "No findings validated in verification stages",
         )
         .resolved_parallel(
