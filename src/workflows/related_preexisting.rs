@@ -421,7 +421,7 @@ const CHECK_INSTRUCTION: &str = r#"# Check a pre-existing bug before telling the
 
 The bug under "Candidate" already existed before this patch. An earlier stage judged it closely related to the patch ("relation", "relation_reason", "cited_code"), so the review would mention it to the author in a public mailing list reply. Before that happens, answer two questions with the repository tools. The Target Commit SHA is the patched tree; use HEAD^ (or the Baseline SHA) for the code before the patch.
 
-1. Is it security-sensitive? Follow the Linux kernel security policy: a bug belongs on security@kernel.org instead of a public list only when it is plausibly exploitable by an attacker without special privileges. Answer "SecuritySensitive" when an unprivileged local user, a remote network peer, a malicious device or filesystem image, or a guest can reach and trigger it, and it gives them memory corruption (use-after-free, double free, out-of-bounds write), privilege escalation, or a leak of kernel memory or data across a privilege boundary. Answer "NotSecuritySensitive" when it is not plausibly exploitable that way, for example: only root or a process holding CAP_SYS_ADMIN or a similar administrative capability can trigger it; it is a local denial of service such as a resource leak, a hang, a WARN or an oops on a NULL pointer; it is a deadlock or data race whose timing an attacker does not control; or it is a functional bug such as a wrong return value or a missing error path that corrupts no memory. In "security_reasoning", name who can trigger the bug and what it gives them. Answer "Unknown" only when you cannot tell who can reach and trigger it.
+1. Is it security-sensitive? Follow the Linux kernel security policy and the `<kernel_threat_model>` (`Documentation/process/threat-model.rst`) when provided below: a bug belongs on security@kernel.org instead of a public list ONLY when an actor can plausibly exploit it across a guaranteed kernel security boundary. Answer "SecuritySensitive" when an unprivileged local user (including an unprivileged user namespace targeting the initial namespace), a remote network peer, a virtualization guest crossing a guest-to-host or hypervisor isolation boundary, or untrusted hardware on an IOMMU/driver path explicitly documented as hardened against hostile peripherals can reach and trigger it to obtain memory corruption (use-after-free, double free, out-of-bounds write), privilege escalation, a sensitive kernel/cross-boundary data leak, or remote/guest-to-host denial of service. Answer "NotSecuritySensitive" for regular bugs outside those boundaries—including bugs requiring root or elevated capabilities (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_SYS_RAWIO`, `CAP_SYS_MODULE`, etc.); `debugfs`, staging, experimental, or debug-only Kconfig paths; administrator-mounted corrupted or crafted filesystem images (unless the filesystem sets `FS_USERNS_MOUNT` allowing unprivileged userns mounts); physically modified or emulated non-conforming hardware outside explicitly hardened drivers/IOMMUs; local non-exploitable denial of service (bounded resource leaks, hangs, `WARN`s, clean NULL-pointer oopses); races whose timing an unprivileged attacker cannot plausibly exploit; random padding or pointer leaks with no exploit path; and ordinary functional or error-path bugs. In "security_reasoning", name who can trigger the bug, what privileges or boundary apply, and what impact it gives them. Answer "Unknown" only when you cannot tell who can reach and trigger it.
 
 2. Is it still present once this patch is applied? Read the affected code at the Target Commit SHA. Answer "StillPresent" only if the defective code is still there and still reachable, and quote it from the patched tree in "post_patch_evidence" with file and line. Answer "RemovedByPatch" if the patch deletes the code, "FixedByPatch" if the patch fixes it, "MovedOrChanged" if the patch reworks it so the report would no longer match, and "Unknown" if you cannot tell.
 
@@ -547,6 +547,26 @@ pub fn apply_disclosure_check(
     }
 }
 
+fn disclosure_check_user_prompt(candidate: &Value) -> PromptTemplate<LinuxPatchReviewState> {
+    let rendered = serde_json::to_string_pretty(candidate).unwrap_or_else(|_| "{}".to_string());
+    PromptTemplate::<LinuxPatchReviewState>::new(format!(
+        "{CHECK_INSTRUCTION}{{{{kernel_threat_model_section}}}}\n\nCandidate:\n{{{{candidate}}}}\n\n{CHECK_SCHEMA}"
+    ))
+    .with_var("kernel_threat_model_section", |s: &LinuxPatchReviewState| {
+        let block = crate::threat_model::KernelThreatModel::render_for_disclosure_check(
+            s.kernel_threat_model.as_ref(),
+        );
+        if block.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{block}")
+        }
+    })
+    .with_var("candidate", move |_: &LinuxPatchReviewState| {
+        rendered.clone()
+    })
+}
+
 fn disclosure_check_stage(
     stage_name: &'static str,
     candidate: Value,
@@ -554,13 +574,7 @@ fn disclosure_check_stage(
     temperature: f32,
     reasoning_effort: Option<crate::ai::ReasoningEffort>,
 ) -> Box<dyn ExecutableStage<LinuxPatchReviewState>> {
-    let rendered = serde_json::to_string_pretty(&candidate).unwrap_or_else(|_| "{}".to_string());
-    let user_template = PromptTemplate::<LinuxPatchReviewState>::new(format!(
-        "{CHECK_INSTRUCTION}\n\nCandidate:\n{{{{candidate}}}}\n\n{CHECK_SCHEMA}"
-    ))
-    .with_var("candidate", move |_: &LinuxPatchReviewState| {
-        rendered.clone()
-    });
+    let user_template = disclosure_check_user_prompt(&candidate);
 
     Box::new(
         Stage::builder(stage_name)
@@ -934,5 +948,40 @@ diff --git a/mm/foo.c b/mm/foo.c
         s.related_preexisting_selected = candidates;
         assert_eq!(resolve_disclosure_check_stages(&s, 5, 0.0).len(), 2);
         assert!(is_related_preexisting_stage_name(CHECK_STAGE_NAMES[1]));
+    }
+
+    #[tokio::test]
+    async fn test_disclosure_check_prompt_renders_kernel_threat_model_and_aligned_rules() {
+        let prompts_dir = std::path::Path::new("projects/linux/prompts");
+        let candidate = json!({
+            "id": "RB1",
+            "description": "mount error path leak",
+        });
+        let template = disclosure_check_user_prompt(&candidate);
+
+        let mut s = state();
+        let without = template.render_for_model(&s, prompts_dir).await.unwrap();
+        assert!(!without.contains("<kernel_threat_model source="));
+        assert!(!without.contains("{{kernel_threat_model_section}}"));
+        assert!(!without.contains("a malicious device or filesystem image"));
+        assert!(without.contains("administrator-mounted corrupted or crafted filesystem images"));
+        assert!(without.contains("FS_USERNS_MOUNT"));
+
+        s.kernel_threat_model = Some(crate::threat_model::KernelThreatModel {
+            text: "Non-conforming devices and media are outside the threat model.".to_string(),
+            commit: "05441d697f7fdeadbeefcafebabe1234567890ab".to_string(),
+            git_ref: "linus/master".to_string(),
+        });
+        let with_model = template.render_for_model(&s, prompts_dir).await.unwrap();
+        let logged = template.render_for_log(&s);
+        for text in [&with_model, &logged] {
+            assert!(text.contains(
+                "<kernel_threat_model source=\"Documentation/process/threat-model.rst @ linus/master (05441d697f7f)\">"
+            ));
+            assert!(
+                text.contains("Non-conforming devices and media are outside the threat model.")
+            );
+            assert!(!text.contains("{{kernel_threat_model_section}}"));
+        }
     }
 }
