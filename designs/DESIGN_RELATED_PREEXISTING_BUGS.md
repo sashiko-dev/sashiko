@@ -141,8 +141,8 @@ Output schema:
   corruption, privilege escalation, or a leak across a privilege boundary. Bugs only root or
   CAP_SYS_ADMIN can trigger, local denial of service (leaks, hangs, WARNs, NULL pointer oopses),
   races without an attacker-controlled trigger, and functional bugs are not security-sensitive
-  and may be reported. The prompt text lives in
-  `projects/linux/prompts/` (with a bundle test, because a missing include renders as empty).
+  and may be reported. The prompt text of both the selection and the check stages lives in
+  `src/workflows/related_preexisting.rs` as constants, not in the prompt bundle.
 - `StillPresent` requires quoting the defective code **from the post-image**.
   If the patch deletes or rewrites it, the result is `RemovedByPatch`/`FixedByPatch`, and the candidate is dropped.
 - Validator: `decision == Report` is only accepted when `post_patch_evidence` and `report_text` are filled in,
