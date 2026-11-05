@@ -54,6 +54,9 @@ impl ClassifyAiError for ReviewError {
 
 use crate::project::ProjectId;
 use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
+use crate::workflows::e2fsprogs_patch_review::{
+    build_e2fsprogs_patch_review_workflow_with_effort, e2fsprogs_system_prompt,
+};
 use crate::workflows::gcc_patch_review::{
     build_gcc_patch_review_workflow_with_effort, gcc_system_prompt,
 };
@@ -422,13 +425,15 @@ impl Worker {
         };
 
         let follow_up_series_context = match self.project {
-            ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu | ProjectId::Zephyr => {
-                build_follow_up_series_context(
-                    self.series_range.as_deref(),
-                    &patchset,
-                    &target_commit_sha,
-                )
-            }
+            ProjectId::Linux
+            | ProjectId::Gcc
+            | ProjectId::Qemu
+            | ProjectId::Zephyr
+            | ProjectId::E2fsprogs => build_follow_up_series_context(
+                self.series_range.as_deref(),
+                &patchset,
+                &target_commit_sha,
+            ),
             ProjectId::Sashiko => build_sashiko_series_context(
                 self.series_range.as_deref(),
                 &patchset,
@@ -525,6 +530,7 @@ impl Worker {
                 ProjectId::Gcc => gcc_system_prompt(true),
                 ProjectId::Qemu => qemu_system_prompt(true),
                 ProjectId::Zephyr => zephyr_system_prompt(true),
+                ProjectId::E2fsprogs => e2fsprogs_system_prompt(true),
             };
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
@@ -559,6 +565,11 @@ impl Worker {
                 self.effort,
             ),
             ProjectId::Zephyr => build_zephyr_patch_review_workflow_with_effort(
+                self.max_interactions,
+                self.temperature,
+                self.effort,
+            ),
+            ProjectId::E2fsprogs => build_e2fsprogs_patch_review_workflow_with_effort(
                 self.max_interactions,
                 self.temperature,
                 self.effort,

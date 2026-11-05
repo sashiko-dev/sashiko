@@ -42,6 +42,7 @@ pub enum ProjectId {
     Gcc,
     Qemu,
     Zephyr,
+    E2fsprogs,
 }
 
 impl ProjectId {
@@ -54,6 +55,7 @@ impl ProjectId {
             ProjectId::Gcc => "gcc",
             ProjectId::Qemu => "qemu",
             ProjectId::Zephyr => "zephyr",
+            ProjectId::E2fsprogs => "e2fsprogs",
         }
     }
 
@@ -65,13 +67,14 @@ impl ProjectId {
             ProjectId::Gcc => "GCC",
             ProjectId::Qemu => "QEMU",
             ProjectId::Zephyr => "Zephyr",
+            ProjectId::E2fsprogs => "e2fsprogs",
         }
     }
 
     /// The upstream development branch, independent of a fork's URL.
     pub fn mainline_branch(self) -> &'static str {
         match self {
-            ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu => "master",
+            ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu | ProjectId::E2fsprogs => "master",
             ProjectId::Sashiko | ProjectId::Zephyr => "main",
         }
     }
@@ -93,6 +96,11 @@ impl ProjectId {
                     || url.contains("qemu/qemu")
             }
             ProjectId::Zephyr => url.contains("zephyrproject-rtos/zephyr"),
+            ProjectId::E2fsprogs => {
+                url.contains("fs/ext2/e2fsprogs")
+                    || url.contains("tytso/e2fsprogs")
+                    || url.contains("e2fsprogs.git.sourceforge.net")
+            }
         }
     }
 
@@ -112,6 +120,7 @@ impl ProjectId {
             ProjectId::Gcc => "gcc",
             ProjectId::Qemu => "qemu",
             ProjectId::Zephyr => "zephyr",
+            ProjectId::E2fsprogs => "e2fsprogs",
         }
     }
 
@@ -122,7 +131,11 @@ impl ProjectId {
     pub fn uses_maintainers(self) -> bool {
         match self {
             ProjectId::Linux => true,
-            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu | ProjectId::Zephyr => false,
+            ProjectId::Sashiko
+            | ProjectId::Gcc
+            | ProjectId::Qemu
+            | ProjectId::Zephyr
+            | ProjectId::E2fsprogs => false,
         }
     }
 
@@ -137,9 +150,11 @@ impl ProjectId {
             ProjectId::Linux => {
                 crate::authority::TrustedBots(&["lkp@intel.com", "*@syzkaller.appspotmail.com"])
             }
-            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu | ProjectId::Zephyr => {
-                crate::authority::TrustedBots(&[])
-            }
+            ProjectId::Sashiko
+            | ProjectId::Gcc
+            | ProjectId::Qemu
+            | ProjectId::Zephyr
+            | ProjectId::E2fsprogs => crate::authority::TrustedBots(&[]),
         }
     }
 
@@ -152,6 +167,7 @@ impl ProjectId {
             ProjectId::Gcc => "projects/gcc/mailing_lists.toml",
             ProjectId::Qemu => "projects/qemu/mailing_lists.toml",
             ProjectId::Zephyr => "projects/zephyr/mailing_lists.toml",
+            ProjectId::E2fsprogs => "projects/e2fsprogs/mailing_lists.toml",
         }
     }
 
@@ -164,6 +180,7 @@ impl ProjectId {
             ProjectId::Gcc => "projects/gcc/bugs_access.toml",
             ProjectId::Qemu => "projects/qemu/bugs_access.toml",
             ProjectId::Zephyr => "projects/zephyr/bugs_access.toml",
+            ProjectId::E2fsprogs => "projects/e2fsprogs/bugs_access.toml",
         }
     }
 
@@ -194,6 +211,10 @@ impl ProjectId {
             ProjectId::Zephyr => Upstream {
                 url: "https://github.com/zephyrproject-rtos/zephyr.git",
                 seed: Seed::None,
+            },
+            ProjectId::E2fsprogs => Upstream {
+                url: "https://git.kernel.org/pub/scm/fs/ext2/e2fsprogs.git",
+                seed: Seed::Mirror("https://github.com/tytso/e2fsprogs.git"),
             },
         }
     }
@@ -241,6 +262,7 @@ impl FromStr for ProjectId {
             "gcc" => Ok(ProjectId::Gcc),
             "qemu" => Ok(ProjectId::Qemu),
             "zephyr" => Ok(ProjectId::Zephyr),
+            "e2fsprogs" => Ok(ProjectId::E2fsprogs),
             _ => Err(UnknownProject(s.to_string())),
         }
     }
@@ -280,6 +302,7 @@ impl ProjectId {
         ProjectId::Gcc,
         ProjectId::Qemu,
         ProjectId::Zephyr,
+        ProjectId::E2fsprogs,
     ];
 }
 
@@ -315,10 +338,11 @@ mod tests {
                 | ProjectId::Sashiko
                 | ProjectId::Gcc
                 | ProjectId::Qemu
-                | ProjectId::Zephyr => {}
+                | ProjectId::Zephyr
+                | ProjectId::E2fsprogs => {}
             }
         }
-        assert_eq!(ProjectId::ALL.len(), 5);
+        assert_eq!(ProjectId::ALL.len(), 6);
     }
 
     #[test]
@@ -336,6 +360,7 @@ mod tests {
         assert_eq!(ProjectId::Gcc.display_name(), "GCC");
         assert_eq!(ProjectId::Qemu.display_name(), "QEMU");
         assert_eq!(ProjectId::Zephyr.display_name(), "Zephyr");
+        assert_eq!(ProjectId::E2fsprogs.display_name(), "e2fsprogs");
     }
 
     #[test]
