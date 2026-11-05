@@ -2088,7 +2088,11 @@ impl Reviewer {
     /// for this patchset, earlier unmailed reservations of the patch are
     /// dropped instead. A failure drops them as well: the email then goes
     /// out without related bugs rather than with stale ones.
-    async fn reserve_related_preexisting(ctx: &ReviewContext, patch_msg_id: &str, review: &Value) {
+    async fn reserve_related_preexisting(
+        ctx: &ReviewContext,
+        patch_msg_id: &str,
+        review: &Value,
+    ) -> Vec<crate::db::PreexistingDisclosure> {
         let result = if ctx
             .worker_overrides
             .related_preexisting
@@ -2103,7 +2107,7 @@ impl Reviewer {
                     crate::related_preexisting::same_disclosed_bug,
                 )
                 .await
-                .map(|won| {
+                .inspect(|won| {
                     if !candidates.is_empty() {
                         info!(
                             "Reserved {} of {} related pre-existing bug(s) for {}",
@@ -2117,18 +2121,22 @@ impl Reviewer {
             ctx.db
                 .release_preexisting_reservations(patch_msg_id)
                 .await
-                .map(|_| ())
+                .map(|_| Vec::new())
         };
-        if let Err(e) = result {
-            warn!(
-                "Failed to reserve related pre-existing bugs for {}: {}",
-                patch_msg_id, e
-            );
-            if let Err(e) = ctx.db.release_preexisting_reservations(patch_msg_id).await {
+        match result {
+            Ok(won) => won,
+            Err(e) => {
                 warn!(
-                    "Failed to drop related pre-existing reservations for {}: {}",
+                    "Failed to reserve related pre-existing bugs for {}: {}",
                     patch_msg_id, e
                 );
+                if let Err(e) = ctx.db.release_preexisting_reservations(patch_msg_id).await {
+                    warn!(
+                        "Failed to drop related pre-existing reservations for {}: {}",
+                        patch_msg_id, e
+                    );
+                }
+                Vec::new()
             }
         }
     }
@@ -2767,12 +2775,78 @@ impl Reviewer {
             }
 
             match result {
-                Ok(json_output) => {
+                Ok(mut json_output) => {
                     let patches_status = json_output["patches"].as_array();
                     let target_applied = patches_status
                         .and_then(|arr| arr.iter().find(|p| p["index"] == index))
                         .map(|p| p["status"] == "applied")
                         .unwrap_or(false);
+
+                    // Reserve related pre-existing bugs before recording
+                    // ai_interactions.output_raw or completing the review: a
+                    // crash after completion would otherwise skip straight to
+                    // the idempotent notification path and lose them, and
+                    // filtering output_raw to the reserved winners keeps UI
+                    // severity counts aligned with the inline review and email.
+                    // A reservation of a review that never completes expires on
+                    // its own.
+                    let reserved_related =
+                        if target_applied && json_output["error"].as_str().is_none() {
+                            let top_inline = json_output
+                                .get("inline_review")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            if let Some(review_content) =
+                                json_output.get_mut("review").filter(|v| !v.is_null())
+                            {
+                                if let Some(inline_str) = top_inline.as_deref()
+                                    && let Some(obj) = review_content.as_object_mut()
+                                    && !obj.contains_key("review_inline")
+                                {
+                                    obj.insert(
+                                        "review_inline".to_string(),
+                                        Value::String(inline_str.to_string()),
+                                    );
+                                }
+                                let won = if let Some(patch_msg_id) = input_payload["patches"]
+                                    .as_array()
+                                    .and_then(|arr| arr.iter().find(|p| p["index"] == index))
+                                    .and_then(|p| p["message_id"].as_str())
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    let won = Self::reserve_related_preexisting(
+                                        ctx,
+                                        patch_msg_id,
+                                        review_content,
+                                    )
+                                    .await;
+                                    crate::related_preexisting::retain_reserved_disclosures(
+                                        review_content,
+                                        &won,
+                                    );
+                                    won
+                                } else {
+                                    crate::related_preexisting::retain_reserved_disclosures(
+                                        review_content,
+                                        &[],
+                                    );
+                                    Vec::new()
+                                };
+                                if let Some(updated_inline) = review_content
+                                    .get("review_inline")
+                                    .or_else(|| review_content.get("inline_review"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                {
+                                    json_output["inline_review"] = Value::String(updated_inline);
+                                }
+                                won
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
 
                     let history = json_output.get("history");
                     let logs_str = if let Some(h) = history {
@@ -2948,27 +3022,32 @@ impl Reviewer {
                                     review_content["summary"].as_str().unwrap_or("").to_string();
                                 let result_desc = "Review completed successfully.";
 
-                                let inline_review = json_output["inline_review"].as_str();
+                                let raw_inline_review = json_output["inline_review"].as_str();
+                                let has_any_findings = review_content
+                                    .get("findings")
+                                    .and_then(|f| f.as_array())
+                                    .is_some_and(|arr| !arr.is_empty());
 
-                                // Reserve related pre-existing bugs before the
-                                // review counts as complete: a crash after it
-                                // completes would otherwise skip straight to
-                                // the idempotent notification path and lose
-                                // them. A reservation of a review that never
-                                // completes expires on its own.
-                                if let Some(patch_msg_id) = input_payload["patches"]
-                                    .as_array()
-                                    .and_then(|arr| arr.iter().find(|p| p["index"] == index))
-                                    .and_then(|p| p["message_id"].as_str())
-                                    .filter(|s| !s.is_empty())
+                                let composed_inline_review = if !reserved_related.is_empty()
+                                    || raw_inline_review.is_some_and(|s| s.contains("[BUG_REF"))
                                 {
-                                    Self::reserve_related_preexisting(
-                                        ctx,
-                                        patch_msg_id,
-                                        review_content,
-                                    )
-                                    .await;
-                                }
+                                    let domain = if ctx.settings.project.domain.is_empty() {
+                                        "sashiko.dev"
+                                    } else {
+                                        ctx.settings.project.domain.as_str()
+                                    };
+                                    let (_, body) = crate::related_preexisting::compose_inline_review_with_related(
+                                        raw_inline_review.unwrap_or(""),
+                                        has_any_findings,
+                                        &reserved_related,
+                                        domain,
+                                    );
+                                    Some(body)
+                                } else {
+                                    None
+                                };
+                                let inline_review =
+                                    composed_inline_review.as_deref().or(raw_inline_review);
 
                                 // Persist the Reviewed status before queueing
                                 // pre-existing bug discoveries or notifications so
@@ -4427,11 +4506,13 @@ impl Reviewer {
                 let final_subject = format!("{}{}", subject_prefix, patch_subject);
 
                 let msg_id_clean = msg_id.trim_matches(|c| c == '<' || c == '>');
-                let (inline_body, inline_footnotes, start_ref) = if total_issues_count > 0 {
-                    crate::related_preexisting::split_inline_review_footnotes(inline_review)
-                } else {
-                    ("", Vec::new(), 1)
-                };
+                let (start_ref, body) =
+                    crate::related_preexisting::compose_inline_review_with_related(
+                        inline_review,
+                        total_issues_count > 0,
+                        &related,
+                        domain,
+                    );
 
                 let mut header = String::new();
 
@@ -4483,37 +4564,6 @@ impl Reviewer {
                 let mut footer = String::new();
 
                 footer.push_str(&format!("\n\n-- \nSashiko AI review · {}", target_url));
-
-                // Without new findings the inline review only says so, and the
-                // header already did.
-                let mut body = inline_body.to_string();
-                if !related.is_empty() {
-                    // After an inline review, a divider keeps the related notes
-                    // from reading like part of its last comment.
-                    if !body.is_empty() {
-                        body.push_str("\n\n");
-                        body.push_str(&crate::related_preexisting::related_email_divider(
-                            related.len(),
-                        ));
-                        body.push_str("\n\n");
-                    }
-                    body.push_str(&crate::related_preexisting::related_email_section_from(
-                        &related, start_ref,
-                    ));
-                }
-                let related_footnotes = crate::related_preexisting::related_email_footnotes(
-                    &related, start_ref, domain,
-                );
-                if !inline_footnotes.is_empty() || !related_footnotes.is_empty() {
-                    if !body.is_empty() {
-                        body.push_str("\n\n");
-                    }
-                    let all_footnotes: Vec<&str> = inline_footnotes
-                        .into_iter()
-                        .chain(related_footnotes.iter().map(String::as_str))
-                        .collect();
-                    body.push_str(&all_footnotes.join("\n"));
-                }
 
                 let final_body = format!("{}{}{}", header, body, footer);
 
@@ -6270,7 +6320,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             "msg_id_p3",
             "msg_id_1",
             2,
-            "inline review content",
+            "> +ret = foo_hw_init(priv);\n\n[Severity: High]\ninline review content\n\n> \treturn -EAGAIN;\n\n[Severity: High]\nThis problem wasn't introduced by this patch, but the retry path also leaks the reference.",
             Some(&findings),
             "summary",
         )
@@ -6293,11 +6343,15 @@ introduce:
 - [High] mm: refcount leak on the retry path of foo_alloc()
 --
 
+> +ret = foo_hw_init(priv);
+
+[Severity: High]
 inline review content
 
-Related pre-existing issue, not introduced by this patch:
+> \treturn -EAGAIN;
 
-The retry path also leaks the reference.
+[Severity: High]
+This problem wasn't introduced by this patch, but the retry path also leaks the reference.
 
 -- ";
         assert!(body.starts_with(expected_head), "{body}");
@@ -6305,7 +6359,8 @@ The retry path also leaks the reference.
         // When the related disclosure links to a canonical bug in the database
         // and the inline review already carries prior-version footnotes [1]..[4],
         // the related bug is numbered [5] in the header bullet, in the opening
-        // sentence of report_text, and at the end of the review after [4].
+        // sentence of the inline pre-existing comment, and at the end of the
+        // review after [4].
         db.execute(
             "INSERT INTO bugs (id, bugid, title, lifecycle_status, pipeline_state, reporter,
                                reported_at, created_at, updated_at)
@@ -6353,7 +6408,7 @@ The retry path also leaks the reference.
             "msg_id_p4",
             "msg_id_1",
             3,
-            "inline review content (previously raised in v1 [4]).\n\n[4] https://lore.kernel.org/all/prior@example.com/",
+            "> \treturn -EINVAL;\n\n[Severity: High]\nThis isn't a bug introduced by this patch, but the same missing unlock\n[BUG_REF] exists a few lines below the path you fixed.\n\n> +ret = foo_hw_init(priv);\n\n[Severity: High]\ninline review content (previously raised in v1 [4]).\n\n[4] https://lore.kernel.org/all/prior@example.com/",
             Some(&findings),
             "summary",
         )
@@ -6376,14 +6431,16 @@ introduce:
 - [High] mm: refcount leak on the retry path of foo_alloc() [5]
 --
 
-inline review content (previously raised in v1 [4]).
-
-Related pre-existing issue, not introduced by this patch:
-
-This isn't a bug introduced by this patch, but the same missing unlock
-[5] exists a few lines below the path you fixed:
-
 > \treturn -EINVAL;
+
+[Severity: High]
+This isn't a bug introduced by this patch, but the same missing unlock
+[5] exists a few lines below the path you fixed.
+
+> +ret = foo_hw_init(priv);
+
+[Severity: High]
+inline review content (previously raised in v1 [4]).
 
 [4] https://lore.kernel.org/all/prior@example.com/
 [5] https://sashiko.dev/#/bug/linux-7f9a2c4b-3e1d-4a80-9b5c-1d2e3f4a5b6c

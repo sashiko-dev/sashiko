@@ -632,7 +632,17 @@ pub fn attribution_line(attr: &PriorAttribution) -> String {
 /// attributions that fail to deserialize are removed so the report LLM never
 /// sees a Sashiko credit it could reproduce on its own initiative.
 pub fn report_findings_json(findings: &[Value]) -> String {
-    let filtered: Vec<Value> = findings
+    report_findings_with_related_json(findings, &[])
+}
+
+/// Serializes `findings` together with any disclosed `related_preexisting`
+/// items for the `report` stage so related pre-existing bugs are formatted
+/// inline under their corresponding diff hunks alongside new findings.
+pub fn report_findings_with_related_json(
+    findings: &[Value],
+    related_preexisting: &[Value],
+) -> String {
+    let mut filtered: Vec<Value> = findings
         .iter()
         .map(|finding| {
             let mut finding = finding.clone();
@@ -649,6 +659,63 @@ pub fn report_findings_json(findings: &[Value]) -> String {
             finding
         })
         .collect();
+
+    for (idx, item) in related_preexisting.iter().enumerate() {
+        let mut entry = serde_json::Map::new();
+        if let Some(id) = item.get("id") {
+            entry.insert("id".to_string(), id.clone());
+        }
+        let problem = crate::related_preexisting::problem_of(item);
+        if !problem.is_empty() {
+            entry.insert("problem".to_string(), Value::String(problem.to_string()));
+        }
+        if let Some(sev) = item.get("severity") {
+            entry.insert("severity".to_string(), sev.clone());
+        }
+        entry.insert("preexisting".to_string(), Value::Bool(true));
+        entry.insert(
+            "bug_ref".to_string(),
+            Value::String(crate::related_preexisting::bug_ref_placeholder(idx)),
+        );
+        if let Some(locs) = item.get("locations") {
+            entry.insert("locations".to_string(), locs.clone());
+        }
+        if let Some(cited) = item.get("cited_code") {
+            entry.insert("cited_code".to_string(), cited.clone());
+        }
+        if let Some(ev) = item.get("post_patch_evidence") {
+            entry.insert("post_patch_evidence".to_string(), ev.clone());
+        }
+        if let Some(rel) = item.get("relation_reason") {
+            entry.insert("relation_reason".to_string(), rel.clone());
+        }
+        if let Some(reasoning) = item.get("reasoning") {
+            entry.insert("reasoning".to_string(), reasoning.clone());
+        }
+        if let Some(note) = item
+            .get("report_text")
+            .or_else(|| item.get("severity_explanation"))
+            .and_then(Value::as_str)
+        {
+            let prose_only: String = note
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('>'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let cleaned = crate::related_preexisting::render_report_text_with_footnote(
+                prose_only.trim(),
+                None,
+            );
+            if !cleaned.trim().is_empty() {
+                entry.insert(
+                    "severity_explanation".to_string(),
+                    Value::String(cleaned.trim().to_string()),
+                );
+            }
+        }
+        filtered.push(Value::Object(entry));
+    }
+
     serde_json::to_string_pretty(&filtered).unwrap_or_default()
 }
 

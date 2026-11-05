@@ -297,6 +297,222 @@ impl RelatedPreexistingMode {
 /// reference (`[N]`) of the disclosed bug, or strips when no link is emitted.
 pub const BUG_REF_PLACEHOLDER: &str = "[BUG_REF]";
 
+/// Returns the placeholder token for the `idx`-th related pre-existing bug on a
+/// patch (`"[BUG_REF]"` for `idx == 0`, `"[BUG_REF:2]"` for `idx == 1`, etc.).
+///
+/// Note that `"[BUG_REF]"` is not a substring of `"[BUG_REF:2]"`, so each item's
+/// placeholder matches unambiguously in the `report` stage output.
+pub fn bug_ref_placeholder(idx: usize) -> String {
+    if idx == 0 {
+        BUG_REF_PLACEHOLDER.to_string()
+    } else {
+        format!("[BUG_REF:{}]", idx + 1)
+    }
+}
+
+fn strip_specific_placeholder(text: &str, placeholder: &str) -> String {
+    text.replace(&format!(" {placeholder}"), "")
+        .replace(&format!("{placeholder} "), "")
+        .replace(placeholder, "")
+}
+
+/// Strips all `[BUG_REF]` and `[BUG_REF:N]` placeholders from `text`.
+pub fn strip_all_bug_ref_placeholders(text: &str) -> String {
+    let mut out = strip_specific_placeholder(text, BUG_REF_PLACEHOLDER);
+    for idx in 1..=8 {
+        let ph = bug_ref_placeholder(idx);
+        if out.contains(&ph) {
+            out = strip_specific_placeholder(&out, &ph);
+        }
+    }
+    out
+}
+
+/// Removes the inline comment block (and its dedicated quoted diff hunk) that
+/// contains `placeholder` from `inline_review`.
+///
+/// If a dropped block's quoted hunk carried a leading `> diff --git` file
+/// header that the next kept block in the same file relies on, or if two
+/// comments shared the same quoted hunk, the needed quote lines are preserved
+/// on the next kept block. When no comment blocks remain, returns
+/// `"No issues found."`.
+pub fn remove_inline_comment_with_placeholder(inline_review: &str, placeholder: &str) -> String {
+    if !inline_review.contains(placeholder) {
+        return inline_review.to_string();
+    }
+    let (raw_body, raw_footnotes, _) = split_inline_review_footnotes(inline_review);
+    let is_quote_or_snip = |line: &str| {
+        let trimmed = line.trim();
+        trimmed.starts_with('>') || trimmed == "[ ... ]"
+    };
+    let is_severity_line = |line: &str| {
+        let trimmed = line.trim();
+        trimmed.starts_with("[Severity:") && trimmed.ends_with(']')
+    };
+
+    let all_lines: Vec<&str> = raw_body.lines().collect();
+    let Some(first_quote_idx) = all_lines
+        .iter()
+        .position(|&l| is_quote_or_snip(l) || is_severity_line(l))
+    else {
+        return strip_specific_placeholder(inline_review, placeholder);
+    };
+    let mut header_lines: Vec<&str> = all_lines[..first_quote_idx].to_vec();
+    while header_lines.last().is_some_and(|l| l.trim().is_empty()) {
+        header_lines.pop();
+    }
+
+    struct CommentUnit<'a> {
+        quote_lines: Vec<&'a str>,
+        comment_lines: Vec<&'a str>,
+    }
+
+    let mut units: Vec<CommentUnit<'_>> = Vec::new();
+    let mut cur_quote: Vec<&str> = Vec::new();
+    let mut cur_comment: Vec<&str> = Vec::new();
+    let mut in_comment = false;
+
+    for &line in &all_lines[first_quote_idx..] {
+        let trimmed = line.trim();
+        if !in_comment {
+            if is_quote_or_snip(line) || trimmed.is_empty() {
+                cur_quote.push(line);
+            } else {
+                while cur_quote.last().is_some_and(|l| l.trim().is_empty()) {
+                    cur_quote.pop();
+                }
+                in_comment = true;
+                cur_comment.push(line);
+            }
+        } else if is_quote_or_snip(line) {
+            while cur_comment.last().is_some_and(|l| l.trim().is_empty()) {
+                cur_comment.pop();
+            }
+            units.push(CommentUnit {
+                quote_lines: std::mem::take(&mut cur_quote),
+                comment_lines: std::mem::take(&mut cur_comment),
+            });
+            in_comment = false;
+            cur_quote.push(line);
+        } else if is_severity_line(line) {
+            while cur_comment.last().is_some_and(|l| l.trim().is_empty()) {
+                cur_comment.pop();
+            }
+            units.push(CommentUnit {
+                quote_lines: std::mem::take(&mut cur_quote),
+                comment_lines: std::mem::take(&mut cur_comment),
+            });
+            cur_comment.push(line);
+        } else {
+            cur_comment.push(line);
+        }
+    }
+    if !cur_comment.is_empty() {
+        while cur_comment.last().is_some_and(|l| l.trim().is_empty()) {
+            cur_comment.pop();
+        }
+        units.push(CommentUnit {
+            quote_lines: cur_quote,
+            comment_lines: cur_comment,
+        });
+    }
+
+    let extract_file_header = |quotes: &[&str]| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen_diff = false;
+        for &l in quotes {
+            let unquoted = l.trim_start().strip_prefix('>').unwrap_or(l).trim_start();
+            if unquoted.starts_with("diff --git ") {
+                seen_diff = true;
+                out.push(l.to_string());
+            } else if seen_diff
+                && (unquoted.starts_with("index ")
+                    || unquoted.starts_with("--- ")
+                    || unquoted.starts_with("+++ ")
+                    || unquoted.starts_with("new file ")
+                    || unquoted.starts_with("deleted file ")
+                    || unquoted.starts_with("similarity index ")
+                    || unquoted.starts_with("rename "))
+            {
+                out.push(l.to_string());
+            } else if seen_diff {
+                break;
+            }
+        }
+        out
+    };
+    let has_file_header = |quotes: &[&str]| -> bool {
+        quotes.iter().any(|&l| {
+            l.trim_start()
+                .strip_prefix('>')
+                .unwrap_or(l)
+                .trim_start()
+                .starts_with("diff --git ")
+        })
+    };
+
+    let mut kept_units: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    let mut carry_quote: Vec<String> = Vec::new();
+    let mut carry_file_header: Vec<String> = Vec::new();
+
+    for unit in units {
+        let mut q: Vec<String> = unit.quote_lines.into_iter().map(str::to_string).collect();
+        while q.first().is_some_and(|l| l.trim().is_empty()) {
+            q.remove(0);
+        }
+        let c: Vec<String> = unit.comment_lines.into_iter().map(str::to_string).collect();
+        let unit_matches =
+            c.iter().any(|l| l.contains(placeholder)) || q.iter().any(|l| l.contains(placeholder));
+        if unit_matches {
+            if !q.is_empty() {
+                let fh = extract_file_header(&q.iter().map(String::as_str).collect::<Vec<_>>());
+                if !fh.is_empty() {
+                    carry_file_header = fh;
+                }
+                carry_quote = q;
+            }
+        } else {
+            if q.is_empty() && !carry_quote.is_empty() {
+                q = std::mem::take(&mut carry_quote);
+                carry_file_header.clear();
+            } else {
+                carry_quote.clear();
+                let q_refs: Vec<&str> = q.iter().map(String::as_str).collect();
+                if has_file_header(&q_refs) {
+                    carry_file_header.clear();
+                } else if !carry_file_header.is_empty() {
+                    let mut merged = std::mem::take(&mut carry_file_header);
+                    merged.push(String::new());
+                    merged.extend(q);
+                    q = merged;
+                }
+            }
+            kept_units.push((q, c));
+        }
+    }
+
+    if kept_units.is_empty() {
+        return "No issues found.".to_string();
+    }
+
+    let mut sections: Vec<String> = Vec::new();
+    if !header_lines.is_empty() {
+        sections.push(header_lines.join("\n"));
+    }
+    for (q, c) in kept_units {
+        if !q.is_empty() {
+            sections.push(q.join("\n"));
+        }
+        if !c.is_empty() {
+            sections.push(c.join("\n"));
+        }
+    }
+    if !raw_footnotes.is_empty() {
+        sections.push(raw_footnotes.join("\n"));
+    }
+    sections.join("\n\n")
+}
+
 /// Replaces [`BUG_REF_PLACEHOLDER`] in `report_text` with `[n]` when a
 /// footnote number is present, or removes the placeholder when rendering
 /// without footnote links. If `report_text` lacks the placeholder and a
@@ -396,9 +612,9 @@ pub fn split_inline_review_footnotes(inline_review: &str) -> (&str, Vec<&str>, u
 pub use gate::{GateInputs, GateSkipReason, evaluate_gate};
 #[cfg(feature = "server")]
 pub use reporting::{
-    disclosure_candidates, related_email_divider, related_email_footnotes, related_email_header,
-    related_email_header_from, related_email_section, related_email_section_from,
-    same_disclosed_bug,
+    compose_inline_review_with_related, disclosure_candidates, related_email_footnotes,
+    related_email_header, related_email_header_from, related_email_section,
+    related_email_section_from, retain_reserved_disclosures, same_disclosed_bug,
 };
 
 #[cfg(feature = "server")]
@@ -514,16 +730,6 @@ mod reporting {
         )
     }
 
-    /// The line that sets the related notes apart from the inline review
-    /// when the email also carries new findings.
-    pub fn related_email_divider(n: usize) -> String {
-        if n == 1 {
-            "Related pre-existing issue, not introduced by this patch:".to_string()
-        } else {
-            "Related pre-existing issues, not introduced by this patch:".to_string()
-        }
-    }
-
     /// The opening lines of a review email that carries related bugs,
     /// wrapped at 72 columns, numbering related bug footnotes from `start_ref`.
     pub fn related_email_header_from(
@@ -592,6 +798,203 @@ mod reporting {
                 Some(format!("[{n}] https://{domain}/#/bug/{bugid}"))
             })
             .collect()
+    }
+
+    fn strip_one_placeholder(text: &str, placeholder: &str) -> String {
+        for pat in [
+            format!(" {placeholder}"),
+            format!("{placeholder} "),
+            placeholder.to_string(),
+        ] {
+            if text.contains(&pat) {
+                return text.replacen(&pat, "", 1);
+            }
+        }
+        text.to_string()
+    }
+
+    /// Filters `review["related_preexisting"]` in place to keep only the
+    /// disclosures that won reservation in `reserved`, moving any unreserved
+    /// items into `review["related_preexisting_dismissed"]` and removing their
+    /// inlined comment blocks from `review["review_inline"]` /
+    /// `review["inline_review"]` so `output_raw`, `reviews.inline_review`, and
+    /// outbound emails match the disclosures actually reserved.
+    pub fn retain_reserved_disclosures(review: &mut Value, reserved: &[PreexistingDisclosure]) {
+        let Some(obj) = review.as_object_mut() else {
+            return;
+        };
+        let Some(items) = obj
+            .get_mut("related_preexisting")
+            .and_then(Value::as_array_mut)
+        else {
+            return;
+        };
+        if items.is_empty() {
+            return;
+        }
+        let mut kept: Vec<(usize, Value)> = Vec::with_capacity(items.len());
+        let mut dropped: Vec<(usize, Value)> = Vec::new();
+        for (old_idx, mut item) in std::mem::take(items).into_iter().enumerate() {
+            let fp = BugKey::from_item(&item).fingerprint;
+            let bug_id = item.get("bug_id").and_then(Value::as_i64);
+            let is_reserved = reserved
+                .iter()
+                .any(|r| r.fingerprint == fp || (bug_id.is_some() && r.bug_id == bug_id));
+            if is_reserved {
+                kept.push((old_idx, item));
+            } else {
+                if let Some(map) = item.as_object_mut() {
+                    map.insert(
+                        "dismissed_by".to_string(),
+                        Value::String("reservation".to_string()),
+                    );
+                    map.insert(
+                        "dismissed_reason".to_string(),
+                        Value::String(
+                            "Already reserved or disclosed by another patch review.".to_string(),
+                        ),
+                    );
+                }
+                dropped.push((old_idx, item));
+            }
+        }
+        let kept_indices: Vec<usize> = kept.iter().map(|(idx, _)| *idx).collect();
+        let dropped_indices: Vec<usize> = dropped.iter().map(|(idx, _)| *idx).collect();
+        *items = kept.into_iter().map(|(_, item)| item).collect();
+        let all_related_dropped = items.is_empty() && !dropped_indices.is_empty();
+        if !dropped.is_empty() {
+            let dismissed = obj
+                .entry("related_preexisting_dismissed")
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(arr) = dismissed.as_array_mut() {
+                arr.extend(dropped.into_iter().map(|(_, item)| item));
+            }
+        }
+        if !dropped_indices.is_empty() {
+            let has_any_findings = obj
+                .get("findings")
+                .and_then(Value::as_array)
+                .is_some_and(|arr| !arr.is_empty());
+            for field in ["review_inline", "inline_review"] {
+                if let Some(text) = obj.get(field).and_then(Value::as_str).map(str::to_string) {
+                    let mut updated = if all_related_dropped && !has_any_findings {
+                        "No issues found.".to_string()
+                    } else {
+                        let mut s = text;
+                        for &d_idx in &dropped_indices {
+                            let ph = super::bug_ref_placeholder(d_idx);
+                            s = super::remove_inline_comment_with_placeholder(&s, &ph);
+                        }
+                        for (new_idx, &old_idx) in kept_indices.iter().enumerate() {
+                            if new_idx != old_idx {
+                                let old_ph = super::bug_ref_placeholder(old_idx);
+                                let new_ph = super::bug_ref_placeholder(new_idx);
+                                s = s.replace(&old_ph, &new_ph);
+                            }
+                        }
+                        s
+                    };
+                    if all_related_dropped && !has_any_findings {
+                        updated = "No issues found.".to_string();
+                    }
+                    obj.insert(field.to_string(), Value::String(updated));
+                }
+            }
+        }
+    }
+
+    /// Composes the inline review body (shared by `reviews.inline_review` and
+    /// the outbound review email body) by substituting any `[BUG_REF]` /
+    /// `[BUG_REF:N]` placeholders in `inline_review` with sequential `[N]`
+    /// footnote numbers and appending trailing
+    /// `[N] https://<domain>/#/bug/<bugid>` footnote definitions, returning
+    /// `(start_ref, composed_body)`.
+    ///
+    /// When `inline_review` is empty or `"No issues found."` (for example in
+    /// unit tests that call `queue_notifications` directly without running the
+    /// `report` stage), falls back to `related_email_section_from`. Repeated
+    /// calls on an already-composed `inline_review` are idempotent.
+    pub fn compose_inline_review_with_related(
+        inline_review: &str,
+        has_any_findings: bool,
+        rows: &[PreexistingDisclosure],
+        domain: &str,
+    ) -> (usize, String) {
+        let (raw_body, raw_footnotes, _) = super::split_inline_review_footnotes(inline_review);
+        let (kept_footnotes, start_ref) = if rows.is_empty() {
+            let max_all = raw_footnotes
+                .iter()
+                .filter_map(|line| super::parse_footnote_definition_line(line))
+                .max()
+                .unwrap_or(0);
+            (raw_footnotes, max_all + 1)
+        } else {
+            let kept: Vec<&str> = raw_footnotes
+                .into_iter()
+                .filter(|line| !line.contains("/#/bug/"))
+                .collect();
+            let max_kept = kept
+                .iter()
+                .filter_map(|line| super::parse_footnote_definition_line(line))
+                .max()
+                .unwrap_or(0);
+            (kept, max_kept + 1)
+        };
+
+        let base_body =
+            if !has_any_findings && (raw_body.is_empty() || raw_body == "No issues found.") {
+                ""
+            } else {
+                raw_body
+            };
+
+        let mut body = base_body.to_string();
+        if !rows.is_empty() {
+            if body.contains("[BUG_REF") {
+                let refs = footnote_numbers(rows, start_ref);
+                for (idx, r) in refs.iter().copied().enumerate() {
+                    let ph = super::bug_ref_placeholder(idx);
+                    match r {
+                        Some(n) => {
+                            let target = if body.contains(&ph) {
+                                ph.as_str()
+                            } else {
+                                super::BUG_REF_PLACEHOLDER
+                            };
+                            body = body.replacen(target, &format!("[{n}]"), 1);
+                        }
+                        None => {
+                            let remaining_some =
+                                refs.iter().skip(idx + 1).filter(|x| x.is_some()).count();
+                            if idx > 0 && body.contains(&ph) {
+                                body = strip_one_placeholder(&body, &ph);
+                            } else if idx == 0 && body.matches("[BUG_REF").count() > remaining_some
+                            {
+                                body = strip_one_placeholder(&body, super::BUG_REF_PLACEHOLDER);
+                            }
+                        }
+                    }
+                }
+                body = super::strip_all_bug_ref_placeholders(&body);
+            } else if body.is_empty() {
+                body = related_email_section_from(rows, start_ref);
+            }
+        } else if body.contains("[BUG_REF") {
+            body = super::strip_all_bug_ref_placeholders(&body);
+        }
+
+        let related_footnotes = related_email_footnotes(rows, start_ref, domain);
+        if !kept_footnotes.is_empty() || !related_footnotes.is_empty() {
+            if !body.is_empty() {
+                body.push_str("\n\n");
+            }
+            let all_footnotes: Vec<&str> = kept_footnotes
+                .into_iter()
+                .chain(related_footnotes.iter().map(String::as_str))
+                .collect();
+            body.push_str(&all_footnotes.join("\n"));
+        }
+        (start_ref, body)
     }
 }
 
@@ -1123,10 +1526,83 @@ rename to mm/b.c
             "{section}"
         );
         assert!(!section.contains(BUG_REF_PLACEHOLDER), "{section}");
-        let footnotes = related_email_footnotes(&[row], next_ref, "sashiko.dev");
+        let footnotes =
+            related_email_footnotes(std::slice::from_ref(&row), next_ref, "sashiko.dev");
         assert_eq!(
             footnotes,
             vec!["[5] https://sashiko.dev/#/bug/linux-7f9a2c4b-3e1d-4a80-9b5c-1d2e3f4a5b6c"]
         );
+
+        let inline_with_bug_ref = "> +buf[256] = 0;\n\n[Severity: High]\nStill buggy (raised in v1 [4]).\n\n> \treturn -EINVAL;\n\n[Severity: High]\nThis problem wasn't introduced by this patch, but the same missing unlock [BUG_REF] exists here.\n\n[4] https://lore.kernel.org/all/prior@example.com/\n";
+        let (start_ref, composed) = compose_inline_review_with_related(
+            inline_with_bug_ref,
+            true,
+            std::slice::from_ref(&row),
+            "sashiko.dev",
+        );
+        assert_eq!(start_ref, 5);
+        assert!(!composed.contains("Related pre-existing issue"));
+        assert!(!composed.contains(BUG_REF_PLACEHOLDER));
+        assert!(composed.contains("same missing unlock [5] exists here."));
+        assert!(composed.contains("[4] https://lore.kernel.org/all/prior@example.com/\n[5] https://sashiko.dev/#/bug/linux-7f9a2c4b-3e1d-4a80-9b5c-1d2e3f4a5b6c"));
+
+        // Re-composing an already-composed inline review must be idempotent.
+        let (start_ref_again, composed_again) = compose_inline_review_with_related(
+            &composed,
+            true,
+            std::slice::from_ref(&row),
+            "sashiko.dev",
+        );
+        assert_eq!(start_ref_again, 5);
+        assert_eq!(composed_again, composed);
+
+        // Without new findings and with a placeholder string, falls back to the related note and footnotes.
+        let (start_no_new, composed_no_new) = compose_inline_review_with_related(
+            "No issues found.",
+            false,
+            std::slice::from_ref(&row),
+            "sashiko.dev",
+        );
+        assert_eq!(start_no_new, 1);
+        assert!(!composed_no_new.contains("Related pre-existing issue"));
+        assert!(composed_no_new.contains("same missing unlock\n[1] exists"));
+        assert!(composed_no_new.ends_with(
+            "\n\n[1] https://sashiko.dev/#/bug/linux-7f9a2c4b-3e1d-4a80-9b5c-1d2e3f4a5b6c"
+        ));
+
+        // When row 0 has bugid: None and row 1 has bugid: Some, row 0's
+        // [BUG_REF] is stripped and row 1's [BUG_REF:2] becomes [1].
+        let mut row0_no_id = row.clone();
+        row0_no_id.bug_id = None;
+        row0_no_id.bugid = None;
+        row0_no_id.fingerprint = "fp0".to_string();
+        let two_inline = "> +a();\n\n[Severity: High]\nFirst pre-existing [BUG_REF] issue.\n\n> +b();\n\n[Severity: High]\nSecond pre-existing [BUG_REF:2] issue.";
+        let (_, composed_two) = compose_inline_review_with_related(
+            two_inline,
+            false,
+            &[row0_no_id, row.clone()],
+            "sashiko.dev",
+        );
+        assert!(composed_two.contains("First pre-existing issue."));
+        assert!(composed_two.contains("Second pre-existing [1] issue."));
+        assert!(!composed_two.contains("[BUG_REF"));
+
+        // When reservation drops the first related bug and keeps the second,
+        // retain_reserved_disclosures removes the first bug's inline comment
+        // block and renumbers the second bug's placeholder to [BUG_REF].
+        let mut review_val = json!({
+            "findings": [{"problem": "new bug", "severity": "High", "preexisting": false}],
+            "related_preexisting": [
+                {"problem": "dropped bug", "severity": "High", "locations": [{"file": "a.c"}]},
+                {"problem": "mm: lock held on the -EINVAL return", "severity": "High", "bug_id": 7, "bugid": "linux-7f9a2c4b-3e1d-4a80-9b5c-1d2e3f4a5b6c", "locations": [{"file": "mm/foo.c"}]}
+            ],
+            "review_inline": "commit 0123456789abcdef\nAuthor: A <a@b.c>\n\n> diff --git a/mm/foo.c b/mm/foo.c\n> --- a/mm/foo.c\n> +++ b/mm/foo.c\n> @@ -1,3 +1,4 @@\n> +dropped();\n\n[Severity: High]\nThis problem wasn't introduced by this patch, but dropped [BUG_REF] here.\n\n[ ... ]\n\n> @@ -10,3 +10,4 @@\n> +new_bug();\n\n[Severity: High]\nNew bug comment.\n\n[ ... ]\n\n> @@ -20,3 +20,4 @@\n> +kept();\n\n[Severity: High]\nThis problem wasn't introduced by this patch, but kept [BUG_REF:2] here."
+        });
+        retain_reserved_disclosures(&mut review_val, std::slice::from_ref(&row));
+        let inline_after = review_val["review_inline"].as_str().unwrap();
+        assert!(!inline_after.contains("dropped"));
+        assert!(inline_after.contains("> diff --git a/mm/foo.c b/mm/foo.c"));
+        assert!(inline_after.contains("New bug comment."));
+        assert!(inline_after.contains("kept [BUG_REF] here."));
     }
 }

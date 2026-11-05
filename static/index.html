@@ -2423,8 +2423,9 @@
                     if (outputJson && Array.isArray(outputJson.findings)) {
                         const isPatchset = (r.patch_id === null || r.patch_id === undefined);
                         const newCounts = countFindingsBySeverity(outputJson.findings, false);
+                        const relatedPreexisting = Array.isArray(outputJson.related_preexisting) ? outputJson.related_preexisting : [];
                         const preCounts = isPatchset ? { low: 0, medium: 0, high: 0, critical: 0 }
-                            : countFindingsBySeverity(outputJson.findings.filter(f => f.preexisting), true);
+                            : countFindingsBySeverity(outputJson.findings.filter(f => f.preexisting).concat(relatedPreexisting), true);
                         const total = newCounts.low + newCounts.medium + newCounts.high + newCounts.critical +
                             preCounts.low + preCounts.medium + preCounts.high + preCounts.critical;
 

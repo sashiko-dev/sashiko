@@ -509,7 +509,12 @@ fn extract_inline_review(patch_index: i64, output: Option<&Value>) -> Result<Opt
         .and_then(|f| f.as_array())
         .is_some_and(|findings| !findings.is_empty());
 
-    if has_findings && inline_content.is_none() {
+    let has_related_preexisting = output
+        .and_then(|out| out.get("related_preexisting"))
+        .and_then(|f| f.as_array())
+        .is_some_and(|items| !items.is_empty());
+
+    if (has_findings || has_related_preexisting) && inline_content.is_none() {
         return Err(anyhow!(
             "Review failure on patch {}: Findings detected but review_inline field was missing or empty.",
             patch_index
@@ -883,6 +888,115 @@ fn build_review_output(
     out
 }
 
+/// Deduplicates related pre-existing bugs in `res` against bugs already
+/// reported by earlier patches in `already_reported`, removing any duplicate's
+/// inlined comment block from `res["inline_review"]` and
+/// `res["review"]["review_inline"]`. When `strip_placeholders` is true
+/// (standalone CLI mode where no database footnote links are composed), also
+/// strips any remaining `[BUG_REF]` placeholders from the inline review text.
+fn dedup_series_related_preexisting(
+    res: &mut Value,
+    already_reported: &[Value],
+    strip_placeholders: bool,
+) {
+    let mut dropped_indices = Vec::new();
+    let mut kept_indices = Vec::new();
+    let mut all_dropped = false;
+    let mut has_any_findings = false;
+
+    if let Some(review_obj) = res.get_mut("review").and_then(Value::as_object_mut) {
+        has_any_findings = review_obj
+            .get("findings")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| !arr.is_empty());
+        if let Some(items) = review_obj
+            .get_mut("related_preexisting")
+            .and_then(Value::as_array_mut)
+            && !items.is_empty()
+        {
+            let mut kept = Vec::with_capacity(items.len());
+            let mut dropped = Vec::new();
+            for (old_idx, mut item) in std::mem::take(items).into_iter().enumerate() {
+                let key = crate::related_preexisting::BugKey::from_item(&item);
+                let bug_id = item.get("bug_id").and_then(Value::as_i64);
+                let is_dup = already_reported.iter().any(|prev| {
+                    let prev_key = crate::related_preexisting::BugKey::from_item(prev);
+                    let prev_bug_id = prev.get("bug_id").and_then(Value::as_i64);
+                    prev_key.is_same_bug(&key) || (bug_id.is_some() && bug_id == prev_bug_id)
+                });
+                if is_dup {
+                    if let Some(map) = item.as_object_mut() {
+                        map.insert(
+                            "dismissed_by".to_string(),
+                            Value::String("series_dedup".to_string()),
+                        );
+                        map.insert(
+                            "dismissed_reason".to_string(),
+                            Value::String(
+                                "Already reported on an earlier patch in this series.".to_string(),
+                            ),
+                        );
+                    }
+                    dropped_indices.push(old_idx);
+                    dropped.push(item);
+                } else {
+                    kept_indices.push(old_idx);
+                    kept.push(item);
+                }
+            }
+            all_dropped = kept.is_empty() && !dropped.is_empty();
+            *items = kept;
+            if !dropped.is_empty() {
+                let dismissed = review_obj
+                    .entry("related_preexisting_dismissed")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Some(arr) = dismissed.as_array_mut() {
+                    arr.extend(dropped);
+                }
+            }
+        }
+    }
+
+    let rewrite_inline = |text: &str| -> String {
+        let mut s = if all_dropped && !has_any_findings {
+            "No issues found.".to_string()
+        } else {
+            let mut cur = text.to_string();
+            for &d_idx in &dropped_indices {
+                let ph = crate::related_preexisting::bug_ref_placeholder(d_idx);
+                cur = crate::related_preexisting::remove_inline_comment_with_placeholder(&cur, &ph);
+            }
+            for (new_idx, &old_idx) in kept_indices.iter().enumerate() {
+                if new_idx != old_idx {
+                    let old_ph = crate::related_preexisting::bug_ref_placeholder(old_idx);
+                    let new_ph = crate::related_preexisting::bug_ref_placeholder(new_idx);
+                    cur = cur.replace(&old_ph, &new_ph);
+                }
+            }
+            cur
+        };
+        if strip_placeholders && s.contains("[BUG_REF") {
+            s = crate::related_preexisting::strip_all_bug_ref_placeholders(&s);
+        }
+        s
+    };
+
+    if (!dropped_indices.is_empty() || strip_placeholders)
+        && let Some(inline_str) = res
+            .get("inline_review")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    {
+        let updated = rewrite_inline(&inline_str);
+        res["inline_review"] = Value::String(updated.clone());
+        if let Some(review_obj) = res.get_mut("review").and_then(Value::as_object_mut)
+            && review_obj.contains_key("review_inline")
+        {
+            review_obj.insert("review_inline".to_string(), Value::String(updated));
+        }
+    }
+}
+
 /// Appends one patch's related pre-existing bugs (reported and dismissed)
 /// to the series-wide lists, tagged with the patch they belong to.
 fn merge_related_preexisting(
@@ -1203,7 +1317,7 @@ async fn run_worker_in_worktree(
         }
     }
 
-    for res in results {
+    for mut res in results {
         let p_idx = res["patch_index"].as_i64().unwrap_or(0);
         let history_offset = combined_history.len();
         let patch_subject = patches_to_review
@@ -1212,6 +1326,8 @@ async fn run_worker_in_worktree(
             .and_then(|p| p.subject.as_ref())
             .cloned()
             .unwrap_or_default();
+
+        dedup_series_related_preexisting(&mut res, &combined_related, patchset_id == 0);
 
         if let Some(review) = res.get("review") {
             if let Some(summary) = review.get("summary").and_then(|v| v.as_str())
