@@ -1312,9 +1312,14 @@ mod tests {
         for name in ["prior-feedback", "prior-feedback-1", "prior-feedback-4"] {
             assert!(is_known_stage(name));
             assert_eq!(stage_short_label(name), Some("Prior Feedback"));
-            assert!(crate::workflows::is_counted_stage(ProjectId::Linux, name));
-            assert!(crate::workflows::is_counted_stage(ProjectId::Sashiko, name));
-            assert!(crate::workflows::is_counted_stage(ProjectId::Gcc, name));
+            for project in [
+                ProjectId::Linux,
+                ProjectId::Sashiko,
+                ProjectId::Gcc,
+                ProjectId::E2fsprogs,
+            ] {
+                assert!(crate::workflows::is_counted_stage(project, name));
+            }
         }
         let planned =
             crate::workflows::planned_stages_from(ProjectId::Linux, &["goal", "prior-feedback"]);

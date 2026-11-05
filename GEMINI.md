@@ -57,7 +57,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `benchmark.rs`: Built-in benchmark runner, per-run database/artifact preservation, and structured AI judge telemetry (`#[cfg(feature = "server")]`).
 - `worker/`: Background workers (`bug_worker.rs`, `email.rs`, `forge.rs`, `patchwork.rs`, `repack.rs`, `sync.rs`, `prefetch.rs`, `prompts.rs`).
 - `workflow/`: Core state-machine LLM workflow engine.
-- `workflows/`: Declarative review, bug, and scan pipelines per project (`linux_patch_review.rs`, `linux_bug.rs`, `linux_scan.rs`, `sashiko_patch_review.rs`, `gcc_patch_review.rs`, `qemu_patch_review.rs`, `zephyr_patch_review.rs`), prior-version feedback auditing (`prior_feedback.rs`), shared security/normalization helpers (`guard.rs`), and the review-map lineage builder (`review_map.rs`).
+- `workflows/`: Declarative review, bug, and scan pipelines per project (`linux_patch_review.rs`, `linux_bug.rs`, `linux_scan.rs`, `sashiko_patch_review.rs`, `gcc_patch_review.rs`, `qemu_patch_review.rs`, `zephyr_patch_review.rs`, `e2fsprogs_patch_review.rs`), prior-version feedback auditing (`prior_feedback.rs`), shared security/normalization helpers (`guard.rs`), and the review-map lineage builder (`review_map.rs`).
 - `authority.rs` & `prior_context.rs`: Programmatic contributor social score engine (`ContributorAuthority`) and transport-agnostic ancestor feedback context (`PriorVersionContext`).
 - `toolbox/`: Agent tools for inspecting git repositories and worktrees.
 - `ai/`: LLM provider integrations, session runner, and response caching.
@@ -75,7 +75,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `api.rs`: Shared HTTP protocol request/response types (unconditional).
 - `server.rs`: Axum HTTP API server handlers (`#[cfg(feature = "server")]`).
 - `settings.rs`: Application settings and ACL configuration.
-- `project.rs` & `prompt_bundle.rs`: Target project profiles (`linux`, `sashiko`, `gcc`, `qemu`, `zephyr`) and prompt bundle loading.
+- `project.rs` & `prompt_bundle.rs`: Target project profiles (`linux`, `sashiko`, `gcc`, `qemu`, `zephyr`, `e2fsprogs`) and prompt bundle loading.
 - `events.rs`, `metrics.rs`, `logging.rs`, `compression.rs`, `utils.rs`: Internal event bus, metrics, logging, and utilities.
 
 ## Cargo Feature Profiles
@@ -91,6 +91,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `projects/sashiko/prompts/`: First-party review prompts for reviewing Sashiko itself (`--project sashiko`): review procedures (`*.md`), maintainer notes (`projects/sashiko/prompts/maintainers/`), and code notes (`notes/`).
 - `projects/qemu/prompts/`: QEMU pilot review prompts (`--project qemu`): review procedures (`*.md`) and maintainer notes (`maintainers/`); generated code notes (`notes/`) are not produced for QEMU yet.
 - `projects/zephyr/prompts/`: Zephyr RTOS pilot review prompts (`--project zephyr`), laid out like the QEMU prompts; each rule cites the Zephyr document or source file it comes from. See `docs/zephyr-review.md`.
+- `projects/e2fsprogs/prompts/`: The e2fsprogs review prompts (`--project e2fsprogs`): review procedures (`*.md`), maintainer notes (`maintainers/`), and code notes profile (`notes/`).
 - `static/`: Web UI assets (`static/index.html`, images).
 - `docs/`: User and operator documentation (`configuration.md`, `daemon.md`, `sashiko-cli.md`, `llm-providers.md`, `benchmarking.md`, `zephyr-review.md`, forge setup guides).
 - `designs/`: Architecture and design documents.

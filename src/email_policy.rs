@@ -1113,6 +1113,21 @@ mod tests {
         let sashiko_config = EmailPolicyConfig::load("projects/sashiko/mailing_lists.toml")
             .expect("Production projects/sashiko/mailing_lists.toml failed to parse");
         assert!(sashiko_config.tracked_nntp_groups().is_empty());
+
+        let e2fsprogs_config = EmailPolicyConfig::load("projects/e2fsprogs/mailing_lists.toml")
+            .expect("projects/e2fsprogs/mailing_lists.toml failed to parse");
+        assert_eq!(
+            e2fsprogs_config.tracked_nntp_groups(),
+            vec![(
+                "linux-ext4".to_string(),
+                "org.kernel.vger.linux-ext4".to_string(),
+            )]
+        );
+        assert!(
+            e2fsprogs_config
+                .ingest_filter_for_nntp_group("org.kernel.vger.linux-ext4")
+                .is_some()
+        );
     }
 
     /// The documented example parses, and so does every commented-out

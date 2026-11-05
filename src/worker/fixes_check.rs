@@ -1426,7 +1426,7 @@ pub async fn analyze_fixes_for_commit(
     // no proactive trailer checks (such as GCC).
     if !matches!(
         project,
-        ProjectId::Linux | ProjectId::Sashiko | ProjectId::Qemu
+        ProjectId::Linux | ProjectId::Sashiko | ProjectId::Qemu | ProjectId::E2fsprogs
     ) {
         return analysis;
     }

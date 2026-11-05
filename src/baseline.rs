@@ -525,21 +525,32 @@ impl BaselineRegistry {
         // LocalRef("HEAD") would resolve to the local checkout, which nothing
         // in Sashiko ever advances after fetching.
         if let Some((url, name)) = &self.mainline_remote {
-            candidates.push(BaselineResolution::RemoteTarget {
-                url: url.clone(),
-                name: name.clone(),
-                branch: Some(mainline_branch(self.project).to_string()),
-            });
+            let is_e2fsprogs = self.project == Some(ProjectId::E2fsprogs)
+                || (self.project.is_none() && is_e2fsprogs_project_url(url));
+            let branches: Vec<&str> = if is_e2fsprogs {
+                e2fsprogs_branch_order(subject).to_vec()
+            } else {
+                vec![mainline_branch(self.project)]
+            };
+            for branch in &branches {
+                candidates.push(BaselineResolution::RemoteTarget {
+                    url: url.clone(),
+                    name: name.clone(),
+                    branch: Some((*branch).to_string()),
+                });
+            }
             // A failed fetch or missing ref must not hide a usable mirror.
             for (mirror_url, mirror_name) in
                 ordered_mainline_remotes(&self.fetch_remotes, self.project)
             {
                 if mirror_name != name {
-                    candidates.push(BaselineResolution::RemoteTarget {
-                        url: mirror_url.clone(),
-                        name: mirror_name.clone(),
-                        branch: Some(mainline_branch(self.project).to_string()),
-                    });
+                    for branch in &branches {
+                        candidates.push(BaselineResolution::RemoteTarget {
+                            url: mirror_url.clone(),
+                            name: mirror_name.clone(),
+                            branch: Some((*branch).to_string()),
+                        });
+                    }
                 }
             }
         } else {
@@ -934,6 +945,22 @@ fn ordered_mainline_remotes(
     remotes
 }
 
+fn is_e2fsprogs_project_url(url: &str) -> bool {
+    url.to_ascii_lowercase().contains("e2fsprogs")
+}
+
+fn e2fsprogs_branch_order(subject: &str) -> [&'static str; 3] {
+    for token in crate::patch::subject_prefix_tokens(subject) {
+        if token.eq_ignore_ascii_case("next") || token.eq_ignore_ascii_case("e2fsprogs-next") {
+            return ["next", "master", "maint"];
+        }
+        if token.eq_ignore_ascii_case("maint") || token.eq_ignore_ascii_case("e2fsprogs-maint") {
+            return ["maint", "master", "next"];
+        }
+    }
+    ["master", "next", "maint"]
+}
+
 fn is_non_linux_project_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.contains("gcc.gnu.org")
@@ -943,6 +970,7 @@ fn is_non_linux_project_url(url: &str) -> bool {
         || lower.contains("qemu.org")
         || lower.contains("qemu/qemu")
         || lower.contains("zephyrproject-rtos/zephyr")
+        || lower.contains("e2fsprogs")
         || lower.contains("sashiko")
 }
 
@@ -2584,6 +2612,48 @@ F: patterns/
                 branch: Some("master".to_string()),
             }]
         );
+
+        let e2fs_url = "https://git.kernel.org/pub/scm/fs/ext2/e2fsprogs.git";
+        let e2fs_registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: repo_path.to_path_buf(),
+            project: Some(ProjectId::E2fsprogs),
+            fetch_remotes: Vec::new(),
+            mainline_remote: Some((e2fs_url.to_string(), "origin".to_string())),
+        };
+        let e2fs_default = e2fs_registry
+            .resolve_candidates(&[], "[PATCH] e2fsck: fix extent check", None)
+            .await;
+        assert_eq!(
+            e2fs_default,
+            vec![
+                BaselineResolution::RemoteTarget {
+                    url: e2fs_url.to_string(),
+                    name: "origin".to_string(),
+                    branch: Some("master".to_string()),
+                },
+                BaselineResolution::RemoteTarget {
+                    url: e2fs_url.to_string(),
+                    name: "origin".to_string(),
+                    branch: Some("next".to_string()),
+                },
+                BaselineResolution::RemoteTarget {
+                    url: e2fs_url.to_string(),
+                    name: "origin".to_string(),
+                    branch: Some("maint".to_string()),
+                },
+            ]
+        );
+        let e2fs_next = e2fs_registry
+            .resolve_candidates(&[], "[PATCH next] libext2fs: add helper", None)
+            .await;
+        assert_eq!(e2fs_next[0].as_str(), "origin/next");
+        let e2fs_maint = e2fs_registry
+            .resolve_candidates(&[], "[PATCH maint] mke2fs: backport fix", None)
+            .await;
+        assert_eq!(e2fs_maint[0].as_str(), "origin/maint");
     }
 
     #[tokio::test]
