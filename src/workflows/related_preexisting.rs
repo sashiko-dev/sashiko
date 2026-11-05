@@ -68,21 +68,37 @@ pub struct DismissedCandidate {
 
 const SELECTION_INSTRUCTION: &str = r#"# Pick related pre-existing bugs worth telling the author about
 
-The pre-existing bugs listed under "Candidates" are verified open bugs tracked in the database for the files this patch touches. None of them was introduced by this patch. The patch author will only be told about a candidate if it is clearly worth their attention in the context of THIS patch. Mentioning an unrelated bug is noise and wastes the author's time, so the default answer for every candidate is to dismiss it.
+The pre-existing bugs listed under "Candidates" are verified open bugs tracked in the database for the files this patch touches. None of them was introduced by this patch. The patch author will only be told about a candidate if it is worth their attention in the context of THIS patch. Mentioning an unrelated bug is noise and wastes the author's time, so the default answer for an unrelated candidate is to dismiss it.
 
 Select a candidate only when one of these holds, and you can cite the code that shows it:
-- "SameCode": the bug sits in code the patch modifies, or in the same function right next to the modified lines, so the author is already working there.
-- "SamePattern": the patch fixes a defect, and the candidate is the same kind of defect (same mistake, same API misuse, same missing check) in nearby or closely related code that the fix missed.
-- "Other": a comparably strong, concrete connection to what the patch does. Explain it precisely; vague topical similarity does not count.
+- "SameCode": the bug sits in a function or code block the patch modifies (not only the immediately adjacent lines, but anywhere in a modified function or its direct helper in the same file), so the author is already working in that function.{{same_code_floor_note}}
+- "SamePattern": the patch fixes a defect or updates an invariant, and the candidate is the same kind of defect (same mistake, same API misuse, same missing check or lock) in the same file that the patch missed.
+- "Other": the candidate affects the same data structure, lock, resource lifecycle, or paired operation in the same file (for example init/destroy, register/unregister, attach/detach, get/set, open/close, or sibling callbacks sharing the state the patch touches). Explain the connection precisely; vague topical similarity does not count.
 
 Dismiss a candidate when:
-- it is only loosely related (same file or subsystem but different code and a different kind of problem);
+- it is in an unrelated part of the file working on different state and a different kind of problem;{{dismiss_floor_bullet}}
 - the patch already removes, rewrites or fixes the code in question;
 - you would have to assume facts the diff and the candidate do not show.
 
 Do not give a candidate the benefit of the doubt. If you are unsure, dismiss it.
 
 You may select at most {{budget}} candidate(s). If more qualify, keep the ones most closely tied to the patch."#;
+
+fn render_selection_instruction(budget: usize, min_severity: crate::db::SeverityFloor) -> String {
+    let (same_code_floor_note, dismiss_floor_bullet) =
+        if crate::related_preexisting::same_function_severity_floor(min_severity) < min_severity {
+            (
+                " Candidates with \"Medium\" severity may ONLY be selected when \"SameCode\" holds.",
+                "\n- its severity is \"Medium\" and it does not sit in a function the patch modifies (\"SameCode\");",
+            )
+        } else {
+            ("", "")
+        };
+    SELECTION_INSTRUCTION
+        .replace("{{same_code_floor_note}}", same_code_floor_note)
+        .replace("{{dismiss_floor_bullet}}", dismiss_floor_bullet)
+        .replace("{{budget}}", &budget.to_string())
+}
 
 const SELECTION_SCHEMA: &str = r#"Return ONLY a JSON object with "selected" and "dismissed" arrays. Every candidate id MUST appear in exactly one of them.
 - Each "selected" object MUST contain: "id" (the candidate id, e.g. "RP1"), "relation" ("SameCode", "SamePattern" or "Other"), "reason" (one or two plain-text sentences explaining the connection to this patch, never using markdown backticks), and "cited_code" (the verbatim code line(s) from the diff or the candidate that show the connection).
@@ -155,6 +171,18 @@ pub fn validate_selection(
     candidates: &[Value],
     budget: usize,
 ) -> Result<(), String> {
+    validate_selection_with_floor(out, candidates, budget, crate::db::SeverityFloor::High)
+}
+
+/// Checks a selection against `candidates`, `budget`, and `min_severity`.
+/// Candidates whose severity is below `min_severity` (such as `Medium` under a
+/// `High` floor) may only be selected with `DisclosureRelation::SameCode`.
+pub fn validate_selection_with_floor(
+    out: &SelectionOutput,
+    candidates: &[Value],
+    budget: usize,
+    min_severity: crate::db::SeverityFloor,
+) -> Result<(), String> {
     let known: BTreeSet<&str> = candidates
         .iter()
         .filter_map(|c| c.get("id").and_then(Value::as_str))
@@ -197,6 +225,24 @@ pub fn validate_selection(
                 "Selected candidate {} needs a non-empty \"reason\" and \"cited_code\".",
                 s.id
             ));
+        }
+        if let Some(cand) = candidates
+            .iter()
+            .find(|c| c.get("id").and_then(Value::as_str) == Some(s.id.as_str()))
+        {
+            let sev = crate::db::Severity::from_str(
+                cand.get("severity")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+            if !min_severity.admits(sev) && s.relation != DisclosureRelation::SameCode {
+                return Err(format!(
+                    "Selected candidate {} has {} severity (below the {} floor), so it may only be selected with \"relation\": \"SameCode\" when it sits in a function the patch modifies; otherwise move it to \"dismissed\".",
+                    s.id,
+                    sev.as_str(),
+                    min_severity
+                ));
+            }
         }
     }
     for d in &out.dismissed {
@@ -255,9 +301,15 @@ fn selection_stage(
     let candidates_for_validate = candidates.clone();
     let candidates_for_reduce = candidates;
     let user_template = PromptTemplate::<LinuxPatchReviewState>::new(format!(
-        "{}\n\nCandidates:\n{{{{candidates}}}}\n\n{SELECTION_SCHEMA}",
-        SELECTION_INSTRUCTION.replace("{{budget}}", &budget.to_string())
+        "{{{{selection_instruction}}}}\n\nCandidates:\n{{{{candidates}}}}\n\n{SELECTION_SCHEMA}"
     ))
+    .with_var("selection_instruction", move |s: &LinuxPatchReviewState| {
+        let floor = s
+            .related_preexisting
+            .min_severity()
+            .unwrap_or(crate::db::SeverityFloor::High);
+        render_selection_instruction(budget, floor)
+    })
     .with_var("candidates", move |_: &LinuxPatchReviewState| {
         rendered.clone()
     });
@@ -267,8 +319,12 @@ fn selection_stage(
             .system_prompt(selection_system_prompt())
             .user_prompt(user_template)
             .output_format(OutputFormat::json().with_validator(
-                move |out: &SelectionOutput, _: &LinuxPatchReviewState| {
-                    validate_selection(out, &candidates_for_validate, budget)
+                move |out: &SelectionOutput, state: &LinuxPatchReviewState| {
+                    let floor = state
+                        .related_preexisting
+                        .min_severity()
+                        .unwrap_or(crate::db::SeverityFloor::High);
+                    validate_selection_with_floor(out, &candidates_for_validate, budget, floor)
                 },
             ))
             .policy(StagePolicy {
@@ -694,6 +750,40 @@ diff --git a/mm/foo.c b/mm/foo.c
         };
         let err = validate_selection(&empty, &candidates, 1).unwrap_err();
         assert!(err.contains("cited_code"), "{err}");
+
+        // A Medium candidate admitted under the High floor (in a modified function)
+        // may only be selected with relation "SameCode".
+        let med_candidates = vec![json!({
+            "id": "RP1",
+            "description": "medium issue in foo_probe",
+            "severity": "Medium",
+            "locations": [{"file": "mm/foo.c", "function_or_symbol": "foo_probe"}],
+        })];
+        let bad_rel = SelectionOutput {
+            selected: vec![selected("RP1")], // SamePattern
+            dismissed: vec![],
+        };
+        let err = validate_selection(&bad_rel, &med_candidates, 1).unwrap_err();
+        assert!(err.contains("SameCode"), "{err}");
+
+        let mut same_code = selected("RP1");
+        same_code.relation = DisclosureRelation::SameCode;
+        let ok_med = SelectionOutput {
+            selected: vec![same_code],
+            dismissed: vec![],
+        };
+        assert_eq!(validate_selection(&ok_med, &med_candidates, 1), Ok(()));
+
+        // When min_severity is Medium, Medium candidates may also use SamePattern/Other,
+        // and the rendered instruction omits the Medium-only-SameCode restriction.
+        assert_eq!(
+            validate_selection_with_floor(&bad_rel, &med_candidates, 1, SeverityFloor::Medium),
+            Ok(())
+        );
+        let instr_high = render_selection_instruction(2, SeverityFloor::High);
+        assert!(instr_high.contains("Candidates with \"Medium\" severity may ONLY be selected"));
+        let instr_med = render_selection_instruction(2, SeverityFloor::Medium);
+        assert!(!instr_med.contains("Candidates with \"Medium\" severity may ONLY be selected"));
     }
 
     #[test]

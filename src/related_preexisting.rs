@@ -201,6 +201,104 @@ impl PatchFiles {
     }
 }
 
+/// Collects lowercase identifier tokens per surviving file from unified diff
+/// hunk headers (`@@ ... @@ <context>`) and hunk body lines.
+fn diff_symbols_by_file(
+    diff: &str,
+    surviving: &BTreeSet<String>,
+) -> std::collections::BTreeMap<String, BTreeSet<String>> {
+    let mut by_file: std::collections::BTreeMap<String, BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    let mut current_file: Option<String> = None;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            current_file = rest
+                .rsplit_once(" b/")
+                .map(|(_, b)| b.trim().trim_matches('"').to_string())
+                .filter(|f| surviving.contains(f));
+            continue;
+        }
+        let Some(file) = current_file.as_ref() else {
+            continue;
+        };
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            continue;
+        }
+        let text = if let Some(after_at) = line.strip_prefix("@@") {
+            after_at
+                .split_once("@@")
+                .map(|(_, ctx)| ctx)
+                .unwrap_or_default()
+        } else if line.starts_with('+') || line.starts_with('-') || line.starts_with(' ') {
+            &line[1..]
+        } else {
+            continue;
+        };
+        let tokens = by_file.entry(file.clone()).or_default();
+        for tok in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+            if tok.len() >= 2 && tok.bytes().any(|b| b.is_ascii_alphabetic()) {
+                tokens.insert(tok.to_ascii_lowercase());
+            }
+        }
+    }
+    by_file
+}
+
+/// Whether any location of `concern` in a surviving file names a function or
+/// symbol that appears in that file's diff hunks.
+fn diff_touches_concern_symbol(
+    file_symbols: &std::collections::BTreeMap<String, BTreeSet<String>>,
+    concern: &Value,
+) -> bool {
+    let Some(locations) = concern.get("locations").and_then(Value::as_array) else {
+        return false;
+    };
+    for loc in locations {
+        let Some(file) = loc
+            .get("file")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let Some(symbols_in_diff) = file_symbols.get(file) else {
+            continue;
+        };
+        let Some(raw_sym) = loc
+            .get("function_or_symbol")
+            .or_else(|| loc.get("function"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let sym = normalize_symbol(raw_sym);
+        if sym.len() < 2 {
+            continue;
+        }
+        if symbols_in_diff.contains(&sym) {
+            return true;
+        }
+        if let Some((_, tail)) = sym.rsplit_once("::")
+            && tail.len() >= 3
+            && symbols_in_diff.contains(tail)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Severity floor for candidates located in a function the patch modifies:
+/// when the general floor is `High`, `Medium` bugs in a modified function are
+/// also eligible as `SameCode` candidates.
+pub fn same_function_severity_floor(min_severity: SeverityFloor) -> SeverityFloor {
+    match min_severity {
+        SeverityFloor::High => SeverityFloor::Medium,
+        other => other,
+    }
+}
+
 /// How many related bugs the review of a patch may report.
 pub fn patch_budget(diff: &str) -> usize {
     let changed = diff
@@ -218,8 +316,10 @@ pub fn patch_budget(diff: &str) -> usize {
 }
 
 /// Deterministic first cut of verified pre-existing concerns: severe
-/// enough, located in a file the patch touches and keeps, and not the same
-/// bug as one already reported (`known`) or as an earlier candidate.
+/// enough (or `Medium` when `min_severity` is `High` and the bug is in a
+/// function the diff touches), located in a file the patch touches and keeps,
+/// and not the same bug as one already reported (`known`) or as an earlier
+/// candidate.
 ///
 /// Returned candidates carry an `id` (`RP1`, `RP2`, ...) for the selection
 /// stage to cite. Lines and sides are not trusted here because concern
@@ -232,35 +332,62 @@ pub fn prefilter_candidates(
     known: &[BugKey],
 ) -> Vec<Value> {
     let files = PatchFiles::from_diff(diff);
+    let file_symbols = diff_symbols_by_file(diff, &files.surviving);
+    let same_fn_floor = same_function_severity_floor(min_severity);
     let mut accepted: Vec<BugKey> = Vec::new();
-    let mut out = Vec::new();
-    for concern in concerns {
-        let severity = Severity::from_str(
-            concern
-                .get("severity")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-        );
-        if !min_severity.admits(severity) {
-            continue;
+    let mut accepted_severities: Vec<Severity> = Vec::new();
+    let mut out: Vec<Value> = Vec::new();
+
+    // Evaluate candidates that meet `min_severity` before below-floor
+    // same-function candidates (`Medium` under `SeverityFloor::High`) so a
+    // lower-severity bug never shadows a `High` or `Critical` bug in the same
+    // function via `BugKey::is_same_bug`.
+    for below_floor_pass in [false, true] {
+        for concern in concerns {
+            let severity = Severity::from_str(
+                concern
+                    .get("severity")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+            let meets_main_floor = min_severity.admits(severity);
+            let admitted = if !below_floor_pass {
+                meets_main_floor
+            } else {
+                !meets_main_floor
+                    && same_fn_floor.admits(severity)
+                    && diff_touches_concern_symbol(&file_symbols, concern)
+            };
+            if !admitted {
+                continue;
+            }
+            let key = BugKey::from_item(concern);
+            if !key.files.iter().any(|f| files.surviving.contains(f)) {
+                continue;
+            }
+            if known.iter().any(|k| k.is_same_bug(&key)) {
+                continue;
+            }
+            if let Some(idx) = accepted.iter().position(|k| k.is_same_bug(&key)) {
+                if severity > accepted_severities[idx] {
+                    let mut candidate = concern.clone();
+                    if let Some(map) = candidate.as_object_mut() {
+                        map.insert("id".to_string(), json!(format!("RP{}", idx + 1)));
+                    }
+                    out[idx] = candidate;
+                    accepted[idx] = key;
+                    accepted_severities[idx] = severity;
+                }
+                continue;
+            }
+            let mut candidate = concern.clone();
+            if let Some(map) = candidate.as_object_mut() {
+                map.insert("id".to_string(), json!(format!("RP{}", out.len() + 1)));
+            }
+            out.push(candidate);
+            accepted.push(key);
+            accepted_severities.push(severity);
         }
-        let key = BugKey::from_item(concern);
-        if !key.files.iter().any(|f| files.surviving.contains(f)) {
-            continue;
-        }
-        if known
-            .iter()
-            .chain(accepted.iter())
-            .any(|k| k.is_same_bug(&key))
-        {
-            continue;
-        }
-        let mut candidate = concern.clone();
-        if let Some(map) = candidate.as_object_mut() {
-            map.insert("id".to_string(), json!(format!("RP{}", out.len() + 1)));
-        }
-        out.push(candidate);
-        accepted.push(key);
     }
     out
 }
@@ -1340,6 +1467,52 @@ rename to mm/b.c
             kept.iter().map(problem_of).collect::<Vec<_>>(),
             vec!["bug in the renamed file"]
         );
+
+        // Medium severity is admitted under High floor when its symbol appears in the diff.
+        let same_fn_medium = vec![
+            concern(
+                "medium bug in modified function",
+                "Medium",
+                "mm/foo.c",
+                "foo",
+            ),
+            concern(
+                "medium bug in untouched function",
+                "Medium",
+                "mm/foo.c",
+                "foo_other",
+            ),
+        ];
+        let kept_med = prefilter_candidates(&same_fn_medium, DIFF, SeverityFloor::High, &[]);
+        assert_eq!(
+            kept_med.iter().map(problem_of).collect::<Vec<_>>(),
+            vec!["medium bug in modified function"]
+        );
+        // Under Critical floor, Medium in the same function is still filtered out.
+        assert!(
+            prefilter_candidates(&same_fn_medium, DIFF, SeverityFloor::Critical, &[]).is_empty()
+        );
+
+        // An earlier Medium bug in the same function never shadows a later High
+        // or Critical bug in that function, under either High or Medium floor.
+        let medium_before_high = vec![
+            concern("earlier medium bug in foo", "Medium", "mm/foo.c", "foo"),
+            concern("later high bug in foo", "High", "mm/foo.c", "foo"),
+        ];
+        let kept_high_floor =
+            prefilter_candidates(&medium_before_high, DIFF, SeverityFloor::High, &[]);
+        assert_eq!(
+            kept_high_floor.iter().map(problem_of).collect::<Vec<_>>(),
+            vec!["later high bug in foo"]
+        );
+        assert_eq!(kept_high_floor[0]["id"], "RP1");
+        let kept_med_floor =
+            prefilter_candidates(&medium_before_high, DIFF, SeverityFloor::Medium, &[]);
+        assert_eq!(
+            kept_med_floor.iter().map(problem_of).collect::<Vec<_>>(),
+            vec!["later high bug in foo"]
+        );
+        assert_eq!(kept_med_floor[0]["id"], "RP1");
     }
 
     #[cfg(feature = "server")]
