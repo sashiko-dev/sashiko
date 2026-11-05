@@ -1807,8 +1807,8 @@ pub async fn process_issue_for_project(
         duplicate_of_id: None,
         subsystems: initial_subsystems,
     };
-    let id = db
-        .create_bug_with_enrichment(
+    let bug = db
+        .create_bug_with_enrichment_returning(
             &new_bug,
             Some(&crate::db::NewBugEnrichment {
                 kind: "candidate".to_string(),
@@ -1822,8 +1822,7 @@ pub async fn process_issue_for_project(
             }),
         )
         .await?;
-    info!("Queued raw bug {} for asynchronous processing", id);
-    let bug = db.get_bug(id).await?.unwrap();
+    info!("Queued raw bug {} for asynchronous processing", bug.id);
     Ok(BugOutcome::NewlyDiscovered { bug })
 }
 
