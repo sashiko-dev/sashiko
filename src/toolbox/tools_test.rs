@@ -666,6 +666,21 @@ mod tests {
                 toolbox.call("git_show", json!({ "object": "HEAD", "paths": [bad_path] })),
             );
             assert!(res.is_err(), "git_show paths should reject {bad_path}");
+
+            // 8a. git_log with paths filter
+            let res = rt
+                .block_on(toolbox.call("git_log", json!({ "range": "HEAD", "paths": [bad_path] })));
+            assert!(res.is_err(), "git_log paths should reject {bad_path}");
+
+            // 8b. git_log with line_range path
+            let res = rt.block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "line_range": { "path": bad_path, "start_line": 1, "end_line": 5 }
+                }),
+            ));
+            assert!(res.is_err(), "git_log line_range should reject {bad_path}");
         }
     }
 
@@ -726,6 +741,181 @@ mod tests {
             ))
             .unwrap();
         assert!(show_res.as_str().unwrap().contains("1: int old_func"));
+
+        // git_log on historical deleted path finds both addition and deletion commits
+        let log_res = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "paths": ["deleted_dir/sub/file.c"],
+                    "oneline": true
+                }),
+            ))
+            .unwrap();
+        let log_text = log_res.as_str().unwrap();
+        assert!(log_text.contains("Add nested file"));
+        assert!(log_text.contains("Remove nested dir"));
+    }
+
+    #[test]
+    fn test_git_log_paths_line_range_and_pickaxe() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path().to_path_buf();
+
+        let run_git = |args: &[&str]| {
+            let status = crate::git_cmd::in_dir(&repo_path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test User"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+
+        std::fs::write(
+            repo_path.join("alpha.c"),
+            "int compute_val(int x)\n{\n    return x + 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(repo_path.join("beta.c"), "int beta(void) { return 0; }\n").unwrap();
+        run_git(&["add", "alpha.c", "beta.c"]);
+        run_git(&["commit", "-m", "Add alpha and beta"]);
+
+        std::fs::write(
+            repo_path.join("alpha.c"),
+            "int compute_val(int x)\n{\n    if (x < 0)\n        return -EINVAL;\n    return x + 2;\n}\n",
+        )
+        .unwrap();
+        run_git(&["add", "alpha.c"]);
+        run_git(&["commit", "-m", "Handle negative input in compute_val"]);
+
+        std::fs::write(repo_path.join("beta.c"), "int beta(void) { return 99; }\n").unwrap();
+        run_git(&["add", "beta.c"]);
+        run_git(&["commit", "-m", "Update beta return value"]);
+
+        let toolbox = ToolBox::new(repo_path);
+        let rt = Runtime::new().unwrap();
+
+        // 1. Path filtering isolates alpha.c commits from beta-only commits
+        let by_path = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({ "range": "HEAD", "paths": ["alpha.c"], "oneline": true }),
+            ))
+            .unwrap();
+        let by_path_text = by_path.as_str().unwrap();
+        assert!(by_path_text.contains("Handle negative input in compute_val"));
+        assert!(!by_path_text.contains("Update beta return value"));
+
+        // 2. Pickaxe (-S) with a leading hyphen ("-EINVAL") must not be parsed as a git flag
+        let pickaxe_s = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({ "range": "HEAD", "pickaxe": "-EINVAL", "oneline": true }),
+            ))
+            .unwrap();
+        let pickaxe_s_text = pickaxe_s.as_str().unwrap();
+        assert!(pickaxe_s_text.contains("Handle negative input in compute_val"));
+        assert!(!pickaxe_s_text.contains("Add alpha and beta"));
+
+        // 3. Regex pickaxe (-G)
+        let pickaxe_g = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "pickaxe": "return [0-9]{2};",
+                    "pickaxe_regex": true,
+                    "oneline": true
+                }),
+            ))
+            .unwrap();
+        assert!(
+            pickaxe_g
+                .as_str()
+                .unwrap()
+                .contains("Update beta return value")
+        );
+
+        // 4. Line evolution (-L start,end:path) and redundant matching paths tolerance
+        let line_hist = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "paths": ["alpha.c"],
+                    "line_range": { "path": "alpha.c", "start_line": 1, "end_line": 6 }
+                }),
+            ))
+            .unwrap();
+        let line_hist_text = line_hist.as_str().unwrap();
+        assert!(line_hist_text.contains("Handle negative input in compute_val"));
+        assert!(line_hist_text.contains("-    return x + 1;"));
+
+        // 5. Symbol evolution (-L :symbol:path) on C top-level function
+        let sym_hist = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "line_range": { "path": "alpha.c", "symbol": "compute_val" }
+                }),
+            ))
+            .unwrap();
+        assert!(
+            sym_hist
+                .as_str()
+                .unwrap()
+                .contains("Handle negative input in compute_val")
+        );
+
+        // 6. Conflicting paths alongside line_range and unsafe symbol injection are rejected
+        assert!(
+            rt.block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "paths": ["beta.c"],
+                    "line_range": { "path": "alpha.c", "start_line": 1, "end_line": 2 }
+                }),
+            ))
+            .is_err()
+        );
+        assert!(
+            rt.block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "line_range": { "path": "alpha.c", "symbol": "bad:inject" }
+                }),
+            ))
+            .is_err()
+        );
+
+        // 7. normalize_args canonicalizes omitted vs explicit default parameters to one cache key
+        let count_before = toolbox.cache.read().unwrap().len();
+        let _ = rt
+            .block_on(toolbox.call("git_log", json!({ "range": "HEAD" })))
+            .unwrap();
+        let count_after_first = toolbox.cache.read().unwrap().len();
+        assert_eq!(count_after_first, count_before + 1);
+        let _ = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "limit": 10,
+                    "paths": [],
+                    "pickaxe": "",
+                    "pickaxe_regex": false,
+                    "oneline": false
+                }),
+            ))
+            .unwrap();
+        assert_eq!(toolbox.cache.read().unwrap().len(), count_after_first);
     }
 
     #[test]
