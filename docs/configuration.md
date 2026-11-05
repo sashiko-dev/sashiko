@@ -482,7 +482,7 @@ Controls which mailing lists Sashiko tracks via NNTP, embargo delays, how Sashik
 | `defaults.ignored_emails` | list | `[]` | Author addresses whose patches are skipped at ingestion, so they are never reviewed or mailed. Matched as case-insensitive substrings of the author address. |
 | `defaults.patchwork` | table | disabled | Patchwork settings (same keys as `patchwork.*` below) for patches that match no list section. |
 | `defaults.related_preexisting.enabled` | bool | `true` | Whether reviews of the first non-RFC posting of a series (an RFC never reports, and neither does a later round) mention a pre-existing bug that sits in the code the patch touches or repeats the defect it fixes. Only Linux reviews do this. At most one such bug is mentioned for small patches and two for larger ones, only after a check that it is not security-sensitive and is still present with the patch applied, and each bug is mentioned at most once across all reviews. See [designs/DESIGN_RELATED_PREEXISTING_BUGS.md](../designs/DESIGN_RELATED_PREEXISTING_BUGS.md). |
-| `defaults.related_preexisting.min_severity` | string | `"high"` | Lowest severity of such a bug: `"low"`, `"medium"`, `"high"` or `"critical"` (case-insensitive). |
+| `defaults.related_preexisting.min_severity` | string | `"medium"` | Lowest severity of such a bug: `"low"`, `"medium"`, `"high"` or `"critical"` (case-insensitive). |
 
 Each mailing list is configured as a `["<list-email>"]` table (e.g. `["bpf@vger.kernel.org"]`). Omitted fields inherit from `[defaults]`. Each mailing list section accepts:
 

@@ -14,7 +14,7 @@ filters them out. This feature mentions a pre-existing bug **only when it is cle
 | R4 | Proportionate | Budget based on patch size, hard cap of 2 |
 | R5 | Not security-sensitive, and still present once the patch is applied | Per-candidate **disclosure check** stage, with tools, on the patched tree |
 | R6 | Report once; record when and with which patch | New `preexisting_disclosures` table |
-| R7 | Configurable severity floor, High+ by default | `related_preexisting.min_severity` policy knob |
+| R7 | Configurable severity floor, Medium+ by default | `related_preexisting.min_severity` policy knob |
 
 ## 2. Relevant current-state facts
 
@@ -88,7 +88,7 @@ Per mailing list, at least for now:
 ```toml
 [defaults.related_preexisting]
 enabled = true
-min_severity = "high"      # low | medium | high | critical
+min_severity = "medium"    # low | medium | high | critical
 
 ["netdev@vger.kernel.org".related_preexisting]
 enabled = false

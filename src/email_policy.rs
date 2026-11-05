@@ -120,7 +120,7 @@ pub struct RelatedPreexistingPolicy {
 }
 
 fn default_related_preexisting_min_severity() -> SeverityFloor {
-    SeverityFloor::High
+    SeverityFloor::Medium
 }
 
 impl Default for RelatedPreexistingPolicy {
@@ -539,7 +539,7 @@ mod tests {
         let resolved = config.related_preexisting_for(["Dev <dev@example.org>"]);
         assert_eq!(resolved, RelatedPreexistingPolicy::default());
         assert!(resolved.enabled);
-        assert_eq!(resolved.min_severity, SeverityFloor::High);
+        assert_eq!(resolved.min_severity, SeverityFloor::Medium);
     }
 
     #[test]
