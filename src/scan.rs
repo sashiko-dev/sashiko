@@ -21,13 +21,16 @@ use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Node, Parser};
 
 /// Files up to this line count are audited as a single chunk without splitting.
-pub const SINGLE_CHUNK_MAX_LINES: usize = 800;
+pub const SINGLE_CHUNK_MAX_LINES: usize = 500;
 
 /// Soft target line count when grouping consecutive functions into a chunk.
-pub const TARGET_CHUNK_LINES: usize = 600;
+pub const TARGET_CHUNK_LINES: usize = 400;
 
 /// Hard upper bound when extending a chunk to keep mutually-calling functions together.
-pub const MAX_CHUNK_LINES: usize = 900;
+pub const MAX_CHUNK_LINES: usize = 650;
+
+/// Maximum number of functions rendered in the per-file outline before summarizing.
+const MAX_INDEXED_FUNCTIONS: usize = 80;
 
 /// Line overlap when splitting a single giant function that exceeds `MAX_CHUNK_LINES`.
 pub const GIANT_FUNCTION_OVERLAP_LINES: usize = 50;
@@ -675,7 +678,28 @@ fn format_function_index(
         "{file_path} ({total_lines} lines, {} functions):\n",
         functions.len()
     );
-    for f in functions {
+    let shown: Vec<&FunctionSpan> = if functions.len() <= MAX_INDEXED_FUNCTIONS {
+        functions.iter().collect()
+    } else {
+        let mut selected: Vec<&FunctionSpan> = functions
+            .iter()
+            .filter(|f| !f.risk_signals.is_empty())
+            .take(MAX_INDEXED_FUNCTIONS)
+            .collect();
+        if selected.len() < MAX_INDEXED_FUNCTIONS {
+            for f in functions {
+                if selected.len() >= MAX_INDEXED_FUNCTIONS {
+                    break;
+                }
+                if f.risk_signals.is_empty() {
+                    selected.push(f);
+                }
+            }
+            selected.sort_by_key(|f| f.start_line);
+        }
+        selected
+    };
+    for f in &shown {
         let signals = if f.risk_signals.is_empty() {
             String::new()
         } else {
@@ -684,6 +708,12 @@ fn format_function_index(
         out.push_str(&format!(
             "- {}() [lines {}-{}]{}\n",
             f.name, f.start_line, f.end_line, signals
+        ));
+    }
+    if functions.len() > shown.len() {
+        out.push_str(&format!(
+            "... and {} more functions in {file_path} (use git_grep / git_read_files to inspect)\n",
+            functions.len() - shown.len()
         ));
     }
     out
@@ -917,9 +947,35 @@ fn detect_risk_signals(body_text: &str) -> Vec<String> {
                 "queue_delayed_work",
                 "cancel_work_sync",
                 "cancel_delayed_work_sync",
+                "irq_work_queue",
+                "irq_work_sync",
                 "mod_timer",
                 "del_timer_sync",
                 "timer_delete_sync",
+                "timer_shutdown_sync",
+            ],
+        ),
+        (
+            "xarray_idr",
+            &[
+                "xa_store",
+                "xas_store",
+                "xas_nomem",
+                "xa_destroy",
+                "idr_alloc",
+                "ida_alloc",
+            ],
+        ),
+        (
+            "cgroup_kernfs",
+            &[
+                "css_free",
+                "css_released",
+                "css_offline",
+                "percpu_ref_",
+                "kernfs_break_active_protection",
+                "__GFP_ACCOUNT",
+                "XA_FLAGS_ACCOUNT",
             ],
         ),
         (
