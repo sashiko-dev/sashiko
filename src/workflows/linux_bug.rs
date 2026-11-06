@@ -2835,6 +2835,23 @@ async fn load_maintainers_for_bug_pipeline(
 /// `VerifySession` -> `TracingSession` -> `SeveritySession`) without a database
 /// or LKML `ReportSession`, returning structured verified bug metadata for
 /// standalone CLI tools such as `sashiko scan`.
+async fn load_linux_threat_model(
+    repo_path: &std::path::Path,
+    fallback_commit: &str,
+) -> Option<crate::threat_model::KernelThreatModel> {
+    if let Some(tm) = crate::threat_model::KernelThreatModel::load(repo_path).await {
+        return Some(tm);
+    }
+    crate::threat_model::KernelThreatModel::load_from_ref(
+        repo_path,
+        &crate::threat_model::MainlineRef {
+            git_ref: "HEAD".to_string(),
+            commit: fallback_commit.to_string(),
+        },
+    )
+    .await
+}
+
 pub async fn run_standalone_bug_pipeline_for_project(
     provider: &dyn AiProvider,
     tools: Option<Arc<ToolBox>>,
@@ -3108,7 +3125,7 @@ pub async fn run_standalone_bug_pipeline_with_min_severity(
     };
     let kernel_threat_model = if project == ProjectId::Linux {
         match tools.as_ref() {
-            Some(tb) => crate::threat_model::KernelThreatModel::load(tb.get_worktree_path()).await,
+            Some(tb) => load_linux_threat_model(tb.get_worktree_path(), &master_sha).await,
             None => None,
         }
     } else {
@@ -3715,7 +3732,7 @@ pub async fn process_issue_worker_with_min_severity(
     };
     let kernel_threat_model = if project == ProjectId::Linux {
         match tools.as_ref() {
-            Some(tb) => crate::threat_model::KernelThreatModel::load(tb.get_worktree_path()).await,
+            Some(tb) => load_linux_threat_model(tb.get_worktree_path(), &master_sha).await,
             None => None,
         }
     } else {
