@@ -157,3 +157,10 @@ fix_check_enabled = false
 # fix_check_interval_seconds = 21600
 # Maximum number of open bugs evaluated per upstream fix check cycle.
 # fix_check_batch_size = 50
+# Evaluate canonical bugs for security importance (CVSS v4.0 + threat model)
+# on discovery and via periodic background backfill sweeps.
+# security_eval_enabled = true
+# Seconds between periodic security evaluation backfill sweeps (0 = disabled).
+# security_eval_interval_seconds = 60
+# Maximum number of bugs evaluated per periodic security evaluation cycle.
+# security_eval_batch_size = 25

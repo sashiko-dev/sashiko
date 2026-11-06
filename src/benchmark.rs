@@ -1271,6 +1271,7 @@ fn configure_benchmark_settings(
         settings.review.concurrency = concurrency.max(1);
     }
     settings.linux_bug.enabled = report_preexisting;
+    settings.linux_bug.security_eval_enabled = false;
     // Outbound notifications are never sent during a benchmark run.
     settings.smtp = None;
     settings.forge.enabled = false;
