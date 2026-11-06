@@ -35,11 +35,24 @@ cargo run --bin sashiko -- benchmark projects/linux/benchmarks/benchmark_tiny.js
 | `projects/linux/benchmarks/benchmark_arm64.json` | arm64 core (non-KVM) bugs fixed in 2026, checked the same way (62 entries). |
 | `projects/linux/benchmarks/benchmark_preexisting.json` | Tests detection of pre-existing bugs. |
 | `projects/linux/benchmarks/benchmark_versioned.json` | Multi-version LKML patchset stories (`v1..vN`) testing prior-feedback verification, reviewer attribution, and false-positive suppression. |
+| `projects/linux/benchmarks/benchmark_scan.json` | Single-file active codebase scan benchmark (`scan_corpus.c`, 32 entries: 26 minted historical kernel bugs across 9 categories + 6 clean false-positive traps) evaluated in one `sashiko scan` pass. |
 
 Each file contains entries with a `Commit` hash (or target patch `Message-ID` for
-versioned mbox entries), an optional `Fixed-by` reference, an optional
-`Subsystem`, and a `problem_description` that the AI judge uses to evaluate
-whether Sashiko detected (or properly suppressed) the issue.
+versioned mbox entries, or logical scan target key for active scan entries), an
+optional `Fixed-by` reference, an optional `Subsystem`, and a
+`problem_description` that the AI judge uses to evaluate whether Sashiko
+detected (or properly suppressed) the issue.
+
+Active scan benchmark entries additionally specify `scan_paths` (repository-relative
+files or directories passed to `sashiko scan`), an optional `scan_fixture` (a file
+or directory relative to the benchmark JSON file that is provisioned into an
+isolated temporary git worktree so the suite runs without an external checkout),
+an optional `scan_ref` git revision (defaulting to `HEAD`), and an optional
+`target_function` symbol anchor. Entries sharing the same `Commit` identifier
+must specify identical scan targets and share a single `sashiko scan` execution,
+allowing one multi-chunk file scan to be scored against many per-function bug
+and false-positive-trap ground-truth entries using the same strict detection and
+suppression denominators as versioned suites.
 
 Versioned benchmark entries may additionally specify `mbox_archive` (a
 `.jsonl.gz` fixture bundle), `ancestor_mboxes` (`v1..v(N-1)` mbox threads with

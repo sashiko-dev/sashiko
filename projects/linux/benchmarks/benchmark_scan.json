@@ -1,0 +1,418 @@
+[
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-01-uaf-nfc-workqueue-rfkill",
+        "category": "use_after_free",
+        "subsystem": "nfc",
+        "Fixed-by": "d2492688bb9fed6ab6e313682c387ae71a66ebae",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_nci_unregister_device",
+        "problem_description": "Use-after-free in kcorp_nci_unregister_device(): ndev->cmd_wq is destroyed via destroy_workqueue() before kcorp_rfkill_unregister(ndev->rfk) runs, whose synchronous set_block callback invokes kcorp_nci_close_device() and queues close_work onto the destroyed cmd_wq."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-02-uaf-cgroup-dmem-pool",
+        "category": "use_after_free",
+        "subsystem": "cgroup",
+        "Fixed-by": "99a2ef500906138ba58093b9893972a5c303c734",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_dmem_unregister_region",
+        "problem_description": "Use-after-free in kcorp_dmem_unregister_region(): dmem pools on region->pools are unconditionally freed with kfree(pool) even while active_charges > 0, so outstanding kcorp_dmem_charge_handle holders later dereference freed pool memory in kcorp_dmem_uncharge_pool()."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-03-uaf-xe-pci-put-before-log",
+        "category": "use_after_free",
+        "subsystem": "drm/xe",
+        "Fixed-by": "c1ed856c09d0d730c2f63bbb757cb6011db148f9",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_xe_pci_check_bound",
+        "problem_description": "Use-after-free in kcorp_xe_pci_check_bound(): pdev->slot_name and pdev->bdf are dereferenced in kcorp_pci_dbg_emit() after kcorp_pci_dev_put(pdev) has already dropped the reference and freed pdev."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-04-uaf-bonding-enslave-rollback",
+        "category": "use_after_free",
+        "subsystem": "bonding",
+        "Fixed-by": "e9acda52fd2ee0cdca332f996da7a95c5fd25294",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_bond_enslave_port",
+        "problem_description": "Use-after-free in kcorp_bond_enslave_port(): new_slave is appended to bond->slaves[bond->slave_cnt++] before slave_dev->ndo_open() is called, and when ndo_open() fails new_slave is kfree()d without removing it from bond->slaves[], leaving a dangling pointer used by kcorp_bond_xmit_roundrobin()."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-05-uaf-gpio-unlock-after-free",
+        "category": "use_after_free",
+        "subsystem": "gpio",
+        "Fixed-by": "53ad4a948a4586359b841d607c08fb16c5503230",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_gpio_sim_item_release",
+        "problem_description": "Use-after-free in kcorp_gpio_sim_item_release(): mutex_unlock(&vdev->lock) is called after kfree(vdev) has already freed the vdev structure containing lock."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-06-dfree-xe-auxdev-add-err",
+        "category": "double_free",
+        "subsystem": "drm/xe",
+        "Fixed-by": "8a44241b0b83a6047c5448da1fff03fcc29496b5",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_xe_nvm_aux_init",
+        "problem_description": "Double-free of nvm in kcorp_xe_nvm_aux_init(): when kcorp_aux_device_add(&nvm->aux) fails, kcorp_aux_device_uninit(&nvm->aux) invokes kcorp_xe_nvm_aux_release() which kfree()s nvm, and the error path then calls kfree(nvm) a second time."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-07-dfree-net-devm-clk-remove",
+        "category": "double_free",
+        "subsystem": "net",
+        "Fixed-by": "2aa1545ba8d4801fba5be83a404e28014b80196a",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_eth_mac_remove",
+        "problem_description": "Double clock disable in kcorp_eth_mac_remove(): tx_clk was acquired via kcorp_devm_clk_get_enabled() which registers kcorp_devm_clk_action_cb() to disable and free tx_clk during detach, yet kcorp_eth_mac_remove() also manually calls kcorp_clk_disable_unprepare(priv->tx_clk) beforehand."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-08-rcu-9p-kill-super-grace",
+        "category": "rcu_lifetime",
+        "subsystem": "fs/9p",
+        "Fixed-by": "bcec7fc2e224088daf94448d663b02e0d0b9c717",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_v9fs_kill_super",
+        "problem_description": "RCU use-after-free in kcorp_v9fs_kill_super(): v9ses and v9ses->aname are freed immediately via kfree() without waiting for an RCU grace period (synchronize_rcu or call_rcu_free) while concurrent RCU readers in kcorp_v9fs_vfs_get_link_rcu() still access dentry->v9ses."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-09-rcu-cgroup-missing-read-lock",
+        "category": "rcu_lifetime",
+        "subsystem": "cgroup",
+        "Fixed-by": "592a68212c5664bcaa88f24ed80bf791282790fe",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_dmem_fold_region_stats",
+        "problem_description": "Missing RCU read lock in kcorp_dmem_fold_region_stats(): traverses RCU-protected cs->stat_list via kcorp_list_next_rcu_checked() without holding rcu_read_lock() or cs->list_lock, triggering RCU warnings and racing with kcorp_dmem_remove_stat_node() reclamation."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-10-rcu-mptcp-list-splice",
+        "category": "rcu_lifetime",
+        "subsystem": "mptcp",
+        "Fixed-by": "e2a9eeb69f7d4ca4cf4c70463af77664fdb6ab1d",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_mptcp_pm_flush_addrs",
+        "problem_description": "RCU list corruption and use-after-free in kcorp_mptcp_pm_flush_addrs(): uses non-RCU kcorp_list_splice_init() on RCU-read pm->anno_list (redirecting last->next to stack-local free_list) and immediately kfree()s entries without an RCU grace period while kcorp_mptcp_pm_lookup_addr_rcu() traverses anno_list locklessly."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-11-rcu-kvm-srcu-early-unlock",
+        "category": "rcu_lifetime",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "3a07249981629ace483ebbef81ef6b34c2d2afec",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_kvm_io_bus_get_dev",
+        "problem_description": "Use-after-free due to premature SRCU unlock in kcorp_kvm_io_bus_get_dev(): srcu_read_unlock(&vm->bus_srcu, srcu_idx) is called before returning matched kcorp_kvm_io_dev, allowing kcorp_kvm_io_bus_unregister() to finish synchronize_srcu() and kfree(target) before kcorp_kvm_dispatch_mmio_read() calls dev->read()."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-12-lock-fprop-hardirq-seqcount",
+        "category": "race_locking",
+        "subsystem": "flex_proportions",
+        "Fixed-by": "dd9e2f5b38f1fdd49b1ab6d3a85f81c14369eacc",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_fprop_new_period",
+        "problem_description": "Hardirq deadlock in kcorp_fprop_new_period(): acquires spin_lock(&fp->lock) without disabling interrupts (spin_lock_irqsave) around kcorp_write_seqcount_begin(&fp->sequence), so if hardirq reader kcorp_fprop_hardirq_read_sum() fires on the same CPU while sequence is odd it spins forever."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-13-lock-iommu-early-publish",
+        "category": "race_locking",
+        "subsystem": "iommu",
+        "Fixed-by": "62e062a29ad5133f67c20b333ba0a952a99161ae",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_rk_iommu_attach_device",
+        "problem_description": "Data race and NULL pointer dereference in kcorp_rk_iommu_attach_device(): iommu is added to domain->iommus and domain->iommus_lock is dropped before iommu->reg_bases is allocated and populated, allowing concurrent kcorp_rk_iommu_zap_iova() to dereference NULL iommu->reg_bases (and leaving a corrupt entry on kcalloc failure)."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-14-lock-firewire-unlocked-list",
+        "category": "race_locking",
+        "subsystem": "firewire",
+        "Fixed-by": "20e01bba2ae4898ce65cdcacd1bd6bec5111abd9",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_fw_at_complete_packet",
+        "problem_description": "Race condition and list corruption in kcorp_fw_at_complete_packet(): kcorp_list_del(&t->link) modifies card->transaction_list before acquiring card->lock, racing with concurrent kcorp_fw_ar_handle_response() traversal and deletion."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-15-lock-kvm-drop-mmu-lock-pgt",
+        "category": "race_locking",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "4c74e233cdedd11592775fae2a6243e67ca3f891",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_kvm_nested_s2_unmap",
+        "problem_description": "NULL pointer dereference after lock drop in kcorp_kvm_nested_s2_unmap(): vm->mmu_lock is dropped and reacquired around cond_resched() inside the loop, after which vm->s2_pgt->ia_bits is dereferenced without rechecking vm->s2_pgt even though kcorp_kvm_teardown_shadow_mmu() can free vm->s2_pgt and set it to NULL meanwhile."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-16-atomic-bpf-preemptible-percpu",
+        "category": "atomic_context",
+        "subsystem": "bpf",
+        "Fixed-by": "de020dc8049bfb2b22e3b6d99c031feb2e22d112",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_rhtab_delete_batch",
+        "problem_description": "Missing preemption protection in kcorp_rhtab_delete_batch(): calls per-CPU accessor kcorp_this_cpu_freelist(htab) in preemptible context (alongside copy_to_user) without preempt_disable(), triggering WARN_ON(preemptible()) and racing on per-CPU freelist state upon task migration."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-17-atomic-mm-resched-under-spinlock",
+        "category": "atomic_context",
+        "subsystem": "mm",
+        "Fixed-by": "cbbbf7795fc35a740e1d09f3a55aba543b72a8d3",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_deferred_init_memmap_chunk",
+        "problem_description": "Sleeping in atomic context in kcorp_deferred_init_memmap_chunk(): cond_resched() is invoked inside the PFN initialization loop while holding spin_lock(&zone->init_lock)."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-18-oob-wwan-max-skb-frags",
+        "category": "out_of_bounds",
+        "subsystem": "net/wwan",
+        "Fixed-by": "f0813bcd2d9d97fdbdf2efb9532ab03ae92e99e6",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_t7xx_dpmaif_append_frag",
+        "problem_description": "Out-of-bounds array write in kcorp_t7xx_dpmaif_append_frag(): appends fragments to shinfo->frags[shinfo->nr_frags] without checking whether shinfo->nr_frags has reached KCORP_MAX_SKB_FRAGS."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-19-oob-mac80211-ttlm-overread",
+        "category": "out_of_bounds",
+        "subsystem": "mac80211",
+        "Fixed-by": "1eab33aa63c993685dd341e03bd5b267dd7403fa",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_ieee80211_parse_ttlm",
+        "problem_description": "Out-of-bounds buffer read in kcorp_ieee80211_parse_ttlm(): reads data[pos++] for link_map_presence without checking pos < elem_len (and before checking out->default_mapping, which omits the link_map_presence byte)."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-20-oob-cpufreq-missing-sentinel",
+        "category": "out_of_bounds",
+        "subsystem": "cpufreq",
+        "Fixed-by": "7e3debb4c72fe840d60014192cf93950871fb3be",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_ipq_cpufreq_probe_soc",
+        "problem_description": "Out-of-bounds read in kcorp_ipq_cpufreq_probe_soc() / kcorp_ipq_cpufreq_match_list: kcorp_ipq_cpufreq_match_list[] is missing a terminating empty {} sentinel entry, causing kcorp_of_match_device_table() to read past the end of the static array when no compatible string matches."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-21-oob-drm-dsi-align-roundup",
+        "category": "out_of_bounds",
+        "subsystem": "drm/msm",
+        "Fixed-by": "057e55f337c5bb2aecc8967dc045c266a4e6c49d",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_dsi_host_read_rx_fifo",
+        "problem_description": "Out-of-bounds read in kcorp_dsi_host_read_rx_fifo(): after clamping req_bytes to host->rx_map_size, ALIGN(clamped, 16) rounds burst_len back up past host->rx_map_size when rx_map_size is not a multiple of 16, reading past the end of host->rx_iomem."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-22-leak-smb-send-receive-err",
+        "category": "memory_leak",
+        "subsystem": "smb",
+        "Fixed-by": "67b3da8d3051fba7e1523b3afce4f71c658f15f8",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_cifs_send_receive_cmd",
+        "problem_description": "Memory leak in kcorp_cifs_send_receive_cmd(): when kcorp_cifs_send_recv_wire() returns a negative error code (rc < 0), the function returns rc without freeing the 64 KiB resp_buf allocated via kzalloc()."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-23-leak-smb2-open-retry-buf",
+        "category": "memory_leak",
+        "subsystem": "smb/client",
+        "Fixed-by": "e3a43633023e3cacaca60d4b8972d084a2b06236",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_smb2_open_file_retry",
+        "problem_description": "Memory leak in kcorp_smb2_open_file_retry(): when kcorp_smb2_raw_open() returns -EAGAIN with an allocated err_buf, the retry branch sets err_buf = NULL and jumps to retry_open without calling kfree(err_buf)."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-24-leak-kvm-pfn-excl-atomic",
+        "category": "memory_leak",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "e07fc9e2da91f6d9eeafa2961be9dc09d65ed633",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_kvm_user_mem_abort",
+        "problem_description": "Host page reference/memory leak in kcorp_kvm_user_mem_abort(): on the KCORP_ESR_FSC_EXCL_ATOMIC fault path, the function injects a guest data abort and returns 1 without calling kcorp_kvm_release_page_clean(pinned_page) to release the page acquired from kcorp_kvm_faultin_pfn()."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-25-null-cgroup-dmem-max-write",
+        "category": "null_deref",
+        "subsystem": "cgroup",
+        "Fixed-by": "43151f812886be1855d2cba059f9c93e4729460b",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_dmem_max_write",
+        "problem_description": "NULL pointer dereference in kcorp_dmem_max_write(): when raw_input contains only a region name with no whitespace separator, kcorp_strsep_ws(&cursor) sets cursor to NULL, which is passed unchecked into kcorp_page_counter_memparse(cursor, &limit) and dereferenced in strcmp()."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-26-dma-nvme-swapped-sgl-args",
+        "category": "api_misuse",
+        "subsystem": "nvme",
+        "Fixed-by": "a54afbc8a2138f8c2490510cf26cde188d480c43",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_nvme_unmap_iod_sgls",
+        "problem_description": "Swapped SGL arguments in kcorp_nvme_unmap_iod_sgls(): kcorp_nvme_free_sgls(dev, iod->seg_table_list, &iod->cmd_sge) passes seg_table_list as data_sge and &iod->cmd_sge as seg_list in reverse order, causing wrong DMA unmap accounting and freeing stack/inline cmd_sge instead of seg_table_list."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-fp-01-safe-rcu-route-replace",
+        "category": "false_positive_trap",
+        "subsystem": "net",
+        "expected_behavior": "suppress_false_positive",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_route_entry_replace",
+        "problem_description": "Use-after-free in kcorp_route_entry_replace() where old_rt is freed immediately while concurrent RCU readers in kcorp_route_lookup_gateway_rcu() may still dereference it."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-fp-02-safe-bt-rfkill-unregister",
+        "category": "false_positive_trap",
+        "subsystem": "bluetooth",
+        "expected_behavior": "suppress_false_positive",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_bt_hci_unregister_dev",
+        "problem_description": "Use-after-free in kcorp_bt_hci_unregister_dev() because power_wq is destroyed before kcorp_rfkill_unregister(hdev->rfk) runs its block callback."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-fp-03-safe-irqsave-seqcount",
+        "category": "false_positive_trap",
+        "subsystem": "net",
+        "expected_behavior": "suppress_false_positive",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_pkt_rate_advance_epoch",
+        "problem_description": "Hardirq deadlock in kcorp_pkt_rate_advance_epoch() because interrupts remain enabled while holding est->lock and updating est->seq."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-fp-04-safe-auxdev-staged-err",
+        "category": "false_positive_trap",
+        "subsystem": "driver-core",
+        "expected_behavior": "suppress_false_positive",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_accel_aux_probe",
+        "problem_description": "Double-free of wrap or fw_ctx in kcorp_accel_aux_probe() when kcorp_aux_device_add() fails because both kcorp_aux_device_uninit() and the error labels free wrap."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-fp-05-safe-checked-ring-ioctl",
+        "category": "false_positive_trap",
+        "subsystem": "io_uring",
+        "expected_behavior": "suppress_false_positive",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_ring_register_buffers",
+        "problem_description": "Integer multiplication overflow in kcorp_ring_register_buffers() when computing nr_iovs * sizeof(*table) or memory leak of table on copy_from_user() error."
+    },
+    {
+        "Commit": "scan_corpus",
+        "case_id": "scan-fp-06-safe-skb-frag-coalesce",
+        "category": "false_positive_trap",
+        "subsystem": "net",
+        "expected_behavior": "suppress_false_positive",
+        "scan_fixture": "scan_corpus.c",
+        "scan_paths": [
+            "drivers/misc/scan_corpus.c"
+        ],
+        "target_function": "kcorp_gro_append_rx_frags",
+        "problem_description": "Out-of-bounds write past shinfo->frags[KCORP_MAX_SKB_FRAGS] in kcorp_gro_append_rx_frags() when count exceeds KCORP_MAX_SKB_FRAGS."
+    }
+]

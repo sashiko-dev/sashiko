@@ -7587,4 +7587,109 @@ mod tests {
         };
         assert!(!fixture_scan.requires_external_repo());
     }
+
+    #[tokio::test]
+    async fn test_benchmark_scan_suite_validates_and_extracts_all_target_functions() -> Result<()> {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let bench_path = manifest_dir.join("projects/linux/benchmarks/benchmark_scan.json");
+        let raw = std::fs::read_to_string(&bench_path)?;
+        let entries: Vec<BenchmarkEntry> = serde_json::from_str(&raw)?;
+
+        assert_eq!(entries.len(), 32);
+        validate_benchmark_entries(&entries)?;
+
+        let mut case_ids = std::collections::HashSet::new();
+        let mut target_functions = Vec::new();
+        let mut detect_count = 0usize;
+        let mut suppress_count = 0usize;
+
+        for entry in &entries {
+            assert!(entry.is_scan());
+            assert_eq!(entry.commit, "scan_corpus");
+            let case_id = entry
+                .case_id
+                .as_deref()
+                .expect("every scan benchmark entry must have a case_id");
+            assert!(
+                case_ids.insert(case_id.to_string()),
+                "duplicate case_id {case_id}"
+            );
+            let target_fn = entry
+                .target_function
+                .as_deref()
+                .expect("every scan benchmark entry must specify target_function");
+            assert!(!target_fn.trim().is_empty());
+            target_functions.push(target_fn.to_string());
+
+            match entry.expected_behavior {
+                BenchmarkExpectedBehavior::DetectBug => {
+                    detect_count += 1;
+                    let fixed_by = entry
+                        .fixed_by
+                        .as_deref()
+                        .expect("minted scan bug entry must carry Fixed-by reference");
+                    assert_eq!(fixed_by.len(), 40);
+                }
+                BenchmarkExpectedBehavior::SuppressFalsePositive => {
+                    suppress_count += 1;
+                }
+                other => panic!("unexpected behavior {other:?} in benchmark_scan.json"),
+            }
+        }
+        assert_eq!(detect_count, 26);
+        assert_eq!(suppress_count, 6);
+
+        let worktree = tempfile::tempdir()?;
+        let suite_dir = bench_path
+            .parent()
+            .expect("benchmark_scan.json must have parent dir");
+        let (repo_dir, resolved_paths) = provision_scan_fixture_repo(
+            suite_dir,
+            worktree.path(),
+            &entries[0].commit,
+            entries[0]
+                .scan_fixture
+                .as_deref()
+                .expect("scan_fixture must be set"),
+            &entries[0].scan_paths,
+        )
+        .await?;
+        assert_eq!(
+            resolved_paths,
+            vec![PathBuf::from("drivers/misc/scan_corpus.c")]
+        );
+
+        let placed_source = repo_dir.join("drivers/misc/scan_corpus.c");
+        let source = std::fs::read_to_string(&placed_source)?;
+        assert!(source.lines().count() >= 2000);
+
+        let chunks = crate::scan::chunk_source_file("drivers/misc/scan_corpus.c", &source);
+        assert!(
+            chunks.len() >= 3,
+            "expected multi-chunk splitting on scan_corpus.c, got {} chunk(s)",
+            chunks.len()
+        );
+
+        let extracted_fns: std::collections::HashSet<String> = chunks
+            .iter()
+            .flat_map(|c| c.functions.iter().map(|f| f.name.clone()))
+            .collect();
+
+        for target_fn in &target_functions {
+            assert!(
+                extracted_fns.contains(target_fn),
+                "Tree-sitter chunker did not extract target_function '{target_fn}'"
+            );
+        }
+
+        for chunk in chunks.iter().skip(1) {
+            assert!(
+                chunk.numbered_source.contains("struct workqueue_struct"),
+                "chunk {} missing prepended file-scope preamble",
+                chunk.chunk_index
+            );
+        }
+
+        Ok(())
+    }
 }
