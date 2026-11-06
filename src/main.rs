@@ -3758,8 +3758,16 @@ async fn handle_review_command(
     {
         sashiko::maintainers::init_global_maintainers(Arc::new(idx));
     }
-    eprintln!("Reviewing: {}", input);
-    eprintln!("Using prompts: {}", prompts.display());
+    eprint_colored(display.color, Color::Cyan, "Reviewing:")?;
+    eprintln!(" {}", input);
+    if !settings.ai.no_ai {
+        eprint_colored(display.color, Color::Cyan, "Model:    ")?;
+        eprintln!(
+            " {} [project: {project}]",
+            format_model_and_effort(&settings)
+        );
+    }
+    eprintln!("Prompts:   {}", prompts.display());
 
     if sashiko::git_ops::is_dirty(&repo_path)
         .await
@@ -3782,11 +3790,12 @@ async fn handle_review_command(
         }
     }
 
+    let run_started = std::time::Instant::now();
     let progress_state = std::sync::Arc::new(std::sync::Mutex::new(ProgressState {
         project,
         patches: std::collections::BTreeMap::new(),
         total_turns: 0,
-        started_at: None,
+        started_at: Some(run_started),
         last_status: std::collections::BTreeMap::new(),
         terminal_width: display.size.1,
         terminal_rows: display.size.0,
@@ -3799,7 +3808,9 @@ async fn handle_review_command(
 
     let progress_state_clone = progress_state.clone();
     let progress = move |event: ProgressEvent| {
-        let mut s = progress_state_clone.lock().unwrap();
+        let mut s = progress_state_clone
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match event {
             ProgressEvent::ResolvingInput { .. } => {}
             ProgressEvent::ResolvedCommits { commits } => {
@@ -3820,7 +3831,7 @@ async fn handle_review_command(
                 }
             }
             ProgressEvent::BaselineResolved { rev, sha } => {
-                eprintln!("Baseline: {} ({})", rev, sha);
+                eprintln!("Baseline:  {} ({})", rev, &sha[..sha.len().min(12)]);
             }
             ProgressEvent::CurrentTreeReady { .. } => {}
             ProgressEvent::WorktreeCreated { path } => {
@@ -3934,7 +3945,11 @@ async fn handle_review_command(
                 // cent of the stages it ran. So this line, and the report after
                 // it, start below the frame instead of inside it or over it.
                 finish_progress(&mut s);
-                eprintln!("Review {}", if partial { "incomplete" } else { "complete" });
+                let elapsed = format_elapsed_mmss(run_started.elapsed().as_secs());
+                let status_word = if partial { "incomplete" } else { "complete" };
+                let color = if partial { Color::Yellow } else { Color::Green };
+                let _ = eprint_colored(s.color_choice, color, &format!("Review {status_word}"));
+                eprintln!(" ({elapsed})");
                 let any_stage_completed = s.patches.values().any(|p| p.completed_stages > 0);
                 if partial && cfg!(feature = "cache") && any_stage_completed {
                     eprintln!(
@@ -3957,6 +3972,14 @@ async fn handle_review_command(
     } else {
         None
     };
+    let ticker = if display.reservation_capable {
+        Some(spawn_elapsed_ticker(
+            progress_state.clone(),
+            render_progress,
+        ))
+    } else {
+        None
+    };
 
     let result = run_git_review(
         repo_path,
@@ -3975,6 +3998,10 @@ async fn handle_review_command(
     )
     .await;
 
+    if let Some(ticker) = ticker {
+        ticker.abort();
+        let _ = ticker.await;
+    }
     if let Some(resize) = resize {
         // Asked to stop, and waited for. A repaint already past its await and
         // waiting on the display's lock has nowhere to be cancelled, so without
@@ -3987,8 +4014,14 @@ async fn handle_review_command(
     // Before anything else prints, and before a failed review carries its error
     // out of here: the report is ordinary output, and the screen has to be whole
     // again for it either way.
-    finish_progress(&mut progress_state.lock().unwrap());
-    let result = result?;
+    finish_progress(&mut progress_state.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut result = result?;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "duration_secs".to_string(),
+            serde_json::json!(run_started.elapsed().as_secs()),
+        );
+    }
 
     if agent {
         println!(
@@ -4796,11 +4829,12 @@ fn write_review_result(
         .get("tokens_cached")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let duration_secs = result.get("duration_secs").and_then(|v| v.as_u64());
     if tokens_in > 0 || tokens_out > 0 || tokens_cached > 0 {
         writeln!(
             out,
-            "\nTokens: {} in / {} out / {} cached",
-            tokens_in, tokens_out, tokens_cached
+            "\n{}",
+            format_tokens_and_elapsed(tokens_in, tokens_out, tokens_cached, duration_secs)
         )?;
     }
 
