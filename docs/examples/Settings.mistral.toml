@@ -22,6 +22,11 @@ max_input_tokens = 400000
 # Context window override; defaults to 1M for the zai-glm-*/glm-* models
 # and 131072 for everything else.
 # context_window_size = 1048576
+# Route requests sharing a prompt prefix (every tool round of a session,
+# and every session of a review stage) to Mistral's prompt cache with a
+# stable prompt_cache_key: cached prefix tokens bill at 10% of the input
+# price. Turn this off only for gateways that reject the field.
+# prompt_caching = true
 
 [review]
 concurrency = 4

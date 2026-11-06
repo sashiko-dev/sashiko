@@ -226,6 +226,7 @@ comes from `MISTRAL_API_KEY` (or `LLM_API_KEY`).
 | `max_tokens` | integer | `32768` | Max output tokens per response, reasoning tokens included. The prompt plus `max_tokens` may not exceed the model's context length. |
 | `context_window_size` | integer | model-derived | Context window override; `1048576` for the hosted `zai-glm-*`/`glm-*` models, `131072` for everything else. |
 | `effort` | string | -- | Reasoning effort sent as the `reasoning_effort` request field when a review stage does not ask for one itself: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"`. Leave unset for the model default. |
+| `prompt_caching` | bool | `true` | Route requests that share a prompt prefix — every tool round of a session, and every session of a review stage — to Mistral's prompt cache with a stable `prompt_cache_key`, so the repeated prefix bills at 10% of the input price instead of full price on every round. Disable for gateways that reject the field. |
 
 #### `[ai.ollama]`
 

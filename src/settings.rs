@@ -558,7 +558,10 @@ pub struct OpenAiCompatSettings {
     pub api: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+/// No `Default` derive: `prompt_caching` defaults on through the serde
+/// attribute when the key is absent, and a derived `Default` would quietly
+/// disagree with it.
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct MistralSettings {
@@ -581,6 +584,12 @@ pub struct MistralSettings {
     /// model default.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Route requests sharing a prompt prefix — every tool round of a
+    /// session, and every session of a review stage — to Mistral's prompt
+    /// cache with a stable `prompt_cache_key`, so the repeated prefix bills
+    /// at 10% of the input price instead of full price on every round.
+    #[serde(default = "default_prompt_caching")]
+    pub prompt_caching: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1804,8 +1813,8 @@ mod tests {
         assert!(settings.validate_for_daemon().is_err());
     }
 
-    /// The `[ai.mistral]` table accepts its four knobs and nothing else, so a
-    /// mistyped key fails the load instead of silently doing nothing.
+    /// The `[ai.mistral]` table accepts its five knobs and nothing else, so
+    /// a mistyped key fails the load instead of silently doing nothing.
     #[test]
     fn test_mistral_settings_parse() {
         let empty: MistralSettings = toml::from_str("").unwrap();
@@ -1814,15 +1823,20 @@ mod tests {
             (None, None),
             "all knobs default to the provider's own choices"
         );
+        assert!(
+            empty.prompt_caching,
+            "prompt caching routes repeated prefixes to the cache, so it defaults on"
+        );
 
         let full: MistralSettings = toml::from_str(
-            "base_url = \"https://gw.example/api/v1\"\nmax_tokens = 4096\ncontext_window_size = 200000\neffort = \"low\"",
+            "base_url = \"https://gw.example/api/v1\"\nmax_tokens = 4096\ncontext_window_size = 200000\neffort = \"low\"\nprompt_caching = false",
         )
         .unwrap();
         assert_eq!(full.base_url.as_deref(), Some("https://gw.example/api/v1"));
         assert_eq!(full.max_tokens, Some(4096));
         assert_eq!(full.context_window_size, Some(200_000));
         assert_eq!(full.effort.as_deref(), Some("low"));
+        assert!(!full.prompt_caching);
 
         let error = toml::from_str::<MistralSettings>("bogus = true")
             .unwrap_err()

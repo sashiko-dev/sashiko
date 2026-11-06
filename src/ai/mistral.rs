@@ -35,6 +35,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 /// Completion token cap when `[ai.mistral] max_tokens` is unset. Reasoning
@@ -56,6 +57,13 @@ pub struct MistralRequest {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<Value>,
+    /// Names the cache that holds this request's shared prompt prefix.
+    /// Mistral's prompt caching is routed by this key: requests carrying
+    /// the same key land where their prefix is already resident, and the
+    /// cached prefix bills at 10% of the input price instead of full
+    /// price on every tool round and every run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
 }
 
 /// One message of a request. Content is either a plain string — every role
@@ -317,6 +325,11 @@ pub struct MistralClient {
     max_tokens: u32,
     /// Sent as `reasoning_effort` when a stage does not specify one.
     effort: Option<String>,
+    /// Whether requests carry a stable `prompt_cache_key`. Without one,
+    /// Mistral routes requests without regard to the prompt cache, and a
+    /// review's repeated prefixes are re-billed at full input price on
+    /// every tool round.
+    prompt_caching: bool,
     client: Client,
 }
 
@@ -390,6 +403,9 @@ impl MistralClient {
                 .and_then(|s| s.max_tokens)
                 .unwrap_or(DEFAULT_MAX_TOKENS),
             effort: settings.and_then(|s| s.effort.clone()),
+            // Prompt caching costs nothing and only shapes routing, so it
+            // defaults on like the sibling providers' prompt_caching.
+            prompt_caching: settings.is_none_or(|s| s.prompt_caching),
             base_url: Self::normalize_base_url(&base_url)?,
             model,
             client,
@@ -436,6 +452,10 @@ impl MistralClient {
     }
 
     fn translate_request(&self, request: AiRequest) -> MistralRequest {
+        // Computed before the system prompt and tools are consumed below:
+        // the key names exactly the prefix those two fields carry.
+        let prompt_cache_key = self.prompt_cache_key(&request);
+
         let mut messages = Vec::new();
 
         if let Some(system_text) = request.system {
@@ -559,6 +579,7 @@ impl MistralClient {
             max_tokens: Some(self.max_tokens),
             reasoning_effort,
             response_format,
+            prompt_cache_key,
         }
     }
 
@@ -567,6 +588,36 @@ impl MistralClient {
             .as_ref()
             .map(|e| e.trim().to_string())
             .filter(|e| !e.is_empty())
+    }
+
+    /// The stable `prompt_cache_key` for a request: a digest of the model,
+    /// the system prompt, and the tool definitions. Those three are every
+    /// request's shared prefix — each tool round of a session repeats them,
+    /// and every session of a review stage repeats them across patchsets —
+    /// so one key per prefix group routes all those requests to the cache
+    /// that already holds the prefix. Patch text and kept chains of thought
+    /// stay out of it: they differ per round and per patchset, so including
+    /// them would hand every conversation its own key and mute exactly the
+    /// reuse the key exists to get billed at the cached rate. The value is
+    /// a digest, so no prompt content travels inside it.
+    fn prompt_cache_key(&self, request: &AiRequest) -> Option<String> {
+        if !self.prompt_caching {
+            return None;
+        }
+        let tools = request
+            .tools
+            .as_deref()
+            .filter(|tools| !tools.is_empty())
+            .unwrap_or(&[]);
+        let mut hasher = Sha256::new();
+        hasher.update(self.model.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(request.system.as_deref().unwrap_or("").as_bytes());
+        hasher.update(b"\0");
+        hasher.update(serde_json::to_vec(tools).unwrap_or_default());
+        let digest = hasher.finalize();
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        Some(hex[..32].to_string())
     }
 
     async fn post_request(&self, body: &MistralRequest) -> Result<MistralResponse, MistralError> {
@@ -831,11 +882,24 @@ mod tests {
     use crate::ai::{AiMessage, AiTool, ReasoningEffort};
     use serde_json::json;
 
+    /// Settings with every knob unset and caching on: the serde-parsed
+    /// shape of an empty `[ai.mistral]` table. The struct has no `Default`
+    /// impl, so tests spell out the parsed defaults here.
+    fn default_settings() -> MistralSettings {
+        MistralSettings {
+            base_url: None,
+            max_tokens: None,
+            effort: None,
+            context_window_size: None,
+            prompt_caching: true,
+        }
+    }
+
     fn settings(base_url: Option<&str>, effort: Option<&str>) -> MistralSettings {
         MistralSettings {
             base_url: base_url.map(str::to_string),
             effort: effort.map(str::to_string),
-            ..Default::default()
+            ..default_settings()
         }
     }
 
@@ -937,7 +1001,7 @@ mod tests {
             "m".to_string(),
             Some(&MistralSettings {
                 context_window_size: Some(4096),
-                ..Default::default()
+                ..default_settings()
             }),
             "k",
             30,
@@ -1365,7 +1429,7 @@ mod tests {
             Some(&MistralSettings {
                 base_url: Some("https://api.mistral.ai".to_string()),
                 max_tokens: Some(1024),
-                ..Default::default()
+                ..default_settings()
             }),
             "k",
             30,
@@ -1374,6 +1438,148 @@ mod tests {
         .cache_identity();
         assert_ne!(bare, with_cap);
         assert!(with_cap.contains("|max_tokens=1024"));
+    }
+
+    /// A client with prompt caching on, the way it is built with the knob
+    /// left at its default.
+    fn caching_client(base_url: &str) -> MistralClient {
+        MistralClient::new_with_key(
+            "zai-glm-5-3-flash".to_string(),
+            Some(&MistralSettings {
+                base_url: Some(base_url.to_string()),
+                ..default_settings()
+            }),
+            "k",
+            30,
+        )
+        .unwrap()
+    }
+
+    fn lookup_tool() -> AiTool {
+        AiTool {
+            name: "lookup".to_string(),
+            description: "finds things".to_string(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+
+    #[test]
+    fn prompt_cache_key_is_stable_across_tool_rounds() {
+        let c = caching_client("https://api.mistral.ai");
+        let tools = || Some(vec![lookup_tool()]);
+
+        // Round 1: the system prompt, the tools, and the user prompt.
+        let round1 = AiRequest {
+            system: Some("review the patch".to_string()),
+            messages: vec![message(AiRole::User, "review this")],
+            tools: tools(),
+            ..empty_request()
+        };
+
+        // Round 3: the same system prompt and tools, with the conversation
+        // the earlier rounds left behind, chain of thought included.
+        let round3 = AiRequest {
+            system: Some("review the patch".to_string()),
+            messages: vec![
+                message(AiRole::User, "review this"),
+                AiMessage {
+                    role: AiRole::Assistant,
+                    content: None,
+                    thought: Some("hmm".to_string()),
+                    thought_signature: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_1".to_string(),
+                        function_name: "lookup".to_string(),
+                        arguments: json!({"q": "x"}),
+                        thought_signature: None,
+                    }]),
+                    tool_call_id: None,
+                },
+                AiMessage {
+                    role: AiRole::Tool,
+                    content: Some("result".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                },
+            ],
+            tools: tools(),
+            ..empty_request()
+        };
+
+        let key1 = c.translate_request(round1).prompt_cache_key.unwrap();
+        let key3 = c.translate_request(round3).prompt_cache_key.unwrap();
+        assert_eq!(
+            key1, key3,
+            "every round of a session shares one key, so the grown prefix stays cached"
+        );
+
+        // A key is a digest: it does not carry prompt content itself.
+        assert!(!key1.contains("review"));
+
+        // A different stage's system prompt names a different cache group.
+        let other_stage = AiRequest {
+            system: Some("classify the report".to_string()),
+            messages: vec![message(AiRole::User, "review this")],
+            tools: tools(),
+            ..empty_request()
+        };
+        assert_ne!(
+            key1,
+            c.translate_request(other_stage).prompt_cache_key.unwrap()
+        );
+
+        // So does a different tool set: the prefix it shares is not the same.
+        let no_tools = AiRequest {
+            system: Some("review the patch".to_string()),
+            messages: vec![message(AiRole::User, "review this")],
+            tools: None,
+            ..empty_request()
+        };
+        assert_ne!(
+            key1,
+            c.translate_request(no_tools).prompt_cache_key.unwrap()
+        );
+    }
+
+    #[test]
+    fn prompt_caching_defaults_on_and_turning_it_off_drops_the_field() {
+        // No [ai.mistral] table: caching is on, like the sibling providers.
+        let on =
+            MistralClient::new_with_key("zai-glm-5-3-flash".to_string(), None, "k", 30).unwrap();
+        let body = on.translate_request(AiRequest {
+            system: Some("sys".to_string()),
+            messages: vec![message(AiRole::User, "hi")],
+            ..empty_request()
+        });
+        let key = body.prompt_cache_key.expect("caching on sends a key");
+        assert_eq!(key.len(), 32);
+
+        // prompt_caching = false: the field leaves the request entirely, so
+        // a gateway that rejects it keeps working.
+        let off = MistralClient::new_with_key(
+            "zai-glm-5-3-flash".to_string(),
+            Some(&MistralSettings {
+                base_url: Some("https://api.mistral.ai".to_string()),
+                prompt_caching: false,
+                ..default_settings()
+            }),
+            "k",
+            30,
+        )
+        .unwrap();
+        let body = off.translate_request(AiRequest {
+            system: Some("sys".to_string()),
+            messages: vec![message(AiRole::User, "hi")],
+            ..empty_request()
+        });
+        assert!(body.prompt_cache_key.is_none());
+        assert!(
+            !serde_json::to_string(&body)
+                .unwrap()
+                .contains("prompt_cache_key")
+        );
     }
 
     /// A stub chat completions server that records every request and answers

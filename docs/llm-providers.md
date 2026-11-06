@@ -716,3 +716,14 @@ behind a path prefix), or the full chat completions URL. Any other path is
 rejected at startup. Tool calling, JSON mode, and `reasoning_effort` are
 supported; an effort level the model rejects comes back as a 400, which
 ends the run as a fatal error.
+
+**Prompt caching** is on by default (`[ai.mistral] prompt_caching`).
+Mistral's chat completions API routes prompt caching by a client-chosen
+`prompt_cache_key`: requests carrying the same key land where their shared
+prefix is already cached, and the cached prefix bills at 10% of the input
+token price. Sashiko keys a request on its model, system prompt, and tool
+definitions — the part of the prompt every tool round of a session
+repeats, and every session of a review stage repeats across patchsets —
+so a review's growing conversation is billed as one cached prefix instead
+of being re-paid in full on every round. The key is a digest, so no
+prompt content travels inside it.
