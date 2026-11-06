@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::OnceLock;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 pub const LINUX_NEXT_URL: &str =
     "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
@@ -157,7 +157,7 @@ impl BaselineRegistry {
             .unwrap_or("origin");
 
         let ref_name = format!("{}/master", mainline_name);
-        info!(
+        debug!(
             "Attempting to load MAINTAINERS from {}:MAINTAINERS",
             ref_name
         );
@@ -175,7 +175,7 @@ impl BaselineRegistry {
                 );
                 let maintainers_path = repo_path.join("MAINTAINERS");
                 if maintainers_path.exists() {
-                    info!("Loading MAINTAINERS from local file {:?}", maintainers_path);
+                    debug!("Loading MAINTAINERS from local file {:?}", maintainers_path);
                     let file = std::fs::File::open(&maintainers_path)?;
                     let reader = std::io::BufReader::new(file);
                     Self::parse_maintainers(reader)?
@@ -336,7 +336,7 @@ impl BaselineRegistry {
             });
         }
 
-        info!("Parsed {} MAINTAINERS entries", entries.len());
+        debug!("Parsed {} MAINTAINERS entries", entries.len());
         Ok(entries)
     }
 

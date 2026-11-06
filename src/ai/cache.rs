@@ -318,7 +318,7 @@ impl AiProvider for CachingAiProvider {
                         + tokens_saved as u64;
                     ("previous session", t)
                 };
-                info!(
+                debug!(
                     "Cache hit [{}] ({}) — {} tokens saved (total {}: {})",
                     hit_prefix, origin, tokens_saved, origin, total
                 );
@@ -418,7 +418,7 @@ impl AiProvider for CachingAiProvider {
                 .await;
             match result {
                 Ok(0) => debug!("{}Cache forget [{}]: nothing to forget", prefix, &h[..12]),
-                Ok(_) => info!("{}Cache forget [{}]", prefix, &h[..12]),
+                Ok(_) => debug!("{}Cache forget [{}]", prefix, &h[..12]),
                 Err(e) => warn!("{}Cache forget [{}] failed: {:#}", prefix, &h[..12], e),
             }
         }

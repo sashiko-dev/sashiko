@@ -276,7 +276,7 @@ impl VllmClient {
             })?;
             match serde_json::from_str::<VllmResponse>(&body_text) {
                 Ok(response) => {
-                    tracing::info!(
+                    tracing::debug!(
                         "vLLM response received. Tokens: in={}, out={}",
                         response.usage.prompt_tokens,
                         response.usage.completion_tokens
@@ -602,7 +602,7 @@ fn translate_vllm_response(resp: VllmResponse) -> Result<AiResponse> {
 #[async_trait]
 impl AiProvider for VllmClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        tracing::info!("Sending vLLM request to model: {}", self.model);
+        tracing::debug!("Sending vLLM request to model: {}", self.model);
 
         let mut vllm_req = translate_vllm_request(
             request,

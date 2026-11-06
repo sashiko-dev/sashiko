@@ -31,7 +31,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// What a worker is asked to do: only what the settings have no notion of, such
 /// as which patch, which baseline, and where the prompts are.
@@ -354,7 +354,7 @@ pub async fn run_worker(
                 sha: short_sha(&baseline_sha),
             },
         );
-        info!("Reusing existing worktree at {:?}", path);
+        debug!("Reusing existing worktree at {:?}", path);
         (
             GitWorktree::from_path(path.clone(), repo_path.clone()),
             baseline_sha,
@@ -613,7 +613,7 @@ async fn review_single_patch(
                 }
             }
         }
-        info!(
+        debug!(
             "Active patch files gathered for patch {}: {:?}",
             p.index, patch_files
         );
@@ -622,7 +622,7 @@ async fn review_single_patch(
         tools.set_active_patch_files(patch_files);
 
         if let Some(sha) = patch_shas.get(&p.index) {
-            info!("Setting virtual HEAD to {} for patch {}", sha, p.index);
+            debug!("Setting virtual HEAD to {} for patch {}", sha, p.index);
             tools.set_virtual_head(sha.clone());
         }
 
@@ -1061,8 +1061,8 @@ async fn run_worker_in_worktree(
     options: &WorkerOptions,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
-    info!("Worktree at {:?}", worktree.path);
-    info!("Found {} patches total", patches.len());
+    debug!("Worktree at {:?}", worktree.path);
+    debug!("Found {} patches total", patches.len());
 
     let mut patch_results = Vec::new();
     let mut patch_shas = HashMap::new();
@@ -1089,7 +1089,7 @@ async fn run_worker_in_worktree(
         }
         true
     } else if let Some(commit_hash) = &options.review_commit {
-        info!("Directly reviewing commit {}", commit_hash);
+        debug!("Directly reviewing commit {}", commit_hash);
         for p in &patches {
             if let Some(sha) = &p.commit_id {
                 patch_shas.insert(p.index, sha.clone());
@@ -1671,7 +1671,7 @@ async fn apply_single_patch(
     patch_results: &mut Vec<Value>,
 ) -> bool {
     if let Some(sha) = &p.commit_id {
-        info!(
+        debug!(
             "Patch {} is identified by commit ID {}, attempting direct checkout...",
             p.index, sha
         );
@@ -1692,7 +1692,7 @@ async fn apply_single_patch(
         && sha.len() == 40
         && sha.chars().all(|c| c.is_ascii_hexdigit())
     {
-        info!(
+        debug!(
             "Patch {} message_id looks like a SHA {}, checking out...",
             p.index, sha
         );

@@ -227,7 +227,9 @@ pub async fn post_json<T: DeserializeOwned>(
     }
     match post_json_once(client, url, headers, body).await {
         Err(ref error) if rejects_temperature_parameter(error) && strip_temperature(body) => {
-            tracing::info!("{url} takes only the default temperature; resending without the field");
+            tracing::debug!(
+                "{url} takes only the default temperature; resending without the field"
+            );
             temperature_unsupported.store(true, Ordering::Relaxed);
             post_json_once(client, url, headers, body).await
         }

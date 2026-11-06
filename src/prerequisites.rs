@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 const MAX_MBOX_MESSAGES: usize = 500;
 const MAX_PREREQUISITE_PATCH_IDS: usize = 128;
@@ -646,13 +646,13 @@ struct LorePrerequisiteRemote;
 #[async_trait]
 impl PrerequisiteRemote for LorePrerequisiteRemote {
     async fn fetch_series(&self, message_id: &str) -> Result<PrerequisiteSeries> {
-        info!("Fetching prerequisite series {} from lore", message_id);
+        debug!("Fetching prerequisite series {} from lore", message_id);
         let raw = LoreMboxClient::new()?.fetch_thread(message_id).await?;
         series_from_mbox(raw, message_id).await
     }
 
     async fn fetch_thread_patches(&self, message_id: &str) -> Result<Vec<PrerequisitePatch>> {
-        info!(
+        debug!(
             "Fetching prerequisite thread {} from lore",
             redact_secret(message_id)
         );
@@ -661,7 +661,7 @@ impl PrerequisiteRemote for LorePrerequisiteRemote {
     }
 
     async fn search_patch_id(&self, patch_id: &str) -> Result<Vec<PrerequisitePatch>> {
-        info!("Fetching prerequisite patch {} from lore", patch_id);
+        debug!("Fetching prerequisite patch {} from lore", patch_id);
         let raw = LoreMboxClient::new()?.search_patch_id(patch_id).await?;
         patches_from_mbox(raw).await
     }
@@ -720,7 +720,7 @@ impl<'a, R: PrerequisiteRemote + ?Sized> PrerequisiteResolver<'a, R> {
             .get_stored_prerequisite_series(message_id, MAX_PREREQUISITE_PATCH_IDS)
             .await?
         {
-            info!(
+            debug!(
                 "Resolved prerequisite series {} from local patchset {}",
                 stored.message_id, stored.patchset_id
             );
@@ -754,7 +754,7 @@ impl<'a, R: PrerequisiteRemote + ?Sized> PrerequisiteResolver<'a, R> {
             if let Some((message_id, diff, subject, author, date)) =
                 self.db.get_patch_by_git_patch_id(patch_id).await?
             {
-                info!(
+                debug!(
                     "Resolved prerequisite patch {} from local message {}",
                     patch_id, message_id
                 );

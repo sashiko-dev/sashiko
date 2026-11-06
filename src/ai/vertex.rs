@@ -34,7 +34,7 @@ use google_cloud_auth::credentials::{AccessTokenCredentials, Builder};
 use reqwest::Client;
 use serde::Serialize;
 use std::time::Duration;
-use tracing::info;
+use tracing::debug;
 
 // --- Model family detection ---
 
@@ -253,7 +253,7 @@ impl VertexClient {
             let response: ClaudeResponse = serde_json::from_str(&body_text)
                 .context("Failed to parse Vertex AI Claude response")?;
 
-            info!(
+            debug!(
                 "Vertex AI response received. Tokens: in={}, out={}, cache_read={} cache_write={}",
                 response.usage.input_tokens,
                 response.usage.output_tokens,
@@ -339,7 +339,7 @@ impl VertexClient {
             else {
                 return gemini::translate_ai_response(acc);
             };
-            info!(
+            debug!(
                 "{}Vertex AI Gemini response reached per-hop limit (finishReason=CONTINUATION); requesting continuation hop {}/{}...",
                 crate::ai::get_log_prefix(),
                 hop,

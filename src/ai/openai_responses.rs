@@ -310,7 +310,7 @@ impl OpenAiResponsesClient {
         )
         .await?;
         let details = response.usage.output_tokens_details.as_ref();
-        tracing::info!(
+        tracing::debug!(
             "OpenAI response received. Tokens: in={}, out={}, reasoning={}, cache_write={}",
             response.usage.input_tokens,
             response.usage.output_tokens,
@@ -690,7 +690,7 @@ fn translate_usage(usage: ResponsesUsage) -> AiUsage {
 #[async_trait]
 impl AiProvider for OpenAiResponsesClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        tracing::info!("Sending OpenAI responses request...");
+        tracing::debug!("Sending OpenAI responses request...");
 
         let responses_req = self.build_request(request)?;
 

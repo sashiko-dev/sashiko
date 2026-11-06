@@ -28,7 +28,7 @@ use aws_sdk_bedrockruntime::types::{
 use aws_smithy_types::{Document, Number};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 // --- serde_json::Value <-> aws_smithy_types::Document conversion ---
 
@@ -580,7 +580,7 @@ impl AiProvider for BedrockClient {
                 )
             })
             .unwrap_or_else(|| "unknown".to_string());
-        info!("Bedrock response received. Tokens: {}", usage_str);
+        debug!("Bedrock response received. Tokens: {}", usage_str);
 
         translate_response(&resp)
     }

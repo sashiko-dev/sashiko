@@ -17,7 +17,7 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 const MAX_PACING_INTERVAL: Duration = Duration::from_secs(86_400);
@@ -177,7 +177,7 @@ impl QuotaManager {
             };
 
             if let Some(duration) = quota_sleep {
-                info!(
+                debug!(
                     "{}Global AI rate limit/quota active. Waiting for {:.2}s...",
                     crate::ai::get_log_prefix(),
                     duration.as_secs_f64()

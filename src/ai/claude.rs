@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tracing::info;
+use tracing::debug;
 
 // --- Claude API Request/Response Types ---
 
@@ -321,7 +321,7 @@ impl ClaudeClient {
             let response: ClaudeResponse =
                 serde_json::from_str(&body_text).context("Failed to parse Claude API response")?;
 
-            info!(
+            debug!(
                 "Claude response received. Tokens: in={}, out={}, cache_read={} cache_write={}",
                 response.usage.input_tokens,
                 response.usage.output_tokens,
