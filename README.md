@@ -55,6 +55,9 @@ sashiko review --report-related-preexisting [--related-preexisting-min-severity 
 
 # Continue a review cut short by a quota stop, a timeout or Ctrl-C
 sashiko review HEAD~3..HEAD --resume
+
+# Combine all exploratory analysis stages into a single pass to save tokens
+sashiko review --cheap
 ```
 
 A local review records each request and the model's response under `$XDG_DATA_HOME/sashiko/`. `--resume` replays them, so the run sends the model only the requests the interrupted one never had answered. Without it, and without `[ai] response_cache`, every run sends every request to the model.

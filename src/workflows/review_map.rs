@@ -273,6 +273,23 @@ fn item_locations(item: &Value, state: &LinuxPatchReviewState) -> Vec<Value> {
 
 fn static_stage_guides(project: ProjectId, stage_name: &str) -> Vec<String> {
     let mut guides = Vec::new();
+    if stage_name == linux_patch_review::COMBINED_ANALYSIS_STAGE_NAME {
+        let all_defs = match project {
+            ProjectId::Linux => linux_patch_review::ANALYSIS_STAGES,
+            ProjectId::Sashiko => sashiko_patch_review::ANALYSIS_STAGES,
+            ProjectId::Gcc => gcc_patch_review::ANALYSIS_STAGES,
+            ProjectId::Qemu => qemu_patch_review::ANALYSIS_STAGES,
+        };
+        for def in all_defs {
+            for g in def.guides {
+                let trimmed = g.trim();
+                if sanitize_prompt_relpath(trimmed) {
+                    push_unique(&mut guides, trimmed);
+                }
+            }
+        }
+        return guides;
+    }
     let analysis_def = match project {
         ProjectId::Linux => linux_patch_review::analysis_stage_by_name(stage_name),
         ProjectId::Sashiko => sashiko_patch_review::analysis_stage_by_name(stage_name),

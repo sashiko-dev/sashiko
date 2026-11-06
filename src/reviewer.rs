@@ -3699,6 +3699,10 @@ async fn run_review_tool_with_cmd_and_overrides(
         cmd.arg("--stages").arg(stages_str);
     }
 
+    if settings.review.cheap {
+        cmd.arg("--cheap");
+    }
+
     if let Some(effort) = settings
         .review
         .effort

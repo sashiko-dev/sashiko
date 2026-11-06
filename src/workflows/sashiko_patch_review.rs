@@ -27,16 +27,17 @@ use crate::workflow::{
 };
 use crate::workflows::guard::{normalize_guide_name, normalize_stage_name};
 use crate::workflows::linux_patch_review::{
-    AnalysisStage, ConsolidationStage, LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES,
-    PlanningOutput, PostVerificationOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
-    VERIFICATION_STAGE_NAMES, VerificationOutput, append_stage_dismissed_concerns_with_prompts,
-    append_stage_items_with_prompts, apply_planning_stage_output,
-    apply_post_verification_stage_output, apply_verification_stage_output,
-    batch_inconclusive_concerns_by_severity, build_stage_efforts_schema, collect_stage_prompts,
+    AnalysisStage, COMBINED_ANALYSIS_SHORT_LABEL, COMBINED_ANALYSIS_STAGE_NAME, ConsolidationStage,
+    LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES, PlanningOutput, PostVerificationOutput,
+    SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput, VERIFICATION_STAGE_NAMES, VerificationOutput,
+    append_stage_dismissed_concerns_with_prompts, append_stage_items_with_prompts,
+    apply_planning_stage_output, apply_post_verification_stage_output,
+    apply_verification_stage_output, batch_inconclusive_concerns_by_severity,
+    build_combined_analysis_stage, build_stage_efforts_schema, collect_stage_prompts,
     deduplication_stage_with_effort, extra_prompt_paths_for_items, extra_prompt_paths_for_state,
     format_planning_feedback, format_post_verification_feedback,
-    format_verification_stage_feedback, has_valid_proof_location, resolve_stage_effort,
-    validate_locations_side, validate_planning_stage_efforts,
+    format_verification_stage_feedback, has_valid_proof_location, resolve_combined_stage_effort,
+    resolve_stage_effort, validate_locations_side, validate_planning_stage_efforts,
     validate_post_verification_batch_items, validate_verification_stage_output,
 };
 
@@ -544,6 +545,9 @@ pub fn stage_short_label(name: &str) -> Option<&'static str> {
     if let Some(def) = analysis_stage_by_name(name) {
         return Some(def.short);
     }
+    if normalize_stage_name(name) == COMBINED_ANALYSIS_STAGE_NAME {
+        return Some(COMBINED_ANALYSIS_SHORT_LABEL);
+    }
     if crate::workflows::prior_feedback::is_prior_feedback_stage_name(name) {
         return Some(crate::workflows::prior_feedback::PRIOR_FEEDBACK_SHORT_LABEL);
     }
@@ -571,6 +575,7 @@ pub fn is_stage_exclusive_guide(name: &str) -> bool {
 pub fn is_known_stage(name: &str) -> bool {
     let normalized = normalize_stage_name(name);
     analysis_stage_by_name(&normalized).is_some()
+        || normalized == COMBINED_ANALYSIS_STAGE_NAME
         || crate::workflows::prior_feedback::is_prior_feedback_stage_name(&normalized)
         || crate::workflows::prior_attribution::is_prior_attribution_stage_name(&normalized)
         || consolidation_stage_by_name(&normalized).is_some()
@@ -901,7 +906,7 @@ pub fn planning_stage_with_effort(
             reasoning_effort: effort.map(crate::ai::EffortMode::lightweight_stage_effort),
             ..Default::default()
         })
-        .skip_if(|s| s.manual_stages.is_some())
+        .skip_if(|s| s.cheap_mode || s.manual_stages.is_some())
         .reduce(move |state, out: PlanningOutput| {
             apply_planning_stage_output(
                 ANALYSIS_STAGES,
@@ -985,18 +990,58 @@ pub fn resolve_analysis_stages_with_options(
     };
 
     let mut include_prior_feedback = state.manual_stages.is_none();
-    let mut stages = Vec::new();
+    let mut use_combined = state.cheap_mode;
+    let mut selected_defs = Vec::new();
     for name in selected_stages {
         if crate::workflows::prior_feedback::is_prior_feedback_stage_name(&name) {
             include_prior_feedback = true;
             continue;
         }
+        if normalize_stage_name(&name) == COMBINED_ANALYSIS_STAGE_NAME {
+            use_combined = true;
+            for def in ANALYSIS_STAGES {
+                if !selected_defs
+                    .iter()
+                    .any(|d: &&AnalysisStage| d.name == def.name)
+                {
+                    selected_defs.push(def);
+                }
+            }
+            continue;
+        }
         match analysis_stage_by_name(&name) {
             Some(def) => {
-                let effort = resolve_stage_effort(state, def.name);
-                stages.push(analysis_stage(def, max_turns, temperature, effort));
+                if !selected_defs
+                    .iter()
+                    .any(|d: &&AnalysisStage| d.name == def.name)
+                {
+                    selected_defs.push(def);
+                }
             }
             None => tracing::warn!("Ignoring unknown Sashiko review stage {:?}", name),
+        }
+    }
+
+    let mut stages = Vec::new();
+    if use_combined {
+        if !selected_defs.is_empty() {
+            let effort = resolve_combined_stage_effort(state);
+            stages.push(build_combined_analysis_stage(
+                selected_defs,
+                sashiko_system_prompt,
+                CONCERN_JSON_SCHEMA_EXAMPLE,
+                false,
+                validate_concerns_output,
+                format_concerns_feedback,
+                max_turns,
+                temperature,
+                effort,
+            ));
+        }
+    } else {
+        for def in selected_defs {
+            let effort = resolve_stage_effort(state, def.name);
+            stages.push(analysis_stage(def, max_turns, temperature, effort));
         }
     }
     if include_prior_feedback {
