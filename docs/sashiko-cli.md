@@ -292,8 +292,9 @@ sashiko bugs evaluate-security [OPTIONS]
 
 In addition to patch review, the `sashiko` binary provides an active codebase
 scanner (`--project linux`) that audits Linux kernel source files or subsystem
-directories for pre-existing `High` and `Critical` severity defects using
-structure-aware chunking and a two-phase map-reduce workflow.
+directories for pre-existing defects (`Medium`, `High`, and `Critical` by
+default, configurable via `--min-severity`) using structure-aware chunking and
+a two-phase map-reduce workflow.
 
 ```
 sashiko scan [OPTIONS] <PATHS>...
@@ -314,7 +315,8 @@ sashiko scan [OPTIONS] <PATHS>...
 | `--max-files <N>` | Maximum number of source files to expand (default: 200). |
 | `--max-chunks <N>` | Optional upper bound on total source chunks to scan. |
 | `--exclude <PATTERN>` | Exclude files matching substring/prefix pattern (may be repeated). |
-| `--submit-bugs` | Submit verified `High`/`Critical` findings directly to the bug repository (`bugs`) for deduplication. |
+| `--min-severity <SEVERITY>` | Lowest verified bug severity to report: `low`, `medium` (default), `high`, or `critical`. |
+| `--submit-bugs` | Submit verified findings at or above `--min-severity` directly to the bug repository (`bugs`) for deduplication. |
 | `--custom-prompt <TEXT>` | Append custom focus instructions to the scan workflow. |
 | `--ai-provider <PROVIDER>` | AI provider override. |
 | `-m, --model <MODEL>` | AI model override (alias: `--ai-model`). |
@@ -324,14 +326,15 @@ sashiko scan [OPTIONS] <PATHS>...
 Candidate defects discovered across source chunks are passed through the
 `linux_bug` pipeline (`NormalizeSession` -> `VerifySession` -> `TracingSession` ->
 `SeveritySession`) so every reported finding is ground-truth verified,
-calibrated for `High` or `Critical` severity, and traced to its introducing
-commit. When `--submit-bugs` is passed, candidate bugs are atomically claimed,
-verified, and deduplicated against the bug repository (`bugs`).
+calibrated against `<kernel_threat_model>` and `--min-severity`, and traced to
+its introducing commit. When `--submit-bugs` is passed, candidate bugs are
+atomically claimed, verified, and deduplicated against the bug repository
+(`bugs`).
 
 **Exit codes:**
 
-- `0` -- All chunks and candidate verifications completed with zero `High` or `Critical` findings.
-- `1` -- One or more verified `High` or `Critical` findings were reported (and no chunk or candidate verification failed).
+- `0` -- All chunks and candidate verifications completed with zero findings at or above `--min-severity`.
+- `1` -- One or more verified findings were reported (and no chunk or candidate verification failed).
 - `3` -- Incomplete scan: one or more chunk analyses or Phase 2 candidate bug verifications failed.
 
 **Examples:**

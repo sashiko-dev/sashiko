@@ -1164,15 +1164,15 @@ pub struct ScanOptions {
     pub max_chunks: Option<usize>,
     pub exclude: Vec<String>,
     pub submit_bugs: bool,
+    pub min_severity: crate::db::SeverityFloor,
     pub prompts: PathBuf,
     pub custom_prompt: Option<String>,
     pub stages: Option<Vec<String>>,
     pub effort: Option<crate::ai::EffortMode>,
 }
 
-/// A verified `High` or `Critical` defect discovered by `sashiko scan`
-/// and processed through the `linux_bug` verification, origin-tracing,
-/// and severity calibration pipeline.
+/// A verified defect discovered by `sashiko scan` and processed through the
+/// `linux_bug` verification, origin-tracing, and severity calibration pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifiedScanBug {
     pub canonical_title: String,
@@ -1313,6 +1313,8 @@ fn emit_scan_progress(progress: Option<&ScanProgressCallback<'_>>, event: ScanPr
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanSummary {
     pub target_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_severity: Option<crate::db::SeverityFloor>,
     pub files_scanned: usize,
     pub chunks_total: usize,
     pub chunks_analyzed: usize,
@@ -1573,6 +1575,7 @@ async fn scan_single_chunk(
     manual_stages: Option<Vec<String>>,
     custom_prompt: Option<String>,
     effort: Option<crate::ai::EffortMode>,
+    min_severity: crate::db::SeverityFloor,
     progress: Option<&ScanProgressCallback<'_>>,
 ) -> Result<ChunkScanResult> {
     let chunk_id = chunk.chunk_id();
@@ -1659,6 +1662,7 @@ async fn scan_single_chunk(
         manual_stages,
         custom_prompt,
         effort,
+        min_severity: Some(min_severity),
         ..Default::default()
     };
 
@@ -1836,41 +1840,44 @@ async fn submit_scan_candidates(
         .with_project(crate::project::ProjectId::Linux)
         .with_settings(settings.linux_bug.clone())
         .with_effort(options.effort.or_else(|| settings.effective_effort()))
-        .with_max_interactions(settings.ai.max_interactions),
+        .with_max_interactions(settings.ai.max_interactions)
+        .with_min_severity(Some(options.min_severity)),
     );
     let attributed_db = std::sync::Arc::new(attributed_db);
     let verify_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(options.concurrency.max(1)));
     let total = candidate_bugs.len();
 
-    let submit_futures = candidate_bugs.into_iter().enumerate().map(|(idx, input)| {
-        let sem = verify_sem.clone();
-        let worker = bug_worker.clone();
-        let attr_db = attributed_db.clone();
-        async move {
-            let _permit = sem.acquire_owned().await;
-            let fallback_input = input.clone();
-            emit_scan_progress(
-                progress,
-                ScanProgressEvent::CandidateVerifyStarted {
-                    index: idx + 1,
-                    total,
-                    problem: fallback_input.problem.clone(),
-                },
-            );
-            let res = worker.submit_and_process_bug(&attr_db, input).await;
-            (fallback_input, res)
-        }
-    });
+    let min_severity = options.min_severity;
+    let submit_futures = candidate_bugs
+        .into_iter()
+        .enumerate()
+        .map(|(idx, mut input)| {
+            let sem = verify_sem.clone();
+            let worker = bug_worker.clone();
+            let attr_db = attributed_db.clone();
+            async move {
+                let _permit = sem.acquire_owned().await;
+                input.min_severity.get_or_insert(min_severity);
+                let fallback_input = input.clone();
+                emit_scan_progress(
+                    progress,
+                    ScanProgressEvent::CandidateVerifyStarted {
+                        index: idx + 1,
+                        total,
+                        problem: fallback_input.problem.clone(),
+                    },
+                );
+                let res = worker.submit_and_process_bug(&attr_db, input).await;
+                (fallback_input, res)
+            }
+        });
 
     let outcomes = futures_util::future::join_all(submit_futures).await;
 
     for (fallback_input, res) in outcomes {
         match res {
             Ok(Some(crate::api::BugOutcome::NewlyDiscovered { bug: saved })) => {
-                if matches!(
-                    saved.severity(),
-                    crate::db::Severity::High | crate::db::Severity::Critical
-                ) {
+                if options.min_severity.admits(saved.severity()) {
                     emit_scan_progress(
                         progress,
                         ScanProgressEvent::BugSubmitted {
@@ -1891,8 +1898,9 @@ async fn submit_scan_candidates(
                     }
                 } else {
                     let reason = format!(
-                        "Calibrated severity {} is below the High/Critical active-scan bar",
-                        saved.severity().as_str()
+                        "Calibrated severity {} is below the {} active-scan threshold",
+                        saved.severity().as_str(),
+                        options.min_severity
                     );
                     emit_scan_progress(
                         progress,
@@ -1910,10 +1918,7 @@ async fn submit_scan_candidates(
             }
             Ok(Some(crate::api::BugOutcome::Duplicate { existing_bug, .. })) => {
                 if existing_bug.lifecycle_status == crate::db::BugLifecycleStatus::Open
-                    && matches!(
-                        existing_bug.severity(),
-                        crate::db::Severity::High | crate::db::Severity::Critical
-                    )
+                    && options.min_severity.admits(existing_bug.severity())
                 {
                     emit_scan_progress(
                         progress,
@@ -2031,6 +2036,7 @@ async fn verify_scan_candidates_standalone(
     let verify_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(options.concurrency.max(1)));
     let total = candidate_bugs.len();
 
+    let min_severity = options.min_severity;
     let verify_futures = candidate_bugs.into_iter().enumerate().map(|(idx, input)| {
         let sem = verify_sem.clone();
         let tools = bug_tools.clone();
@@ -2045,12 +2051,13 @@ async fn verify_scan_candidates_standalone(
                     problem: problem.clone(),
                 },
             );
-            let res = crate::workflows::linux_bug::run_standalone_bug_pipeline_for_project(
+            let res = crate::workflows::linux_bug::run_standalone_bug_pipeline_with_min_severity(
                 provider,
                 Some(tools),
                 input,
                 Some("[scan:linux_bug] "),
                 crate::project::ProjectId::Linux,
+                min_severity,
             )
             .await;
             (problem, res)
@@ -2243,6 +2250,7 @@ pub async fn run_scan(
                 manual_stages,
                 custom_prompt,
                 effort,
+                options.min_severity,
                 progress,
             )
             .await
@@ -2266,6 +2274,7 @@ pub async fn run_scan(
 
     let mut summary = ScanSummary {
         target_sha: target_sha.clone(),
+        min_severity: Some(options.min_severity),
         files_scanned: files.len(),
         chunks_total,
         ..Default::default()
@@ -2710,6 +2719,7 @@ pub fn second_fn() -> u32 {
             patch_id: None,
             baseline_sha: Some(bug1.verified_on_sha.clone()),
             review_id: None,
+            min_severity: None,
         };
         let input_same_fn = crate::api::BugInput {
             problem: bug_same_fn.canonical_title.clone(),
@@ -2738,6 +2748,7 @@ pub fn second_fn() -> u32 {
                 max_chunks: Some(1),
                 exclude: Vec::new(),
                 submit_bugs: false,
+                min_severity: crate::db::SeverityFloor::Medium,
                 prompts: PathBuf::from("projects/sashiko/prompts"),
                 custom_prompt: None,
                 stages: None,
