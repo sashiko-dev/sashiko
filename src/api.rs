@@ -234,6 +234,8 @@ pub struct BugInput {
     pub baseline_sha: Option<String>,
     #[serde(default)]
     pub review_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_severity: Option<crate::db::SeverityFloor>,
 }
 
 /// The result of processing a candidate Linux kernel bug through the pipeline.

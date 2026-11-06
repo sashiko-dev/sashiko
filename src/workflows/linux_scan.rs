@@ -93,6 +93,8 @@ pub struct LinuxScanState {
     pub planned_stages: Vec<String>,
     /// Optional reasoning effort mode (`Mid`, `High`, or `Dynamic`).
     pub effort: Option<crate::ai::EffortMode>,
+    /// Minimum severity floor requested for the scan (`Medium` when `None`).
+    pub min_severity: Option<crate::db::SeverityFloor>,
     /// Per-stage reasoning efforts selected by `triage`.
     pub planned_efforts: std::collections::BTreeMap<String, crate::ai::ReasoningEffort>,
     /// High-risk functions and hypotheses identified by `triage`.
@@ -116,7 +118,7 @@ pub struct LinuxScanState {
     /// Contested or speculative candidates routed to `post-verification`.
     pub inconclusive_concerns: Vec<Value>,
 
-    /// Verified `High` and `Critical` findings discovered in this chunk.
+    /// Verified actionable findings (`Medium`, `High`, and `Critical`) discovered in this chunk.
     pub findings: Vec<Value>,
 }
 
@@ -181,7 +183,7 @@ const SCAN_STAGE_JSON_SCHEMA_INSTRUCTIONS: &str = r#"
 TodoWrite compatibility: vendored prompts may ask you to add tasks or suspected bugs to TodoWrite. Do not call or mention TodoWrite. Treat those instructions as an internal checklist only. If that checklist identifies a concrete suspected bug, carry it forward as a JSON concern with file, function_or_symbol, line when known, triggering condition, and evidence. Do not output generic checklist progress as a concern.
 
 Once you have gathered sufficient information with tools, return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
-If you find no High or Critical bugs and no dismissed concerns, return `{"concerns": [], "dismissed_concerns": []}`.
+If you find no Medium, High, or Critical bugs and no dismissed concerns, return `{"concerns": [], "dismissed_concerns": []}`.
 - Set `"preexisting": true` on all concerns discovered during codebase scanning.
 - Each object in `'concerns'` MUST use: `"type"`, `"description"`, `"reasoning"`, `"preexisting"` (`true`), and `"locations"` (non-empty array of `{"file", "function_or_symbol", "line", "code_snippet", "why_this_location_matters"}`).
 - Each object in `'dismissed_concerns'` MUST use: `"type"`, `"description"`, `"reasoning"`, and `"locations"` (quoting the verbatim disproving guard, lock, cleanup path, or caller check in the repository).
@@ -293,7 +295,7 @@ pub fn linux_scan_system_prompt() -> PromptTemplate<LinuxScanState> {
     PromptTemplate::<LinuxScanState>::new(format!(
         r#"Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.
 
-You are an expert Linux kernel maintainer and static security auditor performing an active deep scan of the Linux kernel source tree to uncover serious (`High` and `Critical`) defects.
+You are an expert Linux kernel maintainer and static security auditor performing an active deep scan of the Linux kernel source tree to uncover real (`Medium`, `High`, and `Critical`) defects.
 
 TOOL USAGE: When you need to gather information using tools (`git_read_files`, `git_grep`, `git_blame`, `git_log`, `git_show`), actively batch parallel or independent tool calls into a single response to minimize conversation turns. Always pass the exact `Target Revision SHA` (`{{{{target_sha}}}}`) when calling Git tools.
 
@@ -980,11 +982,52 @@ pub fn is_high_or_critical_finding(finding: &Value) -> bool {
         .is_some_and(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "high" | "critical"))
 }
 
+pub fn is_actionable_scan_finding(finding: &Value) -> bool {
+    is_actionable_scan_finding_for_floor(finding, crate::db::SeverityFloor::Medium)
+}
+
+pub fn is_actionable_scan_finding_for_floor(
+    finding: &Value,
+    floor: crate::db::SeverityFloor,
+) -> bool {
+    // Retain at least Medium candidates before Phase 2 so SeveritySession can
+    // calibrate borderline issues, while also admitting Low when --min-severity low.
+    let prefilter = floor.min(crate::db::SeverityFloor::Medium);
+    finding
+        .get("severity")
+        .and_then(Value::as_str)
+        .map(crate::db::Severity::from_str)
+        .is_some_and(|sev| prefilter.admits(sev))
+}
+
 pub(crate) fn record_verified_scan_findings(state: &mut LinuxScanState, findings: Vec<Value>) {
+    let floor = state
+        .min_severity
+        .unwrap_or(crate::db::SeverityFloor::Medium);
     for mut finding in findings {
         ensure_affected_source_files(&mut finding, &state.file_path);
-        if is_high_or_critical_finding(&finding) {
+        if is_actionable_scan_finding_for_floor(&finding, floor) {
             state.findings.push(finding);
+        } else {
+            let sev = finding
+                .get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("Low");
+            let desc = finding
+                .get("problem")
+                .and_then(Value::as_str)
+                .unwrap_or("Low-severity scan finding");
+            let expl = finding
+                .get("severity_explanation")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            state.deduplicated_dismissed_concerns.push(json!({
+                "origin": "scan_severity_filter",
+                "type": "Below Scan Threshold",
+                "description": desc,
+                "reasoning": format!("Filtered before linux_bug pipeline because preliminary severity is {sev}: {expl}"),
+                "locations": finding.get("locations").cloned().unwrap_or_else(|| json!([])),
+            }));
         }
     }
 }
@@ -1436,7 +1479,7 @@ Your task is to (1) deduplicate overlapping items that share the same root cause
 - **Category 2: Inconclusive (`inconclusive_concerns`):** Contested (`C*` + `D*`), speculative, or assumption-based dismissals (`"signal_reason": "speculative_dismissal"`) requiring tool-based `post-verification` across callers/callees.
 
 ### CRITICAL SEVERITY & CANONICAL BUGREPO FORMAT REQUIREMENTS
-Active codebase scanning targets ONLY serious (`High` or `Critical`) kernel defects.
+Active codebase scanning forwards verified `Medium`, `High`, and `Critical` kernel defects to the `linux_bug` verification and severity calibration pipeline (filtering out `Low` hygiene/trivia).
 - **LINEAGE REQUIREMENT (`source_ids`):** Every input item in Aggregated Concerns has an `"id"` (`"C1"`, `"C2"`, ...) and every input item in Aggregated Dismissed Concerns has an `"id"` (`"D1"`, `"D2"`, ...). Every output object across `findings`, `inconclusive_concerns`, and `dismissed_concerns` MUST include a non-empty `"source_ids"` array listing the exact input `"id"` string(s) merged into that item. Every input `"C*"` and `"D*"` ID MUST appear in at least one output item's `"source_ids"`.
 - **Category 1a (`findings`) required keys:**
   1. `"source_ids"`: non-empty array of input `C*` IDs only (never `D*` IDs).
@@ -1717,6 +1760,7 @@ impl LinuxScanState {
                 patch_id: None,
                 baseline_sha: Some(self.target_sha.clone()),
                 review_id: None,
+                min_severity: self.min_severity,
             });
         }
         inputs
@@ -1939,7 +1983,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_verified_scan_findings_filters_to_high_and_critical() {
+    fn test_record_verified_scan_findings_retains_medium_plus_and_tracks_low_dismissal() {
         let mut state = LinuxScanState {
             file_path: "fs/smb/server/smb2pdu.c".to_string(),
             target_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
@@ -1948,14 +1992,22 @@ mod tests {
         let findings = vec![
             json!({
                 "id": "VF1",
-                "problem": "smb: minor issue in foo()",
+                "problem": "smb: comment typo in foo()",
                 "canonical_description": "Trigger: x\nFailure Mechanism: y\nImpact: z",
-                "severity": "Medium",
-                "severity_explanation": "Medium issue",
+                "severity": "Low",
+                "severity_explanation": "Low hygiene issue",
                 "locations": [{"file": "fs/smb/server/smb2pdu.c", "function_or_symbol": "foo", "code_snippet": "x();"}]
             }),
             json!({
                 "id": "VF2",
+                "problem": "smb: error-path leak in baz()",
+                "canonical_description": "Trigger: x\nFailure Mechanism: y\nImpact: z",
+                "severity": "Medium",
+                "severity_explanation": "Medium error-path leak",
+                "locations": [{"file": "fs/smb/server/smb2pdu.c", "function_or_symbol": "baz", "code_snippet": "return -ENOMEM;"}]
+            }),
+            json!({
+                "id": "VF3",
                 "problem": "smb: use-after-free in bar()",
                 "canonical_description": "Trigger: x\nFailure Mechanism: y\nImpact: z",
                 "severity": "High",
@@ -1964,24 +2016,33 @@ mod tests {
             }),
         ];
         record_verified_scan_findings(&mut state, findings);
-        assert_eq!(state.findings.len(), 1);
-        assert_eq!(state.findings[0]["problem"], "smb: use-after-free in bar()");
+        assert_eq!(state.findings.len(), 2);
         assert_eq!(
-            state.findings[0]["affected_source_files"],
+            state.findings[0]["problem"],
+            "smb: error-path leak in baz()"
+        );
+        assert_eq!(state.findings[1]["problem"], "smb: use-after-free in bar()");
+        assert_eq!(
+            state.findings[1]["affected_source_files"],
             json!(["fs/smb/server/smb2pdu.c"])
+        );
+        assert_eq!(state.deduplicated_dismissed_concerns.len(), 1);
+        assert_eq!(
+            state.deduplicated_dismissed_concerns[0]["origin"],
+            "scan_severity_filter"
         );
 
         let inputs = state.to_candidate_bug_inputs(None);
-        assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs[0].problem, "smb: use-after-free in bar()");
-        assert!(inputs[0].reasoning.contains("Failure Mechanism: y"));
-        assert!(inputs[0].reasoning.contains("High UAF"));
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[1].problem, "smb: use-after-free in bar()");
+        assert!(inputs[1].reasoning.contains("Failure Mechanism: y"));
+        assert!(inputs[1].reasoning.contains("High UAF"));
         assert_eq!(
-            inputs[0].source_files,
+            inputs[1].source_files,
             vec!["fs/smb/server/smb2pdu.c".to_string()]
         );
         assert_eq!(
-            inputs[0].commit_sha.as_deref(),
+            inputs[1].commit_sha.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
         );
     }
@@ -2083,5 +2144,31 @@ mod tests {
         };
         let err = validate_scan_verification_output(&empty_out, &state).unwrap_err();
         assert!(err.contains("At least one concern was raised"));
+    }
+
+    #[test]
+    fn test_record_verified_scan_findings_respects_low_floor() {
+        let low_finding = json!({
+            "problem": "minor counter drift",
+            "severity": "Low",
+            "severity_explanation": "cosmetic stats counter",
+            "locations": []
+        });
+
+        let mut default_state = LinuxScanState {
+            file_path: "mm/memcontrol.c".to_string(),
+            ..Default::default()
+        };
+        record_verified_scan_findings(&mut default_state, vec![low_finding.clone()]);
+        assert!(default_state.findings.is_empty());
+        assert_eq!(default_state.deduplicated_dismissed_concerns.len(), 1);
+
+        let mut low_floor_state = LinuxScanState {
+            file_path: "mm/memcontrol.c".to_string(),
+            min_severity: Some(crate::db::SeverityFloor::Low),
+            ..Default::default()
+        };
+        record_verified_scan_findings(&mut low_floor_state, vec![low_finding]);
+        assert_eq!(low_floor_state.findings.len(), 1);
     }
 }
