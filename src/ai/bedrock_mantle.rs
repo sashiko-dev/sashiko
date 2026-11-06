@@ -297,7 +297,7 @@ impl MantleClient {
             match &parsed.usage {
                 Some(usage) => {
                     let details = usage.input_tokens_details.as_ref();
-                    tracing::info!(
+                    tracing::debug!(
                         "{}bedrock-mantle response received. Tokens: in={}, out={}, \
                          cache_read={}, cache_write={}",
                         crate::ai::get_log_prefix(),
@@ -307,7 +307,7 @@ impl MantleClient {
                         details.and_then(|d| d.cache_write_tokens).unwrap_or(0),
                     )
                 }
-                None => tracing::info!(
+                None => tracing::debug!(
                     "{}bedrock-mantle response received without usage.",
                     crate::ai::get_log_prefix()
                 ),

@@ -200,7 +200,7 @@ impl OllamaClient {
             })?;
             match serde_json::from_str::<OllamaResponse>(&body_text) {
                 Ok(response) => {
-                    tracing::info!(
+                    tracing::debug!(
                         "Ollama response received. Tokens: in={}, out={}",
                         response.prompt_eval_count,
                         response.eval_count
@@ -348,7 +348,7 @@ fn translate_ollama_response(resp: OllamaResponse) -> Result<AiResponse> {
 #[async_trait]
 impl AiProvider for OllamaClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        tracing::info!("Sending Ollama request to model: {}", self.model);
+        tracing::debug!("Sending Ollama request to model: {}", self.model);
 
         let mut ollama_req = translate_ollama_request(
             request,

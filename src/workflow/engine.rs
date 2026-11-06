@@ -15,7 +15,7 @@
 //! Runtime execution engine for declarative workflows.
 
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::ai::AiMessage;
 
@@ -274,7 +274,7 @@ impl WorkflowEngine {
 
                 WorkflowStep::EarlyExitIf { condition, reason } => {
                     if condition(state) {
-                        info!("Workflow '{}' early exit: {}", workflow.name, reason);
+                        debug!("Workflow '{}' early exit: {}", workflow.name, reason);
                         if let Some(cb) = event_cb {
                             cb(WorkflowEvent::EarlyExitTriggered { reason });
                         }
@@ -297,7 +297,7 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
     event_cb: Option<&(dyn Fn(WorkflowEvent) + Send + Sync)>,
     outcome: &mut WorkflowOutcome,
 ) -> Result<()> {
-    info!("Running {} stages concurrently", stages.len());
+    debug!("Running {} stages concurrently", stages.len());
 
     match policy {
         ParallelPolicy::FailFast => {

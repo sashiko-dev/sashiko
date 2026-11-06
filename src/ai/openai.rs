@@ -312,7 +312,7 @@ impl OpenAiCompatClient {
             &self.temperature_unsupported,
         )
         .await?;
-        tracing::info!(
+        tracing::debug!(
             "OpenAI response received. Tokens: in={}, out={}",
             response.usage.prompt_tokens,
             response.usage.completion_tokens
@@ -583,7 +583,7 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
 #[async_trait]
 impl AiProvider for OpenAiCompatClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        tracing::info!("Sending OpenAI request...");
+        tracing::debug!("Sending OpenAI request...");
 
         let openai_req = self.build_request(request)?;
 

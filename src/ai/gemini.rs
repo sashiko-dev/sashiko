@@ -428,7 +428,7 @@ pub(crate) async fn read_generate_content_response(
         match &response.usage_metadata {
             Some(usage) => {
                 let cached = usage.cached_content_token_count.unwrap_or(0);
-                tracing::info!(
+                tracing::debug!(
                     "{}Gemini response received. Tokens: in={}, cached={}, out={} (candidates={}, thoughts={})",
                     crate::ai::get_log_prefix(),
                     usage.prompt_token_count.saturating_sub(cached),
@@ -438,7 +438,7 @@ pub(crate) async fn read_generate_content_response(
                     usage.thoughts_token_count.unwrap_or(0)
                 );
             }
-            None => tracing::info!(
+            None => tracing::debug!(
                 "{}Gemini response received. No usage metadata.",
                 crate::ai::get_log_prefix()
             ),
@@ -723,7 +723,7 @@ impl GeminiClient {
         &self,
         request: &GenerateContentRequest,
     ) -> Result<GenerateContentResponse> {
-        tracing::info!("Sending Gemini request...");
+        tracing::debug!("Sending Gemini request...");
 
         let base_url = self.effective_base_url().await?;
         let url = format!("{}/v1beta/models/{}:generateContent", base_url, self.model);
@@ -871,7 +871,7 @@ impl GenAiClient for GeminiClient {
             else {
                 return Ok(acc);
             };
-            tracing::info!(
+            tracing::debug!(
                 "{}Gemini response reached per-hop limit (finishReason=CONTINUATION); requesting continuation hop {}/{}...",
                 crate::ai::get_log_prefix(),
                 hop,

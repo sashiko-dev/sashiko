@@ -21,7 +21,7 @@ use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod apply_error;
 use apply_error::GitAmError;
@@ -95,7 +95,7 @@ impl GitWorktree {
             is_managed: false,
         };
 
-        info!("Creating worktree at {:?}", path);
+        debug!("Creating worktree at {:?}", path);
 
         // Split worktree creation into two phases:
         // 1) metadata update (under lock, fast)
@@ -217,7 +217,7 @@ impl GitWorktree {
             is_managed: false,
         };
 
-        info!("Creating scratch clone at {:?}", path);
+        debug!("Creating scratch clone at {:?}", path);
 
         let output = match crate::git_cmd::detached_async()
             .args(["-c", "safe.bareRepository=all"])
@@ -337,7 +337,7 @@ impl GitWorktree {
 
     #[allow(dead_code)]
     pub async fn apply_patch(&self, patch_content: &str) -> Result<()> {
-        info!("Applying patch in {:?}", self.path);
+        debug!("Applying patch in {:?}", self.path);
 
         let before_head = get_commit_hash(&self.path, "HEAD").await?;
         let output = self.run_git_am(patch_content, false).await?;
@@ -436,7 +436,7 @@ impl GitWorktree {
     }
 
     pub async fn reset_hard(&self, ref_name: &str) -> Result<()> {
-        info!("Resetting worktree to {}", ref_name);
+        debug!("Resetting worktree to {}", ref_name);
         let output = crate::git_cmd::in_dir_async(&self.path)
             .args(["reset", "--hard", ref_name])
             .output()
@@ -497,7 +497,7 @@ impl GitWorktree {
         if !std::mem::replace(&mut self.is_managed, false) {
             return Ok(());
         }
-        info!("Removing worktree at {:?}", self.path);
+        debug!("Removing worktree at {:?}", self.path);
         let lock = get_worktree_lock();
         let output = {
             let _guard = lock.lock().await;
@@ -728,7 +728,7 @@ pub async fn git_find_file_rename(
 
 #[allow(dead_code)]
 pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
-    info!("Pruning git worktrees in {:?}", repo_path);
+    debug!("Pruning git worktrees in {:?}", repo_path);
     let output = {
         let lock = get_worktree_lock();
         let _guard = lock.lock().await;
@@ -751,7 +751,7 @@ pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
 
 #[allow(dead_code)]
 pub async fn ensure_submodule_config_compat(repo_path: &Path) -> Result<()> {
-    info!("Ensuring submodule config compatibility in {:?}", repo_path);
+    debug!("Ensuring submodule config compatibility in {:?}", repo_path);
     let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["-c", "safe.bareRepository=all"])
         .args(["config", "--unset", "core.worktree"])
@@ -768,7 +768,7 @@ pub async fn ensure_submodule_config_compat(repo_path: &Path) -> Result<()> {
             ));
         }
     } else {
-        info!("Successfully unset core.worktree in {:?}", repo_path);
+        debug!("Successfully unset core.worktree in {:?}", repo_path);
     }
     Ok(())
 }
@@ -928,7 +928,7 @@ pub async fn write_commit_graph(repo_path: &Path) -> Result<()> {
     let lock = get_object_store_lock();
     let _guard = lock.lock().await;
 
-    info!("Writing commit-graph for {:?}", repo_path);
+    debug!("Writing commit-graph for {:?}", repo_path);
     let started = std::time::Instant::now();
 
     let mut output = run_commit_graph_write(repo_path).await?;
@@ -952,7 +952,7 @@ pub async fn write_commit_graph(repo_path: &Path) -> Result<()> {
         ));
     }
 
-    info!(
+    debug!(
         "Wrote commit-graph for {:?} in {:.1}s",
         repo_path,
         started.elapsed().as_secs_f64()
@@ -978,7 +978,7 @@ pub fn schedule_commit_graph_rebuild(repo_path: &Path) {
 
     tokio::spawn(async move {
         let Ok(_guard) = lock.try_lock() else {
-            info!("A commit-graph rebuild is already running; skipping this one");
+            debug!("A commit-graph rebuild is already running; skipping this one");
             return;
         };
         if let Err(e) = write_commit_graph(&repo_path).await {
@@ -1031,7 +1031,7 @@ pub async fn cleanup_worktree_dir(worktree_dir: &Path) -> Result<()> {
     if !worktree_dir.exists() {
         return Ok(());
     }
-    info!(
+    debug!(
         "Cleaning up stale worktree directories in {:?}",
         worktree_dir
     );
@@ -1403,7 +1403,7 @@ pub async fn refresh_remote(
             .into());
         }
         let reason = "failed recently, backing off";
-        info!("Skipping fetch for {} ({})", name, reason);
+        debug!("Skipping fetch for {} ({})", name, reason);
         return Ok(FetchOutcome::BackedOff);
     }
 
@@ -1427,7 +1427,7 @@ pub async fn refresh_remote(
         } else {
             "fresh"
         };
-        info!("Skipping fetch for {} ({})", name, reason);
+        debug!("Skipping fetch for {} ({})", name, reason);
         return Ok(FetchOutcome::Skipped);
     }
 
@@ -1436,7 +1436,7 @@ pub async fn refresh_remote(
 
     // 4. Fetch
     if should_fetch {
-        info!("Fetching remote {}", name);
+        debug!("Fetching remote {}", name);
 
         let mut fetch_args = vec!["fetch", "--prune"];
         if !url.contains("torvalds/linux.git") && !url.contains("stable/linux.git") {

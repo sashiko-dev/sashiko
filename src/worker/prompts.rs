@@ -136,7 +136,7 @@ async fn select_code_notes(
     let mut notes = crate::notes::select::select_notes(set, &files, identifiers);
     let symbol_notes = crate::notes::select::select_symbol_notes(set, &specific, &notes);
     notes.extend(symbol_notes);
-    tracing::info!(
+    tracing::debug!(
         "code notes: set {} for {} touched file(s): {:?}",
         set.manifest.set,
         files.len(),
@@ -164,7 +164,7 @@ fn select_maintainer_notes(prompts_dir: &std::path::Path, diff: &str) -> String 
         .iter()
         .filter(|note| note.applies(&files, &identifiers))
         .collect();
-    tracing::info!(
+    tracing::debug!(
         "maintainer notes: {} of {} apply: {:?}",
         selected.len(),
         notes.len(),
