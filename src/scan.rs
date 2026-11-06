@@ -1248,6 +1248,10 @@ impl VerifiedScanBug {
 /// Progress events emitted during `sashiko scan`.
 #[derive(Debug, Clone)]
 pub enum ScanProgressEvent {
+    IndexingFiles {
+        target_sha: String,
+        files_count: usize,
+    },
     ResolvedTargets {
         target_sha: String,
         files_count: usize,
@@ -1259,7 +1263,21 @@ pub enum ScanProgressEvent {
         start_line: usize,
         end_line: usize,
     },
+    ChunkPlanned {
+        chunk_id: String,
+        planned_stages: Vec<String>,
+    },
     ChunkStageStarted {
+        chunk_id: String,
+        stage: String,
+    },
+    ChunkStageTurn {
+        chunk_id: String,
+        stage: String,
+        turn: usize,
+        max_turns: usize,
+    },
+    ChunkStageFinished {
         chunk_id: String,
         stage: String,
     },
@@ -1278,21 +1296,28 @@ pub enum ScanProgressEvent {
         problem: String,
     },
     CandidateVerified {
+        index: usize,
         canonical_title: String,
         severity: String,
     },
     CandidateDiscarded {
+        index: usize,
         problem: String,
         reason: String,
     },
     CandidateFailed {
+        index: usize,
         problem: String,
         error: String,
     },
     BugSubmitted {
+        index: usize,
         canonical_title: String,
         bugid: String,
         is_duplicate: bool,
+    },
+    ScanComplete {
+        partial: bool,
     },
 }
 
@@ -1301,6 +1326,53 @@ pub type ScanProgressCallback<'a> = dyn Fn(ScanProgressEvent) + Send + Sync + 'a
 fn emit_scan_progress(progress: Option<&ScanProgressCallback<'_>>, event: ScanProgressEvent) {
     if let Some(cb) = progress {
         cb(event);
+    }
+}
+
+fn translate_chunk_workflow_event(
+    chunk_id: &str,
+    triage_resolved: &std::sync::atomic::AtomicBool,
+    event: crate::workflow::WorkflowEvent,
+) -> Option<ScanProgressEvent> {
+    match event {
+        crate::workflow::WorkflowEvent::ParallelResolved { stage_names } => {
+            // The scan workflow contains two dynamic_parallel steps (triage ->
+            // specialist stages, then verification -> post-verification
+            // batches). Only the initial specialist fan-out defines the chunk's
+            // planned_stages; emitting ChunkPlanned again after verification
+            // would overwrite the specialist plan and move progress backward.
+            if !triage_resolved.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                Some(ScanProgressEvent::ChunkPlanned {
+                    chunk_id: chunk_id.to_string(),
+                    planned_stages: stage_names.into_iter().map(str::to_string).collect(),
+                })
+            } else {
+                None
+            }
+        }
+        crate::workflow::WorkflowEvent::StageStarted { stage_name } => {
+            Some(ScanProgressEvent::ChunkStageStarted {
+                chunk_id: chunk_id.to_string(),
+                stage: stage_name.to_string(),
+            })
+        }
+        crate::workflow::WorkflowEvent::StageTurn {
+            stage_name,
+            turn,
+            max_turns,
+        } => Some(ScanProgressEvent::ChunkStageTurn {
+            chunk_id: chunk_id.to_string(),
+            stage: stage_name.to_string(),
+            turn,
+            max_turns,
+        }),
+        crate::workflow::WorkflowEvent::StageFinished { stage_name, .. } => {
+            Some(ScanProgressEvent::ChunkStageFinished {
+                chunk_id: chunk_id.to_string(),
+                stage: stage_name.to_string(),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -1314,11 +1386,15 @@ pub struct ScanSummary {
     pub chunks_early_exited: usize,
     pub chunks_failed: usize,
     pub candidates_failed: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_severity: Option<crate::db::SeverityFloor>,
     pub findings: Vec<VerifiedScanBug>,
     pub dismissed_concerns: Vec<serde_json::Value>,
     pub tokens_in: usize,
     pub tokens_out: usize,
     pub tokens_cached: usize,
+    #[serde(default)]
+    pub duration_secs: u64,
 }
 
 fn normalize_title_tokens(title: &str) -> BTreeSet<String> {
@@ -1670,15 +1746,12 @@ async fn scan_single_chunk(
     };
 
     let chunk_id_for_cb = chunk_id.clone();
+    let triage_resolved = std::sync::atomic::AtomicBool::new(false);
     let event_cb = move |event: crate::workflow::WorkflowEvent| {
-        if let crate::workflow::WorkflowEvent::StageStarted { stage_name } = event {
-            emit_scan_progress(
-                progress,
-                ScanProgressEvent::ChunkStageStarted {
-                    chunk_id: chunk_id_for_cb.clone(),
-                    stage: stage_name.to_string(),
-                },
-            );
+        if let Some(scan_ev) =
+            translate_chunk_workflow_event(&chunk_id_for_cb, &triage_resolved, event)
+        {
+            emit_scan_progress(progress, scan_ev);
         }
     };
 
@@ -1831,6 +1904,12 @@ async fn submit_scan_candidates(
         .with_project(crate::project::ProjectId::Linux)
         .with_settings(settings.linux_bug.clone()),
     );
+    enum CandidateVerifyAggregation {
+        Verified(Box<VerifiedScanBug>),
+        Dismissed(serde_json::Value),
+        Failed,
+    }
+
     let attributed_db = std::sync::Arc::new(attributed_db);
     let verify_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(options.concurrency.max(1)));
     let total = candidate_bugs.len();
@@ -1841,157 +1920,175 @@ async fn submit_scan_candidates(
         let attr_db = attributed_db.clone();
         async move {
             let _permit = sem.acquire_owned().await;
+            let index = idx + 1;
             let fallback_input = input.clone();
             emit_scan_progress(
                 progress,
                 ScanProgressEvent::CandidateVerifyStarted {
-                    index: idx + 1,
+                    index,
                     total,
                     problem: fallback_input.problem.clone(),
                 },
             );
-            let res = worker.submit_and_process_bug(&attr_db, input).await;
-            (fallback_input, res)
+            match worker.submit_and_process_bug(&attr_db, input).await {
+                Ok(Some(crate::api::BugOutcome::NewlyDiscovered { bug: saved })) => {
+                    if matches!(
+                        saved.severity(),
+                        crate::db::Severity::High | crate::db::Severity::Critical
+                    ) {
+                        emit_scan_progress(
+                            progress,
+                            ScanProgressEvent::BugSubmitted {
+                                index,
+                                canonical_title: saved.title.clone(),
+                                bugid: saved.bugid.clone(),
+                                is_duplicate: false,
+                            },
+                        );
+                        CandidateVerifyAggregation::Verified(Box::new(
+                            VerifiedScanBug::from_db_bug(
+                                &saved,
+                                &fallback_input,
+                                target_sha,
+                                Some(saved.bugid.clone()),
+                                None,
+                            ),
+                        ))
+                    } else {
+                        let reason = format!(
+                            "Calibrated severity {} is below the High/Critical active-scan bar",
+                            saved.severity().as_str()
+                        );
+                        emit_scan_progress(
+                            progress,
+                            ScanProgressEvent::CandidateDiscarded {
+                                index,
+                                problem: fallback_input.problem.clone(),
+                                reason: reason.clone(),
+                            },
+                        );
+                        CandidateVerifyAggregation::Dismissed(serde_json::json!({
+                            "origin": "linux_bug_verification",
+                            "description": fallback_input.problem,
+                            "reasoning": reason,
+                        }))
+                    }
+                }
+                Ok(Some(crate::api::BugOutcome::Duplicate { existing_bug, .. })) => {
+                    if existing_bug.lifecycle_status == crate::db::BugLifecycleStatus::Open
+                        && matches!(
+                            existing_bug.severity(),
+                            crate::db::Severity::High | crate::db::Severity::Critical
+                        )
+                    {
+                        emit_scan_progress(
+                            progress,
+                            ScanProgressEvent::BugSubmitted {
+                                index,
+                                canonical_title: existing_bug.title.clone(),
+                                bugid: existing_bug.bugid.clone(),
+                                is_duplicate: true,
+                            },
+                        );
+                        CandidateVerifyAggregation::Verified(Box::new(
+                            VerifiedScanBug::from_db_bug(
+                                &existing_bug,
+                                &fallback_input,
+                                target_sha,
+                                None,
+                                Some(existing_bug.bugid.clone()),
+                            ),
+                        ))
+                    } else {
+                        let reason = format!(
+                            "Matched existing bug {} ({}, severity {})",
+                            existing_bug.bugid,
+                            existing_bug.lifecycle_status.as_str(),
+                            existing_bug.severity().as_str()
+                        );
+                        emit_scan_progress(
+                            progress,
+                            ScanProgressEvent::CandidateDiscarded {
+                                index,
+                                problem: fallback_input.problem.clone(),
+                                reason: reason.clone(),
+                            },
+                        );
+                        CandidateVerifyAggregation::Dismissed(serde_json::json!({
+                            "origin": "linux_bug_verification",
+                            "description": fallback_input.problem,
+                            "reasoning": reason,
+                        }))
+                    }
+                }
+                Ok(Some(crate::api::BugOutcome::Discarded { reason, .. })) => {
+                    emit_scan_progress(
+                        progress,
+                        ScanProgressEvent::CandidateDiscarded {
+                            index,
+                            problem: fallback_input.problem.clone(),
+                            reason: reason.clone(),
+                        },
+                    );
+                    CandidateVerifyAggregation::Dismissed(serde_json::json!({
+                        "origin": "linux_bug_verification",
+                        "description": fallback_input.problem,
+                        "reasoning": reason,
+                    }))
+                }
+                Ok(None) => {
+                    let msg =
+                        "Lost bug deduplication lease before verification completed".to_string();
+                    tracing::warn!(
+                        "Failed to finish verifying scan finding '{}': {}",
+                        fallback_input.problem,
+                        msg
+                    );
+                    emit_scan_progress(
+                        progress,
+                        ScanProgressEvent::CandidateFailed {
+                            index,
+                            problem: fallback_input.problem,
+                            error: msg,
+                        },
+                    );
+                    CandidateVerifyAggregation::Failed
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::warn!(
+                        "Failed to process and submit scan finding '{}' to bug repository: {}",
+                        fallback_input.problem,
+                        msg
+                    );
+                    emit_scan_progress(
+                        progress,
+                        ScanProgressEvent::CandidateFailed {
+                            index,
+                            problem: fallback_input.problem,
+                            error: msg,
+                        },
+                    );
+                    CandidateVerifyAggregation::Failed
+                }
+            }
         }
     });
 
     let outcomes = futures_util::future::join_all(submit_futures).await;
 
-    for (fallback_input, res) in outcomes {
-        match res {
-            Ok(Some(crate::api::BugOutcome::NewlyDiscovered { bug: saved })) => {
-                if matches!(
-                    saved.severity(),
-                    crate::db::Severity::High | crate::db::Severity::Critical
-                ) {
-                    emit_scan_progress(
-                        progress,
-                        ScanProgressEvent::BugSubmitted {
-                            canonical_title: saved.title.clone(),
-                            bugid: saved.bugid.clone(),
-                            is_duplicate: false,
-                        },
-                    );
-                    let verified = VerifiedScanBug::from_db_bug(
-                        &saved,
-                        &fallback_input,
-                        target_sha,
-                        Some(saved.bugid.clone()),
-                        None,
-                    );
-                    if !is_in_run_duplicate(&summary.findings, &verified) {
-                        summary.findings.push(verified);
-                    }
-                } else {
-                    let reason = format!(
-                        "Calibrated severity {} is below the High/Critical active-scan bar",
-                        saved.severity().as_str()
-                    );
-                    emit_scan_progress(
-                        progress,
-                        ScanProgressEvent::CandidateDiscarded {
-                            problem: fallback_input.problem.clone(),
-                            reason: reason.clone(),
-                        },
-                    );
-                    summary.dismissed_concerns.push(serde_json::json!({
-                        "origin": "linux_bug_verification",
-                        "description": fallback_input.problem,
-                        "reasoning": reason,
-                    }));
+    for outcome in outcomes {
+        match outcome {
+            CandidateVerifyAggregation::Verified(verified) => {
+                if !is_in_run_duplicate(&summary.findings, &verified) {
+                    summary.findings.push(*verified);
                 }
             }
-            Ok(Some(crate::api::BugOutcome::Duplicate { existing_bug, .. })) => {
-                if existing_bug.lifecycle_status == crate::db::BugLifecycleStatus::Open
-                    && matches!(
-                        existing_bug.severity(),
-                        crate::db::Severity::High | crate::db::Severity::Critical
-                    )
-                {
-                    emit_scan_progress(
-                        progress,
-                        ScanProgressEvent::BugSubmitted {
-                            canonical_title: existing_bug.title.clone(),
-                            bugid: existing_bug.bugid.clone(),
-                            is_duplicate: true,
-                        },
-                    );
-                    let verified = VerifiedScanBug::from_db_bug(
-                        &existing_bug,
-                        &fallback_input,
-                        target_sha,
-                        None,
-                        Some(existing_bug.bugid.clone()),
-                    );
-                    if !is_in_run_duplicate(&summary.findings, &verified) {
-                        summary.findings.push(verified);
-                    }
-                } else {
-                    let reason = format!(
-                        "Matched existing bug {} ({}, severity {})",
-                        existing_bug.bugid,
-                        existing_bug.lifecycle_status.as_str(),
-                        existing_bug.severity().as_str()
-                    );
-                    emit_scan_progress(
-                        progress,
-                        ScanProgressEvent::CandidateDiscarded {
-                            problem: fallback_input.problem.clone(),
-                            reason: reason.clone(),
-                        },
-                    );
-                    summary.dismissed_concerns.push(serde_json::json!({
-                        "origin": "linux_bug_verification",
-                        "description": fallback_input.problem,
-                        "reasoning": reason,
-                    }));
-                }
+            CandidateVerifyAggregation::Dismissed(concern) => {
+                summary.dismissed_concerns.push(concern);
             }
-            Ok(Some(crate::api::BugOutcome::Discarded { reason, .. })) => {
-                emit_scan_progress(
-                    progress,
-                    ScanProgressEvent::CandidateDiscarded {
-                        problem: fallback_input.problem.clone(),
-                        reason: reason.clone(),
-                    },
-                );
-                summary.dismissed_concerns.push(serde_json::json!({
-                    "origin": "linux_bug_verification",
-                    "description": fallback_input.problem,
-                    "reasoning": reason,
-                }));
-            }
-            Ok(None) => {
+            CandidateVerifyAggregation::Failed => {
                 summary.candidates_failed += 1;
-                let msg = "Lost bug deduplication lease before verification completed".to_string();
-                tracing::warn!(
-                    "Failed to finish verifying scan finding '{}': {}",
-                    fallback_input.problem,
-                    msg
-                );
-                emit_scan_progress(
-                    progress,
-                    ScanProgressEvent::CandidateFailed {
-                        problem: fallback_input.problem,
-                        error: msg,
-                    },
-                );
-            }
-            Err(e) => {
-                summary.candidates_failed += 1;
-                let msg = e.to_string();
-                tracing::warn!(
-                    "Failed to process and submit scan finding '{}' to bug repository: {}",
-                    fallback_input.problem,
-                    msg
-                );
-                emit_scan_progress(
-                    progress,
-                    ScanProgressEvent::CandidateFailed {
-                        problem: fallback_input.problem,
-                        error: msg,
-                    },
-                );
             }
         }
     }
@@ -2024,16 +2121,37 @@ async fn verify_scan_candidates_standalone(
     let verify_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(options.concurrency.max(1)));
     let total = candidate_bugs.len();
 
+    enum StandaloneVerifyAggregation {
+        Verified {
+            bug: Box<VerifiedScanBug>,
+            tokens_in: usize,
+            tokens_out: usize,
+            tokens_cached: usize,
+        },
+        Dismissed {
+            concern: serde_json::Value,
+            tokens_in: usize,
+            tokens_out: usize,
+            tokens_cached: usize,
+        },
+        Failed {
+            tokens_in: usize,
+            tokens_out: usize,
+            tokens_cached: usize,
+        },
+    }
+
     let verify_futures = candidate_bugs.into_iter().enumerate().map(|(idx, input)| {
         let sem = verify_sem.clone();
         let tools = bug_tools.clone();
         async move {
             let _permit = sem.acquire_owned().await;
+            let index = idx + 1;
             let problem = input.problem.clone();
             emit_scan_progress(
                 progress,
                 ScanProgressEvent::CandidateVerifyStarted {
-                    index: idx + 1,
+                    index,
                     total,
                     problem: problem.clone(),
                 },
@@ -2046,83 +2164,133 @@ async fn verify_scan_candidates_standalone(
                 crate::project::ProjectId::Linux,
             )
             .await;
-            (problem, res)
+            match res {
+                Ok(crate::workflows::linux_bug::StandaloneBugOutcome::Verified(bug)) => {
+                    let tokens_in = bug.tokens_in;
+                    let tokens_out = bug.tokens_out;
+                    let tokens_cached = bug.tokens_cached;
+                    let verified = VerifiedScanBug::from_standalone(*bug);
+                    emit_scan_progress(
+                        progress,
+                        ScanProgressEvent::CandidateVerified {
+                            index,
+                            canonical_title: verified.canonical_title.clone(),
+                            severity: verified.severity.clone(),
+                        },
+                    );
+                    StandaloneVerifyAggregation::Verified {
+                        bug: Box::new(verified),
+                        tokens_in,
+                        tokens_out,
+                        tokens_cached,
+                    }
+                }
+                Ok(crate::workflows::linux_bug::StandaloneBugOutcome::Discarded {
+                    reason,
+                    tokens_in,
+                    tokens_out,
+                    tokens_cached,
+                }) => {
+                    tracing::info!(
+                        "Scan candidate '{}' discarded by linux_bug pipeline: {}",
+                        problem,
+                        reason
+                    );
+                    emit_scan_progress(
+                        progress,
+                        ScanProgressEvent::CandidateDiscarded {
+                            index,
+                            problem: problem.clone(),
+                            reason: reason.clone(),
+                        },
+                    );
+                    StandaloneVerifyAggregation::Dismissed {
+                        concern: serde_json::json!({
+                            "origin": "linux_bug_verification",
+                            "description": problem,
+                            "reasoning": reason,
+                        }),
+                        tokens_in,
+                        tokens_out,
+                        tokens_cached,
+                    }
+                }
+                Err(e) => {
+                    let (tokens_in, tokens_out, tokens_cached) = if let Some(pf) =
+                        e.downcast_ref::<crate::workflows::linux_bug::StandaloneBugPipelineFailure>(
+                        ) {
+                        (pf.tokens_in, pf.tokens_out, pf.tokens_cached)
+                    } else if let Some(sf) = e.downcast_ref::<crate::ai::session::SessionFailure>()
+                    {
+                        (
+                            sf.usage.prompt_tokens,
+                            sf.usage.completion_tokens,
+                            sf.usage.cached_tokens.unwrap_or(0),
+                        )
+                    } else {
+                        (0, 0, 0)
+                    };
+                    let msg = e.to_string();
+                    tracing::warn!(
+                        "Failed to run linux_bug pipeline for scan candidate '{}': {}",
+                        problem,
+                        msg
+                    );
+                    emit_scan_progress(
+                        progress,
+                        ScanProgressEvent::CandidateFailed {
+                            index,
+                            problem,
+                            error: msg,
+                        },
+                    );
+                    StandaloneVerifyAggregation::Failed {
+                        tokens_in,
+                        tokens_out,
+                        tokens_cached,
+                    }
+                }
+            }
         }
     });
 
     let outcomes = futures_util::future::join_all(verify_futures).await;
 
-    for (problem, res) in outcomes {
-        match res {
-            Ok(crate::workflows::linux_bug::StandaloneBugOutcome::Verified(bug)) => {
-                summary.tokens_in += bug.tokens_in;
-                summary.tokens_out += bug.tokens_out;
-                summary.tokens_cached += bug.tokens_cached;
-                let verified = VerifiedScanBug::from_standalone(*bug);
-                emit_scan_progress(
-                    progress,
-                    ScanProgressEvent::CandidateVerified {
-                        canonical_title: verified.canonical_title.clone(),
-                        severity: verified.severity.clone(),
-                    },
-                );
-                if !is_in_run_duplicate(&summary.findings, &verified) {
-                    summary.findings.push(verified);
-                }
-            }
-            Ok(crate::workflows::linux_bug::StandaloneBugOutcome::Discarded {
-                reason,
+    for outcome in outcomes {
+        match outcome {
+            StandaloneVerifyAggregation::Verified {
+                bug,
                 tokens_in,
                 tokens_out,
                 tokens_cached,
-            }) => {
+            } => {
                 summary.tokens_in += tokens_in;
                 summary.tokens_out += tokens_out;
                 summary.tokens_cached += tokens_cached;
-                tracing::info!(
-                    "Scan candidate '{}' discarded by linux_bug pipeline: {}",
-                    problem,
-                    reason
-                );
-                emit_scan_progress(
-                    progress,
-                    ScanProgressEvent::CandidateDiscarded {
-                        problem: problem.clone(),
-                        reason: reason.clone(),
-                    },
-                );
-                summary.dismissed_concerns.push(serde_json::json!({
-                    "origin": "linux_bug_verification",
-                    "description": problem,
-                    "reasoning": reason,
-                }));
-            }
-            Err(e) => {
-                summary.candidates_failed += 1;
-                if let Some(pf) =
-                    e.downcast_ref::<crate::workflows::linux_bug::StandaloneBugPipelineFailure>()
-                {
-                    summary.tokens_in += pf.tokens_in;
-                    summary.tokens_out += pf.tokens_out;
-                    summary.tokens_cached += pf.tokens_cached;
-                } else if let Some(sf) = e.downcast_ref::<crate::ai::session::SessionFailure>() {
-                    summary.tokens_in += sf.usage.prompt_tokens;
-                    summary.tokens_out += sf.usage.completion_tokens;
-                    summary.tokens_cached += sf.usage.cached_tokens.unwrap_or(0);
+                if !is_in_run_duplicate(&summary.findings, &bug) {
+                    summary.findings.push(*bug);
                 }
-                let msg = e.to_string();
-                tracing::warn!(
-                    "Failed to run linux_bug pipeline for scan candidate '{}': {}",
-                    problem,
-                    msg
-                );
-                emit_scan_progress(
-                    progress,
-                    ScanProgressEvent::CandidateFailed {
-                        problem,
-                        error: msg,
-                    },
-                );
+            }
+            StandaloneVerifyAggregation::Dismissed {
+                concern,
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+            } => {
+                summary.tokens_in += tokens_in;
+                summary.tokens_out += tokens_out;
+                summary.tokens_cached += tokens_cached;
+                summary.dismissed_concerns.push(concern);
+            }
+            StandaloneVerifyAggregation::Failed {
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+            } => {
+                summary.candidates_failed += 1;
+                summary.tokens_in += tokens_in;
+                summary.tokens_out += tokens_out;
+                summary.tokens_cached += tokens_cached;
             }
         }
     }
@@ -2152,6 +2320,7 @@ pub async fn run_scan(
         None
     };
 
+    let started_at = std::time::Instant::now();
     let target_sha = resolve_scan_revision(&options.repo_path, options.git_ref.as_deref()).await?;
     let files = resolve_scan_targets(
         &options.repo_path,
@@ -2161,6 +2330,14 @@ pub async fn run_scan(
         options.max_files,
     )
     .await?;
+
+    emit_scan_progress(
+        progress,
+        ScanProgressEvent::IndexingFiles {
+            target_sha: target_sha.clone(),
+            files_count: files.len(),
+        },
+    );
 
     let max_chunks = options.max_chunks.filter(|&n| n > 0);
     let mut all_chunks = Vec::new();
@@ -2261,6 +2438,7 @@ pub async fn run_scan(
         target_sha: target_sha.clone(),
         files_scanned: files.len(),
         chunks_total,
+        min_severity: None,
         ..Default::default()
     };
 
@@ -2309,9 +2487,19 @@ pub async fn run_scan(
             progress,
         )
         .await;
-        return Ok(summary);
+    } else {
+        verify_scan_candidates_standalone(
+            provider.as_ref(),
+            &options,
+            &target_sha,
+            candidate_bugs,
+            &mut summary,
+            progress,
+        )
+        .await;
     }
 
+    #[cfg(not(feature = "server"))]
     verify_scan_candidates_standalone(
         provider.as_ref(),
         &options,
@@ -2321,6 +2509,14 @@ pub async fn run_scan(
         progress,
     )
     .await;
+
+    summary.duration_secs = started_at.elapsed().as_secs();
+    emit_scan_progress(
+        progress,
+        ScanProgressEvent::ScanComplete {
+            partial: summary.chunks_failed > 0 || summary.candidates_failed > 0,
+        },
+    );
 
     Ok(summary)
 }
@@ -2744,5 +2940,49 @@ pub fn second_fn() -> u32 {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_translate_chunk_workflow_event_emits_chunk_planned_only_for_initial_triage() {
+        let triage_resolved = std::sync::atomic::AtomicBool::new(false);
+        let first = translate_chunk_workflow_event(
+            "mm/memcontrol.c:1-200",
+            &triage_resolved,
+            crate::workflow::WorkflowEvent::ParallelResolved {
+                stage_names: vec!["implementation", "resources", "locking"],
+            },
+        );
+        match first {
+            Some(ScanProgressEvent::ChunkPlanned {
+                chunk_id,
+                planned_stages,
+            }) => {
+                assert_eq!(chunk_id, "mm/memcontrol.c:1-200");
+                assert_eq!(
+                    planned_stages,
+                    vec!["implementation", "resources", "locking"]
+                );
+            }
+            other => panic!("expected initial ChunkPlanned event, got {other:?}"),
+        }
+
+        // Second ParallelResolved (post-verification fan-out) must not overwrite planned_stages.
+        let second_empty = translate_chunk_workflow_event(
+            "mm/memcontrol.c:1-200",
+            &triage_resolved,
+            crate::workflow::WorkflowEvent::ParallelResolved {
+                stage_names: vec![],
+            },
+        );
+        assert!(second_empty.is_none());
+
+        let second_non_empty = translate_chunk_workflow_event(
+            "mm/memcontrol.c:1-200",
+            &triage_resolved,
+            crate::workflow::WorkflowEvent::ParallelResolved {
+                stage_names: vec!["post-verification-high"],
+            },
+        );
+        assert!(second_non_empty.is_none());
     }
 }

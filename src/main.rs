@@ -3512,19 +3512,23 @@ async fn handle_scan_command(
         sashiko::scan::ScanProgressEvent::CandidateVerified {
             canonical_title,
             severity,
+            ..
         } => {
             eprintln!("  [Verify] {} | Verified ({})", canonical_title, severity);
         }
-        sashiko::scan::ScanProgressEvent::CandidateDiscarded { problem, reason } => {
+        sashiko::scan::ScanProgressEvent::CandidateDiscarded {
+            problem, reason, ..
+        } => {
             eprintln!("  [Verify] {} | Discarded ({})", problem, reason);
         }
-        sashiko::scan::ScanProgressEvent::CandidateFailed { problem, error } => {
+        sashiko::scan::ScanProgressEvent::CandidateFailed { problem, error, .. } => {
             eprintln!("  [BugPipeline] Failed to verify '{}': {}", problem, error);
         }
         sashiko::scan::ScanProgressEvent::BugSubmitted {
             canonical_title,
             bugid,
             is_duplicate,
+            ..
         } => {
             if is_duplicate {
                 eprintln!("  [BugRepo] Duplicate of {} ({})", bugid, canonical_title);
@@ -3532,6 +3536,7 @@ async fn handle_scan_command(
                 eprintln!("  [BugRepo] Opened {} ({})", bugid, canonical_title);
             }
         }
+        _ => {}
     };
 
     exit_on_interrupt(false);
