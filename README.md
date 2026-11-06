@@ -102,6 +102,7 @@ Sashiko evaluates patches through specialized parallel analysis stages followed 
 - **[Configuration Reference](docs/configuration.md)** — complete reference for `Settings.toml`, `projects/<project>/mailing_lists.toml`, Patchwork integration, and environment variables.
 - **[CLI Reference (`sashiko-cli`)](docs/sashiko-cli.md)** — submitting patches and querying status on a running Sashiko daemon.
 - **[Forge Setup Guide](docs/FORGE_SETUP.md)** *(Experimental)* — webhook integration for [GitHub](docs/GITHUB_SETUP.md), [GitLab](docs/GITLAB_SETUP.md), and [Webhook Security](docs/WEBHOOK_SECURITY.md).
+- **[Reviewing Zephyr](docs/zephyr-review.md)** *(Experimental)* — local review of Zephyr RTOS commits with `--project zephyr`.
 - **[Benchmarking Guide](docs/benchmarking.md)** — evaluating review accuracy against historical bugs.
 - **[Contributing Guide](CONTRIBUTING.md)** — DCO sign-off, local verification (`make check-pr`), and the Sashiko-for-Sashiko review workflow.
 

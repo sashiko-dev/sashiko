@@ -53,7 +53,7 @@ Optional. Describes the project this configuration is for.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `kind` | string | -- | Project this file is for: `"linux"`, `"sashiko"`, or `"gcc"`. When set, it is checked against the project selected by `--project` / `SASHIKO_PROJECT`, and a mismatch is an error. When absent, the file is accepted for any project. |
+| `kind` | string | -- | Project this file is for: `"linux"`, `"sashiko"`, `"gcc"`, `"qemu"`, or `"zephyr"`. When set, it is checked against the project selected by `--project` / `SASHIKO_PROJECT`, and a mismatch is an error. When absent, the file is accepted for any project. |
 | `name` | string | `""` | Display name shown in the web UI. |
 | `description` | string | `""` | Short description shown in the web UI. |
 | `domain` | string | `""` | Public hostname used to build links to the web UI in forge comments (`https://<domain>/#/patchset/...`). Falls back to `sashiko.sashiko.dev` when empty. |
@@ -641,7 +641,7 @@ grant takes effect on existing data after a restart.
 | `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT` | GCP project ID for the Vertex AI provider, in that order. |
 | `CLOUD_ML_REGION`, `GOOGLE_CLOUD_LOCATION` | GCP region for the Vertex AI provider, in that order. |
 | `SASHIKO_CONFIG` | Settings file to read when `--settings` is not given. |
-| `SASHIKO_PROJECT` | Project to review (`linux`, `sashiko` or `gcc`), like `--project`. |
+| `SASHIKO_PROJECT` | Project to review (`linux`, `sashiko`, `gcc`, `qemu` or `zephyr`), like `--project`. |
 | `SASHIKO_SERVER` | Override daemon URL for CLI commands. |
 | `SASHIKO__*` | Override any Settings.toml value (e.g. `SASHIKO__AI__PROVIDER`). |
 | `SASHIKO__FORGE__WEBHOOK_SECRET` | Override webhook secret from Settings.toml. Avoids storing the secret on disk. |

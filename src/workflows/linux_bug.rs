@@ -198,6 +198,12 @@ impl LlmSession for VerifySession<'_> {
                 Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
                 CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
             ),
+            ProjectId::Zephyr => format!(
+                "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
+                You are an expert Zephyr RTOS maintainer and embedded systems engineer. Your task is to rigorously verify a candidate Zephyr defect or vulnerability against the top-of-trunk of the Zephyr main branch.\n\
+                Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
+                CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
+            ),
         }
     }
 
@@ -331,6 +337,42 @@ Return ONLY a valid JSON object matching this schema:
                 locations = loc_str,
                 prefetch_block = prefetch_block,
             ),
+            ProjectId::Zephyr => format!(
+                "{stage_heading}
+
+Candidate Defect to Verify:
+Title: {title}
+Subsystem: {subsystem}
+{files_str}Description:
+{description}
+Locations:
+{locations}
+{prefetch_block}
+Task:
+1. Verify the problem against the mainline code shown above and top-of-trunk of the Zephyr main branch (commit `{master_sha}`). IMPORTANT: Use this exact `{master_sha}` SHA in any tool calls instead of `HEAD` or `main` to check the actual top-of-trunk.
+2. Scope your verification to the relevant drivers, subsystem files, and their Kconfig and Devicetree configuration. Do not wander across unrelated drivers or files.
+3. Determine if the issue is a genuine, reachable defect in the codebase.
+4. If the defect is hallucinated, or a false positive that you can prove based on the code is impossible or safely handled, set \"is_false_positive\": true, provide concrete proof in \"refutation_evidence\", and summarize in \"verification_reasoning\".
+5. If it is a confirmed bug, set \"is_false_positive\": false, \"refutation_evidence\": null, provide your step-by-step proof in \"verification_reasoning\", carry forward and refine the verified code locations in \"relevant_code_locations\", and optionally suggest an \"impact_severity\" (\"Low\", \"Medium\", \"High\", \"Critical\", or \"Unknown\").
+
+EFFICIENCY LIMIT REQUIREMENT: Limit your investigation to the core defect. Do not trace unneeded macro definitions or unrelated history. You have a strict limit on tool calls; be extremely efficient instead of wandering the history.
+
+Return ONLY a valid JSON object matching this schema:
+{{
+  \"verification_reasoning\": \"1. Call chain... 2. Condition...\",
+  \"is_false_positive\": false,
+  \"refutation_evidence\": null,
+  \"impact_severity\": \"High\",
+  \"relevant_code_locations\": [ {{\"file\": \"kernel/sem.c\", \"function_or_symbol\": \"function_name\", \"line\": 123}} ]
+}}",
+                stage_heading = BugStage::Verification.heading(),
+                master_sha = self.master_sha,
+                title = self.title,
+                subsystem = self.subsystem,
+                description = self.description,
+                locations = loc_str,
+                prefetch_block = prefetch_block,
+            ),
         }
     }
 
@@ -417,6 +459,15 @@ impl LlmSession for NormalizeSession<'_> {
                 Use available tools (git_read_files, git_log, git_grep) to inspect the codebase at `{master_sha}`. Specifically:\n\
                 - Use git_read_files with revision: \"{master_sha}\" or git_grep to inspect source code and identify affected files and symbols.\n\
                 - Use git_log with range: \"{master_sha}\" on affected files to observe the conventional subsystem commit prefix used by QEMU maintainers (e.g. 'virtio-net:', 'hw/arm:', 'target/riscv:', 'migration:', 'qapi:', 'block:').",
+                master_sha = self.master_sha
+            ),
+            ProjectId::Zephyr => format!(
+                "You are an expert Zephyr maintainer and technical editor. Your role is to normalize a candidate Zephyr defect into canonical form.\n\
+                You must standardize the defect's title, describe the technical substance, and identify the verified affected source files and symbols.\n\
+                The target codebase is the Zephyr repository at top-of-trunk commit `{master_sha}`.\n\
+                Use available tools (git_read_files, git_log, git_grep) to inspect the codebase at `{master_sha}`. Specifically:\n\
+                - Use git_read_files with revision: \"{master_sha}\" or git_grep to inspect source code and identify affected files and symbols.\n\
+                - Use git_log with range: \"{master_sha}\" on affected files to observe the conventional subsystem commit prefix used by Zephyr maintainers (e.g. 'kernel:', 'drivers: spi:', 'net: tcp:', 'Bluetooth: Host:', 'arch: arm:', 'dts:').",
                 master_sha = self.master_sha
             ),
         }
@@ -574,6 +625,42 @@ Return ONLY a valid JSON object matching this schema:
                 hint = hint_section,
                 master_sha = self.master_sha
             ),
+            ProjectId::Zephyr => format!(
+                "{stage_heading}
+
+Candidate Bug Details:
+Original Problem: {problem}
+Reasoning: {reasoning}
+Reported Locations:
+{locations}
+{hint}
+Target Mainline Commit: {master_sha}
+
+Task:
+1. Determine the conventional subsystem commit prefix for this defect (e.g. 'kernel', 'drivers: spi', 'net: tcp', 'Bluetooth: Host', 'arch: arm', 'dts'). Use git_log on the affected file(s) at revision '{master_sha}' to observe the standard commit prefix used by Zephyr maintainers.
+2. Formulate a canonical title matching Zephyr commit conventions: '<subsystem_prefix>: <defect or broken invariant in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
+   - CRITICAL: This is a bug report title describing an existing defect, NOT a patch or commit title. Do NOT use patch/fix action verbs like 'fix', 'resolve', 'prevent', 'avoid', or 'handle'. State the defect directly (e.g. 'net: tcp: out-of-bounds read in tcp_parse_options()', NEVER 'net: tcp: fix out-of-bounds read in tcp_parse_options()').
+3. Provide a detailed, structured canonical description:
+   - Trigger / Preconditions: Specific conditions, inputs, and Kconfig or Devicetree configuration required to trigger the defect (e.g. a received packet, a system call argument, or an interrupt arriving during a given operation).
+   - Call Chain / Execution Path: Detail the complete chain of events/calls leading up to the problem.
+   - Failure Mechanism: Detail the exact root cause and how the fault or state corruption occurs.
+   - Impact: Consequence of the failure (e.g. memory corruption, a kernel panic, a deadlock, a leak on an error path, or incorrect device behavior).
+4. Verify and list the affected source files and symbols in the mainline tree at commit '{master_sha}'.
+
+Return ONLY a valid JSON object matching this schema:
+{{
+  \"canonical_title\": \"net: tcp: out-of-bounds read in tcp_parse_options()\",
+  \"canonical_description\": \"Trigger / Preconditions: ...\\nFailure Mechanism: ...\\nImpact: ...\",
+  \"affected_source_files\": [\"subsys/net/ip/tcp.c\"],
+  \"affected_symbols\": [\"tcp_parse_options\"]
+}}",
+                stage_heading = BugStage::Normalization.heading(),
+                problem = self.problem,
+                reasoning = self.reasoning,
+                locations = self.locations,
+                hint = hint_section,
+                master_sha = self.master_sha
+            ),
         }
     }
 
@@ -699,7 +786,12 @@ pub fn extract_directory_subsystems_for_project(
                     continue;
                 }
             }
-            ProjectId::Qemu => {
+            // Public headers sit under include/zephyr/<subsystem>/, where two
+            // components would give every header the same label.
+            ProjectId::Zephyr if parts.len() >= 4 && parts[..2] == ["include", "zephyr"] => {
+                format!("{}/{}/{}", parts[0], parts[1], parts[2])
+            }
+            ProjectId::Qemu | ProjectId::Zephyr => {
                 if parts.len() >= 2 {
                     format!("{}/{}", parts[0], parts[1])
                 } else if !parts.is_empty() {
@@ -719,6 +811,7 @@ pub fn extract_directory_subsystems_for_project(
             ProjectId::Sashiko => vec!["sashiko".to_string()],
             ProjectId::Gcc => vec!["gcc".to_string()],
             ProjectId::Qemu => vec!["qemu".to_string()],
+            ProjectId::Zephyr => vec!["zephyr".to_string()],
         }
     } else {
         subs
@@ -1026,6 +1119,12 @@ impl LlmSession for DedupSession<'_> {
         IMPORTANT: Bugs that have the same root cause but different consequences should be considered a duplicate and be merged. Rule of thumb: if fixing one issue will resolve the other issue, it's the same bug.\n\
         Output raw JSON only."
                 .to_string(),
+            ProjectId::Zephyr => "You are an expert Zephyr maintainer responsible for defect tracking and deduplication.\n\
+        You will compare a newly verified Zephyr bug against a list of known Zephyr bugs in the codebase.\n\
+        Determine if the newly verified bug is an identical duplicate (describing the same root cause in the same code path/function) of one of the candidate bugs.\n\
+        IMPORTANT: Bugs that have the same root cause but different consequences should be considered a duplicate and be merged. Rule of thumb: if fixing one issue will resolve the other issue, it's the same bug.\n\
+        Output raw JSON only."
+                .to_string(),
         }
     }
 
@@ -1078,6 +1177,7 @@ impl LlmSession for DedupSession<'_> {
             ProjectId::Sashiko => "Newly Verified Sashiko Bug:",
             ProjectId::Gcc => "Newly Verified GCC Bug:",
             ProjectId::Qemu => "Newly Verified QEMU Bug:",
+            ProjectId::Zephyr => "Newly Verified Zephyr Bug:",
         };
 
         format!(
@@ -1177,6 +1277,9 @@ impl LlmSession for TracingSession<'_> {
         Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
         EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
             ProjectId::Qemu => "You are an expert QEMU maintainer. Your task is to determine the exact commit that introduced a verified QEMU defect.\n\
+        Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
+        EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
+            ProjectId::Zephyr => "You are an expert Zephyr maintainer. Your task is to determine the exact commit that introduced a verified Zephyr defect.\n\
         Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
         EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
         }
@@ -1309,6 +1412,7 @@ impl LlmSession for SeveritySession<'_> {
             ProjectId::Sashiko => "Sashiko",
             ProjectId::Gcc => "GCC",
             ProjectId::Qemu => "QEMU",
+            ProjectId::Zephyr => "Zephyr",
         };
         let threat_model_section = if self.project == ProjectId::Linux {
             let rendered = crate::threat_model::KernelThreatModel::render_for_severity(
@@ -1336,6 +1440,7 @@ impl LlmSession for SeveritySession<'_> {
             ProjectId::Sashiko => "Verified Sashiko Defect:",
             ProjectId::Gcc => "Verified GCC Defect:",
             ProjectId::Qemu => "Verified QEMU Defect:",
+            ProjectId::Zephyr => "Verified Zephyr Defect:",
         };
         let verification_block = if self.verification_reasoning.trim().is_empty() {
             String::new()
@@ -1600,6 +1705,11 @@ fn report_prompt_parts(project: ProjectId) -> ReportPromptParts {
             audience: "Do not explain generic QEMU mechanics such as the QOM property system, MemoryRegions, bottom halves or iothreads. When the guest can trigger the bug, say how. Established terms: out-of-bounds read or write, use-after-free, leak on the unrealize path, assertion failure, abort, incorrect guest-visible behavior.",
             examples: QEMU_REPORT_EXAMPLES,
         },
+        ProjectId::Zephyr => ReportPromptParts {
+            role: "You are an experienced Zephyr maintainer writing a standalone report of a verified defect in the Zephyr RTOS codebase.",
+            audience: "Do not explain generic RTOS, Kconfig or Devicetree concepts. Name the execution context and configuration that trigger the defect. Established terms: ISR, thread, workqueue, spinlock, kernel object, runtime PM, DMA buffer.",
+            examples: "foo_submit() leaks its buffer if k_msgq_put() times out: the failure path\nreturns without calling k_free(). Repeated full-queue submissions exhaust\nthe heap.",
+        },
     }
 }
 
@@ -1748,6 +1858,7 @@ impl LlmSession for ReportSession<'_> {
             ProjectId::Sashiko => "Sashiko Defect Details:",
             ProjectId::Gcc => "GCC Defect Details:",
             ProjectId::Qemu => "QEMU Defect Details:",
+            ProjectId::Zephyr => "Zephyr Defect Details:",
         };
 
         format!(
@@ -1819,6 +1930,17 @@ pub fn generate_bugid_for_project(project: ProjectId) -> String {
     format!("{}-{}", project.as_str(), uuid::Uuid::new_v4())
 }
 
+/// The audit tool that records an upstream fix check of `project`'s bugs.
+pub fn fix_check_tool(project: ProjectId) -> &'static str {
+    match project {
+        ProjectId::Linux => "sashiko:linux_bug:fix_check",
+        ProjectId::Sashiko => "sashiko:sashiko_bug:fix_check",
+        ProjectId::Gcc => "sashiko:gcc_bug:fix_check",
+        ProjectId::Qemu => "sashiko:qemu_bug:fix_check",
+        ProjectId::Zephyr => "sashiko:zephyr_bug:fix_check",
+    }
+}
+
 pub fn infer_project_from_bug_or_tool(
     bugid: Option<&str>,
     tool: Option<&str>,
@@ -1839,6 +1961,11 @@ pub fn infer_project_from_bug_or_tool(
         || tool.is_some_and(|t| t.starts_with("sashiko:qemu"))
     {
         ProjectId::Qemu
+    } else if default_project == ProjectId::Zephyr
+        || bugid.is_some_and(|id| id.starts_with("zephyr-"))
+        || tool.is_some_and(|t| t.starts_with("sashiko:zephyr"))
+    {
+        ProjectId::Zephyr
     } else if bugid.is_some_and(|id| id.starts_with("linux-"))
         || tool.is_some_and(|t| t.starts_with("sashiko:linux"))
     {
@@ -1886,6 +2013,7 @@ fn build_candidate_bug_and_enrichment(
         ProjectId::Sashiko => "sashiko:sashiko_patch_review",
         ProjectId::Gcc => "sashiko:gcc_patch_review",
         ProjectId::Qemu => "sashiko:qemu_patch_review",
+        ProjectId::Zephyr => "sashiko:zephyr_patch_review",
     };
     let effective_db = if db.has_bug_actor() && db.bug_model().is_some() {
         db.with_bug_actor(
@@ -2078,13 +2206,14 @@ async fn run_with_bug_dedup_lease<T>(
     }
 }
 
-async fn get_master_sha(tools: Option<&Arc<ToolBox>>) -> String {
-    let Some(tb) = tools else {
-        return "master".to_string();
-    };
-    resolve_linus_sha(tb.get_worktree_path())
-        .await
-        .unwrap_or_else(|| "master".to_string())
+async fn get_mainline_sha(tools: Option<&Arc<ToolBox>>, project: ProjectId) -> String {
+    if let Some(tools) = tools {
+        resolve_mainline_sha(tools.get_worktree_path(), project)
+            .await
+            .unwrap_or_else(|| project.mainline_branch().to_string())
+    } else {
+        project.mainline_branch().to_string()
+    }
 }
 
 async fn format_commit(tools: Option<&Arc<ToolBox>>, sha: Option<String>) -> Option<String> {
@@ -2716,6 +2845,7 @@ pub async fn run_standalone_bug_pipeline_for_project(
         ProjectId::Sashiko => "Sashiko",
         ProjectId::Gcc => "GCC",
         ProjectId::Qemu => "QEMU",
+        ProjectId::Zephyr => "Zephyr",
     };
     info!(
         "Processing standalone candidate {} issue: '{}' in subsystems '{:?}'",
@@ -2741,7 +2871,7 @@ pub async fn run_standalone_bug_pipeline_for_project(
         .filter(|s| (7..=40).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit()))
     {
         Some(sha) => sha.to_string(),
-        None => get_master_sha(tools.as_ref()).await,
+        None => get_mainline_sha(tools.as_ref(), project).await,
     };
 
     let mut effective_source_files: Vec<String> = input
@@ -3209,6 +3339,7 @@ pub async fn process_issue_worker_for_project(
         ProjectId::Sashiko => "Sashiko",
         ProjectId::Gcc => "GCC",
         ProjectId::Qemu => "QEMU",
+        ProjectId::Zephyr => "Zephyr",
     };
     info!(
         "Processing candidate {} issue: '{}' in subsystems '{:?}'",
@@ -3230,6 +3361,7 @@ pub async fn process_issue_worker_for_project(
             ProjectId::Sashiko => "sashiko:sashiko_bug".to_string(),
             ProjectId::Gcc => "sashiko:gcc_bug".to_string(),
             ProjectId::Qemu => "sashiko:qemu_bug".to_string(),
+            ProjectId::Zephyr => "sashiko:zephyr_bug".to_string(),
         }
     };
     let is_scan_candidate = tool == "sashiko:linux_scan"
@@ -3253,7 +3385,7 @@ pub async fn process_issue_worker_for_project(
     {
         sha.to_string()
     } else {
-        get_master_sha(tools.as_ref()).await
+        get_mainline_sha(tools.as_ref(), project).await
     };
     let dedup_owner = bug_dedup_lease_owner(bug_row.id, db.bug_claim_owner());
 
@@ -3767,36 +3899,28 @@ async fn run_git_query_capped(
     })
 }
 
-/// Resolves the current HEAD commit SHA of the upstream mainline tree in `repo_path`.
+/// Resolves the upstream development tip for the configured project.
 ///
-/// Prefers a remote whose URL matches `torvalds/linux`, `gcc.gnu.org/git/gcc`,
-/// `gnutools/gcc`, `qemu-project/qemu`, or `qemu/qemu` (`{name}/master`) or
-/// `sashiko-dev/sashiko` (`{name}/main`), falling back to `origin/master`,
-/// `origin/main`, `master`, `main`, and `HEAD`.
-pub async fn resolve_linus_sha(repo_path: &std::path::Path) -> Option<String> {
+/// Prefers a matching upstream remote, then the project's branch under origin,
+/// the local branch, and HEAD. Other projects' reference remotes are ignored.
+pub async fn resolve_mainline_sha(
+    repo_path: &std::path::Path,
+    project: ProjectId,
+) -> Option<String> {
+    let branch = project.mainline_branch();
     let mut candidate_refs = Vec::new();
     match run_git_query(repo_path, &["remote", "-v"]).await {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
                 let mut parts = line.split_whitespace();
-                if let (Some(name), Some(url)) = (parts.next(), parts.next()) {
-                    if url.contains("torvalds/linux")
-                        || url.contains("gcc.gnu.org/git/gcc")
-                        || url.contains("gnutools/gcc")
-                        || url.contains("qemu-project/qemu")
-                        || url.contains("qemu.org")
-                        || url.contains("qemu/qemu")
-                    {
-                        let r = format!("{}/master", name);
-                        if !candidate_refs.contains(&r) {
-                            candidate_refs.push(r);
-                        }
-                    } else if url.contains("sashiko-dev/sashiko") {
-                        let r = format!("{}/main", name);
-                        if !candidate_refs.contains(&r) {
-                            candidate_refs.push(r);
-                        }
+                if let (Some(name), Some(url), Some("(fetch)")) =
+                    (parts.next(), parts.next(), parts.next())
+                    && project.matches_upstream_url(url)
+                {
+                    let candidate = format!("{name}/{branch}");
+                    if !candidate_refs.contains(&candidate) {
+                        candidate_refs.push(candidate);
                     }
                 }
             }
@@ -3806,17 +3930,29 @@ pub async fn resolve_linus_sha(repo_path: &std::path::Path) -> Option<String> {
             warn!("Failed to query git remotes for mainline tree: {}", e);
         }
     }
-    for fallback in [
-        "linus/master",
-        "origin/master",
-        "origin/main",
-        "master",
-        "main",
-        "HEAD",
-    ] {
-        let s = fallback.to_string();
-        if !candidate_refs.contains(&s) {
-            candidate_refs.push(s);
+    // Match BaselineRegistry's deterministic ordering of upstream remotes.
+    candidate_refs.sort_by(|a, b| {
+        a.rsplit_once('/')
+            .map(|(remote, _)| remote)
+            .cmp(&b.rsplit_once('/').map(|(remote, _)| remote))
+    });
+    let fallback_refs: &[&str] = match project {
+        ProjectId::Linux => &[
+            "linus/master",
+            "origin/master",
+            "origin/main",
+            "master",
+            "main",
+            "HEAD",
+        ],
+        ProjectId::Gcc | ProjectId::Qemu => {
+            &["origin/master", "origin/main", "master", "main", "HEAD"]
+        }
+        ProjectId::Sashiko | ProjectId::Zephyr => &["origin/main", "main", "HEAD"],
+    };
+    for fallback in fallback_refs {
+        if !candidate_refs.iter().any(|candidate| candidate == fallback) {
+            candidate_refs.push((*fallback).to_string());
         }
     }
 
@@ -4370,6 +4506,13 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
                 Output raw JSON only."
                     .to_string()
             }
+            ProjectId::Zephyr => {
+                "You are an expert Zephyr maintainer and embedded systems engineer auditing whether a previously verified Zephyr bug has been fixed on the upstream Zephyr main branch.\n\
+                Do NOT give commits the benefit of the doubt: only mark a bug as \"fixed\" if you can point to a specific upstream commit that genuinely resolves the root cause of the defect or removes the vulnerable code path.\n\
+                If commits in the range only refactor, move lines, rename symbols, or modify unrelated functions while the defect remains triggerable, you MUST report \"still_present\".\n\
+                Output raw JSON only."
+                    .to_string()
+            }
         }
     }
 
@@ -4431,6 +4574,11 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
                 "Current Upstream Master SHA",
                 "Open QEMU Bug",
                 "the upstream QEMU master branch",
+            ),
+            ProjectId::Zephyr => (
+                "Current Upstream Main SHA",
+                "Open Zephyr Bug",
+                "the upstream Zephyr main branch",
             ),
         };
 
@@ -4692,12 +4840,7 @@ pub async fn check_bug_fixed_upstream_with_candidates(
         }
     };
 
-    let fix_tool = match project {
-        ProjectId::Linux => "sashiko:linux_bug:fix_check",
-        ProjectId::Sashiko => "sashiko:sashiko_bug:fix_check",
-        ProjectId::Gcc => "sashiko:gcc_bug:fix_check",
-        ProjectId::Qemu => "sashiko:qemu_bug:fix_check",
-    };
+    let fix_tool = fix_check_tool(project);
 
     if candidates.is_empty() {
         db.with_bug_actor("sashiko", fix_tool, None)
@@ -4876,10 +5019,18 @@ mod tests {
                 infer_project_from_bug_or_tool(bugid, Some("sashiko:qemu_bug"), ProjectId::Linux),
                 ProjectId::Qemu
             );
+            assert_eq!(
+                infer_project_from_bug_or_tool(bugid, Some("sashiko:zephyr_bug"), ProjectId::Linux),
+                ProjectId::Zephyr
+            );
         }
         assert_eq!(
             infer_project_from_bug_or_tool(Some("qemu-1"), None, ProjectId::Linux),
             ProjectId::Qemu
+        );
+        assert_eq!(
+            infer_project_from_bug_or_tool(Some("zephyr-1"), None, ProjectId::Linux),
+            ProjectId::Zephyr
         );
         assert_eq!(
             infer_project_from_bug_or_tool(
@@ -4901,6 +5052,10 @@ mod tests {
         assert_eq!(
             infer_project_from_bug_or_tool(Some("other"), Some("web"), ProjectId::Qemu),
             ProjectId::Qemu
+        );
+        assert_eq!(
+            infer_project_from_bug_or_tool(None, None, ProjectId::Zephyr),
+            ProjectId::Zephyr
         );
         assert_eq!(
             infer_project_from_bug_or_tool(None, None, ProjectId::Linux),
@@ -6283,6 +6438,19 @@ Call Trace:
     }
 
     #[test]
+    fn test_extract_directory_subsystems_for_zephyr_headers() {
+        let files = vec![
+            "include/zephyr/drivers/spi.h".to_string(),
+            "include/zephyr/kernel.h".to_string(),
+            "drivers/spi/spi_foo.c".to_string(),
+        ];
+        assert_eq!(
+            extract_directory_subsystems_for_project(&files, ProjectId::Zephyr),
+            vec!["include/zephyr/drivers", "include/zephyr", "drivers/spi"]
+        );
+    }
+
+    #[test]
     fn test_extract_directory_subsystems() {
         let files = vec![
             "fs/btrfs/ordered-data.c".to_string(),
@@ -6944,6 +7112,152 @@ F:	drivers/net/ethernet/intel/e1000/
     }
 
     #[tokio::test]
+    async fn mainline_resolution_ignores_other_projects_and_stale_master() {
+        for (project, upstream) in [
+            (
+                ProjectId::Sashiko,
+                "https://github.com/sashiko-dev/sashiko.git",
+            ),
+            (
+                ProjectId::Zephyr,
+                "https://github.com/zephyrproject-rtos/zephyr.git",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path();
+            let old = init_test_git_repo(repo);
+            let run = |args: &[&str]| {
+                let out = crate::git_cmd::in_dir(repo).args(args).output().unwrap();
+                assert!(out.status.success(), "git {:?} failed: {:?}", args, out);
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            run(&[
+                "remote",
+                "add",
+                "a-linux",
+                "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+            ]);
+            run(&[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/contributor/renamed-tree.git",
+            ]);
+            run(&["update-ref", "refs/remotes/origin/master", &old]);
+            run(&["commit", "--allow-empty", "-m", "new mainline"]);
+            let tip = run(&["rev-parse", "HEAD"]);
+            run(&["update-ref", "refs/remotes/origin/main", &tip]);
+            run(&["commit", "--allow-empty", "-m", "Linux reference tip"]);
+            let linux_tip = run(&["rev-parse", "HEAD"]);
+            run(&["update-ref", "refs/remotes/a-linux/master", &linux_tip]);
+
+            assert_eq!(resolve_mainline_sha(repo, project).await, Some(tip.clone()));
+            // Linux takes Linus's tree over the fork's master.
+            assert_eq!(
+                resolve_mainline_sha(repo, ProjectId::Linux).await,
+                Some(linux_tip.clone())
+            );
+            let tools = Arc::new(ToolBox::new(repo.to_path_buf()));
+            assert_eq!(get_mainline_sha(Some(&tools), project).await, tip);
+            assert_eq!(
+                get_mainline_sha(Some(&tools), ProjectId::Linux).await,
+                linux_tip
+            );
+
+            // A known upstream is preferred over a fork's older main branch.
+            run(&["remote", "add", "upstream", upstream]);
+            run(&["update-ref", "refs/remotes/upstream/main", &tip]);
+            run(&["update-ref", "refs/remotes/origin/main", &old]);
+            // A push destination does not supply origin's tracking refs.
+            run(&["remote", "set-url", "--push", "origin", upstream]);
+            assert_eq!(resolve_mainline_sha(repo, project).await, Some(tip));
+
+            // Linux retains its existing origin/main fallback when no matching
+            // upstream remote or origin/master ref exists.
+            run(&["remote", "remove", "a-linux"]);
+            run(&["update-ref", "-d", "refs/remotes/origin/master"]);
+            assert_eq!(
+                resolve_mainline_sha(repo, ProjectId::Linux).await,
+                Some(old)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mainline_registry_and_bug_checks_choose_the_same_mirror() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let old = init_test_git_repo(repo);
+        let run = |args: &[&str]| {
+            let out = crate::git_cmd::in_dir(repo).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["remote", "add", "origin", "https://gcc.gnu.org/git/gcc.git"]);
+        run(&[
+            "remote",
+            "add",
+            "origin-mirror",
+            "https://github.com/gcc-mirror/gcc.git",
+        ]);
+        run(&["update-ref", "refs/remotes/origin-mirror/master", &old]);
+        run(&["commit", "--allow-empty", "-m", "upstream tip"]);
+        let tip = run(&["rev-parse", "HEAD"]);
+        run(&["update-ref", "refs/remotes/origin/master", &tip]);
+        // Exercise both distinct mirrors and duplicate URLs in the remote map.
+        for url in [
+            "https://github.com/gcc-mirror/gcc.git",
+            "https://gcc.gnu.org/git/gcc.git",
+        ] {
+            run(&["remote", "set-url", "origin-mirror", url]);
+            let registry =
+                crate::baseline::BaselineRegistry::new(repo, None, Some(ProjectId::Gcc)).unwrap();
+            assert_eq!(registry.mainline_ref(), "origin/master");
+            let candidates = registry.resolve_candidates(&[], "fix cleanup", None).await;
+            let names: Vec<_> = candidates
+                .iter()
+                .filter_map(|candidate| match candidate {
+                    crate::baseline::BaselineResolution::RemoteTarget { name, .. } => {
+                        Some(name.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(names, vec!["origin", "origin-mirror"]);
+            assert_eq!(
+                resolve_mainline_sha(repo, ProjectId::Gcc).await,
+                Some(tip.clone())
+            );
+        }
+
+        // A backoff is per remote name, even when both names share a URL.
+        let timestamps = repo.join(".sashiko/fetch_timestamps");
+        std::fs::create_dir_all(&timestamps).unwrap();
+        std::fs::write(timestamps.join("origin.fail"), "").unwrap();
+        std::fs::write(timestamps.join("origin-mirror"), "").unwrap();
+        run(&[
+            "symbolic-ref",
+            "refs/remotes/origin-mirror/HEAD",
+            "refs/remotes/origin-mirror/master",
+        ]);
+        let registry =
+            crate::baseline::BaselineRegistry::new(repo, None, Some(ProjectId::Gcc)).unwrap();
+        let candidates = registry.resolve_candidates(&[], "fix cleanup", None).await;
+        let mut resolved = None;
+        for candidate in candidates {
+            if let crate::baseline::BaselineResolution::RemoteTarget { url, name, .. } = &candidate
+                && crate::git_ops::ensure_remote(repo, name, url, false)
+                    .await
+                    .is_ok()
+            {
+                resolved = Some(run(&["rev-parse", &candidate.as_str()]));
+                break;
+            }
+        }
+        assert_eq!(resolved, Some(old));
+    }
+
+    #[tokio::test]
     async fn test_sashiko_bug_triage_and_fix_check_flow() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
@@ -6977,7 +7291,7 @@ F:	drivers/net/ethernet/intel/e1000/
         let sha1 = run(&["rev-parse", "HEAD"]);
         run(&["update-ref", "refs/remotes/origin/main", &sha1]);
 
-        let resolved_main = resolve_linus_sha(repo).await;
+        let resolved_main = resolve_mainline_sha(repo, ProjectId::Sashiko).await;
         assert_eq!(resolved_main.as_deref(), Some(sha1.as_str()));
 
         let tb = Arc::new(ToolBox::new(repo.to_path_buf()));
@@ -7639,7 +7953,12 @@ F:	drivers/net/ethernet/intel/e1000/
                 .contains("git_read_files")
         );
 
-        for other in [ProjectId::Sashiko, ProjectId::Gcc, ProjectId::Qemu] {
+        for other in [
+            ProjectId::Sashiko,
+            ProjectId::Gcc,
+            ProjectId::Qemu,
+            ProjectId::Zephyr,
+        ] {
             let non_linux = SeveritySession {
                 project: other,
                 kernel_threat_model: Some(&model),

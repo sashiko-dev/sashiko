@@ -128,6 +128,7 @@ impl BugWorker {
             crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
             crate::project::ProjectId::Gcc => "sashiko:gcc_bug",
             crate::project::ProjectId::Qemu => "sashiko:qemu_bug",
+            crate::project::ProjectId::Zephyr => "sashiko:zephyr_bug",
         };
         self.db = Arc::new(self.db.with_bug_actor("system", bug_tool, None));
         self
@@ -154,7 +155,8 @@ impl BugWorker {
             return 0;
         }
         let repo_path = std::path::Path::new(&self.repo_path);
-        let Some(mainline_sha) = crate::workflows::linux_bug::resolve_linus_sha(repo_path).await
+        let Some(mainline_sha) =
+            crate::workflows::linux_bug::resolve_mainline_sha(repo_path, self.project).await
         else {
             warn!(
                 "Skipping upstream bug fix check: could not resolve mainline tree SHA in {}",
@@ -233,10 +235,11 @@ impl BugWorker {
             };
             cursor = chunk.last().map(|b| (b.updated_at, b.id));
 
-            let mut untouched_linux = Vec::new();
-            let mut untouched_sashiko = Vec::new();
-            let mut untouched_gcc = Vec::new();
-            let mut untouched_qemu = Vec::new();
+            let mut untouched: Vec<(crate::project::ProjectId, Vec<crate::db::Bug>)> =
+                crate::project::ProjectId::ALL
+                    .iter()
+                    .map(|project| (*project, Vec::new()))
+                    .collect();
             let mut skipped_ids = Vec::new();
 
             for bug in chunk {
@@ -255,11 +258,8 @@ impl BugWorker {
                             None,
                             self.project,
                         );
-                        match proj {
-                            crate::project::ProjectId::Linux => untouched_linux.push(bug),
-                            crate::project::ProjectId::Sashiko => untouched_sashiko.push(bug),
-                            crate::project::ProjectId::Gcc => untouched_gcc.push(bug),
-                            crate::project::ProjectId::Qemu => untouched_qemu.push(bug),
+                        if let Some((_, bugs)) = untouched.iter_mut().find(|(p, _)| *p == proj) {
+                            bugs.push(bug);
                         }
                     }
                     FixCheckClassification::NeedsLlm(candidates) => {
@@ -269,14 +269,7 @@ impl BugWorker {
             }
 
             total_advanced += self
-                .flush_zero_token_chunk(
-                    mainline_sha,
-                    &untouched_linux,
-                    &untouched_sashiko,
-                    &untouched_gcc,
-                    &untouched_qemu,
-                    &skipped_ids,
-                )
+                .flush_zero_token_chunk(mainline_sha, &untouched, &skipped_ids)
                 .await;
 
             if llm_queue.len() >= batch_size {
@@ -411,59 +404,29 @@ impl BugWorker {
     async fn flush_zero_token_chunk(
         &self,
         mainline_sha: &str,
-        untouched_linux: &[crate::db::Bug],
-        untouched_sashiko: &[crate::db::Bug],
-        untouched_gcc: &[crate::db::Bug],
-        untouched_qemu: &[crate::db::Bug],
+        untouched: &[(crate::project::ProjectId, Vec<crate::db::Bug>)],
         skipped_ids: &[i64],
     ) -> usize {
         let mut advanced = 0usize;
-        if !untouched_linux.is_empty() {
-            let db = self
-                .db
-                .with_bug_actor("sashiko", "sashiko:linux_bug:fix_check", None);
-            match db
-                .advance_open_bugs_without_llm_batch(untouched_linux, mainline_sha)
-                .await
-            {
-                Ok(n) => advanced += n,
-                Err(e) => warn!("Failed to batch-advance untouched Linux bugs: {}", e),
+        for (project, bugs) in untouched {
+            if bugs.is_empty() {
+                continue;
             }
-        }
-        if !untouched_sashiko.is_empty() {
-            let db = self
-                .db
-                .with_bug_actor("sashiko", "sashiko:sashiko_bug:fix_check", None);
+            let db = self.db.with_bug_actor(
+                "sashiko",
+                crate::workflows::linux_bug::fix_check_tool(*project),
+                None,
+            );
             match db
-                .advance_open_bugs_without_llm_batch(untouched_sashiko, mainline_sha)
+                .advance_open_bugs_without_llm_batch(bugs, mainline_sha)
                 .await
             {
                 Ok(n) => advanced += n,
-                Err(e) => warn!("Failed to batch-advance untouched Sashiko bugs: {}", e),
-            }
-        }
-        if !untouched_gcc.is_empty() {
-            let db = self
-                .db
-                .with_bug_actor("sashiko", "sashiko:gcc_bug:fix_check", None);
-            match db
-                .advance_open_bugs_without_llm_batch(untouched_gcc, mainline_sha)
-                .await
-            {
-                Ok(n) => advanced += n,
-                Err(e) => warn!("Failed to batch-advance untouched GCC bugs: {}", e),
-            }
-        }
-        if !untouched_qemu.is_empty() {
-            let db = self
-                .db
-                .with_bug_actor("sashiko", "sashiko:qemu_bug:fix_check", None);
-            match db
-                .advance_open_bugs_without_llm_batch(untouched_qemu, mainline_sha)
-                .await
-            {
-                Ok(n) => advanced += n,
-                Err(e) => warn!("Failed to batch-advance untouched QEMU bugs: {}", e),
+                Err(e) => warn!(
+                    "Failed to batch-advance untouched {} bugs: {}",
+                    project.display_name(),
+                    e
+                ),
             }
         }
         if !skipped_ids.is_empty()
@@ -714,6 +677,7 @@ impl BugWorker {
             crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
             crate::project::ProjectId::Gcc => "sashiko:gcc_bug",
             crate::project::ProjectId::Qemu => "sashiko:qemu_bug",
+            crate::project::ProjectId::Zephyr => "sashiko:zephyr_bug",
         };
         let actor = if !bug.reporter.is_empty() {
             bug.reporter.as_str()

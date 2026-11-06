@@ -66,6 +66,9 @@ use crate::workflows::qemu_patch_review::{
 use crate::workflows::sashiko_patch_review::{
     build_sashiko_patch_review_workflow_with_effort, sashiko_system_prompt,
 };
+use crate::workflows::zephyr_patch_review::{
+    build_zephyr_patch_review_workflow_with_effort, zephyr_system_prompt,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -443,11 +446,13 @@ impl Worker {
         };
 
         let follow_up_series_context = match self.project {
-            ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu => build_follow_up_series_context(
-                self.series_range.as_deref(),
-                &patchset,
-                &target_commit_sha,
-            ),
+            ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu | ProjectId::Zephyr => {
+                build_follow_up_series_context(
+                    self.series_range.as_deref(),
+                    &patchset,
+                    &target_commit_sha,
+                )
+            }
             ProjectId::Sashiko => build_sashiko_series_context(
                 self.series_range.as_deref(),
                 &patchset,
@@ -542,6 +547,7 @@ impl Worker {
                 ProjectId::Sashiko => sashiko_system_prompt(true),
                 ProjectId::Gcc => gcc_system_prompt(true),
                 ProjectId::Qemu => qemu_system_prompt(true),
+                ProjectId::Zephyr => zephyr_system_prompt(true),
             };
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
@@ -571,6 +577,11 @@ impl Worker {
                 self.effort,
             ),
             ProjectId::Qemu => build_qemu_patch_review_workflow_with_effort(
+                self.max_interactions,
+                self.temperature,
+                self.effort,
+            ),
+            ProjectId::Zephyr => build_zephyr_patch_review_workflow_with_effort(
                 self.max_interactions,
                 self.temperature,
                 self.effort,
@@ -970,6 +981,28 @@ mod prefetch_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zephyr_device_lookup_loads_devicetree_guidance() {
+        let prompts =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("projects/zephyr/prompts");
+        let marker = "<maintainer_note subsystem=\"Devicetree and Bindings\">";
+        for expression in [
+            "DEVICE_DT_GET(node)",
+            "DEVICE_DT_GET_OR_NULL(node)",
+            "DT_GPIO_CTLR(node, gpios)",
+        ] {
+            let diff = format!(
+                "diff --git a/samples/demo/src/main.c b/samples/demo/src/main.c\n@@ -0,0 +1 @@\n+const void *dev = {expression};\n"
+            );
+            assert!(
+                select_maintainer_notes(&prompts, &diff).contains(marker),
+                "{expression}"
+            );
+        }
+        let unrelated = "diff --git a/samples/demo/src/main.c b/samples/demo/src/main.c\n@@ -0,0 +1 @@\n+int answer = 42;\n";
+        assert!(!select_maintainer_notes(&prompts, unrelated).contains(marker));
+    }
 
     #[test]
     fn test_planned_stages_follow_the_resolved_fan_out() {

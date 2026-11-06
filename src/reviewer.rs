@@ -175,22 +175,29 @@ impl Reviewer {
         let concurrency = settings.review.concurrency;
         let repo_path = PathBuf::from(&settings.git.repository_path);
 
-        let baseline_registry =
-            match BaselineRegistry::new(&repo_path, settings.git.custom_remotes.clone()) {
-                Ok(r) => Arc::new(r),
-                Err(e) => {
-                    error!(
-                        "Failed to initialize BaselineRegistry: {}. Using empty registry.",
-                        e
-                    );
-                    Arc::new(
-                        BaselineRegistry::new(&repo_path, settings.git.custom_remotes.clone())
-                            .unwrap_or_else(|_| {
-                                panic!("Critical error initializing BaselineRegistry: {}", e)
-                            }),
+        let baseline_registry = match BaselineRegistry::new(
+            &repo_path,
+            settings.git.custom_remotes.clone(),
+            settings.project.kind,
+        ) {
+            Ok(r) => Arc::new(r),
+            Err(e) => {
+                error!(
+                    "Failed to initialize BaselineRegistry: {}. Using empty registry.",
+                    e
+                );
+                Arc::new(
+                    BaselineRegistry::new(
+                        &repo_path,
+                        settings.git.custom_remotes.clone(),
+                        settings.project.kind,
                     )
-                }
-            };
+                    .unwrap_or_else(|_| {
+                        panic!("Critical error initializing BaselineRegistry: {}", e)
+                    }),
+                )
+            }
+        };
 
         let provider = create_provider_cached(&settings.ai, Some(settings.database.url.as_str()))
             .await
@@ -1640,9 +1647,10 @@ impl Reviewer {
                     .await
             {
                 current_log.push_str(&format!(
-                    "{} is already merged into {}/master; deferring it until \
+                    "{} is already merged into {}; deferring it until \
                      the other candidates have been tried.\n",
-                    baseline_sha, mainline_remote
+                    baseline_sha,
+                    ctx.baseline_registry.mainline_ref()
                 ));
                 attempts.push(BaselineAttempt {
                     baseline: format!("{} ({})", baseline_ref, baseline_sha),
@@ -3155,26 +3163,11 @@ impl Reviewer {
                                         let repo_path = std::path::PathBuf::from(
                                             &ctx.settings.git.repository_path,
                                         );
-                                        let mainline_remote =
-                                            ctx.baseline_registry.mainline_remote_name();
-                                        let candidate_refs = [
-                                            format!("{}/master", mainline_remote),
-                                            format!("{}/main", mainline_remote),
-                                            "origin/master".to_string(),
-                                            "origin/main".to_string(),
-                                            "master".to_string(),
-                                            "main".to_string(),
-                                            "HEAD".to_string(),
-                                        ];
-                                        let mut mainline_sha = None;
-                                        for candidate_ref in &candidate_refs {
-                                            if let Ok(sha) =
-                                                get_commit_hash(&repo_path, candidate_ref).await
-                                            {
-                                                mainline_sha = Some(sha);
-                                                break;
-                                            }
-                                        }
+                                        let mainline_sha =
+                                            crate::workflows::linux_bug::resolve_mainline_sha(
+                                                &repo_path, project,
+                                            )
+                                            .await;
 
                                         let mut toolbox = None;
                                         let base_path = if repo_path.exists() {
@@ -3201,6 +3194,9 @@ impl Reviewer {
                                             }
                                             crate::project::ProjectId::Qemu => {
                                                 "sashiko:qemu_patch_review"
+                                            }
+                                            crate::project::ProjectId::Zephyr => {
+                                                "sashiko:zephyr_patch_review"
                                             }
                                         };
                                         let discovery_db = ctx.db.with_bug_actor(
@@ -4637,6 +4633,31 @@ mod tests {
         assert!(ids.iter().all(|id| id.starts_with("rev_1234_")));
     }
 
+    #[tokio::test]
+    async fn reviewer_passes_project_to_baseline_registry() -> Result<()> {
+        let dir = tempdir()?;
+        run_git(dir.path(), &["init", "--quiet"])?;
+        run_git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/contributor/renamed-tree.git",
+            ],
+        )?;
+        let mut settings = Settings::new()?;
+        settings.project.kind = Some(crate::project::ProjectId::Sashiko);
+        settings.git.repository_path = dir.path().to_string_lossy().into_owned();
+        settings.database.url = ":memory:".to_string();
+        settings.ai.provider = "codex-cli".to_string();
+        let db = Arc::new(Database::new(&settings.database).await?);
+        let reviewer = Reviewer::new(db, settings).await;
+
+        assert_eq!(reviewer.baseline_registry.mainline_ref(), "origin/main");
+        Ok(())
+    }
+
     fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
         let output = crate::git_cmd::in_dir(repo).args(args).output()?;
         if !output.status.success() {
@@ -4802,7 +4823,7 @@ mod tests {
             llm_semaphore: Arc::new(Semaphore::new(1)),
             db: db.clone(),
             settings: settings.clone(),
-            baseline_registry: Arc::new(BaselineRegistry::new(&repo, None)?),
+            baseline_registry: Arc::new(BaselineRegistry::new(&repo, None, None)?),
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(MockProvider),
@@ -4926,7 +4947,7 @@ mod tests {
             llm_semaphore: Arc::new(Semaphore::new(1)),
             db: db.clone(),
             settings: settings.clone(),
-            baseline_registry: Arc::new(BaselineRegistry::new(&repo, None)?),
+            baseline_registry: Arc::new(BaselineRegistry::new(&repo, None, None)?),
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(MockProvider),
@@ -5428,7 +5449,7 @@ fi
             llm_semaphore: Arc::new(Semaphore::new(1)),
             db,
             settings,
-            baseline_registry: Arc::new(BaselineRegistry::new(repo, None)?),
+            baseline_registry: Arc::new(BaselineRegistry::new(repo, None, None)?),
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(MockProvider),
@@ -5632,7 +5653,7 @@ fi
             llm_semaphore: Arc::new(Semaphore::new(1)),
             db: db.clone(),
             settings,
-            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None).unwrap()),
+            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None, None).unwrap()),
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(MockProvider),
@@ -5742,7 +5763,7 @@ fi
             llm_semaphore: Arc::new(Semaphore::new(56)),
             db: db.clone(),
             settings: settings.clone(),
-            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None).unwrap()),
+            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None, None).unwrap()),
             quota_manager,
             target_review_count: 1,
             provider,
@@ -6143,7 +6164,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             db: db.clone(),
             settings,
             baseline_registry: Arc::new(
-                crate::baseline::BaselineRegistry::new(Path::new("."), None).unwrap(),
+                crate::baseline::BaselineRegistry::new(Path::new("."), None, None).unwrap(),
             ),
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
@@ -6513,7 +6534,7 @@ inline review content (previously raised in v1 [4]).
             db: db.clone(),
             settings,
             baseline_registry: Arc::new(
-                crate::baseline::BaselineRegistry::new(Path::new("."), None).unwrap(),
+                crate::baseline::BaselineRegistry::new(Path::new("."), None, None).unwrap(),
             ),
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
@@ -6845,7 +6866,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             db: db.clone(),
             settings,
             baseline_registry: Arc::new(
-                crate::baseline::BaselineRegistry::new(Path::new("."), None).unwrap(),
+                crate::baseline::BaselineRegistry::new(Path::new("."), None, None).unwrap(),
             ),
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
@@ -7011,7 +7032,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             db: db.clone(),
             settings,
             baseline_registry: Arc::new(
-                crate::baseline::BaselineRegistry::new(Path::new("."), None).unwrap(),
+                crate::baseline::BaselineRegistry::new(Path::new("."), None, None).unwrap(),
             ),
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
@@ -7221,6 +7242,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             baseline_registry: Arc::new(crate::baseline::BaselineRegistry::new(
                 Path::new("."),
                 None,
+                None,
             )?),
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
@@ -7343,7 +7365,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             llm_semaphore: Arc::new(Semaphore::new(1)),
             db: db.clone(),
             settings,
-            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None)?),
+            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None, None)?),
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(FailingProvider),
@@ -7474,7 +7496,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             llm_semaphore: Arc::new(Semaphore::new(1)),
             db: claimed_db.clone(),
             settings,
-            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None)?),
+            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None, None)?),
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(FailingProvider),
@@ -7694,7 +7716,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             llm_semaphore: Arc::new(Semaphore::new(1)),
             db: db.clone(),
             settings,
-            baseline_registry: Arc::new(BaselineRegistry::new(&repo, None)?),
+            baseline_registry: Arc::new(BaselineRegistry::new(&repo, None, None)?),
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 2,
             provider: Arc::new(MockProvider),
@@ -7831,6 +7853,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             settings,
             baseline_registry: Arc::new(crate::baseline::BaselineRegistry::new(
                 Path::new("."),
+                None,
                 None,
             )?),
             quota_manager: Arc::new(QuotaManager::new()),
