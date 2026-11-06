@@ -68,7 +68,7 @@ struct Cli {
     project: Option<ProjectId>,
 
     /// Bearer token for authenticating API requests
-    #[arg(long, global = true, env = "SASHIKO_API_TOKEN")]
+    #[arg(long, global = true, env = "SASHIKO_API_TOKEN", hide_env_values = true)]
     token: Option<String>,
 }
 
@@ -2781,6 +2781,10 @@ mod tests {
                 ..
             } if input == "HEAD~1..HEAD"
         ));
+
+        let cmd = <Cli as clap::CommandFactory>::command();
+        let token_arg = cmd.get_arguments().find(|a| a.get_id() == "token").unwrap();
+        assert!(token_arg.is_hide_env_values_set());
     }
 
     #[test]
