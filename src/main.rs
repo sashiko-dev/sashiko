@@ -636,7 +636,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // read. Nothing dispatched below sees two sources. Only the daemon reports
     // what changed, as it always has.
     let overridden = match settings_result.as_mut() {
-        Ok(settings) => settings.apply_overrides(cli_overrides(&cli)),
+        Ok(settings) => {
+            if !matches!(
+                cli.command,
+                Some(Commands::Init { .. } | Commands::Worker { .. })
+            ) {
+                for warning in settings.deprecated_setting_warnings() {
+                    tracing::warn!("{} (in {})", warning, settings_path.display());
+                }
+            }
+            settings.apply_overrides(cli_overrides(&cli))
+        }
         Err(_) => Vec::new(),
     };
 
