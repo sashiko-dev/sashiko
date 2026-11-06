@@ -75,12 +75,16 @@ pub fn is_counted_stage(project: ProjectId, name: &str) -> bool {
 /// Resolves the ordered list of stages a review will run (analysis fan-out
 /// followed by consolidation stages).
 pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> Vec<String> {
+    let is_combined = |n: &str| {
+        guard::normalize_stage_name(n) == linux_patch_review::COMBINED_ANALYSIS_STAGE_NAME
+    };
     match project {
         ProjectId::Linux => {
             let mut planned: Vec<String> = stage_names
                 .iter()
                 .filter(|n| {
                     linux_patch_review::analysis_stage_by_name(n).is_some()
+                        || is_combined(n)
                         || prior_feedback::is_prior_feedback_stage_name(n)
                 })
                 .map(|n| n.to_string())
@@ -99,6 +103,7 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
                 .iter()
                 .filter(|n| {
                     sashiko_patch_review::analysis_stage_by_name(n).is_some()
+                        || is_combined(n)
                         || prior_feedback::is_prior_feedback_stage_name(n)
                 })
                 .map(|n| n.to_string())
@@ -117,6 +122,7 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
                 .iter()
                 .filter(|n| {
                     gcc_patch_review::analysis_stage_by_name(n).is_some()
+                        || is_combined(n)
                         || prior_feedback::is_prior_feedback_stage_name(n)
                 })
                 .map(|n| n.to_string())
@@ -133,7 +139,9 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
         ProjectId::Qemu => {
             let mut planned: Vec<String> = stage_names
                 .iter()
-                .filter(|n| qemu_patch_review::analysis_stage_by_name(n).is_some())
+                .filter(|n| {
+                    qemu_patch_review::analysis_stage_by_name(n).is_some() || is_combined(n)
+                })
                 .map(|n| n.to_string())
                 .collect();
             if !planned.is_empty() {

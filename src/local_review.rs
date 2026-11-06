@@ -647,6 +647,7 @@ async fn review_single_patch(
                 series_range,
                 baseline_sha: Some(baseline_sha.to_string()),
                 stages: stages.clone(),
+                cheap: settings.review.cheap,
                 skip_report: options.agent,
                 report_preexisting: options.report_preexisting,
                 related_preexisting: options.related_preexisting,

@@ -1126,6 +1126,9 @@ pub struct ReviewSettings {
     /// Regex rules matching subject prefixes to assign elevated queue priority tiers.
     #[serde(default)]
     pub priority_rules: Vec<PriorityRule>,
+    /// Combine exploratory analysis stages into a single stage to reduce cost and latency.
+    #[serde(default)]
+    pub cheap: bool,
     #[serde(skip)]
     pub stages: Option<Vec<String>>,
 }
@@ -1309,6 +1312,7 @@ pub struct Overrides {
     pub worktree_dir: Option<String>,
     pub no_ai: bool,
     pub resume: bool,
+    pub cheap: bool,
     pub ai_provider: Option<String>,
     pub ai_model: Option<String>,
     pub effort: Option<EffortMode>,
@@ -1338,6 +1342,7 @@ impl Settings {
             self.ai.no_ai = true;
         }
         self.ai.resume |= overrides.resume;
+        self.review.cheap |= overrides.cheap;
         if let Some(provider) = overrides.ai_provider {
             self.ai.provider = provider;
         }
@@ -1821,6 +1826,7 @@ mod tests {
         assert!(!settings.ai.no_ai);
         assert!(!settings.ai.resume);
         assert!(settings.review.stages.is_none());
+        assert!(!settings.review.cheap);
 
         let changed = settings.apply_overrides(Overrides {
             repository_path: Some("from_flag".to_string()),
@@ -1831,6 +1837,7 @@ mod tests {
             ai_model: Some("from_flag".to_string()),
             effort: Some(EffortMode::Dynamic),
             stages: Some(vec!["pre-screen".to_string()]),
+            cheap: true,
             read_only: true,
             port: Some(9090),
         });
@@ -1856,6 +1863,7 @@ mod tests {
             settings.review.stages.as_deref(),
             Some(&["pre-screen".to_string()][..])
         );
+        assert!(settings.review.cheap);
         assert!(settings.server.read_only);
         assert_eq!(settings.server.port, 9090);
     }

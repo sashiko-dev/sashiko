@@ -90,6 +90,7 @@ async fn review_requests_use_target_prefetch_or_explicit_failure() {
                 baseline_sha: None,
                 custom_prompt: None,
                 stages: Some(vec!["goal".to_string()]),
+                cheap: false,
                 skip_report: false,
                 report_preexisting: false,
                 related_preexisting: Default::default(),

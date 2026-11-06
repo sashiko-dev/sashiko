@@ -51,6 +51,8 @@ pub struct LinuxPatchReviewState {
     pub selected_guides: Vec<String>,
     /// Optional manual stages filter (e.g. `--stages goal,locking`).
     pub manual_stages: Option<Vec<String>>,
+    /// Combine all selected exploratory analysis stages into a single stage (`--cheap`).
+    pub cheap_mode: bool,
     /// Caller-supplied instructions appended to the shared system prompt.
     pub custom_prompt: Option<String>,
     /// Rendered `<code_notes>` block for the system prompt, or empty.
@@ -1600,6 +1602,8 @@ pub fn extract_item_stages_and_prompts(
     if let Some(stage_str) = item.get("stage").and_then(Value::as_str) {
         if let Some(def) = stage_lookup(stage_str) {
             push_unique_string(&mut stages, def.name);
+        } else if normalize_stage_name(stage_str) == COMBINED_ANALYSIS_STAGE_NAME {
+            push_unique_string(&mut stages, COMBINED_ANALYSIS_STAGE_NAME);
         } else if crate::workflows::prior_feedback::is_prior_feedback_stage_name(stage_str) {
             push_unique_string(&mut stages, &normalize_stage_name(stage_str));
         }
@@ -1609,6 +1613,8 @@ pub fn extract_item_stages_and_prompts(
             if let Some(stage_str) = val.as_str() {
                 if let Some(def) = stage_lookup(stage_str) {
                     push_unique_string(&mut stages, def.name);
+                } else if normalize_stage_name(stage_str) == COMBINED_ANALYSIS_STAGE_NAME {
+                    push_unique_string(&mut stages, COMBINED_ANALYSIS_STAGE_NAME);
                 } else if crate::workflows::prior_feedback::is_prior_feedback_stage_name(stage_str)
                 {
                     push_unique_string(&mut stages, &normalize_stage_name(stage_str));
@@ -2372,7 +2378,7 @@ You MUST respond with ONLY a JSON object, no other text. Use the names exactly a
             reasoning_effort: effort.map(crate::ai::EffortMode::lightweight_stage_effort),
             ..Default::default()
         })
-        .skip_if(|s| s.manual_stages.is_some())
+        .skip_if(|s| s.cheap_mode || s.manual_stages.is_some())
         .reduce(move |state, out: PlanningOutput| {
             apply_planning_stage_output(
                 ANALYSIS_STAGES,
@@ -2634,10 +2640,19 @@ pub fn consolidation_stage_by_name(name: &str) -> Option<&'static ConsolidationS
         .find(|s| s.name == normalized)
 }
 
+/// Stage identifier used when `--cheap` combines exploratory stages into one pass.
+pub const COMBINED_ANALYSIS_STAGE_NAME: &str = "analysis";
+
+/// Progress display label for [`COMBINED_ANALYSIS_STAGE_NAME`].
+pub const COMBINED_ANALYSIS_SHORT_LABEL: &str = "Combined Analysis";
+
 /// Display label for any stage the pipeline runs.
 pub fn stage_short_label(name: &str) -> Option<&'static str> {
     if let Some(def) = analysis_stage_by_name(name) {
         return Some(def.short);
+    }
+    if normalize_stage_name(name) == COMBINED_ANALYSIS_STAGE_NAME {
+        return Some(COMBINED_ANALYSIS_SHORT_LABEL);
     }
     if crate::workflows::prior_feedback::is_prior_feedback_stage_name(name) {
         return Some(crate::workflows::prior_feedback::PRIOR_FEEDBACK_SHORT_LABEL);
@@ -2683,6 +2698,7 @@ pub fn analysis_stage_by_name(name: &str) -> Option<&'static AnalysisStage> {
 pub fn is_known_stage(name: &str) -> bool {
     let normalized = normalize_stage_name(name);
     analysis_stage_by_name(&normalized).is_some()
+        || normalized == COMBINED_ANALYSIS_STAGE_NAME
         || crate::workflows::prior_feedback::is_prior_feedback_stage_name(&normalized)
         || crate::workflows::prior_attribution::is_prior_attribution_stage_name(&normalized)
         || crate::workflows::related_preexisting::is_related_preexisting_stage_name(&normalized)
@@ -2781,6 +2797,122 @@ pub fn resolve_stage_effort(
         .map(|mode| mode.analysis_stage_effort(state.planned_efforts.get(stage_name).copied()))
 }
 
+pub fn resolve_combined_stage_effort(
+    state: &LinuxPatchReviewState,
+) -> Option<crate::ai::ReasoningEffort> {
+    state
+        .effort
+        .map(|mode| mode.analysis_stage_effort(Some(crate::ai::ReasoningEffort::High)))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_combined_analysis_stage(
+    defs: Vec<&'static AnalysisStage>,
+    system_prompt_fn: fn(bool) -> PromptTemplate<LinuxPatchReviewState>,
+    schema_example: &str,
+    include_linux_threat_model: bool,
+    validator: fn(&StageConcernsOutput, &LinuxPatchReviewState) -> Result<(), String>,
+    feedback_formatter: fn(&str) -> String,
+    max_turns: usize,
+    temperature: f32,
+    reasoning_effort: Option<crate::ai::ReasoningEffort>,
+) -> Box<dyn ExecutableStage<LinuxPatchReviewState>> {
+    let uses_commit_log = defs.iter().any(|d| d.uses_commit_log);
+    let wants_series_context = defs.iter().any(|d| d.wants_series_context);
+    let has_security = include_linux_threat_model && defs.iter().any(|d| d.name == "security");
+
+    let mut combined_body = String::from(
+        "Perform a comprehensive exploratory code review covering ALL of the specialist domains \
+         below in a single pass.\n\
+         Audit each domain systematically using the repository tools whenever surrounding \
+         context, callers, callees, or lock and lifetime contracts are needed.\n\
+         Do NOT emit duplicate entries if the same underlying defect falls under multiple \
+         domains; report each distinct candidate issue once in \"concerns\" (and each verified \
+         safe candidate once in \"dismissed_concerns\").",
+    );
+    let mut unique_guides: Vec<&'static str> = Vec::new();
+    for def in &defs {
+        combined_body.push_str(&format!(
+            "\n\n<analysis_domain name=\"{}\" title=\"{}\">\n{}\n</analysis_domain>",
+            def.name, def.short, def.instruction
+        ));
+        for &guide in def.guides {
+            if !unique_guides.contains(&guide) {
+                unique_guides.push(guide);
+            }
+        }
+    }
+
+    let threat_model_placeholder = if has_security {
+        KERNEL_THREAT_MODEL_PLACEHOLDER
+    } else {
+        ""
+    };
+    let mut user_template = PromptTemplate::<LinuxPatchReviewState>::new(format!(
+        "{}{}\n\n{}{}",
+        combined_body,
+        threat_model_placeholder,
+        schema_example,
+        series_context_placeholder(wants_series_context)
+    ));
+    for &guide in &unique_guides {
+        user_template = user_template.include_file(guide);
+    }
+    if has_security {
+        user_template = user_template.with_var(
+            "kernel_threat_model_section",
+            |s: &LinuxPatchReviewState| {
+                let rendered = crate::threat_model::KernelThreatModel::render_for_security_stage(
+                    s.kernel_threat_model.as_ref(),
+                );
+                if rendered.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\n{rendered}")
+                }
+            },
+        );
+    }
+    let user_template = with_series_context(user_template, wants_series_context);
+
+    Box::new(
+        Stage::builder(COMBINED_ANALYSIS_STAGE_NAME)
+            .system_prompt(system_prompt_fn(uses_commit_log))
+            .user_prompt(user_template)
+            .output_format(
+                OutputFormat::json()
+                    .with_validator(validator)
+                    .with_feedback_formatter(feedback_formatter),
+            )
+            .policy(StagePolicy {
+                tools: ToolScope::All,
+                max_turns,
+                temperature,
+                reasoning_effort,
+                ..Default::default()
+            })
+            .reduce(
+                move |state: &mut LinuxPatchReviewState, out: StageConcernsOutput| {
+                    let prompts = collect_stage_prompts(&state.selected_guides, &unique_guides);
+                    append_stage_items_with_prompts(
+                        &mut state.all_concerns,
+                        &out.concerns,
+                        COMBINED_ANALYSIS_STAGE_NAME,
+                        "General",
+                        &prompts,
+                    );
+                    append_stage_dismissed_concerns_with_prompts(
+                        &mut state.all_dismissed_concerns,
+                        &out.dismissed_concerns,
+                        COMBINED_ANALYSIS_STAGE_NAME,
+                        &prompts,
+                    );
+                },
+            )
+            .build(),
+    )
+}
+
 pub fn resolve_analysis_stages_with_options(
     state: &LinuxPatchReviewState,
     max_turns: usize,
@@ -2795,20 +2927,60 @@ pub fn resolve_analysis_stages_with_options(
     };
 
     let mut include_prior_feedback = state.manual_stages.is_none();
-    let mut stages = Vec::new();
+    let mut use_combined = state.cheap_mode;
+    let mut selected_defs = Vec::new();
     for name in selected_stages {
         if crate::workflows::prior_feedback::is_prior_feedback_stage_name(&name) {
             include_prior_feedback = true;
             continue;
         }
+        if normalize_stage_name(&name) == COMBINED_ANALYSIS_STAGE_NAME {
+            use_combined = true;
+            for def in ANALYSIS_STAGES {
+                if !selected_defs
+                    .iter()
+                    .any(|d: &&AnalysisStage| d.name == def.name)
+                {
+                    selected_defs.push(def);
+                }
+            }
+            continue;
+        }
         match analysis_stage_by_name(&name) {
             Some(def) => {
-                let effort = resolve_stage_effort(state, def.name);
-                stages.push(analysis_stage(def, max_turns, temperature, effort));
+                if !selected_defs
+                    .iter()
+                    .any(|d: &&AnalysisStage| d.name == def.name)
+                {
+                    selected_defs.push(def);
+                }
             }
             // Previously an unrecognised entry was dropped in silence, so a
             // mistyped --stages looked like it had worked.
             None => tracing::warn!("Ignoring unknown review stage {:?}", name),
+        }
+    }
+
+    let mut stages = Vec::new();
+    if use_combined {
+        if !selected_defs.is_empty() {
+            let effort = resolve_combined_stage_effort(state);
+            stages.push(build_combined_analysis_stage(
+                selected_defs,
+                linux_system_prompt,
+                STAGE_JSON_SCHEMA_EXAMPLE,
+                true,
+                validate_concerns_output,
+                format_concerns_feedback,
+                max_turns,
+                temperature,
+                effort,
+            ));
+        }
+    } else {
+        for def in selected_defs {
+            let effort = resolve_stage_effort(state, def.name);
+            stages.push(analysis_stage(def, max_turns, temperature, effort));
         }
     }
     if include_prior_feedback {
@@ -6482,5 +6654,133 @@ mod tests {
             );
             assert!(!other_rendered.contains("{{kernel_threat_model_section}}"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_cheap_mode_combines_exploratory_stages_and_preserves_provenance() {
+        let mut state = LinuxPatchReviewState {
+            project: "linux".to_string(),
+            cheap_mode: true,
+            kernel_threat_model: Some(crate::threat_model::KernelThreatModel {
+                text: "Remote network peer boundary.".to_string(),
+                commit: "05441d697f7fdeadbeefcafebabe1234567890ab".to_string(),
+                git_ref: "linus/master".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            stage_short_label(COMBINED_ANALYSIS_STAGE_NAME),
+            Some(COMBINED_ANALYSIS_SHORT_LABEL)
+        );
+        assert!(is_known_stage(COMBINED_ANALYSIS_STAGE_NAME));
+        assert_eq!(
+            crate::workflows::planned_stages_from(
+                crate::project::ProjectId::Linux,
+                &[COMBINED_ANALYSIS_STAGE_NAME]
+            ),
+            vec![
+                "analysis",
+                "deduplication",
+                "verification",
+                "post-verification",
+                "report",
+            ]
+        );
+
+        let stages = resolve_analysis_stages_with_options(&state, 10, 0.0);
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].name(), COMBINED_ANALYSIS_STAGE_NAME);
+
+        // Verify subsetting via --stages + --cheap combines only the requested domains.
+        let subset_state = LinuxPatchReviewState {
+            project: "linux".to_string(),
+            cheap_mode: true,
+            manual_stages: Some(vec!["goal".to_string(), "locking".to_string()]),
+            ..Default::default()
+        };
+        let subset_stages = resolve_analysis_stages_with_options(&subset_state, 10, 0.0);
+        assert_eq!(subset_stages.len(), 1);
+        assert_eq!(subset_stages[0].name(), COMBINED_ANALYSIS_STAGE_NAME);
+
+        // Execute a combined stage against a mock session runner to verify prompt composition
+        // and guide provenance propagation into verification stages.
+        struct CaptureCombinedProvider {
+            seen_user: std::sync::Arc<std::sync::Mutex<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::ai::AiProvider for CaptureCombinedProvider {
+            async fn generate_content(
+                &self,
+                req: crate::ai::AiRequest,
+            ) -> anyhow::Result<crate::ai::AiResponse> {
+                let user = req
+                    .messages
+                    .iter()
+                    .rfind(|m| m.role == crate::ai::AiRole::User)
+                    .and_then(|m| m.content.clone())
+                    .unwrap_or_default();
+                *self.seen_user.lock().unwrap() = user;
+                Ok(crate::ai::AiResponse {
+                    content: Some(
+                        r#"{"concerns": [{"type": "Locking", "description": "foo() drops lock early", "reasoning": "bar() expects lock held", "preexisting": false, "locations": [{"file": "mm/foo.c", "line": 12, "side": "REVISION", "function_or_symbol": "foo"}]}], "dismissed_concerns": []}"#
+                            .to_string(),
+                    ),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+
+            fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+                crate::ai::ProviderCapabilities {
+                    model_name: "mock".to_string(),
+                    context_window_size: 100_000,
+                }
+            }
+        }
+
+        let seen_user = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let provider: std::sync::Arc<dyn crate::ai::AiProvider> =
+            std::sync::Arc::new(CaptureCombinedProvider {
+                seen_user: seen_user.clone(),
+            });
+        let temp = tempfile::tempdir().unwrap();
+        let env = crate::workflow::WorkflowEnv {
+            provider,
+            tools: std::sync::Arc::new(crate::toolbox::ToolBox::new(temp.path().to_path_buf())),
+            base_dir: std::path::Path::new("projects/linux/prompts"),
+            context_tag: None,
+        };
+        let wf = crate::workflow::Workflow::builder("test_cheap")
+            .dynamic_parallel(
+                planning_stage_with_effort(0.0, None),
+                |s| resolve_analysis_stages_with_options(s, 5, 0.0),
+                crate::workflow::ParallelPolicy::FailFast,
+            )
+            .build();
+        state.worktree_path = Some(temp.path().to_path_buf());
+        state.target_commit_diff =
+            "diff --git a/mm/foo.c b/mm/foo.c\n@@ -10,3 +10,5 @@\n+foo();\n".to_string();
+        crate::workflow::WorkflowEngine::execute(&wf, &env, &mut state, None)
+            .await
+            .unwrap();
+        let user_prompt = seen_user.lock().unwrap().clone();
+        for def in ANALYSIS_STAGES {
+            assert!(
+                user_prompt.contains(&format!("<analysis_domain name=\"{}\"", def.name)),
+                "combined prompt missing domain {}",
+                def.name
+            );
+        }
+        assert!(user_prompt.contains("Remote network peer boundary."));
+        assert_eq!(state.all_concerns.len(), 1);
+        assert_eq!(state.all_concerns[0]["stage"], "analysis");
+        let extra_guides = extra_prompt_paths_for_state(&state, analysis_stage_by_name);
+        assert!(extra_guides.contains(&std::path::PathBuf::from("callstack.md")));
+        assert!(extra_guides.contains(&std::path::PathBuf::from("locking.md")));
     }
 }

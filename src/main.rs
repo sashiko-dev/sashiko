@@ -153,6 +153,10 @@ enum Commands {
         #[arg(long)]
         resume: bool,
 
+        /// Combine exploratory analysis stages into a single stage to reduce cost and latency
+        #[arg(long)]
+        cheap: bool,
+
         /// Verify and report pre-existing bugs in the touched code
         #[arg(long)]
         report_preexisting: bool,
@@ -267,6 +271,10 @@ enum Commands {
         /// Run only these analysis stages, by name
         #[arg(long, hide = true, value_delimiter = ',')]
         stages: Option<Vec<String>>,
+
+        /// Combine exploratory analysis stages into a single stage
+        #[arg(long, hide = true)]
+        cheap: bool,
 
         /// Agent mode: skip plain-text report generation
         #[arg(long, hide = true)]
@@ -462,6 +470,7 @@ fn cli_overrides(cli: &Cli) -> Overrides {
         Some(Commands::Review {
             no_ai,
             resume,
+            cheap,
             ai_provider,
             model,
             effort,
@@ -470,6 +479,7 @@ fn cli_overrides(cli: &Cli) -> Overrides {
         }) => Overrides {
             no_ai: *no_ai,
             resume: *resume,
+            cheap: *cheap,
             ai_provider: ai_provider.clone(),
             ai_model: model.clone(),
             effort: effort.or(cli.effort),
@@ -495,6 +505,7 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             repo,
             worktree_dir,
             no_ai,
+            cheap,
             ai_provider,
             model,
             effort,
@@ -504,6 +515,7 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             repository_path: repo.as_deref().map(path_string),
             worktree_dir: worktree_dir.as_deref().map(path_string),
             no_ai: *no_ai,
+            cheap: *cheap,
             ai_provider: ai_provider.clone(),
             ai_model: model.clone(),
             effort: effort.or(cli.effort),
@@ -6115,6 +6127,10 @@ mod tests {
 
         let after = Cli::parse_from(["sashiko", "review", "--effort", "dynamic"]);
         assert_eq!(cli_overrides(&after).effort, Some(EffortMode::Dynamic));
+        assert!(!cli_overrides(&after).cheap);
+
+        let cheap = Cli::parse_from(["sashiko", "review", "--cheap"]);
+        assert!(cli_overrides(&cheap).cheap);
     }
 
     #[test]
