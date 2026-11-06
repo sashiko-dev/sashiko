@@ -358,6 +358,11 @@ pub(crate) fn default_claude_max_tokens() -> u32 {
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct GeminiSettings {
+    /// Deprecated no-op retained so existing `~/.config/sashiko.toml` and
+    /// `Settings.toml` files written before v0.8.0 continue to load on upgrade.
+    #[doc(hidden)]
+    #[serde(default)]
+    pub explicit_prompt_caching: Option<bool>,
     /// Max output tokens per `generateContent` request, thinking included.
     /// Sent as `generationConfig.maxOutputTokens`. When unset, defaults to
     /// `131_072` on models with Long Decodes v2 (`CONTINUATION` support, such
@@ -1070,6 +1075,10 @@ pub struct ReviewSettings {
     /// Whether completed patchsets are queued for review automatically.
     #[serde(default = "default_true")]
     pub auto_review: bool,
+    /// Deprecated no-op retained so existing `Settings.toml` files continue to load on upgrade.
+    #[doc(hidden)]
+    #[serde(default)]
+    pub series_review_enabled: Option<bool>,
     /// Parent directory for the worktrees a review worker checks patches out
     /// into, or None for one under the system temporary directory.
     ///
@@ -1104,6 +1113,10 @@ pub struct ReviewSettings {
     /// How much of each selected unit note a review gets.
     #[serde(default)]
     pub code_notes_scope: CodeNotesScope,
+    /// Deprecated no-op retained so existing `Settings.toml` files continue to load on upgrade.
+    #[doc(hidden)]
+    #[serde(default)]
+    pub code_notes_bytes: Option<usize>,
     /// Maximum cumulative output tokens (including thinking tokens) across all turns in a
     /// single review. Set to 0 to disable.
     #[serde(default = "default_max_total_output_tokens")]
@@ -1405,6 +1418,33 @@ impl Settings {
         let level = gemini_level;
 
         level.is_some_and(|s| s.eq_ignore_ascii_case("low"))
+    }
+
+    /// Returns human-readable deprecation notices for obsolete configuration
+    /// keys that were accepted for backwards compatibility during load.
+    pub fn deprecated_setting_warnings(&self) -> Vec<&'static str> {
+        let mut warnings = Vec::new();
+        if self
+            .ai
+            .gemini
+            .as_ref()
+            .is_some_and(|g| g.explicit_prompt_caching.is_some())
+        {
+            warnings.push(
+                "Deprecated setting '[ai.gemini] explicit_prompt_caching' has no effect and can be removed",
+            );
+        }
+        if self.review.series_review_enabled.is_some() {
+            warnings.push(
+                "Deprecated setting '[review] series_review_enabled' has no effect and can be removed",
+            );
+        }
+        if self.review.code_notes_bytes.is_some() {
+            warnings.push(
+                "Deprecated setting '[review] code_notes_bytes' has no effect and can be removed",
+            );
+        }
+        warnings
     }
 
     /// Refuses a configuration that names no database, no repository, or no
@@ -2617,5 +2657,57 @@ mod tests {
         let settings = Settings::load(Some(&path)).unwrap();
         let err = settings.validate_for_daemon().unwrap_err();
         assert!(err.contains("[review.priority_rules] invalid regex"));
+    }
+
+    #[test]
+    fn test_deprecated_settings_load_cleanly_and_report_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sashiko.toml");
+        // Exact shape produced by `sashiko init` in v0.2.0..v0.6.3, plus
+        // retired `[review]` keys from pre-v0.8 configurations.
+        let legacy_toml = r#"
+[ai]
+provider = "gemini"
+model = "gemini-4-argon"
+max_input_tokens = 950000
+temperature = 1.0
+
+[ai.gemini]
+explicit_prompt_caching = false
+
+[review]
+concurrency = 4
+series_review_enabled = true
+code_notes_bytes = 65536
+"#;
+        std::fs::write(&path, legacy_toml).unwrap();
+        let settings =
+            Settings::load(Some(&path)).expect("legacy configuration must load on upgrade");
+        let warnings = settings.deprecated_setting_warnings();
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings[0].contains("[ai.gemini] explicit_prompt_caching"));
+        assert!(warnings[1].contains("[review] series_review_enabled"));
+        assert!(warnings[2].contains("[review] code_notes_bytes"));
+
+        // Clean modern configurations emit zero deprecation warnings.
+        let modern = Settings::load(Some(Path::new("docs/examples/Settings.example.toml")))
+            .expect("modern init template must load");
+        assert!(modern.deprecated_setting_warnings().is_empty());
+
+        // Genuine typos under `[ai.gemini]` and `[review]` still fail fast.
+        let typo_toml = r#"
+[ai]
+provider = "gemini"
+model = "gemini-4-argon"
+
+[ai.gemini]
+explicit_prompt_cachng = false
+
+[review]
+concurrency = 4
+"#;
+        std::fs::write(&path, typo_toml).unwrap();
+        let err = Settings::load(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("unknown field `explicit_prompt_cachng`"));
     }
 }
