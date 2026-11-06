@@ -258,6 +258,12 @@ sashiko scan [OPTIONS] <PATHS>...
 | `-m, --model <MODEL>` | AI model override (alias: `--ai-model`). |
 | `--effort <MODE>` | Reasoning effort override (`low`, `mid`, `high`, or `dynamic`). |
 | `--format <FORMAT>` | Output format: `text` (default) or `json`. |
+| `--color <MODE>` | Color and interactive progress mode: `auto` (default), `always`, or `never`. |
+
+When run in an interactive terminal, `sashiko scan` renders a live pinned
+progress dashboard (active chunk stages, turn counters, elapsed clock, and
+high-signal candidate/verified bug alerts) and automatically falls back to
+clean, deduplicated line output when redirected.
 
 Candidate defects discovered across source chunks are passed through the
 `linux_bug` pipeline (`NormalizeSession` -> `VerifySession` -> `TracingSession` ->

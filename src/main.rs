@@ -2124,10 +2124,47 @@ fn window_size(stream: &impl AsFd) -> Option<(usize, usize)> {
 /// The repaint arrives as an argument rather than being called outright, so that
 /// a test can watch a resize reach the display without a frame being painted at
 /// the terminal running the test.
-fn watch_for_resize(
-    state: Arc<std::sync::Mutex<ProgressState>>,
+trait ResizableDisplay {
+    fn window(&self) -> (usize, usize);
+    fn set_window(&mut self, rows: usize, cols: usize);
+    fn can_tick(&self) -> bool;
+}
+
+/// Formats elapsed seconds as `MM:SS` (or `HH:MM:SS` once an hour has elapsed).
+fn format_elapsed_mmss(secs: u64) -> String {
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let rem = secs % 60;
+    if hours > 0 {
+        format!("{hours:02}:{mins:02}:{rem:02}")
+    } else {
+        format!("{mins:02}:{rem:02}")
+    }
+}
+
+/// Repaints a reserved progress footer once per second so the elapsed clock stays live.
+fn spawn_elapsed_ticker<S: ResizableDisplay + Send + 'static>(
+    state: Arc<std::sync::Mutex<S>>,
+    mut repaint: impl FnMut(&mut S) + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            if s.can_tick() {
+                repaint(&mut s);
+            }
+        }
+    })
+}
+
+fn watch_for_resize<S: ResizableDisplay + Send + 'static>(
+    state: Arc<std::sync::Mutex<S>>,
     stream: impl AsFd + Send + 'static,
-    mut repaint: impl FnMut(&mut ProgressState) + Send + 'static,
+    mut repaint: impl FnMut(&mut S) + Send + 'static,
 ) -> Option<tokio::task::JoinHandle<()>> {
     window_size(&stream)?;
 
@@ -2143,11 +2180,11 @@ fn watch_for_resize(
     // existed, and a resize in between is a resize nothing will report again.
     // Ask once here, so the gap is closed rather than waited out.
     {
-        let mut state = state.lock().unwrap();
-        if let Some((_, cols)) = window_size(&stream)
-            && state.terminal_width != cols
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((rows, cols)) = window_size(&stream)
+            && state.window() != (rows, cols)
         {
-            state.terminal_width = cols;
+            state.set_window(rows, cols);
             repaint(&mut state);
         }
     }
@@ -2163,11 +2200,10 @@ fn watch_for_resize(
             };
 
             let mut state = state.lock().unwrap();
-            if (state.terminal_rows, state.terminal_width) == (rows, cols) {
+            if state.window() == (rows, cols) {
                 continue;
             }
-            state.terminal_rows = rows;
-            state.terminal_width = cols;
+            state.set_window(rows, cols);
             repaint(&mut state);
         }
     }))
@@ -2180,6 +2216,7 @@ struct ProgressState {
     /// speaks only when one of them changes.
     last_status: std::collections::BTreeMap<i64, String>,
     total_turns: usize,
+    started_at: Option<std::time::Instant>,
     terminal_width: usize,
     terminal_rows: usize,
     color_choice: ColorChoice,
@@ -2198,6 +2235,21 @@ struct ProgressState {
     /// region by a moment: a repaint arriving in that moment would take a region
     /// back and draw a frame across the report. Nothing paints once this is set.
     finished: bool,
+}
+
+impl ResizableDisplay for ProgressState {
+    fn window(&self) -> (usize, usize) {
+        (self.terminal_rows, self.terminal_width)
+    }
+
+    fn set_window(&mut self, rows: usize, cols: usize) {
+        self.terminal_rows = rows;
+        self.terminal_width = cols;
+    }
+
+    fn can_tick(&self) -> bool {
+        self.reserved > 0 && !self.finished && self.started_at.is_some()
+    }
 }
 
 /// Display label for a stage. Held in the stage tables so that adding a stage
@@ -2524,7 +2576,7 @@ fn paint_progress_plain(
 /// on a twenty-four line terminal would otherwise leave nothing to scroll in,
 /// and the reader watching a display instead of a review.
 fn worth_reserving(wanted: usize, rows: usize) -> bool {
-    wanted * 4 <= rows * 3
+    wanted.saturating_mul(4) <= rows.saturating_mul(3)
 }
 
 /// Reserves `wanted` lines at the foot of the screen for the display.
@@ -2547,8 +2599,10 @@ fn worth_reserving(wanted: usize, rows: usize) -> bool {
 ///
 /// Asked for only where those lines are worth taking, so the caller has already
 /// left something to scroll in.
-fn reserve_progress_region(
-    state: &mut ProgressState,
+fn reserve_region_raw(
+    reserved: &mut usize,
+    region_rows: &mut usize,
+    terminal_rows: usize,
     out: &mut impl WriteColor,
     wanted: usize,
 ) -> std::io::Result<()> {
@@ -2559,18 +2613,43 @@ fn reserve_progress_region(
 
     // Room for the lines not held yet, scrolled for at the foot of the screen,
     // where a newline can only scroll: every line taken comes from somewhere.
-    let room = wanted.saturating_sub(state.reserved);
-    write!(out, "\x1b[{};1H", state.terminal_rows)?;
+    let room = wanted.saturating_sub(*reserved);
+    write!(out, "\x1b[{terminal_rows};1H")?;
     for _ in 0..room {
         writeln!(out)?;
     }
 
-    let split = state.terminal_rows - wanted;
+    // When a dynamic display shrinks (for example as concurrent scan chunks
+    // finish), clear the vacated rows before raising the bottom margin so no
+    // stale footer lines remain above the new frame.
+    if *region_rows == terminal_rows && wanted < *reserved {
+        let old_top = terminal_rows.saturating_sub(*reserved) + 1;
+        let new_top = terminal_rows.saturating_sub(wanted) + 1;
+        for row in old_top..new_top {
+            write!(out, "\x1b[{row};1H\x1b[2K")?;
+        }
+    }
+
+    let split = terminal_rows - wanted;
     write!(out, "\x1b[1;{split}r")?;
 
-    state.reserved = wanted;
-    state.region_rows = state.terminal_rows;
+    *reserved = wanted;
+    *region_rows = terminal_rows;
     Ok(())
+}
+
+fn reserve_progress_region(
+    state: &mut ProgressState,
+    out: &mut impl WriteColor,
+    wanted: usize,
+) -> std::io::Result<()> {
+    reserve_region_raw(
+        &mut state.reserved,
+        &mut state.region_rows,
+        state.terminal_rows,
+        out,
+        wanted,
+    )
 }
 
 /// What the display leaves on screen when it gives its region back.
@@ -2584,25 +2663,16 @@ enum RegionExit {
     Kept,
 }
 
-/// Gives the screen back: scrolling returns to the whole screen, and `exit` says
-/// what becomes of the frame the display drew in it.
-///
-/// An `Erased` release clears the lines it held and leaves the cursor where the
-/// output had reached, so whatever prints next carries on from there rather than
-/// from below lines that are no longer the display's. It says so whether or not
-/// lines are currently held: a region left set is the one piece of this display
-/// that outlives the process, and a resize can leave the count of held lines
-/// behind.
-///
-/// A `Kept` release leaves the frame where it is and steps below it instead, and
-/// is the one that says nothing at all where nothing is held, because the escape
-/// that hands the margins back homes the cursor.
-fn release_progress_region(
-    state: &mut ProgressState,
+fn release_region_raw(
+    reservation_capable: bool,
+    reserved: &mut usize,
+    region_rows: usize,
+    terminal_rows: usize,
+    finished: &mut bool,
     out: &mut impl WriteColor,
     exit: RegionExit,
 ) -> std::io::Result<()> {
-    if !state.reservation_capable {
+    if !reservation_capable {
         return Ok(());
     }
 
@@ -2613,8 +2683,8 @@ fn release_progress_region(
         // that is already there. This is called twice by design — once when the
         // review says it is complete, once on the way out for the paths that
         // never get there — and the second call is exactly that case.
-        if state.reserved == 0 {
-            state.finished = true;
+        if *reserved == 0 {
+            *finished = true;
             return Ok(());
         }
 
@@ -2623,10 +2693,10 @@ fn release_progress_region(
         // no restore: a restore here would put the cursor back inside the rows
         // the frame occupies, which is what printed the report over them.
         write!(out, "\x1b[r")?;
-        write!(out, "\x1b[{};1H", state.terminal_rows)?;
+        write!(out, "\x1b[{terminal_rows};1H")?;
         writeln!(out)?;
-        state.reserved = 0;
-        state.finished = true;
+        *reserved = 0;
+        *finished = true;
         return out.flush();
     }
 
@@ -2635,21 +2705,58 @@ fn release_progress_region(
     // does not: clearing the last `reserved` rows of a screen that has shrunk
     // below that count would clear all of it, rows that were never the
     // display's. The margins still go back, and the stale frame scrolls away.
-    let held = if state.region_rows == state.terminal_rows {
-        state.reserved
+    let held = if region_rows == terminal_rows {
+        *reserved
     } else {
         0
     };
 
     write!(out, "\x1b7")?;
-    let top = state.terminal_rows.saturating_sub(held) + 1;
-    for row in top..=state.terminal_rows {
+    let top = terminal_rows.saturating_sub(held) + 1;
+    for row in top..=terminal_rows {
         write!(out, "\x1b[{row};1H\x1b[2K")?;
     }
     write!(out, "\x1b[r\x1b8")?;
 
-    state.reserved = 0;
+    *reserved = 0;
     out.flush()
+}
+
+/// Gives the screen back: scrolling returns to the whole screen, and `exit` says
+/// what becomes of the frame the display drew in it.
+fn release_progress_region(
+    state: &mut ProgressState,
+    out: &mut impl WriteColor,
+    exit: RegionExit,
+) -> std::io::Result<()> {
+    release_region_raw(
+        state.reservation_capable,
+        &mut state.reserved,
+        state.region_rows,
+        state.terminal_rows,
+        &mut state.finished,
+        out,
+        exit,
+    )
+}
+
+/// Formats and pads `text` to `target_width` characters, truncating with `...` when needed.
+fn pad_or_truncate_label(text: &str, width: usize) -> String {
+    let mut padded = if text.chars().count() > width {
+        if width > 3 {
+            let taken: String = text.chars().take(width - 3).collect();
+            format!("{}...", taken.trim_end())
+        } else {
+            "...".to_string()
+        }
+    } else {
+        text.to_string()
+    };
+    let padding_chars = width.saturating_sub(padded.chars().count());
+    if padding_chars > 0 {
+        padded.push_str(&" ".repeat(padding_chars));
+    }
+    padded
 }
 
 /// Paints one frame into `out`, erasing the frame before it.
@@ -2696,25 +2803,8 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
         let available_for_subject = limit
             .saturating_sub(fixed_overhead)
             .saturating_sub(status_len);
-
-        let target_subject_width = 30;
-        let subject_width = std::cmp::min(target_subject_width, available_for_subject);
-
-        let mut subject_padded = if p.subject.chars().count() > subject_width {
-            if subject_width > 3 {
-                let taken: String = p.subject.chars().take(subject_width - 3).collect();
-                format!("{}...", taken.trim_end())
-            } else {
-                "...".to_string()
-            }
-        } else {
-            p.subject.clone()
-        };
-
-        let padding_chars = subject_width.saturating_sub(subject_padded.chars().count());
-        if padding_chars > 0 {
-            subject_padded.push_str(&" ".repeat(padding_chars));
-        }
+        let subject_width = std::cmp::min(30, available_for_subject);
+        let subject_padded = pad_or_truncate_label(&p.subject, subject_width);
 
         let mut tw = TruncatingWriter::new(limit);
         let _ = tw.write_segment(out, &format!("      [Patch {}] ", idx), None, false);
@@ -2757,23 +2847,19 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
 
         let _ = tw.write_segment(out, "] ", None, true);
 
+        let elapsed_suffix = state
+            .started_at
+            .map(|t| format!(" | {}", format_elapsed_mmss(t.elapsed().as_secs())))
+            .unwrap_or_default();
         let stats = format!(
-            "{}% | {}/{} stages | {} turns",
-            percent, display_completed_stages, total_stages, state.total_turns
+            "{}% | {}/{} stages | {} turns{}",
+            percent, display_completed_stages, total_stages, state.total_turns, elapsed_suffix
         );
         let _ = tw.write_segment(out, &stats, None, false);
     }
 
     // The last line of the region, which is where ordinary output carries on
-    // from. Parked outright rather than saved and restored: a restore puts the
-    // cursor back where it was, and where it was can be outside the region a
-    // resize has just moved, which leaves every log record overwriting the same
-    // row with no way back. The column is lost with it, so a record written
-    // without a newline would be overwritten; the log writes whole lines.
-    //
-    // On a screen with room to spare this pulls the log down to meet the display
-    // and leaves a blank band above it until the output scrolls that away, which
-    // is the price of not knowing the row the log had reached.
+    // from.
     write!(
         out,
         "\x1b[{split};1H",
@@ -2783,18 +2869,7 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
 }
 
 /// Stages this patch will have run by the time it is finished.
-///
-/// The pre-screen and the planner are added as they start, since whether they
-/// run is not knowable in advance. The rest are whatever the fan-out resolved
-/// to, plus the consolidation stages that always follow; before it resolves,
-/// assume every stage, which is where a review with no `--stages` and a generous
-/// planner ends up anyway.
 fn patch_stage_total(project: ProjectId, p: &PatchState) -> usize {
-    // Once a patch is done, what it ran is all it was ever going to run. The
-    // workflow leaves by an early exit whenever a stage empties the concern
-    // list, and the consolidation stages after that point never run, though
-    // planned_stages counted them. Whatever else went unrun, a failed stage
-    // under BestEffort say, is settled here too.
     if matches!(p.status, PatchStatus::Finished | PatchStatus::Failed) {
         return p.completed_stages;
     }
@@ -2822,6 +2897,830 @@ fn calculate_progress_metrics(
     let filled = (display_completed_stages.saturating_mul(width) / total_stages).min(width);
 
     (display_completed_stages, percent, filled)
+}
+
+fn format_model_and_effort(settings: &Settings) -> String {
+    let model = if settings.ai.model.trim().is_empty() {
+        settings.ai.provider.clone()
+    } else {
+        format!("{}/{}", settings.ai.provider, settings.ai.model)
+    };
+    let effort = settings
+        .effective_effort()
+        .map(|e| e.to_string().to_ascii_lowercase())
+        .unwrap_or_else(|| "default".to_string());
+    let mut flags = vec![format!("effort: {effort}")];
+    if settings.ai.resume {
+        flags.push("resume".to_string());
+    }
+    format!("{model} ({})", flags.join(", "))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanPhase {
+    Indexing,
+    ScanningChunks,
+    VerifyingCandidates,
+}
+
+struct ActiveScanChunk {
+    ordinal: usize,
+    chunk_id: String,
+    planned_stages: Vec<String>,
+    active_stages: std::collections::BTreeSet<String>,
+    active_stage_turns: std::collections::HashMap<String, usize>,
+    completed_stages: usize,
+}
+
+struct ActiveVerifyItem {
+    index: usize,
+    total: usize,
+    problem: String,
+}
+
+struct ScanProgressState {
+    phase: ScanPhase,
+    concurrency: usize,
+    total_files: usize,
+    total_chunks: usize,
+    next_chunk_ordinal: usize,
+    completed_chunks: usize,
+    early_exited_chunks: usize,
+    failed_chunks: usize,
+    candidate_findings: usize,
+    active_chunks: std::collections::BTreeMap<usize, ActiveScanChunk>,
+    chunk_ordinals: std::collections::HashMap<String, usize>,
+    active_verifies: std::collections::BTreeMap<usize, ActiveVerifyItem>,
+    verify_total: usize,
+    verify_completed: usize,
+    verified_bugs: usize,
+    discarded_candidates: usize,
+    failed_candidates: usize,
+    total_turns: usize,
+    started_at: Option<std::time::Instant>,
+    last_status: std::collections::HashMap<String, String>,
+    terminal_width: usize,
+    terminal_rows: usize,
+    color_choice: ColorChoice,
+    reservation_capable: bool,
+    reserved: usize,
+    region_rows: usize,
+    finished: bool,
+}
+
+impl ScanProgressState {
+    fn new(
+        display: OutputStream,
+        concurrency: usize,
+        started_at: Option<std::time::Instant>,
+    ) -> Self {
+        Self {
+            phase: ScanPhase::Indexing,
+            concurrency: concurrency.max(1),
+            total_files: 0,
+            total_chunks: 0,
+            next_chunk_ordinal: 1,
+            completed_chunks: 0,
+            early_exited_chunks: 0,
+            failed_chunks: 0,
+            candidate_findings: 0,
+            active_chunks: std::collections::BTreeMap::new(),
+            chunk_ordinals: std::collections::HashMap::new(),
+            active_verifies: std::collections::BTreeMap::new(),
+            verify_total: 0,
+            verify_completed: 0,
+            verified_bugs: 0,
+            discarded_candidates: 0,
+            failed_candidates: 0,
+            total_turns: 0,
+            started_at,
+            last_status: std::collections::HashMap::new(),
+            terminal_width: display.size.1,
+            terminal_rows: display.size.0,
+            color_choice: display.color,
+            reservation_capable: display.reservation_capable,
+            reserved: 0,
+            region_rows: 0,
+            finished: false,
+        }
+    }
+}
+
+impl ResizableDisplay for ScanProgressState {
+    fn window(&self) -> (usize, usize) {
+        (self.terminal_rows, self.terminal_width)
+    }
+
+    fn set_window(&mut self, rows: usize, cols: usize) {
+        self.terminal_rows = rows;
+        self.terminal_width = cols;
+    }
+
+    fn can_tick(&self) -> bool {
+        self.reserved > 0 && !self.finished && self.started_at.is_some()
+    }
+}
+
+fn on_scan_stderr(
+    state: &mut ScanProgressState,
+    paint: impl FnOnce(&mut ScanProgressState, &mut Buffer) -> std::io::Result<()>,
+) {
+    let stderr = BufferWriter::stderr(state.color_choice);
+    let mut frame = stderr.buffer();
+    if paint(state, &mut frame).is_ok() {
+        let _ = stderr.print(&frame);
+    }
+}
+
+fn render_scan_progress(state: &mut ScanProgressState) {
+    on_scan_stderr(state, paint_scan_progress);
+}
+
+fn release_scan_progress(
+    state: &mut ScanProgressState,
+    out: &mut impl WriteColor,
+) -> std::io::Result<()> {
+    release_region_raw(
+        state.reservation_capable,
+        &mut state.reserved,
+        state.region_rows,
+        state.terminal_rows,
+        &mut state.finished,
+        out,
+        RegionExit::Kept,
+    )
+}
+
+fn finish_scan_progress(state: &mut ScanProgressState) {
+    on_scan_stderr(state, release_scan_progress);
+}
+
+fn scan_stage_short_name(stage: &str) -> &str {
+    sashiko::workflows::linux_scan::scan_stage_short_label(stage).unwrap_or(stage)
+}
+
+fn scan_chunk_status_label(chunk: &ActiveScanChunk, with_turns: bool) -> String {
+    if chunk.active_stages.is_empty() {
+        return if chunk.completed_stages == 0 {
+            "Triaging...".to_string()
+        } else {
+            "Analyzing...".to_string()
+        };
+    }
+
+    let busiest = |stage: &String| {
+        let turns = chunk.active_stage_turns.get(stage).copied().unwrap_or(0);
+        std::cmp::Reverse(if with_turns { turns } else { 0 })
+    };
+    let top_stage = chunk
+        .active_stages
+        .iter()
+        .min_by_key(|stage| busiest(stage))
+        .expect("active_stages is not empty");
+    let top_turn = chunk
+        .active_stage_turns
+        .get(top_stage)
+        .copied()
+        .unwrap_or(0);
+    let stage_name = scan_stage_short_name(top_stage);
+    let stage_str = if with_turns && top_turn > 0 {
+        format!("{stage_name} (turn {top_turn})")
+    } else {
+        stage_name.to_string()
+    };
+
+    if chunk.active_stages.len() > 1 {
+        format!("{stage_str} (+{} stages)", chunk.active_stages.len() - 1)
+    } else {
+        stage_str
+    }
+}
+
+fn paint_scan_progress_plain(
+    state: &mut ScanProgressState,
+    out: &mut impl WriteColor,
+) -> std::io::Result<()> {
+    match state.phase {
+        ScanPhase::Indexing => {}
+        ScanPhase::ScanningChunks => {
+            for chunk in state.active_chunks.values() {
+                let label = scan_chunk_status_label(chunk, false);
+                let key = format!("chunk:{}", chunk.ordinal);
+                if state.last_status.get(&key) == Some(&label) {
+                    continue;
+                }
+                state.last_status.insert(key, label.clone());
+                writeln!(
+                    out,
+                    "      [Chunk {}/{}] {} | {}",
+                    chunk.ordinal, state.total_chunks, chunk.chunk_id, label
+                )?;
+            }
+        }
+        ScanPhase::VerifyingCandidates => {
+            for item in state.active_verifies.values() {
+                let key = format!("verify:{}", item.index);
+                let label = "Verifying & tracing origin...".to_string();
+                if state.last_status.get(&key) != Some(&label) {
+                    state.last_status.insert(key, label.clone());
+                    writeln!(
+                        out,
+                        "      [Verify {}/{}] {} | {}",
+                        item.index, item.total, item.problem, label
+                    )?;
+                }
+            }
+        }
+    }
+    out.flush()
+}
+
+fn scan_phase1_progress_units(state: &ScanProgressState) -> (usize, usize) {
+    let total_units = state.total_chunks.saturating_mul(100);
+    if total_units == 0 {
+        return (0, 0);
+    }
+    let mut completed_units = state.completed_chunks.saturating_mul(100);
+    for chunk in state.active_chunks.values() {
+        // Use 6 planned stages before triage resolves so expected_stages only
+        // stays equal or shrinks once ChunkPlanned arrives, keeping progress monotonic.
+        let planned_len = if chunk.planned_stages.is_empty() {
+            6
+        } else {
+            chunk.planned_stages.len()
+        };
+        let expected_stages = (1 + planned_len + 1).max(2);
+        let chunk_bp = (chunk.completed_stages.saturating_mul(90) / expected_stages).min(90);
+        completed_units += chunk_bp;
+    }
+    (total_units, completed_units.min(total_units))
+}
+
+fn scan_wanted_rows(state: &ScanProgressState) -> usize {
+    // Cap active item rows so even 100+ chunk / high-concurrency scans fit
+    // comfortably inside the terminal scroll region.
+    let max_items = (state.terminal_rows * 3 / 4).saturating_sub(2).min(8);
+    if max_items == 0 {
+        return state.terminal_rows.saturating_add(1);
+    }
+    match state.phase {
+        ScanPhase::Indexing => 0,
+        ScanPhase::ScanningChunks => {
+            if state.total_chunks == 0 {
+                return 0;
+            }
+            let remaining = state.total_chunks.saturating_sub(state.completed_chunks);
+            let steady_slots = remaining.min(state.concurrency);
+            let item_rows = state.active_chunks.len().max(steady_slots).min(max_items);
+            item_rows + 1
+        }
+        ScanPhase::VerifyingCandidates => {
+            if state.verify_total == 0 {
+                return 0;
+            }
+            let remaining = state.verify_total.saturating_sub(state.verify_completed);
+            let steady_slots = remaining.min(state.concurrency);
+            let item_rows = state.active_verifies.len().max(steady_slots).min(max_items);
+            item_rows + 1
+        }
+    }
+}
+
+fn paint_scan_chunk_row(
+    out: &mut impl WriteColor,
+    row: usize,
+    limit: usize,
+    total_chunks: usize,
+    chunk: &ActiveScanChunk,
+) -> std::io::Result<()> {
+    write!(out, "\x1b[{row};1H\x1b[2K")?;
+    let prefix = format!("      [Chunk {}/{}] ", chunk.ordinal, total_chunks);
+    let status_str = scan_chunk_status_label(chunk, true);
+    let fixed_overhead = prefix.chars().count() + 3;
+    let available = limit
+        .saturating_sub(fixed_overhead)
+        .saturating_sub(status_str.chars().count());
+    let id_width = std::cmp::min(36, available);
+    let id_padded = pad_or_truncate_label(&chunk.chunk_id, id_width);
+
+    let mut tw = TruncatingWriter::new(limit);
+    let _ = tw.write_segment(out, &prefix, None, false);
+    let _ = tw.write_segment(out, &id_padded, None, false);
+    let _ = tw.write_segment(out, " | ", None, false);
+    let bold = !chunk.active_stages.is_empty();
+    let _ = tw.write_segment(out, &status_str, Some(Color::Cyan), bold);
+    Ok(())
+}
+
+fn paint_scan_bar_row(
+    state: &ScanProgressState,
+    out: &mut impl WriteColor,
+    row: usize,
+    limit: usize,
+) -> std::io::Result<()> {
+    write!(out, "\x1b[{row};1H\x1b[2K")?;
+    let width = 20;
+    let elapsed_suffix = state
+        .started_at
+        .map(|t| format!(" | {}", format_elapsed_mmss(t.elapsed().as_secs())))
+        .unwrap_or_default();
+
+    let (bar_label, filled, stats) = match state.phase {
+        ScanPhase::Indexing | ScanPhase::ScanningChunks => {
+            let (total_u, done_u) = scan_phase1_progress_units(state);
+            let (_, pct, fill) = calculate_progress_metrics(total_u, done_u, width);
+            let benign_note = if state.early_exited_chunks > 0 {
+                format!(" ({} benign)", state.early_exited_chunks)
+            } else {
+                String::new()
+            };
+            let s = format!(
+                "{pct}% | {}/{} chunks{benign_note} | {} candidate{} | {} turns{elapsed_suffix}",
+                state.completed_chunks,
+                state.total_chunks,
+                state.candidate_findings,
+                if state.candidate_findings == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                state.total_turns,
+            );
+            ("Scan:   [", fill, s)
+        }
+        ScanPhase::VerifyingCandidates => {
+            let (_, pct, fill) =
+                calculate_progress_metrics(state.verify_total, state.verify_completed, width);
+            let s = format!(
+                "{pct}% | {}/{} candidates | {} verified | {} turns{elapsed_suffix}",
+                state.verify_completed, state.verify_total, state.verified_bugs, state.total_turns,
+            );
+            ("Verify: [", fill, s)
+        }
+    };
+
+    let mut tw = TruncatingWriter::new(limit);
+    let _ = tw.write_segment(out, bar_label, None, true);
+    let _ = tw.write_segment(out, &"█".repeat(filled), Some(Color::Green), false);
+    let _ = tw.write_segment(out, &"░".repeat(width.saturating_sub(filled)), None, false);
+    let _ = tw.write_segment(out, "] ", None, true);
+    let _ = tw.write_segment(out, &stats, None, false);
+    Ok(())
+}
+
+fn paint_scan_verify_row(
+    out: &mut impl WriteColor,
+    row: usize,
+    limit: usize,
+    item: &ActiveVerifyItem,
+) -> std::io::Result<()> {
+    write!(out, "\x1b[{row};1H\x1b[2K")?;
+    let mut tw = TruncatingWriter::new(limit);
+    let prefix = format!("      [Verify {}/{}] ", item.index, item.total);
+    let status_str = "Verifying & tracing origin...";
+    let available = limit
+        .saturating_sub(prefix.chars().count() + 3)
+        .saturating_sub(status_str.chars().count());
+    let prob_padded = pad_or_truncate_label(&item.problem, std::cmp::min(36, available));
+    let _ = tw.write_segment(out, &prefix, None, false);
+    let _ = tw.write_segment(out, &prob_padded, None, false);
+    let _ = tw.write_segment(out, " | ", None, false);
+    let _ = tw.write_segment(out, status_str, Some(Color::Cyan), true);
+    Ok(())
+}
+
+fn paint_scan_progress(
+    state: &mut ScanProgressState,
+    out: &mut impl WriteColor,
+) -> std::io::Result<()> {
+    if state.finished || state.phase == ScanPhase::Indexing {
+        return Ok(());
+    }
+
+    let wanted = scan_wanted_rows(state);
+    if wanted == 0 {
+        return Ok(());
+    }
+    if !state.reservation_capable || !worth_reserving(wanted, state.terminal_rows) {
+        if state.reserved > 0 {
+            release_region_raw(
+                state.reservation_capable,
+                &mut state.reserved,
+                state.region_rows,
+                state.terminal_rows,
+                &mut state.finished,
+                out,
+                RegionExit::Erased,
+            )?;
+        }
+        return paint_scan_progress_plain(state, out);
+    }
+
+    reserve_region_raw(
+        &mut state.reserved,
+        &mut state.region_rows,
+        state.terminal_rows,
+        out,
+        wanted,
+    )?;
+
+    let limit = state.terminal_width.saturating_sub(5);
+    let top = state.terminal_rows.saturating_sub(state.reserved) + 1;
+    let item_slots = wanted.saturating_sub(1);
+    let mut lines_printed = 0;
+
+    match state.phase {
+        ScanPhase::Indexing => {}
+        ScanPhase::ScanningChunks => {
+            let active_total = state.active_chunks.len();
+            let show_overflow = active_total > item_slots && item_slots >= 2;
+            let visible_chunks = if show_overflow {
+                item_slots - 1
+            } else {
+                item_slots.min(active_total)
+            };
+            for chunk in state.active_chunks.values().take(visible_chunks) {
+                paint_scan_chunk_row(out, top + lines_printed, limit, state.total_chunks, chunk)?;
+                lines_printed += 1;
+            }
+            if show_overflow {
+                write!(out, "\x1b[{};1H\x1b[2K", top + lines_printed)?;
+                let hidden = active_total - visible_chunks;
+                let mut tw = TruncatingWriter::new(limit);
+                let _ = tw.write_segment(
+                    out,
+                    &format!("      ... and {hidden} more active chunk(s)"),
+                    Some(Color::Cyan),
+                    false,
+                );
+                lines_printed += 1;
+            }
+            while lines_printed < item_slots {
+                write!(out, "\x1b[{};1H\x1b[2K", top + lines_printed)?;
+                let mut tw = TruncatingWriter::new(limit);
+                let _ =
+                    tw.write_segment(out, "      [Queued] Preparing next chunk...", None, false);
+                lines_printed += 1;
+            }
+        }
+        ScanPhase::VerifyingCandidates => {
+            let active_total = state.active_verifies.len();
+            let show_overflow = active_total > item_slots && item_slots >= 2;
+            let visible_items = if show_overflow {
+                item_slots - 1
+            } else {
+                item_slots.min(active_total)
+            };
+            for item in state.active_verifies.values().take(visible_items) {
+                paint_scan_verify_row(out, top + lines_printed, limit, item)?;
+                lines_printed += 1;
+            }
+            if show_overflow {
+                write!(out, "\x1b[{};1H\x1b[2K", top + lines_printed)?;
+                let hidden = active_total - visible_items;
+                let mut tw = TruncatingWriter::new(limit);
+                let _ = tw.write_segment(
+                    out,
+                    &format!("      ... and {hidden} more active verification(s)"),
+                    Some(Color::Cyan),
+                    false,
+                );
+                lines_printed += 1;
+            }
+            while lines_printed < item_slots {
+                write!(out, "\x1b[{};1H\x1b[2K", top + lines_printed)?;
+                let mut tw = TruncatingWriter::new(limit);
+                let _ = tw.write_segment(
+                    out,
+                    "      [Verify] Preparing next candidate...",
+                    None,
+                    false,
+                );
+                lines_printed += 1;
+            }
+        }
+    }
+
+    paint_scan_bar_row(state, out, top + lines_printed, limit)?;
+    write!(
+        out,
+        "\x1b[{split};1H",
+        split = state.terminal_rows - state.reserved
+    )?;
+    out.flush()
+}
+
+/// Logs a high-signal milestone line above the pinned scan footer (or directly
+/// to `out` in plain mode) and repaints the scan footer in a single write.
+fn paint_scan_milestone(
+    state: &mut ScanProgressState,
+    out: &mut impl WriteColor,
+    badge_color: Option<Color>,
+    badge: &str,
+    detail: &str,
+) -> std::io::Result<()> {
+    if state.reserved > 0 {
+        if state.region_rows != state.terminal_rows {
+            paint_scan_progress(state, out)?;
+        }
+        if state.reserved > 0 {
+            let split = state.terminal_rows - state.reserved;
+            write!(out, "\x1b[{split};1H\x1b[2K")?;
+            let mut tw = TruncatingWriter::new(state.terminal_width.saturating_sub(2));
+            let _ = tw.write_segment(out, "  ", None, false);
+            let _ = tw.write_segment(out, badge, badge_color, badge_color.is_some());
+            let _ = tw.write_segment(out, " ", None, false);
+            let _ = tw.write_segment(out, detail, None, false);
+            writeln!(out)?;
+            return paint_scan_progress(state, out);
+        }
+    }
+
+    write!(out, "  ")?;
+    if let Some(c) = badge_color {
+        write_colored(out, c, badge)?;
+    } else {
+        write!(out, "{badge}")?;
+    }
+    writeln!(out, " {detail}")?;
+    paint_scan_progress(state, out)
+}
+
+fn paint_scan_chunk_finished(
+    s: &mut ScanProgressState,
+    out: &mut impl WriteColor,
+    chunk_id: &str,
+    findings_count: usize,
+    early_exited: bool,
+) -> std::io::Result<()> {
+    let ordinal = s.chunk_ordinals.get(chunk_id).copied().unwrap_or(0);
+    s.active_chunks.remove(&ordinal);
+    s.completed_chunks += 1;
+    if early_exited {
+        s.early_exited_chunks += 1;
+    }
+    s.candidate_findings += findings_count;
+
+    if findings_count > 0 {
+        paint_scan_milestone(
+            s,
+            out,
+            Some(Color::Yellow),
+            "[Candidate]",
+            &format!(
+                "{chunk_id} flagged {findings_count} candidate defect{}",
+                if findings_count == 1 { "" } else { "s" }
+            ),
+        )
+    } else if s.reserved == 0 && !s.reservation_capable {
+        let detail = if early_exited {
+            format!("{chunk_id} | Early exit (benign)")
+        } else {
+            format!("{chunk_id} | Finished (clean)")
+        };
+        paint_scan_milestone(
+            s,
+            out,
+            None,
+            &format!("[Chunk {}/{}]", ordinal, s.total_chunks),
+            &detail,
+        )
+    } else {
+        paint_scan_progress(s, out)
+    }
+}
+
+fn paint_scan_progress_event(
+    s: &mut ScanProgressState,
+    event: sashiko::scan::ScanProgressEvent,
+    run_started: std::time::Instant,
+    out: &mut impl WriteColor,
+) -> std::io::Result<()> {
+    use sashiko::scan::ScanProgressEvent;
+    match event {
+        ScanProgressEvent::IndexingFiles {
+            target_sha,
+            files_count,
+        } => {
+            s.total_files = files_count;
+            let short_sha = &target_sha[..target_sha.len().min(12)];
+            write_colored(out, Color::Cyan, "Indexing: ")?;
+            writeln!(
+                out,
+                " {} file{} at {}...",
+                files_count,
+                if files_count == 1 { "" } else { "s" },
+                short_sha
+            )
+        }
+        ScanProgressEvent::ResolvedTargets {
+            target_sha,
+            files_count,
+            chunks_count,
+        } => {
+            s.phase = ScanPhase::ScanningChunks;
+            s.total_files = files_count;
+            s.total_chunks = chunks_count;
+            let short_sha = &target_sha[..target_sha.len().min(12)];
+            write_colored(out, Color::Cyan, "Auditing: ")?;
+            writeln!(
+                out,
+                " {} chunk{} across {} file{} ({})",
+                chunks_count,
+                if chunks_count == 1 { "" } else { "s" },
+                files_count,
+                if files_count == 1 { "" } else { "s" },
+                short_sha
+            )?;
+            if chunks_count > 0 {
+                paint_scan_progress(s, out)
+            } else {
+                Ok(())
+            }
+        }
+        ScanProgressEvent::ChunkStarted { chunk_id, .. } => {
+            let ordinal = s.next_chunk_ordinal;
+            s.next_chunk_ordinal += 1;
+            s.chunk_ordinals.insert(chunk_id.clone(), ordinal);
+            s.active_chunks.insert(
+                ordinal,
+                ActiveScanChunk {
+                    ordinal,
+                    chunk_id,
+                    planned_stages: Vec::new(),
+                    active_stages: std::collections::BTreeSet::new(),
+                    active_stage_turns: std::collections::HashMap::new(),
+                    completed_stages: 0,
+                },
+            );
+            paint_scan_progress(s, out)
+        }
+        ScanProgressEvent::ChunkPlanned {
+            chunk_id,
+            planned_stages,
+        } => {
+            if let Some(&ord) = s.chunk_ordinals.get(&chunk_id)
+                && let Some(chunk) = s.active_chunks.get_mut(&ord)
+            {
+                chunk.planned_stages = planned_stages;
+                return paint_scan_progress(s, out);
+            }
+            Ok(())
+        }
+        ScanProgressEvent::ChunkStageStarted { chunk_id, stage } => {
+            if let Some(&ord) = s.chunk_ordinals.get(&chunk_id)
+                && let Some(chunk) = s.active_chunks.get_mut(&ord)
+            {
+                chunk.active_stages.insert(stage);
+                return paint_scan_progress(s, out);
+            }
+            Ok(())
+        }
+        ScanProgressEvent::ChunkStageTurn {
+            chunk_id,
+            stage,
+            turn,
+            ..
+        } => {
+            if let Some(&ord) = s.chunk_ordinals.get(&chunk_id)
+                && let Some(chunk) = s.active_chunks.get_mut(&ord)
+            {
+                chunk.active_stage_turns.insert(stage, turn);
+            }
+            s.total_turns += 1;
+            paint_scan_progress(s, out)
+        }
+        ScanProgressEvent::ChunkStageFinished { chunk_id, stage } => {
+            if let Some(&ord) = s.chunk_ordinals.get(&chunk_id)
+                && let Some(chunk) = s.active_chunks.get_mut(&ord)
+            {
+                chunk.active_stages.remove(&stage);
+                chunk.active_stage_turns.remove(&stage);
+                chunk.completed_stages += 1;
+                return paint_scan_progress(s, out);
+            }
+            Ok(())
+        }
+        ScanProgressEvent::ChunkFinished {
+            chunk_id,
+            findings_count,
+            early_exited,
+        } => paint_scan_chunk_finished(s, out, &chunk_id, findings_count, early_exited),
+        ScanProgressEvent::ChunkFailed { chunk_id, error } => {
+            let ordinal = s.chunk_ordinals.get(&chunk_id).copied().unwrap_or(0);
+            s.active_chunks.remove(&ordinal);
+            s.completed_chunks += 1;
+            s.failed_chunks += 1;
+            paint_scan_milestone(
+                s,
+                out,
+                Some(Color::Red),
+                "[Chunk Failed]",
+                &format!("{chunk_id}: {error}"),
+            )
+        }
+        ScanProgressEvent::CandidateVerifyStarted {
+            index,
+            total,
+            problem,
+        } => {
+            s.phase = ScanPhase::VerifyingCandidates;
+            s.active_chunks.clear();
+            s.verify_total = total;
+            s.active_verifies.insert(
+                index,
+                ActiveVerifyItem {
+                    index,
+                    total,
+                    problem,
+                },
+            );
+            paint_scan_progress(s, out)
+        }
+        ScanProgressEvent::CandidateVerified {
+            index,
+            canonical_title,
+            severity,
+        } => {
+            s.active_verifies.remove(&index);
+            s.verify_completed += 1;
+            s.verified_bugs += 1;
+            let badge = format!("[Verified {}]", severity.to_uppercase());
+            paint_scan_milestone(
+                s,
+                out,
+                Some(severity_color(&severity)),
+                &badge,
+                &canonical_title,
+            )
+        }
+        ScanProgressEvent::CandidateDiscarded {
+            index,
+            problem,
+            reason,
+        } => {
+            s.active_verifies.remove(&index);
+            s.verify_completed += 1;
+            s.discarded_candidates += 1;
+            paint_scan_milestone(
+                s,
+                out,
+                Some(Color::Cyan),
+                "[Discarded]",
+                &format!("{problem} ({reason})"),
+            )
+        }
+        ScanProgressEvent::CandidateFailed {
+            index,
+            problem,
+            error,
+        } => {
+            s.active_verifies.remove(&index);
+            s.verify_completed += 1;
+            s.failed_candidates += 1;
+            paint_scan_milestone(
+                s,
+                out,
+                Some(Color::Red),
+                "[Verify Failed]",
+                &format!("'{problem}': {error}"),
+            )
+        }
+        ScanProgressEvent::BugSubmitted {
+            index,
+            canonical_title,
+            bugid,
+            is_duplicate,
+        } => {
+            s.active_verifies.remove(&index);
+            s.verify_completed += 1;
+            s.verified_bugs += 1;
+            let detail = if is_duplicate {
+                format!("Duplicate of {bugid} ({canonical_title})")
+            } else {
+                format!("Opened {bugid} ({canonical_title})")
+            };
+            paint_scan_milestone(s, out, Some(Color::Cyan), "[BugRepo]", &detail)
+        }
+        ScanProgressEvent::ScanComplete { partial } => {
+            release_scan_progress(s, out)?;
+            let elapsed = format_elapsed_mmss(run_started.elapsed().as_secs());
+            let status_word = if partial { "incomplete" } else { "complete" };
+            let color = if partial { Color::Yellow } else { Color::Green };
+            write_colored(out, color, &format!("Scan {status_word}"))?;
+            writeln!(out, " ({elapsed})")
+        }
+    }
+}
+
+fn apply_scan_progress_event(
+    s: &mut ScanProgressState,
+    event: sashiko::scan::ScanProgressEvent,
+    run_started: std::time::Instant,
+) {
+    on_scan_stderr(s, |state, out| {
+        paint_scan_progress_event(state, event, run_started, out)
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2887,6 +3786,7 @@ async fn handle_review_command(
         project,
         patches: std::collections::BTreeMap::new(),
         total_turns: 0,
+        started_at: None,
         last_status: std::collections::BTreeMap::new(),
         terminal_width: display.size.1,
         terminal_rows: display.size.0,
@@ -3401,6 +4301,51 @@ fn write_benchmark_report(
     Ok(())
 }
 
+fn format_scan_targets_banner(paths: &[PathBuf]) -> String {
+    let shown: Vec<String> = paths
+        .iter()
+        .take(4)
+        .map(|p| p.display().to_string())
+        .collect();
+    if paths.len() > 4 {
+        format!("{} (+{} more)", shown.join(", "), paths.len() - 4)
+    } else {
+        shown.join(", ")
+    }
+}
+
+fn clean_scan_message(min_severity: Option<sashiko::db::SeverityFloor>) -> &'static str {
+    match min_severity {
+        None | Some(sashiko::db::SeverityFloor::High) => "\nNo High or Critical defects found.\n",
+        Some(sashiko::db::SeverityFloor::Medium) => {
+            "\nNo Medium, High, or Critical defects found.\n"
+        }
+        Some(sashiko::db::SeverityFloor::Critical) => "\nNo Critical defects found.\n",
+        Some(sashiko::db::SeverityFloor::Low) => "\nNo verified defects found.\n",
+    }
+}
+
+fn format_tokens_and_elapsed(
+    tokens_in: u64,
+    tokens_out: u64,
+    tokens_cached: u64,
+    duration_secs: Option<u64>,
+) -> String {
+    let cache_suffix = if tokens_in > 0 && tokens_cached > 0 {
+        let pct = (tokens_cached.min(tokens_in) as f64 / tokens_in as f64) * 100.0;
+        format!(" ({pct:.0}% cache hit)")
+    } else {
+        String::new()
+    };
+    let elapsed_suffix = duration_secs
+        .filter(|&d| d > 0)
+        .map(|d| format!(" | Elapsed: {}", format_elapsed_mmss(d)))
+        .unwrap_or_default();
+    format!(
+        "Tokens: {tokens_in} in / {tokens_out} out / {tokens_cached} cached{cache_suffix}{elapsed_suffix}"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_scan_command(
     project: ProjectId,
@@ -3420,6 +4365,7 @@ async fn handle_scan_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let terminal = terminfo::Database::from_env().ok();
     let report = OutputStream::detect(color, &std::io::stdout(), terminal.as_ref());
+    let display = OutputStream::detect(color, &std::io::stderr(), terminal.as_ref());
 
     #[cfg(not(feature = "server"))]
     if submit_bugs {
@@ -3450,6 +4396,19 @@ async fn handle_scan_command(
     settings.git.repository_path = repo_path.to_string_lossy().into_owned();
     sashiko::ai::validate_provider_credentials(&settings.ai)?;
 
+    eprint_colored(display.color, Color::Cyan, "Scanning: ")?;
+    eprintln!(" {}", format_scan_targets_banner(&paths));
+    if !settings.ai.no_ai {
+        eprint_colored(display.color, Color::Cyan, "Model:    ")?;
+        eprintln!(
+            " {} [project: {}, concurrency: {}]",
+            format_model_and_effort(&settings),
+            project,
+            concurrency
+        );
+    }
+    eprintln!("Prompts:   {}", prompts.display());
+
     if project.uses_maintainers() && sashiko::maintainers::get_global_maintainers().is_none() {
         let repo_for_maintainers = repo_path.clone();
         if let Ok(Ok(idx)) = tokio::task::spawn_blocking(move || {
@@ -3461,87 +4420,38 @@ async fn handle_scan_command(
         }
     }
 
-    let progress = move |event: sashiko::scan::ScanProgressEvent| match event {
-        sashiko::scan::ScanProgressEvent::ResolvedTargets {
-            target_sha,
-            files_count,
-            chunks_count,
-        } => {
-            eprintln!(
-                "Scanning {} file(s) ({} chunk(s)) at {}...",
-                files_count,
-                chunks_count,
-                &target_sha[..target_sha.len().min(12)]
-            );
-        }
-        sashiko::scan::ScanProgressEvent::ChunkStarted {
-            chunk_id,
-            start_line,
-            end_line,
-            ..
-        } => {
-            eprintln!("  [Scan] {} (lines {}..{})", chunk_id, start_line, end_line);
-        }
-        sashiko::scan::ScanProgressEvent::ChunkStageStarted { chunk_id, stage } => {
-            eprintln!("  [Scan] {} -> {}", chunk_id, stage);
-        }
-        sashiko::scan::ScanProgressEvent::ChunkFinished {
-            chunk_id,
-            findings_count,
-            early_exited,
-        } => {
-            if early_exited {
-                eprintln!("  [Scan] {} | Early exit (benign)", chunk_id);
-            } else {
-                eprintln!(
-                    "  [Scan] {} | Finished ({} candidate finding(s))",
-                    chunk_id, findings_count
-                );
-            }
-        }
-        sashiko::scan::ScanProgressEvent::ChunkFailed { chunk_id, error } => {
-            eprintln!("  [Scan] {} | Failed: {}", chunk_id, error);
-        }
-        sashiko::scan::ScanProgressEvent::CandidateVerifyStarted {
-            index,
-            total,
-            problem,
-        } => {
-            eprintln!("  [Verify] ({}/{}) {}", index, total, problem);
-        }
-        sashiko::scan::ScanProgressEvent::CandidateVerified {
-            canonical_title,
-            severity,
-            ..
-        } => {
-            eprintln!("  [Verify] {} | Verified ({})", canonical_title, severity);
-        }
-        sashiko::scan::ScanProgressEvent::CandidateDiscarded {
-            problem, reason, ..
-        } => {
-            eprintln!("  [Verify] {} | Discarded ({})", problem, reason);
-        }
-        sashiko::scan::ScanProgressEvent::CandidateFailed { problem, error, .. } => {
-            eprintln!("  [BugPipeline] Failed to verify '{}': {}", problem, error);
-        }
-        sashiko::scan::ScanProgressEvent::BugSubmitted {
-            canonical_title,
-            bugid,
-            is_duplicate,
-            ..
-        } => {
-            if is_duplicate {
-                eprintln!("  [BugRepo] Duplicate of {} ({})", bugid, canonical_title);
-            } else {
-                eprintln!("  [BugRepo] Opened {} ({})", bugid, canonical_title);
-            }
-        }
-        _ => {}
+    if display.reservation_capable {
+        release_region_on_panic();
+    }
+    exit_on_interrupt(display.reservation_capable);
+
+    let run_started = std::time::Instant::now();
+    let scan_state = Arc::new(std::sync::Mutex::new(ScanProgressState::new(
+        display,
+        concurrency,
+        Some(run_started),
+    )));
+    let scan_state_clone = scan_state.clone();
+    let progress = move |event: sashiko::scan::ScanProgressEvent| {
+        let mut s = scan_state_clone.lock().unwrap_or_else(|e| e.into_inner());
+        apply_scan_progress_event(&mut s, event, run_started);
     };
 
-    exit_on_interrupt(false);
+    let resize = if display.reservation_capable {
+        watch_for_resize(scan_state.clone(), std::io::stderr(), render_scan_progress)
+    } else {
+        None
+    };
+    let ticker = if display.reservation_capable {
+        Some(spawn_elapsed_ticker(
+            scan_state.clone(),
+            render_scan_progress,
+        ))
+    } else {
+        None
+    };
 
-    let summary = sashiko::scan::run_scan(
+    let summary_res = sashiko::scan::run_scan(
         sashiko::scan::ScanOptions {
             project,
             repo_path,
@@ -3560,7 +4470,19 @@ async fn handle_scan_command(
         &settings,
         Some(&progress),
     )
-    .await?;
+    .await;
+
+    if let Some(ticker) = ticker {
+        ticker.abort();
+        let _ = ticker.await;
+    }
+    if let Some(resize) = resize {
+        resize.abort();
+        let _ = resize.await;
+    }
+    finish_scan_progress(&mut scan_state.lock().unwrap_or_else(|e| e.into_inner()));
+
+    let summary = summary_res?;
 
     match format {
         OutputFormat::Json => {
@@ -3602,10 +4524,17 @@ fn write_scan_result(
     } else {
         String::new()
     };
+    writeln!(out)?;
+    write_bold(out, "Scan Summary")?;
+    write!(out, " (")?;
+    write_colored(
+        out,
+        Color::Cyan,
+        &summary.target_sha[..summary.target_sha.len().min(12)],
+    )?;
     writeln!(
         out,
-        "\nScan Summary ({}): {} file(s), {} chunk(s) ({} analyzed, {} early-exited, {} failed{})",
-        &summary.target_sha[..summary.target_sha.len().min(12)],
+        "): {} file(s), {} chunk(s) ({} analyzed, {} early-exited, {} failed{})",
         summary.files_scanned,
         summary.chunks_total,
         summary.chunks_analyzed,
@@ -3613,6 +4542,13 @@ fn write_scan_result(
         summary.chunks_failed,
         candidate_failures_suffix
     )?;
+    if !summary.dismissed_concerns.is_empty() {
+        writeln!(
+            out,
+            "Dismissed:    {} candidate concern(s) investigated and ruled out",
+            summary.dismissed_concerns.len()
+        )?;
+    }
 
     let incomplete = summary.chunks_failed > 0 || summary.candidates_failed > 0;
     if incomplete {
@@ -3628,24 +4564,25 @@ fn write_scan_result(
 
     if summary.findings.is_empty() {
         if !incomplete {
-            write_colored(out, Color::Green, "\nNo High or Critical defects found.\n")?;
+            write_colored(out, Color::Green, clean_scan_message(summary.min_severity))?;
         }
     } else {
-        writeln!(out, "\nVerified Findings ({}):", summary.findings.len())?;
+        writeln!(out)?;
+        write_bold(
+            out,
+            &format!("Verified Findings ({}):\n", summary.findings.len()),
+        )?;
         for (idx, bug) in summary.findings.iter().enumerate() {
             writeln!(out)?;
             write!(out, "{}. ", idx + 1)?;
-            let badge_color = if bug.severity.eq_ignore_ascii_case("Critical") {
-                Color::Red
-            } else {
-                Color::Yellow
-            };
             write_colored(
                 out,
-                badge_color,
+                severity_color(&bug.severity),
                 &format!("[{}]", bug.severity.to_uppercase()),
             )?;
-            writeln!(out, " {}", bug.canonical_title)?;
+            write!(out, " ")?;
+            write_bold(out, &bug.canonical_title)?;
+            writeln!(out)?;
             if !bug.subsystems.is_empty() {
                 writeln!(out, "   Subsystems: {}", bug.subsystems.join(", "))?;
             }
@@ -3681,8 +4618,13 @@ fn write_scan_result(
     if summary.tokens_in > 0 || summary.tokens_out > 0 || summary.tokens_cached > 0 {
         writeln!(
             out,
-            "\nTokens: {} in / {} out / {} cached",
-            summary.tokens_in, summary.tokens_out, summary.tokens_cached
+            "\n{}",
+            format_tokens_and_elapsed(
+                summary.tokens_in as u64,
+                summary.tokens_out as u64,
+                summary.tokens_cached as u64,
+                Some(summary.duration_secs),
+            )
         )?;
     }
     Ok(())
@@ -4073,7 +5015,6 @@ fn write_colored(out: &mut impl WriteColor, color: Color, text: &str) -> std::io
     out.reset()
 }
 
-#[cfg(feature = "server")]
 fn write_bold(out: &mut impl WriteColor, text: &str) -> std::io::Result<()> {
     out.set_color(ColorSpec::new().set_bold(true))?;
     write!(out, "{}", text)?;
@@ -5130,6 +6071,7 @@ mod tests {
             patches: std::collections::BTreeMap::new(),
             last_status: std::collections::BTreeMap::new(),
             total_turns: 0,
+            started_at: None,
             terminal_width: display.size.1,
             terminal_rows: display.size.0,
             color_choice: display.color,
@@ -7020,5 +7962,187 @@ mod tests {
             assert!(daemon_msg.contains(&user_cfg.display().to_string()));
             assert!(daemon_msg.contains("sashiko review"));
         }
+    }
+
+    #[test]
+    fn test_scan_progress_reserves_bounded_footer_and_transitions_phases() {
+        let mut state = ScanProgressState::new(reserving((24, 120)), 16, None);
+        state.phase = ScanPhase::ScanningChunks;
+        state.total_files = 10;
+        state.total_chunks = 100;
+
+        for idx in 1..=12 {
+            let chunk_id = format!("mm/memcontrol.c:{}-{}", idx * 100, idx * 100 + 99);
+            let mut active_stages = std::collections::BTreeSet::new();
+            active_stages.insert("locking".to_string());
+            active_stages.insert("resources".to_string());
+            let mut turns = std::collections::HashMap::new();
+            turns.insert("locking".to_string(), 3);
+            state.active_chunks.insert(
+                idx,
+                ActiveScanChunk {
+                    ordinal: idx,
+                    chunk_id,
+                    planned_stages: vec![
+                        "execution-flow".to_string(),
+                        "locking".to_string(),
+                        "resources".to_string(),
+                    ],
+                    active_stages,
+                    active_stage_turns: turns,
+                    completed_stages: 2,
+                },
+            );
+        }
+
+        let mut frame_buf = Buffer::no_color();
+        paint_scan_progress(&mut state, &mut frame_buf).unwrap();
+        let frame = String::from_utf8(frame_buf.into_inner()).unwrap();
+
+        // Even with 100 chunks and concurrency=16 on a 24-row screen, the
+        // reserved footer is capped at 9 rows (8 item rows + 1 bar row).
+        assert_eq!(state.reserved, 9);
+        assert!(frame.contains("\x1b[1;15r"));
+        assert!(frame.contains("[Chunk 1/100]"));
+        assert!(frame.contains("Locking & Sync (turn 3) (+1 stages)"));
+        assert!(frame.contains("... and 5 more active chunk(s)"));
+        assert!(frame.contains("Scan:   ["));
+
+        // Transition to Phase 2 (VerifyingCandidates) shrinks the reserved
+        // region cleanly from 9 rows down to 3 rows (2 concurrent items + 1 bar),
+        // clearing vacated rows.
+        state.phase = ScanPhase::VerifyingCandidates;
+        state.active_chunks.clear();
+        state.verify_total = 3;
+        state.verify_completed = 1;
+        state.verified_bugs = 1;
+        state.active_verifies.insert(
+            2,
+            ActiveVerifyItem {
+                index: 2,
+                total: 3,
+                problem: "mm: memcontrol: missing css_put on error path".to_string(),
+            },
+        );
+        state.active_verifies.insert(
+            3,
+            ActiveVerifyItem {
+                index: 3,
+                total: 3,
+                problem: "mm: page_alloc: order-0 race in drain".to_string(),
+            },
+        );
+
+        let mut verify_buf = Buffer::no_color();
+        paint_scan_progress(&mut state, &mut verify_buf).unwrap();
+        let verify_frame = String::from_utf8(verify_buf.into_inner()).unwrap();
+
+        assert_eq!(state.reserved, 3);
+        assert!(verify_frame.contains("\x1b[16;1H\x1b[2K"));
+        assert!(verify_frame.contains("\x1b[1;21r"));
+        assert!(verify_frame.contains("[Verify 2/3]"));
+        assert!(verify_frame.contains("[Verify 3/3]"));
+        assert!(verify_frame.contains("Verify: ["));
+        assert!(verify_frame.contains("33% | 1/3 candidates | 1 verified"));
+
+        // BugSubmitted (--submit-bugs) advances verify completion and clears only that index.
+        let mut bug_buf = Buffer::no_color();
+        paint_scan_progress_event(
+            &mut state,
+            sashiko::scan::ScanProgressEvent::BugSubmitted {
+                index: 2,
+                canonical_title: "mm: memcontrol: missing css_put on error path".to_string(),
+                bugid: "linux-1234".to_string(),
+                is_duplicate: false,
+            },
+            std::time::Instant::now(),
+            &mut bug_buf,
+        )
+        .unwrap();
+        let bug_frame = String::from_utf8(bug_buf.into_inner()).unwrap();
+        assert!(bug_frame.contains("[BugRepo]"));
+        assert!(bug_frame.contains("Opened linux-1234"));
+        assert!(!state.active_verifies.contains_key(&2));
+        assert!(state.active_verifies.contains_key(&3));
+        assert_eq!(state.verify_completed, 2);
+        assert_eq!(state.verified_bugs, 2);
+
+        // Resizing to a tiny 2-row pane falls back cleanly without arithmetic overflow.
+        state.set_window(2, 80);
+        let mut tiny_buf = Buffer::no_color();
+        paint_scan_progress(&mut state, &mut tiny_buf).unwrap();
+        assert_eq!(state.reserved, 0);
+    }
+
+    #[test]
+    fn test_scan_progress_plain_deduplicates_turns_without_ansi_escapes() {
+        let mut state = ScanProgressState::new(appending((24, 80)), 4, None);
+        state.phase = ScanPhase::ScanningChunks;
+        state.total_chunks = 4;
+
+        let mut stages = std::collections::BTreeSet::new();
+        stages.insert("execution-flow".to_string());
+        let mut turns = std::collections::HashMap::new();
+        turns.insert("execution-flow".to_string(), 1);
+        state.active_chunks.insert(
+            1,
+            ActiveScanChunk {
+                ordinal: 1,
+                chunk_id: "net/core/dev.c:1-380".to_string(),
+                planned_stages: vec!["execution-flow".to_string()],
+                active_stages: stages,
+                active_stage_turns: turns,
+                completed_stages: 1,
+            },
+        );
+
+        let mut first = Buffer::no_color();
+        paint_scan_progress(&mut state, &mut first).unwrap();
+        let first_text = String::from_utf8(first.into_inner()).unwrap();
+        assert_eq!(
+            first_text,
+            "      [Chunk 1/4] net/core/dev.c:1-380 | Execution Flow\n"
+        );
+        assert!(!first_text.contains("\x1b["));
+
+        // Advancing turn counter on the same stage produces no duplicate plain line.
+        state
+            .active_chunks
+            .get_mut(&1)
+            .unwrap()
+            .active_stage_turns
+            .insert("execution-flow".to_string(), 2);
+        let mut second = Buffer::no_color();
+        paint_scan_progress(&mut state, &mut second).unwrap();
+        assert!(second.into_inner().is_empty());
+    }
+
+    #[test]
+    fn test_write_scan_result_calibrates_severity_floor_and_tokens_footer() {
+        let summary = sashiko::scan::ScanSummary {
+            target_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            files_scanned: 1,
+            chunks_total: 3,
+            chunks_analyzed: 2,
+            chunks_early_exited: 1,
+            min_severity: Some(sashiko::db::SeverityFloor::Medium),
+            dismissed_concerns: vec![serde_json::json!({"problem": "checked lock"})],
+            tokens_in: 2000,
+            tokens_out: 400,
+            tokens_cached: 1500,
+            duration_secs: 75,
+            ..Default::default()
+        };
+
+        let mut buf = Buffer::no_color();
+        write_scan_result(&mut buf, &summary).unwrap();
+        let text = String::from_utf8(buf.into_inner()).unwrap();
+        assert!(text.contains("No Medium, High, or Critical defects found."));
+        assert!(text.contains("Dismissed:    1 candidate concern(s) investigated and ruled out"));
+        assert!(
+            text.contains(
+                "Tokens: 2000 in / 400 out / 1500 cached (75% cache hit) | Elapsed: 01:15"
+            )
+        );
     }
 }
