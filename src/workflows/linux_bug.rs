@@ -31,7 +31,9 @@ use serde_json::Value;
 #[cfg(feature = "server")]
 use serde_json::json;
 use std::sync::Arc;
-use tracing::{info, warn};
+#[cfg(feature = "server")]
+use tracing::info;
+use tracing::{debug, warn};
 
 #[cfg(feature = "server")]
 use crate::ai::ToolCall;
@@ -1953,7 +1955,7 @@ pub async fn process_issue_for_project(
     _context_tag: Option<&str>,
     project: ProjectId,
 ) -> Result<BugOutcome> {
-    info!(
+    debug!(
         "Queueing candidate {} issue: '{}' in subsystems '{:?}'",
         project.display_name(),
         input.problem,
@@ -1964,7 +1966,7 @@ pub async fn process_issue_for_project(
     let bug = effective_db
         .create_bug_with_enrichment_returning(&new_bug, Some(&enrichment))
         .await?;
-    info!("Queued raw bug {} for asynchronous processing", bug.id);
+    debug!("Queued raw bug {} for asynchronous processing", bug.bugid);
     Ok(BugOutcome::NewlyDiscovered { bug })
 }
 
@@ -1980,7 +1982,7 @@ pub async fn create_claimed_issue_for_project(
     worker_id: &str,
     lease_ttl_seconds: i64,
 ) -> Result<Bug> {
-    info!(
+    debug!(
         "Creating and claiming candidate {} issue: '{}' in subsystems '{:?}'",
         project.display_name(),
         input.problem,
@@ -2213,7 +2215,7 @@ pub async fn deterministic_blame_fallback(
             if let Some(first_line) = stdout.lines().next() {
                 let sha = first_line.split_whitespace().next().unwrap_or("");
                 if !sha.is_empty() && !sha.chars().all(|c| c == '0') {
-                    info!(
+                    debug!(
                         "Blame fallback identified introducing commit: {} for {}:{}",
                         sha, file, line
                     );
@@ -2717,7 +2719,7 @@ pub async fn run_standalone_bug_pipeline_for_project(
         ProjectId::Gcc => "GCC",
         ProjectId::Qemu => "QEMU",
     };
-    info!(
+    debug!(
         "Processing standalone candidate {} issue: '{}' in subsystems '{:?}'",
         project_label, input.problem, input.subsystems
     );
@@ -2787,13 +2789,13 @@ pub async fn run_standalone_bug_pipeline_for_project(
             if let Some(renamed) =
                 crate::git_ops::git_find_file_rename(repo_path, file, Some(&master_sha)).await
             {
-                info!("Traced renamed file from {} to {}", file, renamed);
+                debug!("Traced renamed file from {} to {}", file, renamed);
                 *file = renamed;
             }
         }
     }
 
-    info!("--- {} ---", BugStage::Normalization.title());
+    debug!("--- {} ---", BugStage::Normalization.title());
     let loaded_maintainers = if project.uses_maintainers() {
         load_maintainers_for_bug_pipeline(tools.as_ref()).await
     } else {
@@ -2869,7 +2871,7 @@ pub async fn run_standalone_bug_pipeline_for_project(
     );
     let title_prefix = extract_title_prefix(&norm.canonical_title);
 
-    info!("--- {} ---", BugStage::Verification.title());
+    debug!("--- {} ---", BugStage::Verification.title());
     let prefetched_context =
         prefetch_bug_locations(tools.as_ref(), &master_sha, &effective_locations).await;
     let mut verify_session = VerifySession {
@@ -2916,7 +2918,7 @@ pub async fn run_standalone_bug_pipeline_for_project(
         .and_then(|v| serde_json::to_string_pretty(v).ok())
         .unwrap_or_else(|| "[]".to_string());
 
-    info!("--- {} ---", BugStage::OriginTracing.title());
+    debug!("--- {} ---", BugStage::OriginTracing.title());
     let tracing_runner = SessionRunner::new(provider).with_max_turns(30);
     let mut tracing_session = TracingSession {
         input: &input,
@@ -2962,7 +2964,7 @@ pub async fn run_standalone_bug_pipeline_for_project(
         None
     };
 
-    info!("--- {} ---", BugStage::SeverityAssessment.title());
+    debug!("--- {} ---", BugStage::SeverityAssessment.title());
     let mut severity_session = SeveritySession {
         canonical_title: &norm.canonical_title,
         canonical_description: &norm.canonical_description,
@@ -3108,7 +3110,7 @@ impl DedupAttemptContext<'_> {
             DEFAULT_TOP_CANDIDATES,
             DEFAULT_SIMILARITY_THRESHOLD,
         );
-        info!(
+        debug!(
             "Deduplication: found {} potential candidates.",
             candidate_matches.len()
         );
@@ -3210,7 +3212,7 @@ pub async fn process_issue_worker_for_project(
         ProjectId::Gcc => "GCC",
         ProjectId::Qemu => "QEMU",
     };
-    info!(
+    debug!(
         "Processing candidate {} issue: '{}' in subsystems '{:?}'",
         project_label, input.problem, input.subsystems
     );
@@ -3301,14 +3303,14 @@ pub async fn process_issue_worker_for_project(
             if let Some(renamed) =
                 crate::git_ops::git_find_file_rename(repo_path, file, Some(&master_sha)).await
             {
-                info!("Traced renamed file from {} to {}", file, renamed);
+                debug!("Traced renamed file from {} to {}", file, renamed);
                 *file = renamed;
             }
         }
     }
 
     // Normalization and canonical naming.
-    info!("--- {} ---", BugStage::Normalization.title());
+    debug!("--- {} ---", BugStage::Normalization.title());
     let loaded_maintainers = if project.uses_maintainers() {
         load_maintainers_for_bug_pipeline(tools.as_ref()).await
     } else {
@@ -3382,13 +3384,13 @@ pub async fn process_issue_worker_for_project(
 
     let title_prefix = extract_title_prefix(&norm.canonical_title);
 
-    info!(
+    debug!(
         "Normalization complete: title '{}' (prefix '{}') with official subsystems '{:?}'",
         norm.canonical_title, title_prefix, official_subsystems
     );
 
     // Verification and ground-truth confirmation.
-    info!("--- {} ---", BugStage::Verification.title());
+    debug!("--- {} ---", BugStage::Verification.title());
     let prefetched_context =
         prefetch_bug_locations(tools.as_ref(), &master_sha, &effective_locations).await;
     let mut verify_session = VerifySession {
@@ -3409,7 +3411,7 @@ pub async fn process_issue_worker_for_project(
     full_history.extend(verify_result.history);
 
     let verification = verify_result.output;
-    info!(
+    debug!(
         "Verification complete: is_false_positive={}",
         verification.is_false_positive
     );
@@ -3452,7 +3454,7 @@ pub async fn process_issue_worker_for_project(
         .unwrap_or_else(|| "[]".to_string());
 
     // Deduplication confirmation, under BUG_DEDUP_LOCK + cross-process lease.
-    info!("--- {} ---", BugStage::Deduplication.title());
+    debug!("--- {} ---", BugStage::Deduplication.title());
     let query_vector = extract_bug_vector(
         &norm.canonical_title,
         &official_subsystem_names,
@@ -3495,10 +3497,10 @@ pub async fn process_issue_worker_for_project(
     if let Some(dup_outcome) = early_dup_outcome {
         return Ok(dup_outcome);
     }
-    info!("Deduplication complete: novel bug confirmed.");
+    debug!("Deduplication complete: novel bug confirmed.");
 
     // Origin tracing, recorded as an enrichment.
-    info!("--- {} ---", BugStage::OriginTracing.title());
+    debug!("--- {} ---", BugStage::OriginTracing.title());
     let tracing_runner = SessionRunner::new(provider).with_max_turns(30);
     let mut tracing_session = TracingSession {
         input: &input,
@@ -3538,7 +3540,7 @@ pub async fn process_issue_worker_for_project(
     };
 
     // Severity and impact estimation, recorded as an enrichment.
-    info!("--- {} ---", BugStage::SeverityAssessment.title());
+    debug!("--- {} ---", BugStage::SeverityAssessment.title());
     let mut severity_session = SeveritySession {
         canonical_title: &norm.canonical_title,
         canonical_description: &norm.canonical_description,
@@ -3595,7 +3597,7 @@ pub async fn process_issue_worker_for_project(
     }
 
     // Standalone plaintext review generation, recorded as an enrichment.
-    info!("--- {} ---", BugStage::ReportGeneration.title());
+    debug!("--- {} ---", BugStage::ReportGeneration.title());
     let mut report_session = ReportSession {
         problem: &norm.canonical_title,
         severity: severity.as_str(),
@@ -3617,7 +3619,7 @@ pub async fn process_issue_worker_for_project(
     // Final database write, serialized under BUG_DEDUP_LOCK + cross-process
     // lease so any canonical bug committed while Stages 4-6 were in flight is
     // checked before this bug transitions to 'open' and publishes its vector.
-    info!("--- Final database write ---");
+    debug!("--- Final database write ---");
 
     let late_dup_outcome = run_with_bug_dedup_lease(db, &dedup_owner, async {
         let mut newly_arrived_bugs = db.list_all_bugs_for_vector_search().await?;

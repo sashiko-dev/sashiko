@@ -5,7 +5,7 @@ use crate::toolbox::ToolBox;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// How long a claim stays valid without being renewed.
 ///
@@ -176,7 +176,7 @@ impl BugWorker {
         let lease_ttl_seconds = clamp_lease_ttl_seconds(self.settings.lease_ttl_seconds);
         let mut llm_checked = 0;
         if !llm_queue.is_empty() {
-            info!(
+            debug!(
                 "Evaluating {} open bug(s) with candidate commits (batch limit {}) against mainline SHA {}...",
                 llm_queue.len(),
                 batch_size,
@@ -553,7 +553,7 @@ impl BugWorker {
                     crate::workflows::linux_bug::UpstreamFixCheckOutcome::AdvancedWithoutLlm {
                         ..
                     } => {
-                        info!(
+                        debug!(
                             "Advanced open bug {} verified_on_sha to {} (0 commits touched affected files)",
                             bug.bugid, mainline_sha
                         );
@@ -561,7 +561,7 @@ impl BugWorker {
                     crate::workflows::linux_bug::UpstreamFixCheckOutcome::StillPresentAfterLlm {
                         ..
                     } => {
-                        info!(
+                        debug!(
                             "Open bug {} confirmed still present at {}",
                             bug.bugid, mainline_sha
                         );
@@ -725,7 +725,7 @@ impl BugWorker {
             bug_tool,
             Some(self.provider.get_capabilities().model_name),
         );
-        info!("Processing raw bug ID {} ({})", bug.id, bug.bugid);
+        debug!("Processing raw bug ID {} ({})", bug.id, bug.bugid);
 
         let input = if let Some(raw) = bug.raw_input() {
             serde_json::from_str::<BugInput>(&raw).ok()
@@ -787,29 +787,29 @@ impl BugWorker {
         let Some(analysis) = analysis else {
             warn!(
                 "Cancelled analysis of bug {} after losing its lease",
-                bug.id
+                bug.bugid
             );
             return Ok(None);
         };
 
         match analysis {
             Ok(outcome) => {
-                info!("Successfully processed raw bug {}: {}", bug.id, outcome);
+                info!("Successfully processed bug {}: {}", bug.bugid, outcome);
                 // The workflow records the outcome; this only
                 // drops the claim so the row stops looking
                 // like it is still being worked on.
                 if let Err(e) = db.release_bug_lease(bug.id).await {
-                    error!("Failed to release lease on bug {}: {}", bug.id, e);
+                    error!("Failed to release lease on bug {}: {}", bug.bugid, e);
                 }
                 Ok(Some(outcome))
             }
             Err(e) => {
-                error!("Failed to process bug {}: {}", bug.id, e);
+                error!("Failed to process bug {}: {}", bug.bugid, e);
                 let error_msg = format!("Error during async processing: {}", e);
                 if let Err(db_err) = db.fail_bug_analysis(bug.id, &error_msg).await {
                     warn!(
                         "Could not settle failed analysis of bug {}: {}",
-                        bug.id, db_err
+                        bug.bugid, db_err
                     );
                 }
                 Err(e)

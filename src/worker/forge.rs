@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 const MAX_GITHUB_POLL_PAGES: u32 = 5;
@@ -449,7 +449,7 @@ impl ForgeWorker {
                         continue;
                     }
 
-                    info!(
+                    debug!(
                         "Processing forge outbox ID {} for {}#{}",
                         entry.id, entry.repo, entry.pr_number
                     );

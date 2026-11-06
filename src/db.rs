@@ -31,7 +31,7 @@ use std::str::FromStr;
 #[cfg(feature = "server")]
 use std::sync::Arc;
 #[cfg(feature = "server")]
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "server")]
 mod patch_lineage;
@@ -2592,7 +2592,7 @@ impl Database {
     }
 
     pub async fn new(settings: &DatabaseSettings) -> Result<Self> {
-        info!(
+        debug!(
             "Connecting to database at {}",
             crate::utils::redact_secret(&settings.url)
         );
@@ -2875,7 +2875,7 @@ impl Database {
                 }
             };
             if locked_version >= 14 {
-                info!(
+                debug!(
                     "Database already at version {} under the migration lock; skipping version 14.",
                     locked_version
                 );
@@ -2912,7 +2912,7 @@ impl Database {
                 }
             };
             if locked_version >= 15 {
-                info!(
+                debug!(
                     "Database already at version {} under the migration lock; skipping version 15.",
                     locked_version
                 );
@@ -2938,7 +2938,7 @@ impl Database {
                 }
             };
             if locked_version >= 16 {
-                info!(
+                debug!(
                     "Database already at version {} under the migration lock; skipping version 16.",
                     locked_version
                 );
@@ -2988,7 +2988,7 @@ impl Database {
                 }
             };
             if locked_version >= 17 {
-                info!(
+                debug!(
                     "Database already at version {} under the migration lock; skipping version 17.",
                     locked_version
                 );
@@ -3039,7 +3039,7 @@ impl Database {
                 }
             };
             if locked_version >= 18 {
-                info!(
+                debug!(
                     "Database already at version {} under the migration lock; skipping version 18.",
                     locked_version
                 );
@@ -3063,7 +3063,7 @@ impl Database {
                 }
             };
             if locked_version >= 19 {
-                info!(
+                debug!(
                     "Database already at version {} under the migration lock; skipping version 19.",
                     locked_version
                 );
@@ -3089,7 +3089,7 @@ impl Database {
                 }
             };
             if locked_version >= 20 {
-                info!(
+                debug!(
                     "Database already at version {} under the migration lock; skipping version 20.",
                     locked_version
                 );
@@ -3131,7 +3131,7 @@ impl Database {
             .await?;
         }
 
-        info!("Database schema is up to date at version 19.");
+        debug!("Database schema is up to date at version 20.");
 
         Ok(())
     }
@@ -7866,7 +7866,7 @@ impl Database {
         if let Some(old_thread_id) = old_thread_id
             && old_thread_id != thread_id
         {
-            info!("Merging thread {} into {}", old_thread_id, thread_id);
+            debug!("Merging thread {} into {}", old_thread_id, thread_id);
             // 1. Move messages
             tx.execute(
                 "UPDATE messages SET thread_id = ? WHERE thread_id = ?",
@@ -9023,7 +9023,7 @@ impl Database {
                 let tx = self.begin_transaction().await?;
                 for merge_from in matches.iter().skip(1) {
                     let merge_from_id = merge_from.id;
-                    info!("Merging patchset {} into {}", merge_from_id, target_id);
+                    debug!("Merging patchset {} into {}", merge_from_id, target_id);
 
                     // Re-point any bugs referencing duplicate patches before deleting them
                     tx.execute(
@@ -9576,7 +9576,7 @@ impl Database {
                         )
                         .await?;
                     if self_owner.next().await?.is_none() {
-                        info!(
+                        debug!(
                             "Message {} belongs to a series named {}, which another patchset holds; naming the new series after itself",
                             message_id, clid
                         );
@@ -13265,7 +13265,7 @@ impl Database {
             match Self::choose_predecessor(qualifying, signal) {
                 PredecessorChoice::NoCandidate => continue,
                 PredecessorChoice::Ambiguous(ids) => {
-                    info!(
+                    debug!(
                         "Not linking patchset {} to a previous version: {} candidates {:?} are equally ranked",
                         ctx.patchset_id,
                         signal.as_str(),
@@ -14858,7 +14858,7 @@ impl Database {
                 tx.commit().await?;
                 return Ok(true);
             }
-            tracing::info!(
+            tracing::debug!(
                 "Email outbox entry already exists for patch_id {} (status {}), skipping to prevent duplicates.",
                 patch_id,
                 existing_status
@@ -15231,7 +15231,7 @@ impl Database {
             .is_patchset_claim_active_for_outbox(Some(patchset_id))
             .await?
         {
-            info!(
+            debug!(
                 "Skipping forge outbox insertion for superseded worker on patchset {}",
                 patchset_id
             );
@@ -15240,7 +15240,7 @@ impl Database {
         if tx_db.get_patchset_status(patchset_id).await?.as_deref()
             == Some(ReviewStatus::Cancelled.as_str())
         {
-            info!(
+            debug!(
                 "Skipping forge outbox insertion for cancelled patchset {}",
                 patchset_id
             );
@@ -15263,7 +15263,7 @@ impl Database {
             )
             .await?;
         if newer_rows.next().await?.is_some() {
-            info!(
+            debug!(
                 "Skipping forge outbox insertion for patchset {} (PR #{} has a newer revision)",
                 patchset_id, pr_number
             );
@@ -15339,7 +15339,7 @@ impl Database {
                 return Ok(());
             }
             tx.commit().await?;
-            info!(
+            debug!(
                 "Forge outbox entry already exists for patchset_id {}, skipping duplicate.",
                 patchset_id
             );

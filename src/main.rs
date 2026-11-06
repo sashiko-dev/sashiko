@@ -651,6 +651,7 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Determine formatting features independently
     let plain_logs = std::env::var("SASHIKO_LOG_PLAIN").is_ok();
+    let level_only_logs = std::env::var("SASHIKO_LOG_LEVEL_ONLY").is_ok();
     let use_ansi = std::env::var("NO_COLOR").is_err() && std::io::stderr().is_terminal();
 
     let builder = fmt()
@@ -664,6 +665,8 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
             .with_target(false)
             .without_time()
             .init();
+    } else if level_only_logs {
+        builder.with_target(false).without_time().init();
     } else {
         builder.init();
     }
@@ -1143,7 +1146,7 @@ async fn run_daemon(
     };
 
     let parser_handle = tokio::spawn(async move {
-        info!("Parser Dispatcher started");
+        debug!("Parser Dispatcher started");
         while let Some(event) = raw_rx.recv().await {
             // Forward pre-parsed events inline without spawning a separate task
             // so the patches of a multi-patch git-fetch series are delivered to
@@ -1346,7 +1349,7 @@ async fn run_daemon(
                                     }
                                 }
                                 Ok(Err(e)) => {
-                                    info!("Parse error for {}: {}", msg_id, e);
+                                    debug!("Parse error for {}: {}", msg_id, e);
                                 }
                                 Err(e) => {
                                     error!("Join error in parser: {}", e);
@@ -1432,7 +1435,7 @@ async fn run_daemon(
                 }
             });
         }
-        info!("Parser Dispatcher finished");
+        debug!("Parser Dispatcher finished");
     });
 
     // DB Worker (Transactional Batching)
@@ -1448,7 +1451,7 @@ async fn run_daemon(
     let mut policy =
         sashiko::email_policy::EmailPolicyConfig::load_async(&email_policy_path).await?;
     let db_worker_handle = tokio::spawn(async move {
-        info!("DB Worker started");
+        debug!("DB Worker started");
 
         let mut buffer = Vec::with_capacity(100);
         let mut total_processed = 0;
@@ -4127,7 +4130,7 @@ async fn process_parsed_article(
 
     // Handle ingestion failure
     if let Some(err) = failed_error {
-        info!("Handling ingestion failure for {}: {}", article_id, err);
+        debug!("Handling ingestion failure for {}: {}", article_id, err);
         if let Err(e) = worker_db.update_patchset_error(&root_msg_id, &err).await {
             error!("Failed to update patchset error in DB: {}", e);
         }
@@ -4153,7 +4156,7 @@ async fn process_parsed_article(
 
     if sashiko::email_router::EmailRouter::is_ignored_author(policy, &author_email) {
         if metadata.is_patch_or_cover {
-            info!(
+            debug!(
                 "Ignoring patch/cover from {} according to email policy",
                 author_email
             );
@@ -4407,7 +4410,7 @@ async fn process_parsed_article(
     } else {
         metadata.subject.clone()
     };
-    info!(
+    debug!(
         "Article: group={}, id={}, author={}, subject=\"{}\"",
         group, article_id, metadata.author, subject
     );

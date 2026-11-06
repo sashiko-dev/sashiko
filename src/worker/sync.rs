@@ -3,7 +3,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct GitSyncWorker {
     repo_path: PathBuf,
@@ -32,7 +32,7 @@ impl GitSyncWorker {
     }
 
     async fn sync_all_remotes(&self) -> Result<()> {
-        info!("GitSyncWorker: Starting sync cycle.");
+        debug!("GitSyncWorker: Starting sync cycle.");
 
         // Enumerate all configured remotes
         let output = crate::git_cmd::in_dir_async(&self.repo_path)
@@ -53,7 +53,7 @@ impl GitSyncWorker {
             .filter(|l| !l.is_empty() && !l.starts_with("fetcher-"))
             .collect();
 
-        info!("GitSyncWorker: Found {} remotes to check.", remotes.len());
+        debug!("GitSyncWorker: Found {} remotes to check.", remotes.len());
 
         let mut fetched = 0usize;
         let mut skipped = 0usize;
@@ -106,7 +106,7 @@ impl GitSyncWorker {
                     record_failure(&message);
                 }
                 Err(e) if e.downcast_ref::<BackoffError>().is_some() => {
-                    info!("GitSyncWorker: {}", e);
+                    debug!("GitSyncWorker: {}", e);
                     backed_off += 1;
                 }
                 Err(e) => {
@@ -142,8 +142,13 @@ impl GitSyncWorker {
                 "GitSyncWorker: Sync cycle fetched nothing: {} skipped, {} backing off.",
                 skipped, backed_off
             );
-        } else {
+        } else if tried > 0 {
             info!(
+                "GitSyncWorker: Sync cycle complete: {} fetched, {} skipped, {} backing off, {} stale, {} failed.",
+                fetched, skipped, backed_off, stale, failed
+            );
+        } else {
+            debug!(
                 "GitSyncWorker: Sync cycle complete: {} fetched, {} skipped, {} backing off, {} stale, {} failed.",
                 fetched, skipped, backed_off, stale, failed
             );
