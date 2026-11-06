@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const SMTP_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 const SMTP_SEND_TIMEOUT: Duration = Duration::from_secs(60);
@@ -86,7 +86,7 @@ impl EmailWorker {
             // Lock and send next pending email
             match self.db.lock_pending_email().await {
                 Ok(Some(email)) => {
-                    info!(
+                    debug!(
                         "Locked pending {} email ID {} for patch {:?}",
                         email.kind.as_str(),
                         email.id,
@@ -171,15 +171,19 @@ impl EmailWorker {
                 email_row.to_addresses, email_row.cc_addresses, email_row.subject
             );
             // The body of a sign-in mail carries the link, which is a bearer
-            // credential and so is withheld from the log by default. Every
-            // other kind of mail is safe to show in full.
-            if email_row.kind == crate::db::EmailKind::SignInLink && !self.log_sign_in_links {
-                info!(
-                    "DRY RUN Body withheld because it contains a sign-in link. Set \
-                     server.log_sign_in_links to print it."
-                );
+            // credential and so is withheld from the log by default. Full
+            // review mail bodies run to hundreds of lines and stay at debug.
+            if email_row.kind == crate::db::EmailKind::SignInLink {
+                if self.log_sign_in_links {
+                    info!("DRY RUN Body:\n{}", email_row.body);
+                } else {
+                    info!(
+                        "DRY RUN Body withheld because it contains a sign-in link. Set \
+                         server.log_sign_in_links to print it."
+                    );
+                }
             } else {
-                info!("DRY RUN Body:\n{}", email_row.body);
+                debug!("DRY RUN Body:\n{}", email_row.body);
             }
             return Ok(());
         }
@@ -630,7 +634,7 @@ mod tests {
         let parsed = parse_lenient(addr_str);
         assert!(parsed.is_ok(), "Failed to parse: {:?}", parsed.err());
         // We will see what format!() returns for plain email
-        info!("Plain email formatted: {}", parsed.as_ref().unwrap());
+        debug!("Plain email formatted: {}", parsed.as_ref().unwrap());
     }
 
     #[test]

@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Clone, Debug, Default)]
 pub struct WorkerSubprocessOverrides {
@@ -249,7 +249,7 @@ impl Reviewer {
             if let Some(worktree_dir) = self.settings.review.worktree_dir.clone().map(PathBuf::from)
                 && let Err(e) = tokio::task::spawn_blocking(move || {
                     if worktree_dir.exists() {
-                        info!(
+                        debug!(
                             "Cleaning up previous worktree directory: {:?}",
                             worktree_dir
                         );
@@ -304,7 +304,7 @@ impl Reviewer {
         }
 
         let count = patchsets.len();
-        info!("Found {} pending patchsets for review", count);
+        debug!("Found {} pending patchsets for review", count);
         let mut claimed_count = 0usize;
 
         for mut patchset in patchsets {
@@ -324,7 +324,7 @@ impl Reviewer {
                     generation
                 }
                 Ok(None) => {
-                    info!(
+                    debug!(
                         "Skipping patchset {} as it is no longer Pending (likely cancelled)",
                         patchset.id
                     );
@@ -436,14 +436,14 @@ impl Reviewer {
             return Ok(());
         }
 
-        info!(
+        debug!(
             "Found {} embargoed patchsets eligible for release",
             patchsets.len()
         );
 
         for patchset in patchsets {
             let patchset_id = patchset.id;
-            info!("Releasing embargo for patchset {}", patchset_id);
+            debug!("Releasing embargo for patchset {}", patchset_id);
 
             let context = ReviewContext {
                 semaphore: self.semaphore.clone(),
@@ -475,7 +475,7 @@ impl Reviewer {
             .claim_patchset_embargo_release(patchset.id, now)
             .await?
         {
-            info!(
+            debug!(
                 "Patchset {} is no longer eligible for embargo release or is already claimed",
                 patchset.id
             );
@@ -848,7 +848,7 @@ impl Reviewer {
             None => None,
         };
         let candidates = if let Some(commit) = forced_baseline {
-            info!(
+            debug!(
                 "Using forced baseline commit {} from ingestion for patchset {}",
                 commit, patchset_id
             );
@@ -877,7 +877,7 @@ impl Reviewer {
             match Self::check_patchset_claim_active_with_retry(&ctx.db, patchset_id).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    info!(
+                    debug!(
                         "Patchset {} was cancelled or superseded during baseline preparation, aborting",
                         patchset_id
                     );
@@ -1077,7 +1077,7 @@ impl Reviewer {
 
             for (patch_id, index, diff, _subj, _auth, _date, _msg_id) in &diffs {
                 if ctx.worker_overrides.skip_patch_ids.contains(patch_id) {
-                    info!(
+                    debug!(
                         "Skipping non-target benchmark patch {}/{}",
                         patchset_id, index
                     );
@@ -1088,7 +1088,7 @@ impl Reviewer {
 
                 // Opt-out logic
                 if skip_regexes.iter().any(|re| re.is_match(_subj)) {
-                    info!(
+                    debug!(
                         "Skipping patch {}/{} (subject matches skip filter)",
                         patchset_id, index
                     );
@@ -1100,7 +1100,7 @@ impl Reviewer {
                     && !only_regexes.is_empty()
                     && !only_regexes.iter().any(|re| re.is_match(_subj))
                 {
-                    info!(
+                    debug!(
                         "Skipping patch {}/{} (subject does not match any only filter)",
                         patchset_id, index
                     );
@@ -1124,7 +1124,7 @@ impl Reviewer {
                     if patch_lines_changed > ctx.settings.review.max_lines_changed
                         || patch_files_count > ctx.settings.review.max_files_touched
                     {
-                        info!(
+                        debug!(
                             "Skipping patch {}/{} (exceeds size limits: {} lines, {} files)",
                             patchset_id, index, patch_lines_changed, patch_files_count
                         );
@@ -1280,6 +1280,10 @@ impl Reviewer {
                 .await
                 {
                     Ok(true) => {
+                        info!(
+                            "Completed review for patchset {} (status: {})",
+                            patchset_id, final_status
+                        );
                         if let Err(e) = Self::queue_forge_pr_comment(&ctx, &patchset, &diffs).await
                         {
                             error!(
@@ -1363,7 +1367,7 @@ impl Reviewer {
             let total_hits = stats.hits_this_session + stats.hits_prev_session;
             let total_tokens = stats.tokens_saved_this_session + stats.tokens_saved_prev_session;
             if total_hits > 0 {
-                info!(
+                debug!(
                     "Patchset {} cache summary — {} hits ({} this session, {} previous), {} tokens saved ({} this session, {} previous)",
                     patchset_id,
                     total_hits,
@@ -1508,7 +1512,7 @@ impl Reviewer {
             )
             .await;
             if let Ok(resolved) = get_commit_hash(repo_path, sha.as_str()).await {
-                info!("Fetched base-commit {} from {}", sha, name);
+                debug!("Fetched base-commit {} from {}", sha, name);
                 return Ok(resolved);
             }
         }
@@ -1654,7 +1658,7 @@ impl Reviewer {
             }
 
             if !tested_shas.insert(baseline_sha.clone()) {
-                info!("Skipping duplicate baseline SHA {}", baseline_sha);
+                debug!("Skipping duplicate baseline SHA {}", baseline_sha);
                 continue;
             }
 
@@ -1730,7 +1734,7 @@ impl Reviewer {
                             }
                             Err(e) => {
                                 let msg = format!("Commit {} missing: {}\n", msg_id, e);
-                                info!("{}", msg);
+                                debug!("{}", msg);
                                 apply_logs.push_str(&msg);
                             }
                         }
@@ -1739,7 +1743,7 @@ impl Reviewer {
                             Ok(_) => applied = true,
                             Err(e) => {
                                 let msg = format!("Failed to reset hard to {}: {}\n", msg_id, e);
-                                info!("{}", msg);
+                                debug!("{}", msg);
                                 apply_logs.push_str(&msg);
                             }
                         }
@@ -1817,7 +1821,7 @@ impl Reviewer {
                 let logs_json = serde_json::to_string(&attempts).unwrap_or_default();
 
                 if let Some(bid) = baseline_id {
-                    info!(
+                    debug!(
                         "Baseline found for patchset {}: {} ({} attempts)",
                         patchset_id,
                         candidate.as_str(),
@@ -2109,7 +2113,7 @@ impl Reviewer {
                 .await
                 .inspect(|won| {
                     if !candidates.is_empty() {
-                        info!(
+                        debug!(
                             "Reserved {} of {} related pre-existing bug(s) for {}",
                             won.len(),
                             candidates.len(),
@@ -2277,14 +2281,14 @@ impl Reviewer {
         };
         match evaluate_gate(&inputs, &policy) {
             Ok(min_severity) => {
-                info!(
+                debug!(
                     "Related pre-existing bugs on for patchset {} (min severity {})",
                     patchset_id, min_severity
                 );
                 RelatedPreexistingMode::Enabled { min_severity }
             }
             Err(reason) => {
-                info!(
+                debug!(
                     "Related pre-existing bugs off for patchset {}: {:?}",
                     patchset_id, reason
                 );
@@ -2447,7 +2451,7 @@ impl Reviewer {
             .await
         {
             Ok(crate::db::PanickedPatchOutcome::Superseded) => {
-                info!(
+                debug!(
                     "Patchset {} was cancelled or superseded before panicked patch {} was settled",
                     patchset_id, index
                 );
@@ -2486,7 +2490,7 @@ impl Reviewer {
         diff: &str,
         embargo_until: Option<i64>,
     ) -> Result<PatchResult> {
-        info!(
+        debug!(
             "Reviewing patch {}/{} (ID: {})",
             patchset_id, index, patch_id
         );
@@ -2497,7 +2501,7 @@ impl Reviewer {
             .await?;
 
         if successful_count >= ctx.target_review_count {
-            info!(
+            debug!(
                 "Patch {}/{} (ID: {}) already has {} successful reviews with baseline {:?} (target: {}). Skipping.",
                 patchset_id,
                 index,
@@ -2554,7 +2558,7 @@ impl Reviewer {
             .has_failed_review(patchset_id, patch_id, baseline_id)
             .await?
         {
-            info!(
+            debug!(
                 "Patch {}/{} (ID: {}) already has a failed review. Skipping to keep it visible.",
                 patchset_id, index, patch_id
             );
@@ -2563,7 +2567,7 @@ impl Reviewer {
         }
 
         if Self::touches_only_ignored_files(diff, &ctx.settings.review.ignore_files) {
-            info!(
+            debug!(
                 "Skipping review for patch {}/{} (ID: {}) as it touches only ignored files.",
                 patchset_id, index, patch_id
             );
@@ -2582,7 +2586,7 @@ impl Reviewer {
             {
                 Ok(id) => id,
                 Err(e) if Self::is_deleted_review_error(&e) => {
-                    info!(
+                    debug!(
                         "Patchset {} was cancelled before skipping patch {}/{}, aborting worker",
                         patchset_id, patchset_id, index
                     );
@@ -2604,7 +2608,7 @@ impl Reviewer {
             .await
             {
                 if Self::is_deleted_review_error(&e) {
-                    info!(
+                    debug!(
                         "Review {} for patch {}/{} was deleted by a concurrent rerun, aborting superseded worker",
                         review_id, patchset_id, index
                     );
@@ -2629,7 +2633,7 @@ impl Reviewer {
             match Self::check_patchset_claim_active_with_retry(&ctx.db, patchset_id).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    info!(
+                    debug!(
                         "Patchset {} was cancelled or superseded before reviewing patch {}/{}",
                         patchset_id, patchset_id, index
                     );
@@ -2683,7 +2687,7 @@ impl Reviewer {
             let review_id = if let Some(id) = existing_pending_review_id.take() {
                 if let Err(e) = ctx.db.clear_aborted_review_artifacts(id).await {
                     if Self::is_deleted_review_error(&e) {
-                        info!(
+                        debug!(
                             "Review {} for patch {}/{} was deleted by a concurrent rerun, aborting superseded worker",
                             id, patchset_id, index
                         );
@@ -2707,7 +2711,7 @@ impl Reviewer {
                 {
                     Ok(id) => id,
                     Err(e) if Self::is_deleted_review_error(&e) => {
-                        info!(
+                        debug!(
                             "Patchset {} was cancelled before claiming review for patch {}/{}, aborting worker",
                             patchset_id, patchset_id, index
                         );
@@ -2737,7 +2741,7 @@ impl Reviewer {
             match Self::check_patchset_claim_active_with_retry(&ctx.db, patchset_id).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    info!(
+                    debug!(
                         "Patchset {} was cancelled or superseded while reviewing patch {}/{}",
                         patchset_id, patchset_id, index
                     );
@@ -2923,7 +2927,7 @@ impl Reviewer {
                             .await
                             {
                                 if Self::is_deleted_review_error(&e) {
-                                    info!(
+                                    debug!(
                                         "Review {} for patch {}/{} was deleted by a concurrent rerun, aborting superseded worker",
                                         review_id, patchset_id, index
                                     );
@@ -2983,7 +2987,7 @@ impl Reviewer {
                                             .await
                                         {
                                             if Self::is_deleted_review_error(&e) {
-                                                info!(
+                                                debug!(
                                                     "Review {} for patch {}/{} was deleted by a concurrent rerun while saving findings, aborting",
                                                     review_id, patchset_id, index
                                                 );
@@ -3009,7 +3013,7 @@ impl Reviewer {
                                         .await
                                 {
                                     if Self::is_deleted_review_error(&e) {
-                                        info!(
+                                        debug!(
                                             "Review {} for patch {}/{} was deleted by a concurrent rerun while saving prior resolutions, aborting",
                                             review_id, patchset_id, index
                                         );
@@ -3067,7 +3071,7 @@ impl Reviewer {
                                 .await
                                 {
                                     if Self::is_deleted_review_error(&e) {
-                                        info!(
+                                        debug!(
                                             "Review {} for patch {}/{} was deleted by a concurrent rerun, aborting superseded worker",
                                             review_id, patchset_id, index
                                         );
@@ -3234,7 +3238,7 @@ impl Reviewer {
 
                                 if let Some(inline) = inline_review {
                                     if let Some(until) = embargo_until.filter(|&u| u > now) {
-                                        info!(
+                                        debug!(
                                             "Review completed but embargoed until {} for patch {}/{}",
                                             until, patchset_id, index
                                         );
@@ -3269,7 +3273,7 @@ impl Reviewer {
                                 ctx.db.update_patch_status(patch_id, "Reviewed").await?;
                                 return Ok(PatchResult::Success);
                             } else if ctx.settings.ai.no_ai {
-                                info!(
+                                debug!(
                                     "Review skipped as requested for ps={} idx={}",
                                     patchset_id, index
                                 );
@@ -3286,7 +3290,7 @@ impl Reviewer {
                                 .await
                                 {
                                     if Self::is_deleted_review_error(&e) {
-                                        info!(
+                                        debug!(
                                             "Review {} for patch {}/{} was deleted by a concurrent rerun, aborting superseded worker",
                                             review_id, patchset_id, index
                                         );
@@ -3322,7 +3326,7 @@ impl Reviewer {
                                 .await
                                 {
                                     if Self::is_deleted_review_error(&e) {
-                                        info!(
+                                        debug!(
                                             "Review {} for patch {}/{} was deleted by a concurrent rerun, aborting superseded worker",
                                             review_id, patchset_id, index
                                         );
@@ -3362,7 +3366,7 @@ impl Reviewer {
                             .await
                             {
                                 if Self::is_deleted_review_error(&e) {
-                                    info!(
+                                    debug!(
                                         "Review {} for patch {}/{} was deleted by a concurrent rerun, aborting superseded worker",
                                         review_id, patchset_id, index
                                     );
@@ -3403,7 +3407,7 @@ impl Reviewer {
                         .await
                         {
                             if Self::is_deleted_review_error(&e) {
-                                info!(
+                                debug!(
                                     "Review {} for patch {}/{} was deleted by a concurrent rerun, aborting superseded worker",
                                     review_id, patchset_id, index
                                 );
@@ -3477,7 +3481,7 @@ impl Reviewer {
                     .await
                     {
                         if Self::is_deleted_review_error(&err) {
-                            info!(
+                            debug!(
                                 "Review {} for patch {}/{} was deleted by a concurrent rerun, aborting superseded worker",
                                 review_id, patchset_id, index
                             );
@@ -3659,7 +3663,6 @@ async fn run_review_tool_with_cmd_and_overrides(
     }
 
     cmd.env("NO_COLOR", "1");
-    cmd.env("SASHIKO_LOG_PLAIN", "1");
 
     // Forward SASHIKO_* env vars to the child so that env-var overrides
     // (e.g. SASHIKO_AI__MODEL, SASHIKO_GIT__REPOSITORY_PATH) are visible
@@ -3670,8 +3673,21 @@ async fn run_review_tool_with_cmd_and_overrides(
         }
     }
 
+    // Override log formatting after forwarding SASHIKO_* so the worker always
+    // prefixes lines with their tracing level (even when the parent daemon runs
+    // with SASHIKO_LOG_PLAIN=1 in a container).
+    cmd.env_remove("SASHIKO_LOG_PLAIN");
+    cmd.env("SASHIKO_LOG_LEVEL_ONLY", "1");
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        cmd.env("RUST_LOG", rust_log);
+    }
+
     if let Some(ref settings_path) = worker_overrides.settings_path {
         cmd.env("SASHIKO_CONFIG", settings_path);
+    }
+
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        cmd.arg("--debug");
     }
 
     if let Some(idx) = review_index {
@@ -3718,20 +3734,17 @@ async fn run_review_tool_with_cmd_and_overrides(
 
     let mut child = cmd.spawn()?;
 
+    let log_turns = settings.ai.log_turns;
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if line.contains(" ERROR ")
-                    || line.starts_with("Error:")
-                    || line.contains("panicked")
-                {
-                    error!("[review-bin] {}", line);
-                } else if line.contains(" WARN ") {
-                    warn!("[review-bin] {}", line);
-                } else {
-                    info!("[review-bin] {}", line);
+                match classify_worker_stderr_line(&line, log_turns) {
+                    (WorkerStderrLevel::Error, msg) => error!("[review-bin] {}", msg),
+                    (WorkerStderrLevel::Warn, msg) => warn!("[review-bin] {}", msg),
+                    (WorkerStderrLevel::Info, msg) => info!("[review-bin] {}", msg),
+                    (WorkerStderrLevel::Debug, msg) => debug!("[review-bin] {}", msg),
                 }
             }
         });
@@ -3860,7 +3873,7 @@ async fn run_review_tool_with_cmd_and_overrides(
                                 match type_str {
                                     "ai_request" | "ai_request_with_cache" => {
                                         if !db.is_patchset_claim_active(patchset_id).await.unwrap_or(true) {
-                                            info!(
+                                            debug!(
                                                 "Patchset {} was cancelled or superseded before AI request; aborting worker",
                                                 patchset_id
                                             );
@@ -3870,7 +3883,7 @@ async fn run_review_tool_with_cmd_and_overrides(
                                         match db.mark_review_in_review_if_active(review_id).await {
                                             Ok(true) => {}
                                             Ok(false) => {
-                                                info!(
+                                                debug!(
                                                     "Review {} for patchset {} was cancelled or deleted before AI request; aborting worker",
                                                     review_id, patchset_id
                                                 );
@@ -4136,7 +4149,7 @@ async fn run_review_tool_with_cmd_and_overrides(
                 .await
                 .unwrap_or(true)
             {
-                info!(
+                debug!(
                     "Review {} for patchset {} was cancelled or superseded before persisting patch application status; aborting worker",
                     review_id, patchset_id
                 );
@@ -4208,7 +4221,7 @@ impl Reviewer {
         let sender_address = match &ctx.settings.smtp {
             Some(s) => s.sender_address.clone(),
             None => {
-                info!("SMTP not configured, recording email as disabled.");
+                debug!("SMTP not configured, recording email as disabled.");
                 "sashiko-bot@localhost".to_string()
             }
         };
@@ -4270,7 +4283,7 @@ impl Reviewer {
                 && (author_bare == sashiko_bare
                     || patch_author.to_ascii_lowercase().contains(&sashiko_bare)))
         {
-            info!(
+            debug!(
                 "Bot loop guard muted notifications for patch {}/{} (ID: {}) from {:?}",
                 patchset_id, index, patch_id, patch_author
             );
@@ -4458,7 +4471,7 @@ impl Reviewer {
             }
 
             if !sent_positive_review {
-                info!(
+                debug!(
                     "No issues found for patch {}/{} (ID: {}), skipping email.",
                     patchset_id, index, patch_id
                 );
@@ -4480,7 +4493,7 @@ impl Reviewer {
 
         match action {
             EmailAction::Mute => {
-                info!(
+                debug!(
                     "Email policy muted email for patch {}/{} (ID: {})",
                     patchset_id, index, patch_id
                 );
@@ -4605,13 +4618,47 @@ impl Reviewer {
                     ctx.db.release_preexisting_reservations(msg_id).await?;
                 }
 
-                info!(
+                debug!(
                     "Queued email for patch {}/{} (ID: {})",
                     patchset_id, index, patch_id
                 );
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerStderrLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
+fn classify_worker_stderr_line(line: &str, log_turns: bool) -> (WorkerStderrLevel, &str) {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("ERROR ") {
+        return (WorkerStderrLevel::Error, rest);
+    }
+    if let Some(rest) = trimmed.strip_prefix("WARN ") {
+        return (WorkerStderrLevel::Warn, rest);
+    }
+    if let Some(rest) = trimmed.strip_prefix("DEBUG ") {
+        return (WorkerStderrLevel::Debug, rest);
+    }
+    if let Some(rest) = trimmed.strip_prefix("TRACE ") {
+        return (WorkerStderrLevel::Debug, rest);
+    }
+    let body = trimmed.strip_prefix("INFO ").unwrap_or(line);
+    if body.contains(" ERROR ") || body.starts_with("Error:") || body.contains("panicked") {
+        (WorkerStderrLevel::Error, body)
+    } else if body.contains(" WARN ") {
+        (WorkerStderrLevel::Warn, body)
+    } else if log_turns {
+        (WorkerStderrLevel::Info, body)
+    } else {
+        (WorkerStderrLevel::Debug, body)
     }
 }
 
@@ -8103,6 +8150,41 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 .trim_end_matches("...")
                 .chars()
                 .all(|c| c == '\u{4e2d}')
+        );
+    }
+
+    #[test]
+    fn test_classify_worker_stderr_line_routes_levels_and_panics() {
+        assert_eq!(
+            classify_worker_stderr_line("ERROR Failed to parse patch", false),
+            (WorkerStderrLevel::Error, "Failed to parse patch")
+        );
+        assert_eq!(
+            classify_worker_stderr_line(" WARN Retrying transient AI error", false),
+            (WorkerStderrLevel::Warn, "Retrying transient AI error")
+        );
+        assert_eq!(
+            classify_worker_stderr_line(" INFO progress: context turn 1/100", false),
+            (WorkerStderrLevel::Debug, "progress: context turn 1/100")
+        );
+        assert_eq!(
+            classify_worker_stderr_line(" INFO === AI REQUEST (turn 1) ===", true),
+            (WorkerStderrLevel::Info, "=== AI REQUEST (turn 1) ===")
+        );
+        assert_eq!(
+            classify_worker_stderr_line("  indented continuation line", true),
+            (WorkerStderrLevel::Info, "  indented continuation line")
+        );
+        assert_eq!(
+            classify_worker_stderr_line("DEBUG Sending prompt to Claude API", true),
+            (WorkerStderrLevel::Debug, "Sending prompt to Claude API")
+        );
+        assert_eq!(
+            classify_worker_stderr_line("thread 'main' panicked at src/main.rs:10", false),
+            (
+                WorkerStderrLevel::Error,
+                "thread 'main' panicked at src/main.rs:10"
+            )
         );
     }
 }

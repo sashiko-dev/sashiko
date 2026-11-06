@@ -32,7 +32,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -447,7 +447,7 @@ async fn submit_patch(
         auth.0.as_ref(),
         crate::settings::Permission::Ingest,
     ) {
-        info!("Refused unauthorized patch submission from {}", addr);
+        warn!("Refused unauthorized patch submission from {}", addr);
         return Err(StatusCode::FORBIDDEN.into_response());
     }
 
@@ -542,7 +542,7 @@ async fn submit_patch(
             // skip creating placeholder and skip fetch queue entirely.
             match state.db.has_patchset_by_msgid(&id).await {
                 Ok(true) => {
-                    info!(
+                    debug!(
                         "Remote fetch request for already ingested SHA {}, skipping placeholder and fetch",
                         id
                     );
@@ -562,7 +562,7 @@ async fn submit_patch(
                 repo_path.exists() && crate::git_ops::git_range_exists(repo_path, &sha).await;
 
             if !already_local && repo.is_none() {
-                info!(
+                warn!(
                     "Refused remote fetch request for {}: commit not found in local repository and no remote URL provided",
                     sha
                 );
@@ -571,7 +571,7 @@ async fn submit_patch(
 
             let effective_repo = if already_local {
                 if repo.is_some() {
-                    info!(
+                    debug!(
                         "Target {} is already present in local git repository, skipping remote fetch for {}",
                         sha, repo_display
                     );
@@ -1125,19 +1125,19 @@ async fn get_patchset(
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
-        info!("Fetching details for patchset id: {}", id_val);
+        debug!("Fetching details for patchset id: {}", id_val);
         state
             .db
             .get_patchset_details(id_val, query.page, query.page_size())
             .await
     } else if query.id.contains('-') && !query.id.contains('@') {
-        info!("Fetching details for patchset slug: {}", query.id);
+        debug!("Fetching details for patchset slug: {}", query.id);
         state
             .db
             .get_patchset_details_by_slug(&query.id, query.page, query.page_size())
             .await
     } else {
-        info!("Fetching details for patchset msgid: {}", query.id);
+        debug!("Fetching details for patchset msgid: {}", query.id);
         state
             .db
             .get_patchset_details_by_msgid(&query.id, query.page, query.page_size())
@@ -1161,11 +1161,11 @@ async fn get_patchset(
             Ok(Json(details))
         }
         Ok(None) => {
-            info!("Patchset not found: {}", query.id);
+            debug!("Patchset not found: {}", query.id);
             Err(StatusCode::NOT_FOUND)
         }
         Err(e) => {
-            info!("Database error: {}", e);
+            error!("Database error: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1202,10 +1202,10 @@ async fn get_review(
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Some(ps_id) = query.patchset_id {
-        info!("Fetching latest review for patchset id: {}", ps_id);
+        debug!("Fetching latest review for patchset id: {}", ps_id);
         state.db.get_latest_review_for_patchset(ps_id).await
     } else if let Some(id) = query.id {
-        info!("Fetching details for review id: {}", id);
+        debug!("Fetching details for review id: {}", id);
         state.db.get_review_details(id).await
     } else {
         return Err(StatusCode::BAD_REQUEST);
@@ -1218,11 +1218,11 @@ async fn get_review(
             Ok(Json(details))
         }
         Ok(None) => {
-            info!("Review not found");
+            debug!("Review not found");
             Err(StatusCode::NOT_FOUND)
         }
         Err(e) => {
-            info!("Database error: {}", e);
+            error!("Database error: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1236,19 +1236,19 @@ async fn get_patchset_summary(
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
-        info!("Fetching summary for patchset id: {}", id_val);
+        debug!("Fetching summary for patchset id: {}", id_val);
         state
             .db
             .get_patchset_summary(id_val, query.page, query.page_size())
             .await
     } else if query.id.contains('-') && !query.id.contains('@') {
-        info!("Fetching summary for patchset slug: {}", query.id);
+        debug!("Fetching summary for patchset slug: {}", query.id);
         state
             .db
             .get_patchset_summary_by_slug(&query.id, query.page, query.page_size())
             .await
     } else {
-        info!("Fetching summary for patchset msgid: {}", query.id);
+        debug!("Fetching summary for patchset msgid: {}", query.id);
         state
             .db
             .get_patchset_summary_by_msgid(&query.id, query.page, query.page_size())
@@ -1271,11 +1271,11 @@ async fn get_patchset_summary(
             Ok(Json(details))
         }
         Ok(None) => {
-            info!("Patchset not found: {}", query.id);
+            debug!("Patchset not found: {}", query.id);
             Err(StatusCode::NOT_FOUND)
         }
         Err(e) => {
-            info!("Database error: {}", e);
+            error!("Database error: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1289,10 +1289,10 @@ async fn get_review_log(
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Some(ps_id) = query.patchset_id {
-        info!("Fetching latest review log for patchset id: {}", ps_id);
+        debug!("Fetching latest review log for patchset id: {}", ps_id);
         state.db.get_latest_review_for_patchset(ps_id).await
     } else if let Some(id) = query.id {
-        info!("Fetching details for review id: {}", id);
+        debug!("Fetching details for review id: {}", id);
         state.db.get_review_details(id).await
     } else {
         return Err(StatusCode::BAD_REQUEST);
@@ -1305,11 +1305,11 @@ async fn get_review_log(
             Ok(Json(details))
         }
         Ok(None) => {
-            info!("Review not found");
+            debug!("Review not found");
             Err(StatusCode::NOT_FOUND)
         }
         Err(e) => {
-            info!("Database error: {}", e);
+            error!("Database error: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -2008,10 +2008,10 @@ async fn get_message(
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<crate::db::MessageRow>, StatusCode> {
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
-        info!("Fetching details for message id: {}", id_val);
+        debug!("Fetching details for message id: {}", id_val);
         state.db.get_message_details(id_val).await
     } else {
-        info!("Fetching details for message msgid: {}", query.id);
+        debug!("Fetching details for message msgid: {}", query.id);
         state.db.get_message_details_by_msgid(&query.id).await
     };
 
@@ -2060,11 +2060,11 @@ async fn get_message(
             Ok(Json(details))
         }
         Ok(None) => {
-            info!("Message not found: {}", query.id);
+            debug!("Message not found: {}", query.id);
             Err(StatusCode::NOT_FOUND)
         }
         Err(e) => {
-            info!("Database error: {}", e);
+            error!("Database error: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -2104,7 +2104,7 @@ async fn stats_timeline(
                 .get_timeline_stats(params.subsystem_id)
                 .await
                 .map_err(|e| {
-                    info!("Error getting timeline stats: {}", e);
+                    error!("Error getting timeline stats: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })
         })
@@ -2119,7 +2119,7 @@ async fn stats_reviews(
         .stats_reviews_cache
         .get_or_fetch(|| async {
             state.db.get_review_stats().await.map_err(|e| {
-                info!("Error getting review stats: {}", e);
+                error!("Error getting review stats: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })
         })
@@ -2134,7 +2134,7 @@ async fn stats_tools(
         .stats_tools_cache
         .get_or_fetch(|| async {
             state.db.get_tool_usage_stats().await.map_err(|e| {
-                info!("Error getting tool stats: {}", e);
+                error!("Error getting tool stats: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })
         })
@@ -2424,7 +2424,7 @@ async fn forge_webhook(
     // unauthenticated is an endpoint anyone can reach, and arriving on
     // loopback never distinguished the two behind a reverse proxy.
     if !has_secret && !presents_local_token(&headers, &state) && !state.allow_all_submit {
-        info!(
+        warn!(
             "Refused {} webhook from {}: configure webhook_secret or use --enable-unsafe-all-submit",
             crate::forge::loggable(&provider),
             addr
@@ -2498,7 +2498,7 @@ async fn forge_webhook(
     // moves with the target branch. Reviewing an action that changed only a
     // label would spend a full review re-reading code that did not change.
     if forge.review_intent(&action) == crate::forge::ReviewIntent::Skip {
-        info!(
+        debug!(
             "{} {} carries no new commits, skipping review",
             forge.name(),
             crate::forge::loggable(&action)
@@ -2512,7 +2512,7 @@ async fn forge_webhook(
     if let Some(ref author) = metadata.author
         && crate::forge::is_dependabot_author(author)
     {
-        info!(
+        debug!(
             "{} PR #{} by {} is from Dependabot, skipping review",
             forge.name(),
             metadata.pr_number,
@@ -2559,7 +2559,7 @@ pub async fn ingest_forge_pull_request(
     if let Some(ref author) = metadata.author
         && crate::forge::is_dependabot_author(author)
     {
-        info!(
+        debug!(
             "{} PR #{} by {} is from Dependabot, skipping review",
             forge_name,
             metadata.pr_number,

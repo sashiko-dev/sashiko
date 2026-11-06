@@ -25,7 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{Duration, sleep};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const LORE_MANIFEST_URL: &str = "https://lore.kernel.org/manifest.js.gz";
 /// The manifest is a few MiB compressed; anything larger is not lore.
@@ -383,7 +383,7 @@ impl Ingestor {
     }
 
     async fn find_epoch_urls(&self, list_id: &str) -> Result<Vec<(i32, String)>> {
-        info!("Fetching manifest to find epochs for {}", list_id);
+        debug!("Fetching manifest to find epochs for {}", list_id);
 
         // An in-process fetch is dropped together with the task that awaits
         // it, so cancellation cannot leave a shell pipeline running.
@@ -393,7 +393,7 @@ impl Ingestor {
             .context("lore manifest decompression task failed")??;
         let epochs = parse_epoch_urls(list_id, &manifest)?;
 
-        info!("Found {} epochs for {}", epochs.len(), list_id);
+        debug!("Found {} epochs for {}", epochs.len(), list_id);
         Ok(epochs)
     }
 
@@ -460,7 +460,7 @@ impl Ingestor {
                 }
             }
 
-            info!("Fetching latest changes in {:?} with depth {}", path, n);
+            debug!("Fetching latest changes in {:?} with depth {}", path, n);
             let output = bootstrap_fetch_command(path, n).output().await?;
 
             if !output.status.success() {
@@ -515,7 +515,7 @@ impl Ingestor {
             self.db.ensure_mailing_list(&name, group_name).await?;
             let last_known = self.db.get_last_article_num(group_name).await?;
 
-            info!(
+            debug!(
                 "Group {}: estimated count={}, low={}, high={}, last_known={}",
                 group_name, info.number, info.low, info.high, last_known
             );
@@ -533,7 +533,7 @@ impl Ingestor {
                 };
                 current = info.high.saturating_sub(overlap);
                 self.db.update_last_article_num(group_name, current).await?;
-                info!(
+                debug!(
                     "Initialized high-water mark to {} (overlap window: {})",
                     current, overlap
                 );
@@ -597,7 +597,7 @@ impl Ingestor {
                         // 423 is "No such article number in this group"
                         if msg.contains("423") {
                             if next_id >= info.high {
-                                info!(
+                                debug!(
                                     "Article {} missing (423) at tip for group {}, retrying later",
                                     next_id, group_name
                                 );
@@ -646,7 +646,7 @@ impl Ingestor {
         info!("Starting Git Ingestion from {:?}", path);
 
         // 1. Start git rev-list (Producer)
-        info!("Starting object enumeration...");
+        debug!("Starting object enumeration...");
         let mut rev_list_cmd = crate::git_cmd::in_dir_async(path);
         rev_list_cmd
             .arg("-c")
@@ -749,7 +749,7 @@ impl Ingestor {
 
                 processed_blobs += 1;
                 if processed_blobs % 1000 == 0 {
-                    info!("Processed {} blobs", processed_blobs);
+                    debug!("Processed {} blobs", processed_blobs);
                 }
             }
 
@@ -792,7 +792,7 @@ pub fn resolve_tracked_group(entry: &str, available_groups: Option<&[String]>) -
                 .iter()
                 .find(|g| g.as_str() == normalized_entry || g.ends_with(&suffix))
             {
-                info!(
+                debug!(
                     "Dynamically resolved short name '{}' to NNTP group '{}'",
                     entry, found
                 );

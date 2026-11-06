@@ -17,7 +17,7 @@ use crate::email_policy::EmailPolicyConfig;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 pub struct PatchworkWorker {
     db: Arc<Database>,
@@ -96,7 +96,7 @@ impl PatchworkWorker {
 
             match self.db.lock_pending_patchwork().await {
                 Ok(Some(entry)) => {
-                    info!(
+                    debug!(
                         "Processing patchwork check ID {} for msgid {}",
                         entry.id, entry.patch_msg_id
                     );
@@ -125,7 +125,7 @@ impl PatchworkWorker {
                         Err(e) => {
                             match &e {
                                 crate::patchwork::PatchworkCheckError::NotIndexedYet => {
-                                    info!("Patchwork check ID {} not ready yet: {}", entry.id, e);
+                                    debug!("Patchwork check ID {} not ready yet: {}", entry.id, e);
                                 }
                                 crate::patchwork::PatchworkCheckError::Api(_) => {
                                     error!("Patchwork check failed for ID {}: {}", entry.id, e);
