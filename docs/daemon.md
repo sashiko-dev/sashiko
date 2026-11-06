@@ -92,6 +92,8 @@ sashiko
 
 (Or from source: `cargo run --release --bin sashiko`)
 
+By default (`log_level = "info"`), the daemon logs concise lifecycle milestones, completed reviews and bug analyses, outbound deliveries, warnings, and errors while clamping third-party transport crates to `warn`. Pass `--debug` (or set `log_level = "debug"` in `Settings.toml`) to inspect per-turn AI requests, git/worktree mechanics, HTTP read queries, and polling cycles, or set `RUST_LOG` for fine-grained `tracing` target filters.
+
 ### Web Interface
 
 Once the daemon is running, it prints the local URL (default `http://localhost:8080`) where you can access the Web UI to browse patchsets, review statuses, inline findings, and bug tracking.

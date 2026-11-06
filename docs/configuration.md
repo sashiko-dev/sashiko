@@ -45,7 +45,7 @@ the [LLM Provider Configuration Guide](llm-providers.md).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `log_level` | string | `"info"` | Default log filter for the daemon (e.g. `"warn"`, `"info"`, `"debug"`). `RUST_LOG` overrides it when set, `--debug` forces `"info"`, and `sashiko review` defaults to `"warn"` regardless of this value. |
+| `log_level` | string | `"info"` | Default log filter for the daemon (e.g. `"warn"`, `"info"`, `"debug"`, or a full `EnvFilter` directive such as `"info,hyper=debug"`). Bare levels (`"info"`, `"debug"`, `"trace"`) apply to `sashiko` while clamping noisy third-party crates to `"warn"`. `RUST_LOG` overrides everything when set, `--debug` forces `"warn,sashiko=debug"`, and `sashiko review` / `sashiko scan` default to `"warn"` unless `--debug` or `RUST_LOG` is passed. |
 
 ### `[project]`
 
