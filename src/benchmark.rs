@@ -43,6 +43,8 @@ const DEFAULT_KERNEL_REPO_URL: &str =
     "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git";
 const MAX_MBOX_ARCHIVE_DECOMPRESSED_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_INLINE_REVIEW_PROMPT_CHARS: usize = 8_192;
+const MAX_SCAN_FIXTURE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SCAN_FIXTURE_FILES: usize = 1_024;
 
 // The two patterns below are constant literals using only basic RE2 syntax,
 // so Regex::new cannot fail on them; test_judge_regexes_compile forces both
@@ -196,6 +198,22 @@ pub struct BenchmarkEntry {
     pub acceptable_attributions: Vec<AcceptableAttribution>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lore_urls: Vec<String>,
+    /// Optional source file or directory fixture (relative to the benchmark
+    /// JSON file's parent directory) materialized into a temporary git
+    /// repository before running `sashiko scan`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_fixture: Option<String>,
+    /// Repository-relative file or directory paths passed to `sashiko scan`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scan_paths: Vec<String>,
+    /// Optional git revision passed to `sashiko scan --git-ref` when scanning
+    /// an existing repository (`scan_fixture` unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_ref: Option<String>,
+    /// Optional function or symbol name in the scanned target that anchors
+    /// this ground-truth defect or suppression claim for the judge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_function: Option<String>,
 }
 
 /// One optional credit on a benchmark entry: a reviewer, the version in
@@ -212,8 +230,100 @@ impl BenchmarkEntry {
         self.target_mbox.is_some() || !self.ancestor_mboxes.is_empty()
     }
 
+    pub fn is_scan(&self) -> bool {
+        self.scan_fixture
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || !self.scan_paths.is_empty()
+            || self
+                .scan_ref
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    pub fn requires_external_repo(&self) -> bool {
+        !(self.is_scan()
+            && self
+                .scan_fixture
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty()))
+    }
+
     fn label(&self) -> &str {
         self.case_id.as_deref().unwrap_or(&self.commit)
+    }
+
+    fn normalized_scan_target(&self) -> Result<(Option<String>, Vec<String>, Option<String>)> {
+        let label = self.label();
+        let fixture = match self.scan_fixture.as_deref() {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    resolve_benchmark_relative_path(Path::new("."), trimmed)
+                        .with_context(|| format!("case {label}: invalid scan_fixture"))?;
+                    Some(trimmed.trim_start_matches("./").to_string())
+                }
+            }
+            None => None,
+        };
+
+        let mut paths = Vec::with_capacity(self.scan_paths.len());
+        for raw_path in &self.scan_paths {
+            let clean = crate::scan::sanitize_scan_path(Path::new(raw_path))
+                .with_context(|| format!("case {label}: invalid scan_paths entry {raw_path:?}"))?;
+            paths.push(clean);
+        }
+
+        if fixture.is_none() && paths.is_empty() {
+            bail!(
+                "case {label}: scan entry without scan_fixture must specify at least one path in scan_paths"
+            );
+        }
+
+        let scan_ref = match self.scan_ref.as_deref() {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else if trimmed.starts_with('-') || trimmed.chars().any(char::is_control) {
+                    bail!("case {label}: invalid scan_ref {raw:?}");
+                } else {
+                    if fixture.is_some() && trimmed != "HEAD" {
+                        bail!(
+                            "case {label}: scan_ref cannot be set to {trimmed:?} when scan_fixture is used"
+                        );
+                    }
+                    Some(trimmed.to_string())
+                }
+            }
+            None => None,
+        };
+
+        Ok((fixture, paths, scan_ref))
+    }
+
+    pub fn validate_scan_fields(&self) -> Result<()> {
+        if !self.is_scan() {
+            return Ok(());
+        }
+        let label = self.label();
+        if self.is_versioned() {
+            bail!(
+                "case {label}: scan fields (scan_fixture, scan_paths, scan_ref) cannot be combined with versioned mbox fields"
+            );
+        }
+        if self.commit.trim().is_empty() {
+            bail!("case {label}: scan entry Commit key cannot be empty");
+        }
+        if matches!(
+            self.expected_behavior,
+            BenchmarkExpectedBehavior::DetectWithAttribution
+        ) {
+            bail!("case {label}: scan entry cannot expect prior-version reviewer attribution");
+        }
+        self.normalized_scan_target().map(|_| ())
     }
 
     /// Checks that the attribution ground truth is internally consistent.
@@ -355,13 +465,20 @@ impl BenchmarkEntry {
     }
 }
 
-/// Validates the attribution ground truth of every entry in a suite.
+/// Validates the ground truth and target configuration of every entry in a suite.
 pub fn validate_benchmark_entries(entries: &[BenchmarkEntry]) -> Result<()> {
-    let errors: Vec<String> = entries
-        .iter()
-        .filter_map(|e| e.validate_attribution_labels().err())
-        .map(|e| e.to_string())
-        .collect();
+    let mut errors: Vec<String> = Vec::new();
+    for entry in entries {
+        if let Err(err) = entry.validate_attribution_labels() {
+            errors.push(err.to_string());
+        }
+        if let Err(err) = entry.validate_scan_fields() {
+            errors.push(err.to_string());
+        }
+    }
+    if errors.is_empty() {
+        validate_scan_commit_groups(entries, &mut errors);
+    }
     if !errors.is_empty() {
         bail!(
             "Benchmark ground truth is invalid ({} entries):\n{}",
@@ -370,6 +487,36 @@ pub fn validate_benchmark_entries(entries: &[BenchmarkEntry]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn validate_scan_commit_groups(entries: &[BenchmarkEntry], errors: &mut Vec<String>) {
+    type ScanTargetTuple = (Option<String>, Vec<String>, Option<String>);
+    let mut seen: HashMap<String, Option<ScanTargetTuple>> = HashMap::new();
+    for entry in entries {
+        let key = entry.commit.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let current = if entry.is_scan() {
+            match entry.normalized_scan_target() {
+                Ok(t) => Some(t),
+                Err(_) => continue,
+            }
+        } else {
+            None
+        };
+        if let Some(prev) = seen.get(key) {
+            if prev != &current {
+                errors.push(format!(
+                    "case {}: Commit key {:?} mixes incompatible scan targets across entries",
+                    entry.label(),
+                    key
+                ));
+            }
+        } else {
+            seen.insert(key.to_string(), current);
+        }
+    }
 }
 
 /// Canonical identity for an expected reviewer, compared exactly against the
@@ -841,6 +988,9 @@ pub struct BenchmarkEntryResult {
     /// classic commit entries keep the original metric definitions.
     #[serde(default)]
     pub versioned: bool,
+    /// Active codebase scan entries also use strict summary semantics.
+    #[serde(default)]
+    pub scan: bool,
     pub explanation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_finding: Option<MatchedFindingSummary>,
@@ -1156,7 +1306,14 @@ pub async fn run_benchmark(
     let report_preexisting =
         options.report_preexisting || settings.linux_bug.enabled || auto_preexisting;
 
-    configure_benchmark_settings(&mut settings, &options, &paths, report_preexisting)?;
+    let needs_external_repo = entries.iter().any(BenchmarkEntry::requires_external_repo);
+    configure_benchmark_settings(
+        &mut settings,
+        &options,
+        &paths,
+        report_preexisting,
+        needs_external_repo,
+    )?;
 
     info!(
         "Benchmark run {} using preserved database {}",
@@ -1171,7 +1328,9 @@ pub async fn run_benchmark(
     db.migrate().await?;
     db.ensure_project_stamp(options.project).await?;
 
-    if options.project.uses_maintainers() && crate::maintainers::get_global_maintainers().is_none()
+    if options.project.uses_maintainers()
+        && !settings.git.repository_path.trim().is_empty()
+        && crate::maintainers::get_global_maintainers().is_none()
     {
         let repo_path = PathBuf::from(&settings.git.repository_path);
         if let Ok(idx) = crate::maintainers::MaintainersIndex::from_top_of_trunk(&repo_path) {
@@ -1188,15 +1347,21 @@ pub async fn run_benchmark(
         if entries.iter().any(BenchmarkEntry::is_versioned) {
             ingest_versioned_benchmark_entries(&db, &options.file, &entries).await?;
         }
-        run_benchmark_reviews(
-            &db,
-            &settings,
-            &options,
-            &paths,
-            report_preexisting,
-            &unique_commits,
-        )
-        .await?;
+        let review_commits = deduplicate_review_benchmark_commits(&entries);
+        if !review_commits.is_empty() {
+            run_benchmark_reviews(
+                &db,
+                &settings,
+                &options,
+                &paths,
+                report_preexisting,
+                &review_commits,
+            )
+            .await?;
+        }
+        if entries.iter().any(BenchmarkEntry::is_scan) {
+            run_benchmark_scans(&db, &settings, &options, &paths, &entries).await?;
+        }
     }
 
     info!("Evaluating {} benchmark entries...", entries.len());
@@ -1262,6 +1427,7 @@ fn configure_benchmark_settings(
     options: &BenchmarkOptions,
     paths: &BenchmarkRunPaths,
     report_preexisting: bool,
+    needs_external_repo: bool,
 ) -> Result<()> {
     settings.project.kind = Some(options.project);
     settings.database.url = paths.db_path.to_string_lossy().into_owned();
@@ -1282,7 +1448,7 @@ fn configure_benchmark_settings(
         {
             settings.git.repository_path = repo.to_string();
         }
-        if settings.git.repository_path.trim().is_empty() {
+        if needs_external_repo && settings.git.repository_path.trim().is_empty() {
             bail!(
                 "[git] repository_path must be set in Settings.toml or provided via --repo <path> \
                  to run benchmark reviews"
@@ -1301,7 +1467,22 @@ fn deduplicate_classic_benchmark_commits(entries: &[BenchmarkEntry]) -> Vec<Stri
     let mut seen = BTreeSet::new();
     let mut unique = Vec::new();
     for entry in entries {
-        if entry.is_versioned() {
+        if entry.is_versioned() || entry.is_scan() {
+            continue;
+        }
+        let trimmed = entry.commit.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            unique.push(trimmed.to_string());
+        }
+    }
+    unique
+}
+
+fn deduplicate_review_benchmark_commits(entries: &[BenchmarkEntry]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut unique = Vec::new();
+    for entry in entries {
+        if entry.is_scan() {
             continue;
         }
         let trimmed = entry.commit.trim();
@@ -1682,6 +1863,593 @@ async fn run_benchmark_reviews(
     {
         warn!(
             "Failed to remove temporary benchmark worktree dir {:?}: {}",
+            paths.worktree_dir, e
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ScanTargetSpec {
+    commit_key: String,
+    scan_fixture: Option<String>,
+    scan_paths: Vec<String>,
+    scan_ref: Option<String>,
+}
+
+fn collect_unique_scan_targets(entries: &[BenchmarkEntry]) -> Result<Vec<ScanTargetSpec>> {
+    let mut seen = BTreeSet::new();
+    let mut targets = Vec::new();
+    for entry in entries {
+        if !entry.is_scan() {
+            continue;
+        }
+        let commit_key = entry.commit.trim().to_string();
+        if commit_key.is_empty() || !seen.insert(commit_key.clone()) {
+            continue;
+        }
+        let (scan_fixture, scan_paths, scan_ref) = entry.normalized_scan_target()?;
+        targets.push(ScanTargetSpec {
+            commit_key,
+            scan_fixture,
+            scan_paths,
+            scan_ref,
+        });
+    }
+    Ok(targets)
+}
+
+fn copy_fixture_dir_recursive(
+    src_dir: &Path,
+    dst_dir: &Path,
+    files_copied: &mut usize,
+    bytes_copied: &mut u64,
+) -> Result<()> {
+    std::fs::create_dir_all(dst_dir)?;
+    for dir_entry in std::fs::read_dir(src_dir)? {
+        let dir_entry = dir_entry?;
+        let name = dir_entry.file_name();
+        if name == ".git" {
+            continue;
+        }
+        let src_path = dir_entry.path();
+        let meta = std::fs::symlink_metadata(&src_path)?;
+        if meta.file_type().is_symlink() {
+            bail!(
+                "Scan fixture must not contain symlinks: {}",
+                src_path.display()
+            );
+        }
+        let dst_path = dst_dir.join(&name);
+        if meta.is_dir() {
+            copy_fixture_dir_recursive(&src_path, &dst_path, files_copied, bytes_copied)?;
+        } else if meta.is_file() {
+            *files_copied += 1;
+            if *files_copied > MAX_SCAN_FIXTURE_FILES {
+                bail!(
+                    "Scan fixture exceeds {} file safety cap",
+                    MAX_SCAN_FIXTURE_FILES
+                );
+            }
+            *bytes_copied = bytes_copied.saturating_add(meta.len());
+            if *bytes_copied > MAX_SCAN_FIXTURE_BYTES {
+                bail!(
+                    "Scan fixture exceeds {} byte safety cap",
+                    MAX_SCAN_FIXTURE_BYTES
+                );
+            }
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_fixture_tree_blocking(
+    src: &Path,
+    dst_root: &Path,
+    scan_paths: &[String],
+) -> Result<Vec<PathBuf>> {
+    let meta = std::fs::symlink_metadata(src)
+        .with_context(|| format!("Scan fixture not found at {}", src.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!("Scan fixture must not be a symlink: {}", src.display());
+    }
+    if dst_root.exists() {
+        std::fs::remove_dir_all(dst_root)?;
+    }
+    std::fs::create_dir_all(dst_root)?;
+
+    if meta.is_file() {
+        if meta.len() > MAX_SCAN_FIXTURE_BYTES {
+            bail!(
+                "Scan fixture {} exceeds {} byte safety cap",
+                src.display(),
+                MAX_SCAN_FIXTURE_BYTES
+            );
+        }
+        if scan_paths.len() > 1 {
+            bail!(
+                "Single-file scan_fixture {} cannot map to multiple scan_paths",
+                src.display()
+            );
+        }
+        let rel = match scan_paths
+            .first()
+            .map(|first| crate::scan::sanitize_scan_path(Path::new(first)))
+            .transpose()?
+            .filter(|p| p != ".")
+        {
+            Some(sanitized) => sanitized,
+            None => {
+                let fname = src
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow!("Invalid scan_fixture filename {}", src.display()))?;
+                crate::scan::sanitize_scan_path(Path::new(fname))?
+            }
+        };
+        let dst_file = dst_root.join(&rel);
+        if let Some(parent) = dst_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, &dst_file)?;
+        return Ok(vec![PathBuf::from(rel)]);
+    }
+
+    if meta.is_dir() {
+        let mut files_copied = 0usize;
+        let mut bytes_copied = 0u64;
+        copy_fixture_dir_recursive(src, dst_root, &mut files_copied, &mut bytes_copied)?;
+        if files_copied == 0 {
+            bail!(
+                "Scan fixture directory {} contains no regular files",
+                src.display()
+            );
+        }
+        let resolved = if scan_paths.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            scan_paths.iter().map(PathBuf::from).collect()
+        };
+        return Ok(resolved);
+    }
+
+    bail!(
+        "Scan fixture {} must be a regular file or directory",
+        src.display()
+    )
+}
+
+async fn init_git_repo_for_scan_fixture(repo_dir: &Path) -> Result<()> {
+    let init_out = crate::git_cmd::in_dir_async(repo_dir)
+        .arg("init")
+        .arg("-q")
+        .output()
+        .await
+        .context("Failed to spawn git init for scan fixture")?;
+    if !init_out.status.success() {
+        bail!(
+            "git init failed for scan fixture: {}",
+            String::from_utf8_lossy(&init_out.stderr).trim()
+        );
+    }
+
+    let add_out = crate::git_cmd::in_dir_async(repo_dir)
+        .args(["add", "--", "."])
+        .output()
+        .await
+        .context("Failed to stage scan fixture files")?;
+    if !add_out.status.success() {
+        bail!(
+            "git add failed for scan fixture: {}",
+            String::from_utf8_lossy(&add_out.stderr).trim()
+        );
+    }
+
+    let commit_out = crate::git_cmd::in_dir_async(repo_dir)
+        .args([
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "benchmark scan fixture",
+        ])
+        .env("GIT_AUTHOR_NAME", "Sashiko Benchmark")
+        .env("GIT_AUTHOR_EMAIL", "benchmark@sashiko.local")
+        .env("GIT_COMMITTER_NAME", "Sashiko Benchmark")
+        .env("GIT_COMMITTER_EMAIL", "benchmark@sashiko.local")
+        .output()
+        .await
+        .context("Failed to commit scan fixture files")?;
+    if !commit_out.status.success() {
+        bail!(
+            "git commit failed for scan fixture: {}",
+            String::from_utf8_lossy(&commit_out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) async fn provision_scan_fixture_repo(
+    suite_dir: &Path,
+    worktree_dir: &Path,
+    commit_key: &str,
+    fixture_rel: &str,
+    scan_paths: &[String],
+) -> Result<(PathBuf, Vec<PathBuf>)> {
+    let fixture_src = resolve_benchmark_relative_path(suite_dir, fixture_rel)?;
+    let safe_tag = sanitize_suite_name(Path::new(commit_key));
+    let repo_dir = worktree_dir.join(format!("scan_fixture_{safe_tag}"));
+
+    let src_owned = fixture_src.clone();
+    let repo_owned = repo_dir.clone();
+    let paths_owned = scan_paths.to_vec();
+    let resolved_paths = tokio::task::spawn_blocking(move || {
+        copy_fixture_tree_blocking(&src_owned, &repo_owned, &paths_owned)
+    })
+    .await
+    .context("Scan fixture copy task panicked")??;
+
+    init_git_repo_for_scan_fixture(&repo_dir).await?;
+    Ok((repo_dir, resolved_paths))
+}
+
+fn format_scan_finding_locations(locations: &Value) -> String {
+    let Some(arr) = locations.as_array() else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    for loc in arr {
+        let file = loc.get("file").and_then(Value::as_str).unwrap_or("").trim();
+        let line = loc.get("line").and_then(Value::as_u64);
+        let sym = loc
+            .get("function_or_symbol")
+            .or_else(|| loc.get("function"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let label = match (!file.is_empty(), line, !sym.is_empty()) {
+            (true, Some(l), true) => format!("{file}:{l} in {sym}"),
+            (true, None, true) => format!("{file} in {sym}"),
+            (true, Some(l), false) => format!("{file}:{l}"),
+            (false, _, true) => sym.to_string(),
+            (true, None, false) => file.to_string(),
+            _ => continue,
+        };
+        parts.push(label);
+    }
+    parts.join("; ")
+}
+
+fn build_scan_output_json(summary: &crate::scan::ScanSummary) -> Value {
+    let findings: Vec<Value> = summary
+        .findings
+        .iter()
+        .map(|bug| {
+            let loc_str = format_scan_finding_locations(&bug.locations);
+            let title = bug.canonical_title.trim();
+            let desc = bug.canonical_description.trim();
+            let problem = match (!loc_str.is_empty(), !desc.is_empty()) {
+                (true, true) => format!("{title} [{loc_str}] — {desc}"),
+                (true, false) => format!("{title} [{loc_str}]"),
+                (false, true) => format!("{title} — {desc}"),
+                (false, false) => title.to_string(),
+            };
+            serde_json::json!({
+                "problem": problem,
+                "severity": bug.severity,
+                "severity_explanation": bug.severity_explanation,
+                "preexisting": false,
+                "origin": "linux_scan",
+                "stages": ["linux_scan", "linux_bug"],
+                "introduced_in_commit": bug.introduced_in_commit,
+                "locations": bug.locations,
+            })
+        })
+        .collect();
+
+    let concerns_count = findings.len() + summary.dismissed_concerns.len();
+    serde_json::json!({
+        "findings": findings,
+        "dismissed_concerns": summary.dismissed_concerns,
+        "concerns_count": concerns_count,
+        "dismissed_concerns_count": summary.dismissed_concerns.len(),
+        "scan_summary": {
+            "target_sha": summary.target_sha,
+            "files_scanned": summary.files_scanned,
+            "chunks_total": summary.chunks_total,
+            "chunks_analyzed": summary.chunks_analyzed,
+            "chunks_early_exited": summary.chunks_early_exited,
+            "chunks_failed": summary.chunks_failed,
+            "candidates_failed": summary.candidates_failed,
+        }
+    })
+}
+
+pub(crate) async fn persist_scan_benchmark_outcome(
+    db: &Database,
+    settings: &Settings,
+    commit_key: &str,
+    subject: &str,
+    scan_result: Result<crate::scan::ScanSummary, String>,
+    existing_review_id: Option<i64>,
+) -> Result<()> {
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if lookup_benchmark_patch_row(db, commit_key).await?.is_none() {
+        persist_benchmark_patch(
+            db,
+            commit_key,
+            commit_key,
+            subject,
+            "Sashiko Scan Benchmark <benchmark@sashiko.local>",
+            subject,
+            "",
+            None,
+            now_ts,
+            1,
+            1,
+        )
+        .await?;
+    }
+    let (patch_id, patchset_id, _, _, _) = lookup_benchmark_patch_row(db, commit_key)
+        .await?
+        .ok_or_else(|| anyhow!("Missing benchmark patch row for scan target {commit_key}"))?;
+
+    let review_id = match existing_review_id {
+        Some(id) => id,
+        None => {
+            db.create_review(
+                patchset_id,
+                Some(patch_id),
+                &settings.ai.provider,
+                &settings.ai.model,
+                None,
+                Some(crate::prompt_bundle::PROMPT_BUNDLE_REVISION),
+            )
+            .await?
+        }
+    };
+
+    match scan_result {
+        Ok(summary) if summary.chunks_failed == 0 && summary.candidates_failed == 0 => {
+            let output_val = build_scan_output_json(&summary);
+            let output_str = serde_json::to_string(&output_val)?;
+            let interaction_id = uuid::Uuid::new_v4().to_string();
+            let summary_line = format!(
+                "Scanned {} file(s) ({} chunks analyzed, {} early-exited, {} failed): {} verified finding(s), {} dismissed concern(s).",
+                summary.files_scanned,
+                summary.chunks_analyzed,
+                summary.chunks_early_exited,
+                summary.chunks_failed,
+                summary.findings.len(),
+                summary.dismissed_concerns.len(),
+            );
+            db.create_ai_interaction(crate::db::AiInteractionParams {
+                id: &interaction_id,
+                parent_id: None,
+                workflow_id: Some("linux_scan"),
+                provider: &settings.ai.provider,
+                model: &settings.ai.model,
+                input: subject,
+                output: &output_str,
+                tokens_in: summary.tokens_in.min(u32::MAX as usize) as u32,
+                tokens_out: summary.tokens_out.min(u32::MAX as usize) as u32,
+                tokens_cached: summary.tokens_cached.min(u32::MAX as usize) as u32,
+            })
+            .await?;
+            db.complete_review(
+                review_id,
+                "Reviewed",
+                &summary_line,
+                Some(&summary_line),
+                Some(&interaction_id),
+                None,
+                None,
+            )
+            .await?;
+            db.execute(
+                "UPDATE patches SET status = 'Reviewed', apply_error = NULL WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+            db.execute(
+                "UPDATE patchsets SET status = 'Reviewed', failed_reason = NULL WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        }
+        Ok(summary) => {
+            let reason = format!(
+                "Scan incomplete: {} of {} chunk(s) and {} candidate verification(s) failed",
+                summary.chunks_failed, summary.chunks_total, summary.candidates_failed
+            );
+            db.complete_review(
+                review_id,
+                "Failed",
+                &reason,
+                Some(&reason),
+                None,
+                None,
+                None,
+            )
+            .await?;
+            db.execute(
+                "UPDATE patches SET status = 'Failed' WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+            db.execute(
+                "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE id = ?",
+                libsql::params![reason, patchset_id],
+            )
+            .await?;
+        }
+        Err(err_msg) => {
+            db.complete_review(
+                review_id,
+                "Failed",
+                &err_msg,
+                Some(&err_msg),
+                None,
+                None,
+                None,
+            )
+            .await?;
+            db.execute(
+                "UPDATE patches SET status = 'Failed' WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+            db.execute(
+                "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE id = ?",
+                libsql::params![err_msg, patchset_id],
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_benchmark_scans(
+    db: &Arc<Database>,
+    settings: &Settings,
+    options: &BenchmarkOptions,
+    paths: &BenchmarkRunPaths,
+    entries: &[BenchmarkEntry],
+) -> Result<()> {
+    let targets = collect_unique_scan_targets(entries)?;
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let suite_dir = options
+        .file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    info!(
+        "--- Phase 2 (Scan): Running sashiko scan across {} unique target(s) (concurrency: {}) ---",
+        targets.len(),
+        settings.review.concurrency
+    );
+
+    for spec in &targets {
+        if commit_has_completed_review(db, &spec.commit_key)
+            .await
+            .unwrap_or(false)
+        {
+            info!(
+                "Scan benchmark target {} already has a completed scan in DB, skipping",
+                spec.commit_key
+            );
+            continue;
+        }
+
+        let subject = format!(
+            "scan {}: {}",
+            spec.commit_key,
+            if spec.scan_paths.is_empty() {
+                spec.scan_fixture.as_deref().unwrap_or(".").to_string()
+            } else {
+                spec.scan_paths.join(", ")
+            }
+        );
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        persist_benchmark_patch(
+            db,
+            &spec.commit_key,
+            &spec.commit_key,
+            &subject,
+            "Sashiko Scan Benchmark <benchmark@sashiko.local>",
+            &subject,
+            "",
+            None,
+            now_ts,
+            1,
+            1,
+        )
+        .await?;
+        let (patch_id, patchset_id, _, _, _) = lookup_benchmark_patch_row(db, &spec.commit_key)
+            .await?
+            .ok_or_else(|| anyhow!("Failed to look up scan benchmark patch {}", spec.commit_key))?;
+        let review_id = db
+            .create_review(
+                patchset_id,
+                Some(patch_id),
+                &settings.ai.provider,
+                &settings.ai.model,
+                None,
+                Some(crate::prompt_bundle::PROMPT_BUNDLE_REVISION),
+            )
+            .await?;
+
+        let prep: Result<(PathBuf, Vec<PathBuf>, Option<String>)> = match spec.scan_fixture {
+            Some(ref rel) => provision_scan_fixture_repo(
+                suite_dir,
+                &paths.worktree_dir,
+                &spec.commit_key,
+                rel,
+                &spec.scan_paths,
+            )
+            .await
+            .map(|(repo, scan_paths)| (repo, scan_paths, Some("HEAD".to_string()))),
+            None => {
+                let repo = PathBuf::from(&settings.git.repository_path);
+                let scan_paths = spec.scan_paths.iter().map(PathBuf::from).collect();
+                let git_ref = spec
+                    .scan_ref
+                    .clone()
+                    .or_else(|| Some(spec.commit_key.clone()));
+                Ok((repo, scan_paths, git_ref))
+            }
+        };
+
+        let scan_outcome = match prep {
+            Ok((repo_path, scan_paths, git_ref)) => {
+                let scan_opts = crate::scan::ScanOptions {
+                    project: options.project,
+                    repo_path,
+                    paths: scan_paths,
+                    git_ref,
+                    concurrency: settings.review.concurrency.max(1),
+                    max_files: 10_000,
+                    max_chunks: None,
+                    exclude: Vec::new(),
+                    submit_bugs: false,
+                    prompts: options.prompts.clone(),
+                    custom_prompt: None,
+                    stages: None,
+                    effort: settings.effective_effort(),
+                };
+                crate::scan::run_scan(scan_opts, settings, None)
+                    .await
+                    .map_err(|e| format!("{e:#}"))
+            }
+            Err(e) => Err(format!("{e:#}")),
+        };
+
+        persist_scan_benchmark_outcome(
+            db,
+            settings,
+            &spec.commit_key,
+            &subject,
+            scan_outcome,
+            Some(review_id),
+        )
+        .await?;
+    }
+
+    if paths.worktree_dir.exists()
+        && let Err(e) = std::fs::remove_dir_all(&paths.worktree_dir)
+    {
+        warn!(
+            "Failed to remove temporary scan benchmark worktree dir {:?}: {}",
             paths.worktree_dir, e
         );
     }
@@ -3180,6 +3948,7 @@ fn empty_entry_result(
             .then_some(AttributionOutcome::Missing),
         suppressed_with_no_findings: false,
         versioned: entry.is_versioned(),
+        scan: entry.is_scan(),
         explanation: explanation.to_string(),
         matched_finding: None,
         miss_reason: miss_reason.map(str::to_string),
@@ -3259,6 +4028,7 @@ fn build_entry_result_from_data(
         attribution,
         suppressed_with_no_findings: false,
         versioned: entry.is_versioned(),
+        scan: entry.is_scan(),
         explanation,
         matched_finding,
         miss_reason,
@@ -3334,14 +4104,31 @@ pub(crate) fn build_judge_prompt_for_entry(
         }
     }
 
+    let target_fn_block = entry
+        .target_function
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|fn_name| {
+            format!(
+                "Target Function / Symbol: `{fn_name}`\n(When evaluating a multi-function scan report, only match findings or dismissed concerns that apply to `{fn_name}` or its direct call path rather than unrelated defects in other functions.)\n\n"
+            )
+        })
+        .unwrap_or_default();
+
     // Attribution is scored deterministically from structured fields
     // (`score_attribution`); the judge only decides whether a finding matches.
     // For suppression entries the description is a refuted claim, so the judge
     // is told explicitly that matching it means a false positive.
     let (claim_heading, claim_preamble, task_target) = if entry.expected_behavior.is_suppression() {
+        let preamble = if entry.is_scan() {
+            "The description below is a false-positive trap claim about clean/properly-guarded code in the scanned target: it is NOT a real defect in the code. A correct scan does not report it. Your task is to detect whether the tool nevertheless reported this false claim as an active defect; findings about unrelated functions or unrelated real defects elsewhere in the scanned file do not count.\n\n"
+        } else {
+            "The description below is a claim that an earlier reviewer made about a previous version of this patch and that has been refuted: it is NOT a real defect in the reviewed code. A correct review does not report it. Your task is to detect whether the tool nevertheless reported this false claim. Use `\"DETECTED\"` or `\"PARTIALLY_DETECTED\"` only when a finding asserts this same refuted claim as an active defect; findings about unrelated issues do not count.\n\n"
+        };
         (
             "Refuted Claim (FALSE; must NOT be reported):",
-            "The description below is a claim that an earlier reviewer made about a previous version of this patch and that has been refuted: it is NOT a real defect in the reviewed code. A correct review does not report it. Your task is to detect whether the tool nevertheless reported this false claim. Use `\"DETECTED\"` or `\"PARTIALLY_DETECTED\"` only when a finding asserts this same refuted claim as an active defect; findings about unrelated issues do not count.\n\n",
+            preamble,
             "the Refuted Claim (asserting it as an active defect)",
         )
     } else {
@@ -3355,6 +4142,7 @@ pub(crate) fn build_judge_prompt_for_entry(
     format!(
         "You are evaluating an automated Linux kernel code review tool against a target claim or ground-truth bug.\n\n\
         {claim_preamble}\
+        {target_fn_block}\
         {claim_heading}\n\
         {problem_description}\n\n\
         Reported Findings:\n\
@@ -3628,11 +4416,11 @@ pub(crate) fn build_benchmark_summary(
             .unwrap_or("unspecified")
             .to_string();
 
-        // Versioned entries: every entry that was not skipped for lacking a
-        // description is scored, and unreviewed entries and failed judge
-        // evaluations count as failures. Classic entries keep the original
-        // semantics, which only score judged outcomes.
-        let strict = res.versioned;
+        // Versioned and scan entries: every entry that was not skipped for
+        // lacking a description is scored, and unreviewed entries and failed
+        // judge evaluations count as failures. Classic entries keep the
+        // original semantics, which only score judged outcomes.
+        let strict = res.versioned || res.scan;
         let is_scored = if strict {
             res.status != "SKIPPED"
         } else {
@@ -4077,7 +4865,8 @@ pub fn format_benchmark_summary_markdown(report: &BenchmarkRunReport) -> String 
         }
     ));
     let any_versioned = report.results.iter().any(|r| r.versioned);
-    if any_versioned {
+    let any_strict = any_versioned || report.results.iter().any(|r| r.scan);
+    if any_strict {
         out.push_str(&format!(
             "| Not Reviewed / Failed (scored as failures) | {} | - |\n",
             s.not_reviewed
@@ -4098,7 +4887,15 @@ pub fn format_benchmark_summary_markdown(report: &BenchmarkRunReport) -> String 
     ));
 
     if s.suppression_evaluated_entries > 0 || s.attribution_expected_entries > 0 {
-        out.push_str("## Versioned Feedback Metrics\n\n");
+        let show_attribution = any_versioned
+            || s.attribution_expected_entries > 0
+            || s.unexpected_attributions > 0
+            || s.attribution_acceptable > 0;
+        if show_attribution {
+            out.push_str("## Versioned Feedback Metrics\n\n");
+        } else {
+            out.push_str("## False-Positive Suppression\n\n");
+        }
         out.push_str("| Metric | Count | Rate |\n|---|---:|---:|\n");
         if s.attribution_expected_entries > 0 {
             let pct = |n: usize| (n as f64 * 100.0) / s.attribution_expected_entries as f64;
@@ -4117,20 +4914,22 @@ pub fn format_benchmark_summary_markdown(report: &BenchmarkRunReport) -> String 
                 pct(s.attribution_missing)
             ));
         }
-        out.push_str(&format!(
-            "| Unexpected Attributions (no prior credit expected) | {} | - |\n",
-            s.unexpected_attributions
-        ));
-        out.push_str(&format!(
-            "| Acceptable Attributions (optional credit, not scored) | {} | - |\n",
-            s.attribution_acceptable
-        ));
-        out.push_str(&format!(
-            "| Attribution Precision (correct / emitted) | {} / {} | {:.1}% |\n",
-            s.attributed,
-            s.attributed + s.attribution_wrong + s.unexpected_attributions,
-            s.attribution_precision_pct
-        ));
+        if show_attribution {
+            out.push_str(&format!(
+                "| Unexpected Attributions (no prior credit expected) | {} | - |\n",
+                s.unexpected_attributions
+            ));
+            out.push_str(&format!(
+                "| Acceptable Attributions (optional credit, not scored) | {} | - |\n",
+                s.attribution_acceptable
+            ));
+            out.push_str(&format!(
+                "| Attribution Precision (correct / emitted) | {} / {} | {:.1}% |\n",
+                s.attributed,
+                s.attributed + s.attribution_wrong + s.unexpected_attributions,
+                s.attribution_precision_pct
+            ));
+        }
         if s.suppression_evaluated_entries > 0 {
             out.push_str(&format!(
                 "| **False-Positive Suppression** | **{} / {}** | **{:.1}%** |\n",
@@ -6472,5 +7271,320 @@ mod tests {
             failures.join("\n")
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_validate_scan_benchmark_entries_accepts_shared_target_and_rejects_bad_configs() {
+        let valid_entries = vec![
+            BenchmarkEntry {
+                commit: "scan_corpus".to_string(),
+                case_id: Some("scan-01".to_string()),
+                category: Some("use_after_free".to_string()),
+                scan_fixture: Some("scan_corpus.c".to_string()),
+                scan_paths: vec!["drivers/misc/scan_corpus.c".to_string()],
+                target_function: Some("kcorp_nci_unregister_device".to_string()),
+                problem_description: Some("UAF on workqueue".to_string()),
+                ..Default::default()
+            },
+            BenchmarkEntry {
+                commit: "scan_corpus".to_string(),
+                case_id: Some("scan-fp-01".to_string()),
+                category: Some("false_positive_trap".to_string()),
+                expected_behavior: BenchmarkExpectedBehavior::SuppressFalsePositive,
+                scan_fixture: Some("scan_corpus.c".to_string()),
+                scan_paths: vec!["drivers/misc/scan_corpus.c".to_string()],
+                target_function: Some("kcorp_bt_adapter_unregister".to_string()),
+                problem_description: Some("Safe teardown order".to_string()),
+                ..Default::default()
+            },
+        ];
+        validate_benchmark_entries(&valid_entries).expect("valid shared scan target");
+
+        let traversal = vec![BenchmarkEntry {
+            commit: "scan_corpus".to_string(),
+            scan_fixture: Some("../escape.c".to_string()),
+            ..Default::default()
+        }];
+        assert!(validate_benchmark_entries(&traversal).is_err());
+
+        let bad_ref = vec![BenchmarkEntry {
+            commit: "abc123456789".to_string(),
+            scan_paths: vec!["fs/btrfs/raid56.c".to_string()],
+            scan_ref: Some("--upload-pack=evil".to_string()),
+            ..Default::default()
+        }];
+        assert!(validate_benchmark_entries(&bad_ref).is_err());
+
+        let mixed_versioned = vec![BenchmarkEntry {
+            commit: "msg@id".to_string(),
+            target_mbox: Some("v2.mbox".to_string()),
+            scan_fixture: Some("scan_corpus.c".to_string()),
+            ..Default::default()
+        }];
+        assert!(validate_benchmark_entries(&mixed_versioned).is_err());
+
+        let conflicting_group = vec![
+            valid_entries[0].clone(),
+            BenchmarkEntry {
+                scan_paths: vec!["drivers/misc/other.c".to_string()],
+                ..valid_entries[1].clone()
+            },
+        ];
+        assert!(validate_benchmark_entries(&conflicting_group).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_provision_scan_fixture_repo_materializes_git_repo_and_rejects_symlinks()
+    -> Result<()> {
+        let temp = tempdir()?;
+        let suite_dir = temp.path().join("suite");
+        let worktree_dir = temp.path().join("worktrees");
+        std::fs::create_dir_all(&suite_dir)?;
+        let c_file = suite_dir.join("sample.c");
+        std::fs::write(&c_file, "int sample_fn(int x) { return x + 1; }\n")?;
+
+        let (repo_dir, paths) = provision_scan_fixture_repo(
+            &suite_dir,
+            &worktree_dir,
+            "scan_sample",
+            "sample.c",
+            &["drivers/misc/sample.c".to_string()],
+        )
+        .await?;
+        assert_eq!(paths, vec![PathBuf::from("drivers/misc/sample.c")]);
+        let sha = crate::scan::resolve_scan_revision(&repo_dir, Some("HEAD")).await?;
+        assert_eq!(sha.len(), 40);
+        let targets = crate::scan::resolve_scan_targets(&repo_dir, &sha, &paths, &[], 100).await?;
+        assert_eq!(targets, vec!["drivers/misc/sample.c".to_string()]);
+
+        #[cfg(unix)]
+        {
+            let link_path = suite_dir.join("evil_link.c");
+            std::os::unix::fs::symlink(&c_file, &link_path)?;
+            let err = provision_scan_fixture_repo(
+                &suite_dir,
+                &worktree_dir,
+                "scan_symlink",
+                "evil_link.c",
+                &[],
+            )
+            .await
+            .expect_err("symlink fixture must be rejected");
+            assert!(err.to_string().contains("symlink"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_persist_scan_benchmark_outcome_roundtrips_and_scores_multi_bug_file() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("scan_bench.db");
+        let mut settings = Settings::new().unwrap_or_else(|_| {
+            toml::from_str(
+                r#"
+                [ai]
+                provider = "gemini"
+                model = "gemini-3.1-pro-preview"
+                max_interactions = 10
+                temperature = 1.0
+                [database]
+                url = ""
+                token = ""
+                [git]
+                repository_path = ""
+                [review]
+                concurrency = 2
+                "#,
+            )
+            .expect("valid minimal settings")
+        });
+        settings.database.url = db_path.to_string_lossy().into_owned();
+        settings.database.token = String::new();
+
+        let db = Database::new(&settings.database).await?;
+        db.migrate().await?;
+
+        let scan_summary = crate::scan::ScanSummary {
+            target_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            files_scanned: 1,
+            chunks_total: 4,
+            chunks_analyzed: 4,
+            chunks_early_exited: 0,
+            chunks_failed: 0,
+            candidates_failed: 0,
+            findings: vec![
+                crate::scan::VerifiedScanBug {
+                    canonical_title: "Use-after-free of cmd_wq in kcorp_nci_unregister_device"
+                        .to_string(),
+                    canonical_description:
+                        "destroy_workqueue runs before rfkill unregister callback.".to_string(),
+                    severity: "High".to_string(),
+                    severity_explanation: "Kernel UAF on device teardown.".to_string(),
+                    subsystems: vec!["nfc".to_string()],
+                    source_files: vec!["drivers/misc/scan_corpus.c".to_string()],
+                    locations: serde_json::json!([{
+                        "file": "drivers/misc/scan_corpus.c",
+                        "line": 120,
+                        "function_or_symbol": "kcorp_nci_unregister_device"
+                    }]),
+                    introduced_in_commit: None,
+                    verified_on_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                    submitted_bugid: None,
+                    duplicate_of_bugid: None,
+                },
+                crate::scan::VerifiedScanBug {
+                    canonical_title: "Buffer overflow in kcorp_t7xx_dpmaif_add_frag".to_string(),
+                    canonical_description: "Missing MAX_SKB_FRAGS check.".to_string(),
+                    severity: "Critical".to_string(),
+                    severity_explanation: "Out-of-bounds write on RX path.".to_string(),
+                    subsystems: vec!["net/wwan".to_string()],
+                    source_files: vec!["drivers/misc/scan_corpus.c".to_string()],
+                    locations: serde_json::json!([{
+                        "file": "drivers/misc/scan_corpus.c",
+                        "line": 410,
+                        "function_or_symbol": "kcorp_t7xx_dpmaif_add_frag"
+                    }]),
+                    introduced_in_commit: None,
+                    verified_on_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                    submitted_bugid: None,
+                    duplicate_of_bugid: None,
+                },
+            ],
+            dismissed_concerns: vec![serde_json::json!({
+                "origin": "linux_bug_verification",
+                "description": "Suspected race in kcorp_route_cache_replace",
+                "reasoning": "kfree_rcu waits for RCU grace period"
+            })],
+            tokens_in: 42_000,
+            tokens_out: 4_200,
+            tokens_cached: 21_000,
+        };
+
+        persist_scan_benchmark_outcome(
+            &db,
+            &settings,
+            "scan_corpus",
+            "scan scan_corpus: drivers/misc/scan_corpus.c",
+            Ok(scan_summary),
+            None,
+        )
+        .await?;
+
+        let loaded = load_commit_review_data(&db, "scan_corpus").await?;
+        assert!(loaded.is_completed_review());
+        assert_eq!(loaded.findings.len(), 2);
+        assert_eq!(loaded.dismissed_concerns.len(), 1);
+        assert_eq!(loaded.tokens_in, 42_000);
+        assert!(
+            loaded.findings[0]
+                .problem
+                .contains("kcorp_nci_unregister_device")
+        );
+
+        // Verify partial chunk failure or candidate verification failure is recorded as Failed.
+        let partial_chunk_fail = crate::scan::ScanSummary {
+            chunks_total: 3,
+            chunks_analyzed: 2,
+            chunks_failed: 1,
+            ..Default::default()
+        };
+        persist_scan_benchmark_outcome(
+            &db,
+            &settings,
+            "scan_partial_chunk_fail",
+            "scan scan_partial_chunk_fail: drivers/misc/scan_corpus.c",
+            Ok(partial_chunk_fail),
+            None,
+        )
+        .await?;
+        assert!(
+            !load_commit_review_data(&db, "scan_partial_chunk_fail")
+                .await?
+                .is_completed_review()
+        );
+
+        let cand_fail = crate::scan::ScanSummary {
+            chunks_total: 3,
+            chunks_analyzed: 3,
+            chunks_failed: 0,
+            candidates_failed: 1,
+            ..Default::default()
+        };
+        persist_scan_benchmark_outcome(
+            &db,
+            &settings,
+            "scan_cand_fail",
+            "scan scan_cand_fail: drivers/misc/scan_corpus.c",
+            Ok(cand_fail),
+            None,
+        )
+        .await?;
+        assert!(
+            !load_commit_review_data(&db, "scan_cand_fail")
+                .await?
+                .is_completed_review()
+        );
+
+        // Verify single-file scan_fixture paired with scan_paths: ["."] falls back to filename.
+        let dot_tmp = tempfile::tempdir()?;
+        let src_file = dot_tmp.path().join("single_fixture.c");
+        std::fs::write(&src_file, "int ok(void) { return 0; }\n")?;
+        let dst_dir = dot_tmp.path().join("dst");
+        let resolved_dot = copy_fixture_tree_blocking(&src_file, &dst_dir, &[".".to_string()])?;
+        assert_eq!(resolved_dot, vec![PathBuf::from("single_fixture.c")]);
+        assert!(dst_dir.join("single_fixture.c").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn test_judge_prompt_includes_target_function_and_scan_suppression_guidance() {
+        let entry = BenchmarkEntry {
+            commit: "scan_corpus".to_string(),
+            expected_behavior: BenchmarkExpectedBehavior::SuppressFalsePositive,
+            scan_fixture: Some("scan_corpus.c".to_string()),
+            scan_paths: vec!["drivers/misc/scan_corpus.c".to_string()],
+            target_function: Some("kcorp_route_cache_replace".to_string()),
+            ..Default::default()
+        };
+        let data = CommitReviewData::default();
+        let prompt = build_judge_prompt_for_entry(&entry, "False UAF claim", &data);
+        assert!(prompt.contains("Target Function / Symbol: `kcorp_route_cache_replace`"));
+        assert!(prompt.contains("false-positive trap claim"));
+        assert!(
+            prompt.contains("unrelated real defects elsewhere in the scanned file do not count")
+        );
+    }
+
+    #[test]
+    fn test_requires_external_repo_only_bypasses_scan_fixture_entries() {
+        let classic = BenchmarkEntry {
+            commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            ..Default::default()
+        };
+        assert!(classic.requires_external_repo());
+
+        let versioned = BenchmarkEntry {
+            commit: "patch@example.com".to_string(),
+            target_mbox: Some("v2.mbox".to_string()),
+            baseline_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            ..Default::default()
+        };
+        assert!(versioned.requires_external_repo());
+
+        let repo_scan = BenchmarkEntry {
+            commit: "scan_btrfs".to_string(),
+            scan_paths: vec!["fs/btrfs/raid56.c".to_string()],
+            ..Default::default()
+        };
+        assert!(repo_scan.requires_external_repo());
+
+        let fixture_scan = BenchmarkEntry {
+            commit: "scan_corpus".to_string(),
+            scan_fixture: Some("scan_corpus.c".to_string()),
+            scan_paths: vec!["drivers/misc/scan_corpus.c".to_string()],
+            ..Default::default()
+        };
+        assert!(!fixture_scan.requires_external_repo());
     }
 }
