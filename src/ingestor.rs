@@ -15,7 +15,7 @@
 use crate::db::Database;
 use crate::events::{Event, IngestTracker};
 pub use crate::mbox::{is_mbox_separator, split_mbox};
-use crate::nntp::NntpClient;
+use crate::nntp::{ArticleResponseError, NntpClient};
 use crate::settings::Settings;
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
@@ -593,9 +593,10 @@ impl Ingestor {
                         }
                     }
                     Err(e) => {
-                        let msg = e.to_string();
                         // 423 is "No such article number in this group"
-                        if msg.contains("423") {
+                        if e.downcast_ref::<ArticleResponseError>()
+                            .is_some_and(|response| response.code == 423)
+                        {
                             if next_id >= info.high {
                                 info!(
                                     "Article {} missing (423) at tip for group {}, retrying later",
@@ -908,6 +909,202 @@ mod tests {
     fn decode_manifest_rejects_corrupt_and_non_json_input() {
         assert!(decode_manifest(b"not gzip at all").is_err());
         assert!(decode_manifest(&gzip(b"not json")).is_err());
+    }
+
+    type DeliveredArticles = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
+    async fn checkpoint_ingestor(
+        address: std::net::SocketAddr,
+    ) -> (
+        Ingestor,
+        Arc<Database>,
+        DeliveredArticles,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut settings = Settings::new().unwrap();
+        settings.nntp.server = address.ip().to_string();
+        settings.nntp.port = address.port();
+        settings.mailing_lists.track = vec!["test:test.group".into()];
+        settings.database.url = ":memory:".into();
+        let db = Arc::new(Database::new(&settings.database).await.unwrap());
+        db.migrate().await.unwrap();
+        db.ensure_mailing_list("test", "test.group").await.unwrap();
+        db.update_last_article_num("test.group", 1422)
+            .await
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(10);
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = delivered.clone();
+        let consumer = tokio::spawn(async move {
+            while let Some(Event::ArticleFetched {
+                article_id,
+                content,
+                receipt: Some(mut receipt),
+                ..
+            }) = receiver.recv().await
+            {
+                let (metadata, _) =
+                    crate::patch::parse_email(content.join("\n").as_bytes()).unwrap();
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((article_id, metadata.message_id, metadata.subject));
+                // A parseable partial article could also be persisted;
+                // settle every handoff so a dropped receipt cannot mask it.
+                receipt.settle();
+            }
+        });
+        let ingestor = Ingestor::new(settings, db.clone(), sender, None, true);
+        (ingestor, db, delivered, consumer)
+    }
+
+    #[tokio::test]
+    async fn nntp_failed_article_fetch_does_not_advance_the_checkpoint() {
+        use tokio::net::TcpListener;
+
+        for first_response in [
+            "400 service unavailable\r\n",
+            "400 service unavailable (trace 423)\r\n",
+            "220 article follows\r\nFrom: Author <author@example.org>\r\nMessage-ID: <truncated@example.org>\r\nSubject: [PATCH] truncated\r\n\r\npartial body\r\n",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut fetched = Vec::new();
+                // A failed fetch reconnects immediately, then QUITs that
+                // recovery connection before the next ingestion cycle.
+                for connection in 0..3 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = BufReader::new(stream);
+                    stream.write_all(b"200 ready\r\n").await.unwrap();
+                    loop {
+                        let mut command = String::new();
+                        if stream.read_line(&mut command).await.unwrap() == 0 {
+                            break;
+                        }
+                        let response = if command.starts_with("GROUP ") {
+                            assert_ne!(connection, 1, "recovery connection only quits");
+                            "211 3 1422 1424 test.group\r\n".to_string()
+                        } else if let Some(id) = command.trim().strip_prefix("ARTICLE ") {
+                            fetched.push((connection, id.to_string()));
+                            if connection == 0 {
+                                assert_eq!(id, "1423");
+                                stream.write_all(first_response.as_bytes()).await.unwrap();
+                                break;
+                            }
+                            format!(
+                                "220 article follows\r\nFrom: Author <author@example.org>\r\nMessage-ID: <complete-{id}@example.org>\r\nSubject: [PATCH] complete {id}\r\n\r\ncomplete body\r\n.\r\n"
+                            )
+                        } else {
+                            assert_eq!(command.trim(), "QUIT");
+                            stream.write_all(b"205 bye\r\n").await.unwrap();
+                            break;
+                        };
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    }
+                }
+                fetched
+            });
+            let (ingestor, db, delivered, consumer) = checkpoint_ingestor(address).await;
+            tokio::time::timeout(Duration::from_secs(3), ingestor.process_nntp_cycle())
+                .await
+                .expect("failed-fetch cycle must finish")
+                .unwrap();
+            assert_eq!(db.get_last_article_num("test.group").await.unwrap(), 1422);
+            assert!(delivered.lock().unwrap().is_empty());
+
+            tokio::time::timeout(Duration::from_secs(3), ingestor.process_nntp_cycle())
+                .await
+                .expect("retry cycle must finish")
+                .unwrap();
+            assert_eq!(db.get_last_article_num("test.group").await.unwrap(), 1424);
+            assert_eq!(
+                *delivered.lock().unwrap(),
+                vec![
+                    (
+                        "1423".into(),
+                        "complete-1423@example.org".into(),
+                        "[PATCH] complete 1423".into()
+                    ),
+                    (
+                        "1424".into(),
+                        "complete-1424@example.org".into(),
+                        "[PATCH] complete 1424".into()
+                    ),
+                ]
+            );
+            assert_eq!(
+                server.await.unwrap(),
+                vec![(0, "1423".into()), (2, "1423".into()), (2, "1424".into())]
+            );
+            drop(ingestor);
+            consumer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn nntp_real_article_gaps_preserve_checkpoint_policy() {
+        use tokio::net::TcpListener;
+
+        for (high, expected_mark, expected_articles) in [
+            (1423, 1422, vec!["1423"]),
+            (1424, 1424, vec!["1423", "1424"]),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                stream.write_all(b"200 ready\r\n").await.unwrap();
+                let mut fetched = Vec::new();
+                loop {
+                    let mut command = String::new();
+                    if stream.read_line(&mut command).await.unwrap() == 0 {
+                        break;
+                    }
+                    let response = if command.starts_with("GROUP ") {
+                        format!("211 3 1422 {high} test.group\r\n")
+                    } else if let Some(id) = command.trim().strip_prefix("ARTICLE ") {
+                        fetched.push(id.to_string());
+                        if id == "1423" {
+                            "423 no article with that number\r\n".into()
+                        } else {
+                            format!(
+                                "220 article follows\r\nFrom: Author <author@example.org>\r\nMessage-ID: <complete-{id}@example.org>\r\nSubject: [PATCH] complete {id}\r\n\r\ncomplete body\r\n.\r\n"
+                            )
+                        }
+                    } else {
+                        assert_eq!(command.trim(), "QUIT");
+                        stream.write_all(b"205 bye\r\n").await.unwrap();
+                        break;
+                    };
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+                fetched
+            });
+            let (ingestor, db, delivered, consumer) = checkpoint_ingestor(address).await;
+            tokio::time::timeout(Duration::from_secs(3), ingestor.process_nntp_cycle())
+                .await
+                .expect("real article gaps must not stall ingestion")
+                .unwrap();
+            assert_eq!(
+                db.get_last_article_num("test.group").await.unwrap(),
+                expected_mark
+            );
+            let expected_delivered: Vec<(String, String, String)> = if high == 1424 {
+                vec![(
+                    "1424".into(),
+                    "complete-1424@example.org".into(),
+                    "[PATCH] complete 1424".into(),
+                )]
+            } else {
+                vec![]
+            };
+            assert_eq!(*delivered.lock().unwrap(), expected_delivered);
+            assert_eq!(server.await.unwrap(), expected_articles);
+            drop(ingestor);
+            consumer.await.unwrap();
+        }
     }
 
     #[tokio::test]
