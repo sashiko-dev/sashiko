@@ -84,6 +84,8 @@ pub struct LinuxScanState {
     pub maintainer_notes: String,
     /// Rendered `<code_notes>` block for the system prompt, or empty.
     pub code_notes: String,
+    /// Verbatim Linux kernel threat model (`Documentation/process/threat-model.rst`), when present.
+    pub kernel_threat_model: Option<crate::threat_model::KernelThreatModel>,
 
     /// Optional manual stages filter (`--stages locking,security`).
     pub manual_stages: Option<Vec<String>>,
@@ -1000,6 +1002,17 @@ pub fn is_actionable_scan_finding_for_floor(
         .is_some_and(|sev| prefilter.admits(sev))
 }
 
+pub fn scan_kernel_threat_model_severity_section(state: &LinuxScanState) -> String {
+    let rendered = crate::threat_model::KernelThreatModel::render_for_severity(
+        state.kernel_threat_model.as_ref(),
+    );
+    if rendered.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{rendered}")
+    }
+}
+
 pub(crate) fn record_verified_scan_findings(state: &mut LinuxScanState, findings: Vec<Value>) {
     let floor = state
         .min_severity
@@ -1383,19 +1396,44 @@ Respond with ONLY a JSON object. Example:
         .build()
 }
 
+pub fn scan_analysis_stage_user_prompt(
+    def: &'static AnalysisStage,
+) -> PromptTemplate<LinuxScanState> {
+    let threat_model_placeholder = if def.name == "security" {
+        "{{kernel_threat_model_section}}"
+    } else {
+        ""
+    };
+    let mut user_template = PromptTemplate::<LinuxScanState>::new(format!(
+        "{}{}\n\n{}",
+        def.instruction, threat_model_placeholder, SCAN_STAGE_JSON_SCHEMA_INSTRUCTIONS
+    ));
+    for guide in def.guides {
+        user_template = user_template.include_file(*guide);
+    }
+    if def.name == "security" {
+        user_template =
+            user_template.with_var("kernel_threat_model_section", |s: &LinuxScanState| {
+                let rendered = crate::threat_model::KernelThreatModel::render_for_security_stage(
+                    s.kernel_threat_model.as_ref(),
+                );
+                if rendered.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\n{rendered}")
+                }
+            });
+    }
+    user_template
+}
+
 fn scan_analysis_stage(
     def: &'static AnalysisStage,
     max_turns: usize,
     temperature: f32,
     reasoning_effort: Option<crate::ai::ReasoningEffort>,
 ) -> Box<dyn ExecutableStage<LinuxScanState>> {
-    let mut user_template = PromptTemplate::<LinuxScanState>::new(format!(
-        "{}\n\n{}",
-        def.instruction, SCAN_STAGE_JSON_SCHEMA_INSTRUCTIONS
-    ));
-    for guide in def.guides {
-        user_template = user_template.include_file(*guide);
-    }
+    let user_template = scan_analysis_stage_user_prompt(def);
 
     Box::new(
         Stage::builder(def.name)
@@ -1528,7 +1566,7 @@ pub fn scan_verification_stage_with_effort(
 
 <severity_guidelines>
 @include("severity.md")
-</severity_guidelines>@includes
+</severity_guidelines>{{{{kernel_threat_model_section}}}}@includes
 
 Aggregated Concerns:
 {{{{aggregated_concerns}}}}
@@ -1549,6 +1587,10 @@ Return ONLY a JSON object with 'findings', 'inconclusive_concerns', and 'dismiss
         combined.extend_from_slice(&s.all_dismissed_concerns);
         extra_prompt_paths_for_items(&[], &combined, scan_analysis_stage_by_name)
     })
+    .with_var(
+        "kernel_threat_model_section",
+        scan_kernel_threat_model_severity_section,
+    )
     .with_var("aggregated_concerns", |s: &LinuxScanState| {
         serde_json::to_string_pretty(&s.all_concerns).unwrap_or_default()
     })
@@ -1617,7 +1659,7 @@ pub fn scan_post_verification_stage_with_effort(
 
 <severity_guidelines>
 @include("severity.md")
-</severity_guidelines>@includes
+</severity_guidelines>{{{{kernel_threat_model_section}}}}@includes
 
 Candidate Inconclusive Concern(s) to Verify:
 {{{{candidate_inconclusive_concerns}}}}
@@ -1629,6 +1671,10 @@ Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays accoun
     .include_files_from_state(move |_: &LinuxScanState| {
         extra_prompt_paths_for_items(&[], &batch_for_prompts, scan_analysis_stage_by_name)
     })
+    .with_var(
+        "kernel_threat_model_section",
+        scan_kernel_threat_model_severity_section,
+    )
     .with_var("candidate_inconclusive_concerns", move |_: &LinuxScanState| {
         candidate_json.clone()
     });
@@ -2045,6 +2091,44 @@ mod tests {
             inputs[1].commit_sha.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
         );
+    }
+
+    #[test]
+    fn test_scan_security_and_verification_render_kernel_threat_model() {
+        let model = crate::threat_model::KernelThreatModel {
+            text: "Guaranteed boundary: unprivileged local users.".to_string(),
+            commit: "05441d697f7f0000000000000000000000000000".to_string(),
+            git_ref: "linus/master".to_string(),
+        };
+        let state_with = LinuxScanState {
+            kernel_threat_model: Some(model),
+            ..Default::default()
+        };
+        let state_without = LinuxScanState::default();
+
+        let sec_def = scan_analysis_stage_by_name("security").unwrap();
+        let sec_with = scan_analysis_stage_user_prompt(sec_def).render_for_log(&state_with);
+        assert!(sec_with.contains(
+            "<kernel_threat_model source=\"Documentation/process/threat-model.rst @ linus/master (05441d697f7f)\">"
+        ));
+        assert!(!sec_with.contains("{{kernel_threat_model_section}}"));
+
+        let sec_without = scan_analysis_stage_user_prompt(sec_def).render_for_log(&state_without);
+        assert!(!sec_without.contains("<kernel_threat_model source="));
+        assert!(!sec_without.contains("{{kernel_threat_model_section}}"));
+
+        for non_sec in ["execution-flow", "resources", "locking", "hardware"] {
+            let def = scan_analysis_stage_by_name(non_sec).unwrap();
+            let rendered = scan_analysis_stage_user_prompt(def).render_for_log(&state_with);
+            assert!(
+                !rendered.contains("<kernel_threat_model source="),
+                "{non_sec} must not include <kernel_threat_model>"
+            );
+        }
+
+        let sev_section = scan_kernel_threat_model_severity_section(&state_with);
+        assert!(sev_section.contains("<kernel_threat_model source="));
+        assert!(scan_kernel_threat_model_severity_section(&state_without).is_empty());
     }
 
     #[test]

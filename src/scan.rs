@@ -1426,6 +1426,7 @@ struct ChunkNotesContext {
     maintainer_notes: std::sync::Arc<Vec<crate::notes::maintainer_notes::MaintainerNote>>,
     code_notes_set: Option<std::sync::Arc<crate::notes::select::NotesSet>>,
     code_notes_scope: crate::settings::CodeNotesScope,
+    kernel_threat_model: Option<crate::threat_model::KernelThreatModel>,
 }
 
 fn render_chunk_notes_blocking(
@@ -1497,10 +1498,25 @@ async fn preload_scan_notes(
         }
     };
 
+    let kernel_threat_model = match crate::threat_model::KernelThreatModel::load(repo_path).await {
+        Some(tm) => Some(tm),
+        None => {
+            crate::threat_model::KernelThreatModel::load_from_ref(
+                repo_path,
+                &crate::threat_model::MainlineRef {
+                    git_ref: "HEAD".to_string(),
+                    commit: target_sha.to_string(),
+                },
+            )
+            .await
+        }
+    };
+
     ChunkNotesContext {
         maintainer_notes: std::sync::Arc::new(maintainer_notes),
         code_notes_set,
         code_notes_scope,
+        kernel_threat_model,
     }
 }
 
@@ -1654,6 +1670,7 @@ async fn scan_single_chunk(
         maintainers_hint,
         maintainer_notes,
         code_notes,
+        kernel_threat_model: notes_ctx.kernel_threat_model.clone(),
         manual_stages,
         custom_prompt,
         effort,
