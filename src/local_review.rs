@@ -761,7 +761,11 @@ async fn review_single_patch(
                     "AI review for patch {} failed with exception: {}",
                     p.index, e
                 );
+                let stop_retrying = crate::ai::is_non_retryable_review_error(&e);
                 last_error = Some(e);
+                if stop_retrying {
+                    break;
+                }
             }
         }
     }
@@ -773,6 +777,22 @@ async fn review_single_patch(
         },
     );
     Err(last_error.unwrap_or_else(|| anyhow!("Patch review failed")))
+}
+
+/// Formats an `anyhow::Error` chain on a single human-readable line, omitting
+/// redundant inner causes whose text is already contained in an outer wrapper
+/// (such as `WorkflowFailure` and `SessionFailure`, which embed `err.to_string()`
+/// in their own display messages).
+fn format_error_chain(err: &anyhow::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for cause in err.chain() {
+        let msg = cause.to_string();
+        let trimmed = msg.trim();
+        if !trimmed.is_empty() && parts.last().is_none_or(|prev| !prev.contains(trimmed)) {
+            parts.push(trimmed.to_string());
+        }
+    }
+    parts.join(": ")
 }
 
 /// Lists the failed patches in series order.
@@ -1280,7 +1300,7 @@ async fn run_worker_in_worktree(
                 if let Some(wf) = err.downcast_ref::<crate::workflow::WorkflowFailure>() {
                     failed_outcomes.push((patch_index, wf.outcome.clone()));
                 }
-                let err = format!("{:?}", err);
+                let err = format_error_chain(&err);
                 mark_patch_review_incomplete(&mut patch_results, patch_index, &err);
                 review_errors.push((patch_index, err));
             }
@@ -2507,6 +2527,36 @@ mod tests {
         assert_eq!(
             combined_review_error(errors),
             "patch 2: output truncated; patch 10: timed out"
+        );
+    }
+
+    #[test]
+    fn format_error_chain_deduplicates_nested_workflow_and_session_messages() {
+        let root: anyhow::Error =
+            crate::ai::gemini::GeminiError::PermissionDenied("missing key".to_string()).into();
+        let session_wrapped = root.context(crate::ai::session::SessionFailure {
+            message: "Permission denied: missing key".to_string(),
+            history: Vec::new(),
+            usage: crate::ai::AiUsage::default(),
+        });
+        let stage_wrapped = session_wrapped.context(
+            "Stage 'pre-screen' failed after 1 turns: Permission denied: missing key".to_string(),
+        );
+        let wf_wrapped = stage_wrapped.context(crate::workflow::WorkflowFailure {
+            message: "Stage 'pre-screen' failed after 1 turns: Permission denied: missing key"
+                .to_string(),
+            outcome: crate::workflow::WorkflowOutcome::default(),
+        });
+        assert_eq!(
+            format_error_chain(&wf_wrapped),
+            "Stage 'pre-screen' failed after 1 turns: Permission denied: missing key"
+        );
+
+        let distinct =
+            anyhow!("Unsupported openai api: foo").context("Failed to create AI provider");
+        assert_eq!(
+            format_error_chain(&distinct),
+            "Failed to create AI provider: Unsupported openai api: foo"
         );
     }
 

@@ -423,6 +423,127 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
     AiErrorClass::Fatal
 }
 
+/// Returns true when a failed patch review attempt cannot recover by re-running
+/// the workflow from the start (for example, fatal provider authentication or
+/// request errors, or an exhausted review deadline/budget). Session-level model
+/// output failures (`ReviewError::LimitExceeded`, `FormatRejection`,
+/// `OutputTruncated`) remain retryable so the next attempt can ask the model
+/// for a fresh completion after forgetting the rejected turn.
+pub fn is_non_retryable_review_error(error: &anyhow::Error) -> bool {
+    if let Some(re) = error.downcast_ref::<crate::worker::prompts::ReviewError>() {
+        return matches!(
+            re,
+            crate::worker::prompts::ReviewError::BudgetExceeded(_)
+                | crate::worker::prompts::ReviewError::Cancelled
+        );
+    }
+    // Standalone SessionFailure values (built by SessionRunner::run via
+    // anyhow::Error::new(SessionFailure { .. }) for output truncation, format
+    // validation exhaustion, turn limits, or transient retry exhaustion) have
+    // SessionFailure as their root cause and remain retryable across patch
+    // attempts after cache eviction. Fatal provider and deadline errors attach
+    // SessionFailure via e.context(SessionFailure { .. }), leaving the underlying
+    // error as root_cause().
+    if error.root_cause().is::<session::SessionFailure>() {
+        return false;
+    }
+    matches!(classify_ai_error(error), AiErrorClass::Fatal)
+}
+
+fn non_empty_opt(val: Option<&str>) -> bool {
+    val.is_some_and(|s| !s.trim().is_empty())
+}
+
+fn non_empty_env<F: Fn(&str) -> Option<String>>(env: &F, key: &str) -> bool {
+    env(key).is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Validates that the configured AI provider has credentials or a proxy/custom
+/// endpoint configured before starting expensive repository prefetch or review
+/// work.
+pub fn validate_provider_credentials(ai: &AiSettings) -> Result<()> {
+    validate_provider_credentials_with(
+        ai,
+        |key| std::env::var(key).ok(),
+        gemini::GeminiClient::has_auto_proxy_helper(),
+    )
+}
+
+pub(crate) fn validate_provider_credentials_with<F>(
+    ai: &AiSettings,
+    env: F,
+    has_gemini_auto_proxy: bool,
+) -> Result<()>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if ai.no_ai {
+        return Ok(());
+    }
+    match ai.provider.to_lowercase().as_str() {
+        "gemini" => {
+            let gemini_cfg = ai.gemini.as_ref();
+            let has_key =
+                non_empty_env(&env, "GEMINI_API_KEY") || non_empty_env(&env, "LLM_API_KEY");
+            let base_url = env("GOOGLE_GEMINI_BASE_URL")
+                .or_else(|| env("GEMINI_BASE_URL"))
+                .or_else(|| gemini_cfg.and_then(|s| s.base_url.clone()))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let has_custom_base_url = base_url
+                .as_deref()
+                .is_some_and(|u| u != "https://generativelanguage.googleapis.com");
+            let has_proxy = non_empty_env(&env, "GEMINI_PROXY_COMMAND")
+                || non_empty_opt(gemini_cfg.and_then(|s| s.proxy_command.as_deref()))
+                || has_gemini_auto_proxy;
+            let has_bearer = non_empty_env(&env, "GEMINI_AUTH_TOKEN")
+                || non_empty_env(&env, "GEMINI_AUTH_TOKEN_COMMAND")
+                || non_empty_opt(gemini_cfg.and_then(|s| s.auth_token_command.as_deref()));
+            if !has_key && !has_custom_base_url && !has_proxy && !has_bearer {
+                return Err(gemini::GeminiError::PermissionDenied(
+                    gemini::MISSING_GEMINI_CREDENTIALS_MSG.to_string(),
+                )
+                .into());
+            }
+            Ok(())
+        }
+        "claude" => {
+            let claude_cfg = ai.claude.as_ref();
+            let has_key = non_empty_env(&env, "ANTHROPIC_API_KEY")
+                || non_empty_env(&env, "ANTHROPIC_AUTH_TOKEN")
+                || non_empty_env(&env, "LLM_API_KEY")
+                || non_empty_env(&env, "ANTHROPIC_CUSTOM_HEADERS");
+            let has_custom_base_url = non_empty_env(&env, "ANTHROPIC_BASE_URL")
+                || claude_cfg
+                    .and_then(|s| s.base_url.as_deref())
+                    .map(str::trim)
+                    .is_some_and(|u| !u.is_empty() && u != "https://api.anthropic.com/v1/messages");
+            if !has_key && !has_custom_base_url {
+                return Err(claude::ClaudeError::AuthenticationError(
+                    "Anthropic API key is not set. Set ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN or LLM_API_KEY), or configure [ai.claude] base_url.".to_string(),
+                )
+                .into());
+            }
+            Ok(())
+        }
+        "openai" => {
+            let compat_cfg = ai.openai_compat.as_ref();
+            let has_key =
+                non_empty_env(&env, "OPENAI_API_KEY") || non_empty_env(&env, "LLM_API_KEY");
+            let has_custom_base_url = non_empty_opt(compat_cfg.and_then(|s| s.base_url.as_deref()));
+            let has_extra_headers = compat_cfg.is_some_and(|s| !s.extra_headers.is_empty());
+            if !has_key && !has_custom_base_url && !has_extra_headers {
+                return Err(openai_common::OpenAiCompatError::AuthenticationError(
+                    "OpenAI API key is not set. Set OPENAI_API_KEY (or LLM_API_KEY), or configure [ai.openai_compat] base_url or extra_headers.".to_string(),
+                )
+                .into());
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Token usage statistics for an AI interaction.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AiUsage {
@@ -1917,5 +2038,90 @@ mod tests {
             effort: None,
         });
         assert_eq!(resolve_vertex_max_tokens(&settings.ai), 32_768);
+    }
+
+    #[test]
+    fn test_validate_provider_credentials_reports_missing_keys() {
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.provider = "gemini".to_string();
+        settings.ai.gemini = None;
+
+        let err = validate_provider_credentials_with(&settings.ai, |_| None, false)
+            .expect_err("gemini without key, proxy, or custom base_url must fail");
+        assert!(err.to_string().contains("GEMINI_API_KEY"));
+
+        // Passing GEMINI_API_KEY or auto-proxy or --no-ai satisfies validation.
+        assert!(
+            validate_provider_credentials_with(
+                &settings.ai,
+                |k| (k == "GEMINI_API_KEY").then(|| "secret".to_string()),
+                false
+            )
+            .is_ok()
+        );
+        assert!(validate_provider_credentials_with(&settings.ai, |_| None, true).is_ok());
+
+        settings.ai.no_ai = true;
+        assert!(validate_provider_credentials_with(&settings.ai, |_| None, false).is_ok());
+        settings.ai.no_ai = false;
+
+        settings.ai.provider = "claude".to_string();
+        settings.ai.claude = None;
+        let claude_err = validate_provider_credentials_with(&settings.ai, |_| None, false)
+            .expect_err("claude without key must fail");
+        assert!(claude_err.to_string().contains("ANTHROPIC_API_KEY"));
+
+        settings.ai.provider = "openai".to_string();
+        settings.ai.openai_compat = None;
+        let openai_err = validate_provider_credentials_with(&settings.ai, |_| None, false)
+            .expect_err("openai without key must fail");
+        assert!(openai_err.to_string().contains("OPENAI_API_KEY"));
+        assert!(openai_err.to_string().contains("[ai.openai_compat]"));
+    }
+
+    #[test]
+    fn test_is_non_retryable_review_error_distinguishes_provider_fatal_from_session_errors() {
+        let perm_err: anyhow::Error =
+            gemini::GeminiError::PermissionDenied("missing key".to_string()).into();
+        let wrapped_perm = perm_err.context("Stage 'pre-screen' failed after 1 turns");
+        assert!(is_non_retryable_review_error(&wrapped_perm));
+
+        let untyped_deadline = anyhow::anyhow!("Review tool timed out (active time exceeded)")
+            .context(session::SessionFailure {
+                message: "Review tool timed out (active time exceeded)".to_string(),
+                history: Vec::new(),
+                usage: AiUsage::default(),
+            })
+            .context("WorkflowFailure wrapper");
+        assert!(is_non_retryable_review_error(&untyped_deadline));
+
+        let standalone_session_failure = anyhow::Error::new(session::SessionFailure {
+            message: "LLM output was truncated by provider (e.g. hit max tokens)".to_string(),
+            history: Vec::new(),
+            usage: AiUsage::default(),
+        })
+        .context("WorkflowFailure wrapper");
+        assert!(!is_non_retryable_review_error(&standalone_session_failure));
+
+        let transient_err: anyhow::Error = RemoteAiError {
+            message: "connection reset".to_string(),
+            class: AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER,
+            },
+        }
+        .into();
+        assert!(!is_non_retryable_review_error(&transient_err));
+
+        let format_err: anyhow::Error =
+            crate::worker::prompts::ReviewError::FormatRejection("bad json".to_string()).into();
+        assert!(!is_non_retryable_review_error(&format_err));
+
+        let truncated_err: anyhow::Error =
+            crate::worker::prompts::ReviewError::OutputTruncated.into();
+        assert!(!is_non_retryable_review_error(&truncated_err));
+
+        let budget_err: anyhow::Error =
+            crate::worker::prompts::ReviewError::BudgetExceeded("timeout".to_string()).into();
+        assert!(is_non_retryable_review_error(&budget_err));
     }
 }

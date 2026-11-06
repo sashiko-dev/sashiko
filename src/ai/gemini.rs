@@ -188,6 +188,8 @@ pub trait GenAiClient: Send + Sync {
     ) -> Result<GenerateContentResponse>;
 }
 
+pub const MISSING_GEMINI_CREDENTIALS_MSG: &str = "Gemini API key is not set. Set GEMINI_API_KEY (or LLM_API_KEY), or configure [ai.gemini] base_url, proxy_command, or auth_token_command.";
+
 fn extract_gemini_error_reason(error_text: &str) -> Option<String> {
     let json = serde_json::from_str::<serde_json::Value>(error_text).ok()?;
     let err = json.get("error")?;
@@ -208,6 +210,36 @@ fn extract_gemini_error_reason(error_text: &str) -> Option<String> {
     }
 
     None
+}
+
+fn format_gemini_error_body(error_text: &str) -> (Option<String>, String) {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(error_text)
+        && let Some(err) = json.get("error")
+    {
+        let reason = err
+            .get("details")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|f| f.get("reason"))
+            .and_then(|r| r.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let message = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        if let Some(msg) = message {
+            return (reason, msg);
+        }
+        if let Some(r) = reason {
+            return (Some(r), error_text.trim().to_string());
+        }
+    }
+    (None, error_text.trim().to_string())
 }
 
 fn summarize_gemini_error(status: reqwest::StatusCode, error_text: &str) -> String {
@@ -253,17 +285,19 @@ impl std::fmt::Display for GeminiError {
                 write!(f, "Transient error: {}, retry in {:?}", msg, d)
             }
             GeminiError::PermissionDenied(msg) => {
-                if let Some(reason) = extract_gemini_error_reason(msg) {
-                    write!(f, "Permission denied (reason: {}): {}", reason, msg)
+                let (reason, body) = format_gemini_error_body(msg);
+                if let Some(reason) = reason {
+                    write!(f, "Permission denied (reason: {}): {}", reason, body)
                 } else {
-                    write!(f, "Permission denied: {}", msg)
+                    write!(f, "Permission denied: {}", body)
                 }
             }
             GeminiError::ApiError(s, msg) => {
-                if let Some(reason) = extract_gemini_error_reason(msg) {
-                    write!(f, "Gemini API error ({}) (reason: {}): {}", s, reason, msg)
+                let (reason, body) = format_gemini_error_body(msg);
+                if let Some(reason) = reason {
+                    write!(f, "Gemini API error ({}) (reason: {}): {}", s, reason, body)
                 } else {
-                    write!(f, "Gemini API error ({}): {}", s, msg)
+                    write!(f, "Gemini API error ({}): {}", s, body)
                 }
             }
             GeminiError::Other(msg) => write!(f, "{}", msg),
@@ -503,7 +537,13 @@ impl GeminiClient {
         settings: Option<&crate::settings::GeminiSettings>,
     ) -> Self {
         let api_key = std::env::var("GEMINI_API_KEY")
-            .or_else(|_| std::env::var("LLM_API_KEY"))
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("LLM_API_KEY")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
             .unwrap_or_default();
         let base_url = std::env::var("GOOGLE_GEMINI_BASE_URL")
             .or_else(|_| std::env::var("GEMINI_BASE_URL"))
@@ -654,11 +694,22 @@ impl GeminiClient {
         )
     }
 
+    pub(crate) fn has_auto_proxy_helper() -> bool {
+        Self::find_auto_proxy_helper().is_some()
+    }
+
+    fn has_bearer_auth(&self) -> bool {
+        self.auth_token_command.is_some()
+            || std::env::var("GEMINI_AUTH_TOKEN")
+                .ok()
+                .is_some_and(|s| !s.trim().is_empty())
+    }
+
     async fn effective_base_url(&self) -> Result<String> {
         if self.base_url != "https://generativelanguage.googleapis.com" {
             return Ok(self.base_url.clone());
         }
-        if !self.api_key.is_empty() && self.proxy_command.is_none() {
+        if !self.api_key.trim().is_empty() && self.proxy_command.is_none() {
             return Ok(self.base_url.clone());
         }
         let url = self
@@ -672,6 +723,11 @@ impl GeminiClient {
                     let (url, guard) = Self::start_proxy_command(&cmd_str).await?;
                     *self.proxy_guard.lock().await = Some(guard);
                     Ok::<String, anyhow::Error>(url)
+                } else if self.api_key.trim().is_empty() && !self.has_bearer_auth() {
+                    Err(
+                        GeminiError::PermissionDenied(MISSING_GEMINI_CREDENTIALS_MSG.to_string())
+                            .into(),
+                    )
                 } else {
                     Ok(self.base_url.clone())
                 }
@@ -3081,6 +3137,42 @@ mod tests {
                 GeminiError::ApiError(reqwest::StatusCode::BAD_REQUEST, _)
             ),
             "genuine 400 must remain ApiError, got {err2:?}"
+        );
+    }
+
+    #[test]
+    fn test_gemini_error_display_extracts_clean_json_message() {
+        let unregistered_403 = r#"{
+  "error": {
+    "code": 403,
+    "message": "Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this API.",
+    "status": "PERMISSION_DENIED"
+  }
+}"#;
+        let err = GeminiError::PermissionDenied(unregistered_403.to_string());
+        assert_eq!(
+            err.to_string(),
+            "Permission denied: Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this API."
+        );
+
+        let invalid_key_400 = r#"{
+  "error": {
+    "code": 400,
+    "message": "API key not valid. Please pass a valid API key.",
+    "status": "INVALID_ARGUMENT",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+        "reason": "API_KEY_INVALID"
+      }
+    ]
+  }
+}"#;
+        let api_err =
+            GeminiError::ApiError(reqwest::StatusCode::BAD_REQUEST, invalid_key_400.into());
+        assert_eq!(
+            api_err.to_string(),
+            "Gemini API error (400 Bad Request) (reason: API_KEY_INVALID): API key not valid. Please pass a valid API key."
         );
     }
 }
