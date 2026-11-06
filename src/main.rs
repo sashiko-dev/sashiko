@@ -547,8 +547,63 @@ fn exit_worker_with_error(error: String) -> ! {
     std::process::exit(1);
 }
 
+/// Formats a top-level CLI error chain using `Display` instead of `Debug`,
+/// avoiding quoted string literals and deduplicating nested causes.
+fn format_cli_error(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(cause) = current {
+        let msg = cause.to_string();
+        let trimmed = msg.trim();
+        if !trimmed.is_empty() && parts.last().is_none_or(|prev| !prev.contains(trimmed)) {
+            parts.push(trimmed.to_string());
+        }
+        current = cause.source();
+    }
+    parts.join(": ")
+}
+
+fn format_settings_load_error(settings_path: &Path, err: &config::ConfigError) -> String {
+    let err_str = err.to_string();
+    let base = format!(
+        "Failed to load settings from {}: {}",
+        settings_path.display(),
+        err_str
+    );
+    if settings_path == Settings::user_config_path() && err_str.contains("unknown field") {
+        format!(
+            "{base}\nHint: run 'sashiko init --force' to regenerate {} for this version of sashiko, or remove the unknown field.",
+            settings_path.display()
+        )
+    } else {
+        base
+    }
+}
+
+#[cfg(feature = "server")]
+fn format_daemon_startup_error(settings_path: &Path, reason: &str) -> String {
+    let base = format!(
+        "Refusing to start daemon (settings from {}): {reason}",
+        settings_path.display()
+    );
+    if reason.starts_with("[database] url must be set") {
+        format!(
+            "{base}\nHint: bare 'sashiko' starts the server daemon. To review commits in the current repository, run 'sashiko review' (or see 'sashiko --help')."
+        )
+    } else {
+        base
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(err) = try_main().await {
+        eprintln!("Error: {}", format_cli_error(err.as_ref()));
+        std::process::exit(1);
+    }
+}
+
+async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let cli = Cli::parse();
 
@@ -678,9 +733,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 // The settings themselves, not the path they came from: a review
                 // does not read them again.
-                let settings = anyhow::Context::with_context(settings_result, || {
-                    format!("Failed to load settings from {}", settings_path.display())
-                })?;
+                let settings =
+                    settings_result.map_err(|e| format_settings_load_error(&settings_path, &e))?;
 
                 let related_preexisting = related_preexisting_mode(
                     project,
@@ -723,9 +777,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .into());
                 }
-                let settings = anyhow::Context::with_context(settings_result, || {
-                    format!("Failed to load settings from {}", settings_path.display())
-                })?;
+                let settings =
+                    settings_result.map_err(|e| format_settings_load_error(&settings_path, &e))?;
 
                 return handle_scan_command(
                     project,
@@ -765,10 +818,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let settings = match settings_result {
                     Ok(settings) => settings,
-                    Err(e) => exit_worker_with_error(format!(
-                        "Failed to load settings from {}: {e}",
-                        settings_path.display()
-                    )),
+                    Err(e) => {
+                        exit_worker_with_error(format_settings_load_error(&settings_path, &e))
+                    }
                 };
 
                 let result = run_worker_from_stdin(
@@ -828,9 +880,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 color,
                 ..
             } => {
-                let settings = anyhow::Context::with_context(settings_result, || {
-                    format!("Failed to load settings from {}", settings_path.display())
-                })?;
+                let settings =
+                    settings_result.map_err(|e| format_settings_load_error(&settings_path, &e))?;
                 let benchmark_file = file
                     .clone()
                     .or_else(|| file_flag.clone())
@@ -881,11 +932,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "server")]
     {
-        run_daemon(cli, settings_result, overridden, project).await
+        run_daemon(cli, &settings_path, settings_result, overridden, project).await
     }
     #[cfg(not(feature = "server"))]
     {
-        let _ = (cli, settings_result, overridden, project);
+        let _ = (cli, settings_path, settings_result, overridden, project);
         Err("this build has no daemon; rebuild with --features server".into())
     }
 }
@@ -893,6 +944,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(feature = "server")]
 async fn run_daemon(
     cli: Cli,
+    settings_path: &Path,
     settings_result: Result<Settings, config::ConfigError>,
     overridden: Vec<String>,
     project: ProjectId,
@@ -904,8 +956,7 @@ async fn run_daemon(
             s
         }
         Err(e) => {
-            error!("Failed to load settings: {}", e);
-            return Err(e.into());
+            return Err(format_settings_load_error(settings_path, &e).into());
         }
     };
 
@@ -930,8 +981,7 @@ async fn run_daemon(
     // reads the same file shape and has none of them. Asked for here, where a
     // missing one is reported as itself rather than as a failed connection.
     if let Err(reason) = settings.validate_for_daemon() {
-        error!("Refusing to start: {}", reason);
-        return Err(reason.into());
+        return Err(format_daemon_startup_error(settings_path, &reason).into());
     }
 
     // The daemon never clones its tree. Without one, MAINTAINERS indexing
@@ -939,13 +989,11 @@ async fn run_daemon(
     // apply, so a missing tree is refused here with the command that fixes it.
     let repository_path = std::path::PathBuf::from(&settings.git.repository_path);
     if let Err(reason) = sashiko::repo_sync::check_daemon_tree(&repository_path, project).await {
-        error!("Refusing to start: {}", reason);
-        return Err(reason.into());
+        return Err(format_daemon_startup_error(settings_path, &reason).into());
     }
 
     if let Err(reason) = settings.validate_sign_in_delivery() {
-        error!("Refusing to start: {}", reason);
-        return Err(reason.into());
+        return Err(format_daemon_startup_error(settings_path, &reason).into());
     }
 
     if let Some(Err(reason)) = settings
@@ -953,8 +1001,7 @@ async fn run_daemon(
         .as_ref()
         .map(sashiko::worker::email::EmailWorker::check_sendmail_path)
     {
-        error!("Refusing to start: {}", reason);
-        return Err(reason.into());
+        return Err(format_daemon_startup_error(settings_path, &reason).into());
     }
 
     // Initialize Database
@@ -2784,6 +2831,7 @@ async fn handle_review_command(
     let display = OutputStream::detect(color, &std::io::stderr(), terminal.as_ref());
 
     let repo_path = current_git_toplevel()?;
+    sashiko::ai::validate_provider_credentials(&settings.ai)?;
 
     // The repository a local review works in: the checkout it was run in, which
     // no settings file can name. The command-line overrides were merged onto
@@ -2972,7 +3020,8 @@ async fn handle_review_command(
                 // it, start below the frame instead of inside it or over it.
                 finish_progress(&mut s);
                 eprintln!("Review {}", if partial { "incomplete" } else { "complete" });
-                if partial && cfg!(feature = "cache") {
+                let any_stage_completed = s.patches.values().any(|p| p.completed_stages > 0);
+                if partial && cfg!(feature = "cache") && any_stage_completed {
                     eprintln!(
                         "Run it again with --resume to continue from the answers it recorded"
                     );
@@ -3384,6 +3433,7 @@ async fn handle_scan_command(
         );
     };
     settings.git.repository_path = repo_path.to_string_lossy().into_owned();
+    sashiko::ai::validate_provider_credentials(&settings.ai)?;
 
     if project.uses_maintainers() && sashiko::maintainers::get_global_maintainers().is_none() {
         let repo_for_maintainers = repo_path.clone();
@@ -6915,5 +6965,36 @@ mod tests {
             duplicate_of_bugid: None,
         });
         assert_eq!(scan_exit_code(&summary), 1);
+    }
+
+    #[test]
+    fn test_format_cli_and_settings_errors_are_human_readable() {
+        let str_err: Box<dyn std::error::Error> =
+            "/home/user/.config/sashiko.toml already exists; use --force to overwrite it".into();
+        let formatted = format_cli_error(str_err.as_ref());
+        assert_eq!(
+            formatted,
+            "/home/user/.config/sashiko.toml already exists; use --force to overwrite it"
+        );
+        assert!(!formatted.starts_with('"'));
+
+        let user_cfg = Settings::user_config_path();
+        let unknown_field_err = config::ConfigError::Message(
+            "unknown field `explicit_prompt_caching`, expected one of `max_tokens` for key `ai.gemini`"
+                .to_string(),
+        );
+        let settings_msg = format_settings_load_error(&user_cfg, &unknown_field_err);
+        assert!(settings_msg.contains(&user_cfg.display().to_string()));
+        assert!(settings_msg.contains("sashiko init --force"));
+
+        #[cfg(feature = "server")]
+        {
+            let daemon_msg = format_daemon_startup_error(
+                &user_cfg,
+                "[database] url must be set; a daemon has nowhere to store patchsets or reviews without one",
+            );
+            assert!(daemon_msg.contains(&user_cfg.display().to_string()));
+            assert!(daemon_msg.contains("sashiko review"));
+        }
     }
 }
