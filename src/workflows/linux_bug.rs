@@ -2713,6 +2713,27 @@ pub async fn run_standalone_bug_pipeline_for_project(
     context_tag: Option<&str>,
     project: ProjectId,
 ) -> Result<StandaloneBugOutcome> {
+    run_standalone_bug_pipeline_with_min_severity(
+        provider,
+        tools,
+        input,
+        context_tag,
+        project,
+        crate::db::SeverityFloor::High,
+    )
+    .await
+}
+
+/// Runs the standalone bug verification, origin-tracing, and severity
+/// calibration pipeline and filters results against `min_severity`.
+pub async fn run_standalone_bug_pipeline_with_min_severity(
+    provider: &dyn AiProvider,
+    tools: Option<Arc<ToolBox>>,
+    input: BugInput,
+    context_tag: Option<&str>,
+    project: ProjectId,
+    min_severity: crate::db::SeverityFloor,
+) -> Result<StandaloneBugOutcome> {
     let project_label = match project {
         ProjectId::Linux => "Linux kernel",
         ProjectId::Sashiko => "Sashiko",
@@ -2989,11 +3010,16 @@ pub async fn run_standalone_bug_pipeline_for_project(
     );
     let severity_output = severity_result.output;
     let severity = Severity::from_str(&severity_output.severity);
-    if !matches!(severity, Severity::High | Severity::Critical) {
+    if !min_severity.admits(severity) {
+        let floor_label = match min_severity {
+            crate::db::SeverityFloor::High => "requires High or Critical".to_string(),
+            floor => format!("requires >= {floor}"),
+        };
         return Ok(StandaloneBugOutcome::Discarded {
             reason: format!(
-                "Calibrated severity is {} (requires High or Critical): {}",
+                "Calibrated severity is {} ({}): {}",
                 severity.as_str(),
+                floor_label,
                 severity_output.severity_explanation
             ),
             tokens_in,
@@ -3205,6 +3231,31 @@ pub async fn process_issue_worker_for_project(
     input: BugInput,
     context_tag: Option<&str>,
     project: ProjectId,
+) -> Result<BugOutcome> {
+    process_issue_worker_with_min_severity(
+        provider,
+        tools,
+        db,
+        bug_row,
+        input,
+        context_tag,
+        project,
+        None,
+    )
+    .await
+}
+
+#[cfg(feature = "server")]
+#[allow(clippy::too_many_arguments)]
+pub async fn process_issue_worker_with_min_severity(
+    provider: &dyn AiProvider,
+    tools: Option<Arc<ToolBox>>,
+    db: &Database,
+    bug_row: &crate::db::Bug,
+    input: BugInput,
+    context_tag: Option<&str>,
+    project: ProjectId,
+    min_severity_override: Option<crate::db::SeverityFloor>,
 ) -> Result<BugOutcome> {
     let project_label = match project {
         ProjectId::Linux => "Linux kernel",
@@ -3566,10 +3617,20 @@ pub async fn process_issue_worker_for_project(
     let severity_output = severity_result.output;
     let severity = Severity::from_str(&severity_output.severity);
 
-    if is_scan_candidate && !matches!(severity, Severity::High | Severity::Critical) {
+    let effective_min_severity = min_severity_override
+        .or(input.min_severity)
+        .or_else(|| is_scan_candidate.then_some(crate::db::SeverityFloor::Medium));
+    if let Some(floor) = effective_min_severity
+        && !floor.admits(severity)
+    {
+        let floor_label = match floor {
+            crate::db::SeverityFloor::High => "requires High or Critical".to_string(),
+            other => format!("requires >= {other}"),
+        };
         let reason = format!(
-            "Calibrated severity is {} (requires High or Critical): {}",
+            "Calibrated severity is {} ({}): {}",
             severity.as_str(),
+            floor_label,
             severity_output.severity_explanation
         );
         info!("{} scan candidate discarded: {}", project_label, reason);
@@ -4923,6 +4984,7 @@ mod tests {
             patch_id: None,
             baseline_sha: None,
             review_id: None,
+            min_severity: None,
         };
 
         let mock_provider = MockAiProvider {
@@ -5010,6 +5072,7 @@ mod tests {
             patch_id: None,
             baseline_sha: None,
             review_id: Some(rev_id),
+            min_severity: None,
         };
 
         let outcome = process_issue(&provider, None, &db, input.clone(), None)
@@ -5511,6 +5574,7 @@ mod tests {
             patch_id: None,
             baseline_sha: None,
             review_id: None,
+            min_severity: None,
         };
         let BugOutcome::NewlyDiscovered { bug } =
             process_issue(&provider, None, &db, input.clone(), None)
@@ -5602,6 +5666,7 @@ mod tests {
             patch_id: None,
             baseline_sha: None,
             review_id: None,
+            min_severity: None,
         };
         let no_files: Vec<String> = Vec::new();
         let subsystem_names: Vec<String> =
@@ -5850,6 +5915,7 @@ mod tests {
             patch_id: None,
             baseline_sha: None,
             review_id: Some(rev_id),
+            min_severity: None,
         };
 
         let outcome = process_issue(&provider, None, &db, input.clone(), None)
@@ -6008,6 +6074,7 @@ mod tests {
             patch_id: None,
             baseline_sha: None,
             review_id: Some(rev_id),
+            min_severity: None,
         };
 
         let outcome = process_issue(&provider, None, &db, input.clone(), None)
@@ -6468,6 +6535,7 @@ Call Trace:
             patch_id: None,
             baseline_sha: None,
             review_id: None,
+            min_severity: None,
         };
         let mut session = TracingSession {
             project: ProjectId::Linux,
@@ -7044,6 +7112,7 @@ F:	drivers/net/ethernet/intel/e1000/
             patch_id: None,
             baseline_sha: Some(sha1.clone()),
             review_id: None,
+            min_severity: None,
         };
 
         let BugOutcome::NewlyDiscovered { bug: pending_bug } = process_issue_for_project(
@@ -7265,6 +7334,7 @@ F:	drivers/net/ethernet/intel/e1000/
             patch_id: None,
             baseline_sha: None,
             review_id: None,
+            min_severity: None,
         };
 
         // Both Bug A and Bug B are queued as 'new' / 'pending' before either
@@ -7463,6 +7533,7 @@ F:	drivers/net/ethernet/intel/e1000/
             patch_id: None,
             baseline_sha: None,
             review_id: None,
+            min_severity: None,
         };
         let BugOutcome::NewlyDiscovered { bug: canon_bug } =
             process_issue(&dummy, None, &db, input.clone(), None)
@@ -7686,6 +7757,7 @@ F:	drivers/net/ethernet/intel/e1000/
             patch_id: None,
             baseline_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
             review_id: None,
+            min_severity: None,
         };
 
         let dummy = MockAiProvider {
@@ -7703,13 +7775,87 @@ F:	drivers/net/ethernet/intel/e1000/
         .await
         .unwrap();
 
-        // Only 4 responses provided (Normalize, Verify, Tracing, Severity=Medium).
+        // Only 4 responses provided (Normalize, Verify, Tracing, Severity=Low).
         // If ReportSession were invoked, QueuedMockAiProvider would return "{}" and
         // the bug would be committed as Open instead of Dismissed.
         let provider = QueuedMockAiProvider::new(vec![
             json!({
                 "canonical_title": "net: minor error code in dev_alloc()",
                 "canonical_description": "Trigger: Error path.\nFailure Mechanism: Returns -EINVAL.\nImpact: Minor.",
+                "affected_source_files": ["net/core/dev.c"]
+            })
+            .to_string(),
+            json!({
+                "verification_reasoning": "Verified on tree.",
+                "is_false_positive": false,
+                "refutation_evidence": null,
+                "impact_severity": "Low",
+                "relevant_code_locations": locs
+            })
+            .to_string(),
+            json!({
+                "introducing_commit_sha": "112233445566"
+            })
+            .to_string(),
+            json!({
+                "severity": "Low",
+                "severity_explanation": "Cosmetic error code difference only."
+            })
+            .to_string(),
+        ]);
+
+        let worker_db = db.with_bug_claim(claimed.id, "worker:1").with_bug_actor(
+            "sashiko",
+            "sashiko:linux_bug",
+            Some("mock".to_string()),
+        );
+        let outcome = process_issue_worker_for_project(
+            &provider,
+            None,
+            &worker_db,
+            &claimed,
+            input.clone(),
+            Some("bug_worker"),
+            ProjectId::Linux,
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            BugOutcome::Discarded { reason, .. } => {
+                assert!(reason.contains("Calibrated severity is Low"));
+            }
+            other => panic!("Expected Discarded outcome for Low scan bug, got {other:?}"),
+        }
+
+        let stored = db.get_bug(claimed.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.lifecycle_status,
+            crate::db::BugLifecycleStatus::Dismissed
+        );
+        assert!(stored.vector_json.is_none());
+        assert!(
+            !stored.enrichments.iter().any(|e| e.kind == "report"),
+            "ReportSession must not run for dismissed scan candidates"
+        );
+
+        // Explicit --min-severity high still dismisses Medium scan candidates.
+        let mut high_input = input;
+        high_input.problem = "net: medium issue in dev_alloc()".to_string();
+        let claimed_high = create_claimed_issue_for_project(
+            &dummy,
+            &scan_db,
+            high_input.clone(),
+            ProjectId::Linux,
+            "worker:2",
+            300,
+        )
+        .await
+        .unwrap();
+        let provider_high = QueuedMockAiProvider::new(vec![
+            json!({
+                "canonical_title": "net: medium error path in dev_alloc()",
+                "canonical_description": "Trigger: Error path.\nFailure Mechanism: Returns -EINVAL.\nImpact: Bounded.",
                 "affected_source_files": ["net/core/dev.c"]
             })
             .to_string(),
@@ -7727,44 +7873,25 @@ F:	drivers/net/ethernet/intel/e1000/
             .to_string(),
             json!({
                 "severity": "Medium",
-                "severity_explanation": "Cosmetic error code difference only."
+                "severity_explanation": "Bounded impact."
             })
             .to_string(),
         ]);
-
-        let worker_db = db.with_bug_claim(claimed.id, "worker:1").with_bug_actor(
-            "sashiko",
-            "sashiko:linux_bug",
-            Some("mock".to_string()),
-        );
-        let outcome = process_issue_worker_for_project(
-            &provider,
+        let worker_db_high = db
+            .with_bug_claim(claimed_high.id, "worker:2")
+            .with_bug_actor("sashiko", "sashiko:linux_bug", Some("mock".to_string()));
+        let outcome_high = process_issue_worker_with_min_severity(
+            &provider_high,
             None,
-            &worker_db,
-            &claimed,
-            input,
+            &worker_db_high,
+            &claimed_high,
+            high_input,
             Some("bug_worker"),
             ProjectId::Linux,
+            Some(crate::db::SeverityFloor::High),
         )
         .await
         .unwrap();
-
-        match outcome {
-            BugOutcome::Discarded { reason, .. } => {
-                assert!(reason.contains("Calibrated severity is Medium"));
-            }
-            other => panic!("Expected Discarded outcome for Medium scan bug, got {other:?}"),
-        }
-
-        let stored = db.get_bug(claimed.id).await.unwrap().unwrap();
-        assert_eq!(
-            stored.lifecycle_status,
-            crate::db::BugLifecycleStatus::Dismissed
-        );
-        assert!(stored.vector_json.is_none());
-        assert!(
-            !stored.enrichments.iter().any(|e| e.kind == "report"),
-            "ReportSession must not run for dismissed scan candidates"
-        );
+        assert!(matches!(outcome_high, BugOutcome::Discarded { .. }));
     }
 }

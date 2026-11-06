@@ -629,6 +629,15 @@ impl std::str::FromStr for SeverityFloor {
     }
 }
 
+impl Serialize for SeverityFloor {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 impl<'de> Deserialize<'de> for SeverityFloor {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,

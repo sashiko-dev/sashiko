@@ -95,6 +95,7 @@ pub struct BugWorker {
     repo_path: String,
     project: crate::project::ProjectId,
     settings: crate::settings::LinuxBugSettings,
+    min_severity: Option<crate::db::SeverityFloor>,
     /// Identifies this worker in the lease it takes, so that a lease which
     /// never gets released can be traced back to a process.
     worker_id: String,
@@ -113,6 +114,7 @@ impl BugWorker {
                 max_attempts: BUG_MAX_ATTEMPTS,
                 ..Default::default()
             },
+            min_severity: None,
             worker_id: format!(
                 "{}:{}",
                 std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string()),
@@ -135,6 +137,11 @@ impl BugWorker {
 
     pub fn with_settings(mut self, settings: crate::settings::LinuxBugSettings) -> Self {
         self.settings = settings;
+        self
+    }
+
+    pub fn with_min_severity(mut self, min_severity: Option<crate::db::SeverityFloor>) -> Self {
+        self.min_severity = min_severity;
         self
     }
 
@@ -754,6 +761,7 @@ impl BugWorker {
             patch_id: bug.discovered_in_patch_id,
             baseline_sha: bug.discovered_in_commit.clone(),
             review_id: None,
+            min_severity: None,
         });
 
         let mut tb = ToolBox::new(std::path::PathBuf::from(&self.repo_path));
@@ -762,8 +770,9 @@ impl BugWorker {
         }
         let tools = Some(Arc::new(tb));
 
+        let effective_min_severity = self.min_severity.or(input.min_severity);
         let analysis = run_while_leased(
-            crate::workflows::linux_bug::process_issue_worker_for_project(
+            crate::workflows::linux_bug::process_issue_worker_with_min_severity(
                 self.provider.as_ref(),
                 tools,
                 &db,
@@ -771,6 +780,7 @@ impl BugWorker {
                 input,
                 Some("bug_worker"),
                 effective_project,
+                effective_min_severity,
             ),
             maintain_lease(
                 &db,

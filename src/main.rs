@@ -394,7 +394,11 @@ enum Commands {
         #[arg(long)]
         exclude: Vec<String>,
 
-        /// Submit verified High/Critical findings to the bug repository for deduplication
+        /// Lowest severity of a verified bug to report (low, medium, high, critical)
+        #[arg(long, value_name = "SEVERITY", default_value = "medium")]
+        min_severity: sashiko::db::SeverityFloor,
+
+        /// Submit verified findings at or above --min-severity to the bug repository for deduplication
         #[arg(long)]
         submit_bugs: bool,
 
@@ -779,6 +783,7 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
                 max_files,
                 max_chunks,
                 exclude,
+                min_severity,
                 submit_bugs,
                 custom_prompt,
                 prompts,
@@ -805,6 +810,7 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
                     *max_files,
                     *max_chunks,
                     exclude.clone(),
+                    *min_severity,
                     *submit_bugs,
                     custom_prompt.clone(),
                     resolve_prompts_path(prompts.clone(), project)?,
@@ -3412,6 +3418,7 @@ async fn handle_scan_command(
     max_files: usize,
     max_chunks: Option<usize>,
     exclude: Vec<String>,
+    min_severity: sashiko::db::SeverityFloor,
     submit_bugs: bool,
     custom_prompt: Option<String>,
     prompts: PathBuf,
@@ -3546,6 +3553,7 @@ async fn handle_scan_command(
             max_files,
             max_chunks,
             exclude,
+            min_severity,
             submit_bugs,
             prompts,
             custom_prompt,
@@ -3582,6 +3590,17 @@ fn scan_exit_code(summary: &sashiko::scan::ScanSummary) -> i32 {
         1
     } else {
         0
+    }
+}
+
+fn clean_scan_message(min_severity: Option<sashiko::db::SeverityFloor>) -> &'static str {
+    match min_severity {
+        None | Some(sashiko::db::SeverityFloor::High) => "\nNo High or Critical defects found.\n",
+        Some(sashiko::db::SeverityFloor::Medium) => {
+            "\nNo Medium, High, or Critical defects found.\n"
+        }
+        Some(sashiko::db::SeverityFloor::Critical) => "\nNo Critical defects found.\n",
+        Some(sashiko::db::SeverityFloor::Low) => "\nNo verified defects found.\n",
     }
 }
 
@@ -3623,7 +3642,7 @@ fn write_scan_result(
 
     if summary.findings.is_empty() {
         if !incomplete {
-            write_colored(out, Color::Green, "\nNo High or Critical defects found.\n")?;
+            write_colored(out, Color::Green, clean_scan_message(summary.min_severity))?;
         }
     } else {
         writeln!(out, "\nVerified Findings ({}):", summary.findings.len())?;
@@ -6905,6 +6924,7 @@ mod tests {
                 max_files,
                 max_chunks,
                 exclude,
+                min_severity,
                 submit_bugs,
                 format,
                 ..
@@ -6922,8 +6942,23 @@ mod tests {
                 assert_eq!(max_files, 50);
                 assert_eq!(max_chunks, Some(20));
                 assert_eq!(exclude, vec!["trace.h".to_string()]);
+                assert_eq!(min_severity, sashiko::db::SeverityFloor::Medium);
                 assert!(submit_bugs);
                 assert!(matches!(format, OutputFormat::Json));
+            }
+            _ => panic!("expected scan command"),
+        }
+
+        let cli_high = Cli::parse_from([
+            "sashiko",
+            "scan",
+            "mm/memcontrol.c",
+            "--min-severity",
+            "high",
+        ]);
+        match cli_high.command {
+            Some(Commands::Scan { min_severity, .. }) => {
+                assert_eq!(min_severity, sashiko::db::SeverityFloor::High);
             }
             _ => panic!("expected scan command"),
         }
@@ -6944,6 +6979,25 @@ mod tests {
         write_scan_result(&mut clean_buf, &summary).unwrap();
         let clean_text = String::from_utf8(clean_buf.into_inner()).unwrap();
         assert!(clean_text.contains("No High or Critical defects found."));
+
+        summary.min_severity = Some(sashiko::db::SeverityFloor::Medium);
+        let mut med_buf = termcolor::NoColor::new(Vec::new());
+        write_scan_result(&mut med_buf, &summary).unwrap();
+        let med_text = String::from_utf8(med_buf.into_inner()).unwrap();
+        assert!(med_text.contains("No Medium, High, or Critical defects found."));
+
+        summary.min_severity = Some(sashiko::db::SeverityFloor::Low);
+        let mut low_buf = termcolor::NoColor::new(Vec::new());
+        write_scan_result(&mut low_buf, &summary).unwrap();
+        let low_text = String::from_utf8(low_buf.into_inner()).unwrap();
+        assert!(low_text.contains("No verified defects found."));
+
+        summary.min_severity = Some(sashiko::db::SeverityFloor::Critical);
+        let mut crit_buf = termcolor::NoColor::new(Vec::new());
+        write_scan_result(&mut crit_buf, &summary).unwrap();
+        let crit_text = String::from_utf8(crit_buf.into_inner()).unwrap();
+        assert!(crit_text.contains("No Critical defects found."));
+        summary.min_severity = None;
 
         // Partial chunk failure or candidate verification failure must exit 3
         // and never claim a clean scan.
