@@ -66,6 +66,7 @@ pub mod repo_sync;
 #[cfg(feature = "server")]
 pub mod reviewer;
 pub mod scan;
+pub mod security_eval;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod settings;
