@@ -43,8 +43,8 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Semaphore, mpsc};
 #[cfg(feature = "server")]
 use tracing::error;
-use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing::{debug, info, warn};
+use tracing_subscriber::fmt;
 
 const DEFAULT_SETTINGS: &str = include_str!("../docs/examples/Settings.example.toml");
 
@@ -71,8 +71,8 @@ struct Cli {
     #[arg(long)]
     port: Option<u16>,
 
-    /// Enable debug logging (overrides settings)
-    #[arg(long)]
+    /// Enable Sashiko debug logging (overrides settings)
+    #[arg(long, global = true)]
     debug: bool,
 
     /// Allow non-localhost POST requests (unsafe)
@@ -579,34 +579,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut settings_result = Settings::load(Some(&settings_path));
 
     // Determine log level
-    // 1. CLI --debug takes precedence (implies "info")
-    // 2. Review/Scan commands default to "warn" (unless --debug)
-    // 3. Settings log_level
-    // 4. Worker command defaults to "info" (worker logs progress on stderr)
-    // 5. Fallback to "warn" (if settings failed)
-    let is_review = matches!(
-        cli.command,
-        Some(Commands::Review { .. } | Commands::Notes { .. } | Commands::Scan { .. })
-    );
-    let is_worker = matches!(cli.command, Some(Commands::Worker { .. }));
-    // A sync can run for most of an hour; its progress is the point.
-    let is_repo = matches!(cli.command, Some(Commands::Repo { .. }));
-    let log_level = if cli.debug || is_repo {
-        "info"
-    } else if is_review {
-        "warn"
-    } else if let Ok(s) = &settings_result {
-        &s.log_level
-    } else if is_worker {
-        "info"
-    } else {
-        "warn"
+    let log_kind = match &cli.command {
+        Some(Commands::Review { .. } | Commands::Notes { .. } | Commands::Scan { .. }) => {
+            sashiko::logging::LogCommandKind::InteractiveCli
+        }
+        Some(Commands::Repo { .. }) => sashiko::logging::LogCommandKind::RepoSync,
+        Some(Commands::Worker { .. }) => sashiko::logging::LogCommandKind::Worker,
+        _ => sashiko::logging::LogCommandKind::Daemon,
     };
-
-    // Initialize tracing with EnvFilter
-    // RUST_LOG env var still overrides everything if present
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
+    let configured_level = settings_result.as_ref().ok().map(|s| s.log_level.as_str());
+    let fallback_spec =
+        sashiko::logging::resolve_log_filter_spec(cli.debug, log_kind, configured_level);
+    let rust_log_env = std::env::var("RUST_LOG").ok();
+    let (env_filter, filter_warning) =
+        sashiko::logging::build_env_filter(rust_log_env.as_deref(), &fallback_spec);
 
     // Determine formatting features independently
     let plain_logs = std::env::var("SASHIKO_LOG_PLAIN").is_ok();
@@ -627,8 +613,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder.init();
     }
 
+    if let Some(warning) = filter_warning {
+        warn!("{warning}");
+    }
+
     if cli.debug {
-        info!("Debug logging enabled");
+        debug!("Debug logging enabled");
     }
 
     // The command line's say over the file, merged once, here, where both are

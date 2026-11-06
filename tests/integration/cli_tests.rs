@@ -80,6 +80,11 @@ fn test_review_subcommand_shows_info_logs_with_debug() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
+        stderr.contains("DEBUG"),
+        "stderr missing DEBUG logs in debug mode: {}",
+        stderr
+    );
+    assert!(
         stderr.contains("INFO"),
         "stderr missing INFO logs in debug mode: {}",
         stderr
