@@ -451,6 +451,9 @@ reviews are ignored and the background bug worker is not started.
 | `max_attempts` | integer | `3` | How many analysis attempts a bug gets before it is abandoned. Abandoned bugs are never retried automatically. |
 | `fix_check_interval_seconds` | integer | `21600` | Interval in seconds between periodic upstream fix checks against the mainline tree. Set to `0` to disable periodic checks. |
 | `fix_check_batch_size` | integer | `50` | Maximum number of open bugs evaluated per upstream fix check cycle. |
+| `security_eval_enabled` | bool | `true` | Automatically evaluate canonical verified bugs for security importance (CVSS v4.0 + project threat model) upon discovery and during periodic background backfill sweeps when `BugWorker` is active. |
+| `security_eval_interval_seconds` | integer | `60` | Interval in seconds between periodic background security evaluation sweeps over unevaluated or manually queued canonical bugs. Set to `0` to disable periodic sweeps. |
+| `security_eval_batch_size` | integer | `25` | Maximum number of canonical bugs evaluated per periodic security evaluation sweep. |
 
 ### `[subsystems]`
 

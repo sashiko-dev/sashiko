@@ -1285,6 +1285,7 @@ mod tests {
             max_attempts: 1,
             fix_check_interval_seconds: 0,
             fix_check_batch_size: 10,
+            ..Default::default()
         });
 
         let handle = tokio::spawn(async move {

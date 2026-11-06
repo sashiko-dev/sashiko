@@ -1323,6 +1323,19 @@ pub struct LinuxBugSettings {
     /// Maximum number of open bugs to evaluate per upstream fix check cycle.
     #[serde(default = "default_fix_check_batch_size")]
     pub fix_check_batch_size: usize,
+    /// Whether canonical bugs are automatically evaluated for security
+    /// importance (CVSS v4.0 + threat model) on discovery and via periodic
+    /// background backfill sweeps.
+    #[serde(default = "default_security_eval_enabled")]
+    pub security_eval_enabled: bool,
+    /// Interval in seconds between periodic background security evaluation
+    /// sweeps for existing unevaluated or queued bugs. Set to 0 to disable
+    /// periodic sweeps while keeping new-bug evaluation active.
+    #[serde(default = "default_security_eval_interval_seconds")]
+    pub security_eval_interval_seconds: u64,
+    /// Maximum number of bugs evaluated per periodic security evaluation cycle.
+    #[serde(default = "default_security_eval_batch_size")]
+    pub security_eval_batch_size: usize,
 }
 
 fn default_bug_concurrency() -> usize {
@@ -1345,6 +1358,18 @@ fn default_fix_check_batch_size() -> usize {
     50
 }
 
+fn default_security_eval_enabled() -> bool {
+    true
+}
+
+fn default_security_eval_interval_seconds() -> u64 {
+    60
+}
+
+fn default_security_eval_batch_size() -> usize {
+    25
+}
+
 impl Default for LinuxBugSettings {
     fn default() -> Self {
         Self {
@@ -1355,6 +1380,9 @@ impl Default for LinuxBugSettings {
             max_attempts: default_bug_max_attempts(),
             fix_check_interval_seconds: default_fix_check_interval_seconds(),
             fix_check_batch_size: default_fix_check_batch_size(),
+            security_eval_enabled: default_security_eval_enabled(),
+            security_eval_interval_seconds: default_security_eval_interval_seconds(),
+            security_eval_batch_size: default_security_eval_batch_size(),
         }
     }
 }
@@ -2528,14 +2556,20 @@ mod tests {
         assert_eq!(default_bug.max_attempts, 3);
         assert_eq!(default_bug.fix_check_interval_seconds, 21_600);
         assert_eq!(default_bug.fix_check_batch_size, 50);
+        assert!(default_bug.security_eval_enabled);
+        assert_eq!(default_bug.security_eval_interval_seconds, 60);
+        assert_eq!(default_bug.security_eval_batch_size, 25);
 
         let settings = Settings::new().unwrap();
         assert!(!settings.linux_bug.enabled);
         assert_eq!(settings.linux_bug.concurrency, 4);
         assert!(!settings.linux_bug.fix_check_enabled);
+        assert!(settings.linux_bug.security_eval_enabled);
+        assert_eq!(settings.linux_bug.security_eval_interval_seconds, 60);
+        assert_eq!(settings.linux_bug.security_eval_batch_size, 25);
 
         let custom: LinuxBugSettings = toml::from_str(
-            "enabled = true\nconcurrency = 8\nfix_check_enabled = true\nfix_check_interval_seconds = 3600\nfix_check_batch_size = 20\n",
+            "enabled = true\nconcurrency = 8\nfix_check_enabled = true\nfix_check_interval_seconds = 3600\nfix_check_batch_size = 20\nsecurity_eval_enabled = false\nsecurity_eval_interval_seconds = 120\nsecurity_eval_batch_size = 10\n",
         )
         .unwrap();
         assert!(custom.enabled);
@@ -2543,6 +2577,9 @@ mod tests {
         assert!(custom.fix_check_enabled);
         assert_eq!(custom.fix_check_interval_seconds, 3600);
         assert_eq!(custom.fix_check_batch_size, 20);
+        assert!(!custom.security_eval_enabled);
+        assert_eq!(custom.security_eval_interval_seconds, 120);
+        assert_eq!(custom.security_eval_batch_size, 10);
     }
 
     #[test]

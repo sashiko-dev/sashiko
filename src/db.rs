@@ -907,6 +907,117 @@ impl Bug {
         None
     }
 
+    pub fn security_evaluation(&self) -> Option<crate::security_eval::SecurityEvaluation> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "security_evaluation"
+                && let Some(ref data) = e.data_json
+                && let Ok(eval) =
+                    serde_json::from_value::<crate::security_eval::SecurityEvaluation>(data.clone())
+            {
+                return Some(eval);
+            }
+        }
+        None
+    }
+
+    pub fn security_score_tenths(&self) -> Option<u8> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "security_evaluation"
+                && let Some(ref data) = e.data_json
+            {
+                let raw = data
+                    .get("score_tenths")
+                    .or_else(|| data.get("security_score_tenths"))
+                    .and_then(|v| v.as_u64());
+                if let Some(val) = raw.and_then(|v| u8::try_from(v).ok())
+                    && val <= 100
+                {
+                    return Some(val);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn security_score(&self) -> Option<f64> {
+        self.security_score_tenths()
+            .map(|tenths| f64::from(tenths) / 10.0)
+    }
+
+    pub fn security_rating(&self) -> Option<crate::security_eval::SecurityRating> {
+        self.security_score_tenths()
+            .map(crate::security_eval::SecurityRating::from_score_tenths)
+    }
+
+    pub fn security_class(&self) -> Option<crate::security_eval::SecurityClass> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "security_evaluation"
+                && let Some(ref data) = e.data_json
+                && let Some(cls_str) = data.get("security_class").and_then(|v| v.as_str())
+                && let Ok(cls) = cls_str.parse::<crate::security_eval::SecurityClass>()
+            {
+                return Some(cls);
+            }
+        }
+        None
+    }
+
+    pub fn cvss_vector(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "security_evaluation"
+                && let Some(ref data) = e.data_json
+            {
+                return data
+                    .get("cvss_vector")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+            }
+        }
+        None
+    }
+
+    pub fn security_summary(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "security_evaluation" {
+                if let Some(content) = e
+                    .content
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(content.to_string());
+                }
+                if let Some(ref data) = e.data_json
+                    && let Some(summary) = data
+                        .get("summary")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                {
+                    return Some(summary.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn security_eval_requested(&self) -> bool {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "security_evaluation" {
+                return false;
+            }
+            if e.kind == "audit"
+                && let Some(ref data) = e.data_json
+                && data.get("field").and_then(|v| v.as_str()) == Some("security_evaluation")
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn description(&self) -> Option<String> {
         for e in self.enrichments.iter().rev() {
             if e.kind == "report"
@@ -1456,6 +1567,20 @@ pub struct UpstreamFixCheckParams<'a> {
     pub tokens_cached: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SecurityEvaluationRecordParams<'a> {
+    pub evaluation: &'a crate::security_eval::SecurityEvaluation,
+    pub logs: Option<&'a str>,
+    pub tokens_in: Option<usize>,
+    pub tokens_out: Option<usize>,
+    pub tokens_cached: Option<usize>,
+    /// Clears `locked_by` and `lease_expires_at` inside the same transaction
+    /// when `true`. Callers holding an outer analysis lease (such as
+    /// `BugWorker::process_claimed_bug`) pass `false` and release their lease
+    /// on exit.
+    pub release_lease: bool,
+}
+
 /// Which bugs a listing may return.
 ///
 /// The default is the empty scope rather than everything: a caller that forgets
@@ -1483,6 +1608,8 @@ pub struct ListBugsParams<'a> {
     pub page: Option<u32>,
     pub limit: Option<u32>,
     pub min_severity: Option<Severity>,
+    pub min_security_score_tenths: Option<u8>,
+    pub security_classes: Option<&'a [crate::security_eval::SecurityClass]>,
     pub subsystem: Option<&'a str>,
     pub subsystems: Option<&'a [String]>,
     pub lifecycle_status: Option<BugLifecycleStatus>,
@@ -3113,6 +3240,41 @@ impl Database {
             }
         }
 
+        if current_version < 21 {
+            info!("Applying database migration version 21 (bug security evaluation)...");
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 21 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 21.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                let has_security_score_tenths = {
+                    let mut columns = tx.query("PRAGMA table_info(bugs)", ()).await?;
+                    let mut found = false;
+                    while let Some(row) = columns.next().await? {
+                        let name: String = row.get(1)?;
+                        found |= name == "security_score_tenths";
+                    }
+                    found
+                };
+                if !has_security_score_tenths {
+                    tx.execute_batch(include_str!("migrations/021_bug_security_evaluation.sql"))
+                        .await?;
+                }
+                tx.execute("PRAGMA user_version = 21", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
         let has_patchwork_outbox = {
             let mut rows = self
                 .conn
@@ -3131,7 +3293,7 @@ impl Database {
             .await?;
         }
 
-        debug!("Database schema is up to date at version 20.");
+        debug!("Database schema is up to date at version 21.");
 
         Ok(())
     }
@@ -5130,6 +5292,36 @@ impl Database {
                     };
                     event["fixed_in_commit"] = json!(fixed_ref);
                 }
+                if enrichment.kind == "security_evaluation"
+                    && let Some(data) = &enrichment.data_json
+                {
+                    if let Some(cls) = data.get("security_class") {
+                        event["security_class"] = cls.clone();
+                    }
+                    if let Some(score) = data.get("score") {
+                        event["security_score"] = score.clone();
+                    }
+                    if let Some(tenths) = data.get("score_tenths") {
+                        event["security_score_tenths"] = tenths.clone();
+                    }
+                    if let Some(rating) = data.get("qualitative_rating") {
+                        event["security_rating"] = rating.clone();
+                    }
+                    if let Some(vec_str) = data.get("cvss_vector").filter(|v| !v.is_null()) {
+                        event["cvss_vector"] = vec_str.clone();
+                    }
+                    if let Some(boundary) = data.get("trust_boundary").filter(|v| !v.is_null()) {
+                        event["trust_boundary"] = boundary.clone();
+                    }
+                    if let Some(attacker) = data.get("attacker_model").filter(|v| !v.is_null()) {
+                        event["attacker_model"] = attacker.clone();
+                    }
+                    if let Some(justifications) =
+                        data.get("metric_justifications").filter(|v| !v.is_null())
+                    {
+                        event["metric_justifications"] = justifications.clone();
+                    }
+                }
                 if enrichment.kind == "audit"
                     && let Some(data) = &enrichment.data_json
                 {
@@ -5149,6 +5341,20 @@ impl Database {
                                 "Title changed to {}",
                                 data["new"].as_str().unwrap_or("untitled")
                             ))
+                        }
+                        Some("security_evaluation") => {
+                            let content = match data
+                                .get("reason")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                Some(reason) => {
+                                    format!("Security re-evaluation requested: {reason}")
+                                }
+                                None => "Security re-evaluation requested".to_string(),
+                            };
+                            event["content"] = json!(content);
                         }
                         _ => {}
                     }
@@ -6450,6 +6656,290 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically claims the highest-priority canonical verified bug needing a
+    /// security evaluation or manual re-evaluation.
+    ///
+    /// Leaves `pipeline_state` and `updated_at` untouched so background
+    /// security backfills never disturb initial bug triage or periodic upstream
+    /// fix check cursors.
+    pub async fn claim_bug_for_security_eval(
+        &self,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+        max_attempts: i64,
+    ) -> Result<Option<Bug>> {
+        let now = chrono::Utc::now().timestamp();
+        let ttl = lease_ttl_seconds.clamp(5, 86_400);
+        let capped_attempts = max_attempts.max(1);
+        let id_opt = self
+            .query_returning_i64(
+                "UPDATE bugs
+                    SET locked_by = ?1,
+                        lease_expires_at = ?2,
+                        security_eval_attempts = security_eval_attempts + 1
+                  WHERE id = (
+                      SELECT id FROM bugs
+                       WHERE duplicate_of_id IS NULL
+                         AND pipeline_state = 'succeeded'
+                         AND lifecycle_status IN ('open', 'fixed', 'closed')
+                         AND (security_score_tenths IS NULL OR security_eval_requested = 1)
+                         AND security_eval_attempts < ?4
+                         AND (lease_expires_at IS NULL OR lease_expires_at <= ?3)
+                       ORDER BY security_eval_requested DESC,
+                                CASE lifecycle_status
+                                    WHEN 'open' THEN 0
+                                    WHEN 'fixed' THEN 1
+                                    ELSE 2
+                                END ASC,
+                                severity_int DESC,
+                                id DESC
+                       LIMIT 1
+                  )
+                  RETURNING id",
+                libsql::params![worker_id, now.saturating_add(ttl), now, capped_attempts],
+            )
+            .await?;
+        match id_opt {
+            Some(id) => self.get_bug_on_write_conn(id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Atomically claims a specific canonical verified bug by internal `bug_id`
+    /// for an explicit security evaluation run.
+    pub async fn claim_specific_bug_for_security_eval(
+        &self,
+        bug_id: i64,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+    ) -> Result<Option<Bug>> {
+        let now = chrono::Utc::now().timestamp();
+        let ttl = lease_ttl_seconds.clamp(5, 86_400);
+        let updated = self
+            .execute(
+                "UPDATE bugs
+                    SET locked_by = ?1,
+                        lease_expires_at = ?2,
+                        security_eval_attempts = security_eval_attempts + 1
+                  WHERE id = ?4
+                    AND duplicate_of_id IS NULL
+                    AND pipeline_state = 'succeeded'
+                    AND lifecycle_status IN ('open', 'fixed', 'closed')
+                    AND (lease_expires_at IS NULL OR lease_expires_at <= ?3)",
+                libsql::params![worker_id, now.saturating_add(ttl), now, bug_id],
+            )
+            .await?;
+        if updated > 0 {
+            self.get_bug_on_write_conn(bug_id).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Persists a `security_evaluation` enrichment (which projects score,
+    /// classification, and CVSS vector onto `bugs` via trigger and clears
+    /// `security_eval_requested`).
+    ///
+    /// Returns `Ok(false)` without writing the enrichment if the bug was
+    /// concurrently marked `duplicate` or `dismissed`.
+    pub async fn record_bug_security_evaluation(
+        &self,
+        id: i64,
+        params: SecurityEvaluationRecordParams<'_>,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = if self.bug_claim.is_some() {
+            self.begin_bug_write(id).await?
+        } else {
+            self.begin_immediate_transaction().await?
+        };
+
+        let eligible = {
+            let mut rows = tx
+                .query(
+                    "SELECT 1 FROM bugs
+                      WHERE id = ?1
+                        AND duplicate_of_id IS NULL
+                        AND lifecycle_status IN ('open', 'fixed', 'closed')",
+                    libsql::params![id],
+                )
+                .await?;
+            rows.next().await?.is_some()
+        };
+
+        if !eligible {
+            if params.release_lease {
+                tx.execute(
+                    "UPDATE bugs
+                        SET locked_by = NULL,
+                            lease_expires_at = NULL,
+                            security_eval_requested = 0
+                      WHERE id = ?1",
+                    libsql::params![id],
+                )
+                .await?;
+            } else {
+                tx.execute(
+                    "UPDATE bugs SET security_eval_requested = 0 WHERE id = ?1",
+                    libsql::params![id],
+                )
+                .await?;
+            }
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        let data_json = serde_json::to_value(params.evaluation)?;
+        self.with_connection((*tx).clone())
+            .insert_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "security_evaluation".to_string(),
+                    tool: self.bug_tool.clone(),
+                    author: Some(self.bug_actor.clone()),
+                    model: self.bug_model.clone(),
+                    created_at: now,
+                    content: Some(params.evaluation.summary.clone()),
+                    data_json: Some(data_json),
+                    tokens_in: params.tokens_in,
+                    tokens_out: params.tokens_out,
+                    tokens_cached: params.tokens_cached,
+                    logs: params.logs.map(str::to_string),
+                },
+            )
+            .await?;
+
+        if params.release_lease {
+            tx.execute(
+                "UPDATE bugs
+                    SET locked_by = NULL,
+                        lease_expires_at = NULL
+                  WHERE id = ?1",
+                libsql::params![id],
+            )
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Releases a standalone security-evaluation lease, optionally applying a
+    /// short cooldown window before another background sweep retries the bug.
+    pub async fn release_security_eval_lease(&self, id: i64, cooldown_seconds: i64) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let owner = self.bug_claim.as_ref().map(|c| c.owner.as_str());
+        let next_expiry = if cooldown_seconds > 0 {
+            Some(now.saturating_add(cooldown_seconds))
+        } else {
+            None
+        };
+        self.execute(
+            "UPDATE bugs
+                SET locked_by = NULL,
+                    lease_expires_at = ?1
+              WHERE id = ?2
+                AND (?3 IS NULL OR locked_by = ?3)",
+            libsql::params![next_expiry, id, owner],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Flags a canonical bug for security re-evaluation, resets its automatic
+    /// attempt counter, and records an audit enrichment in one transaction.
+    pub async fn request_bug_security_eval(&self, id: i64, reason: Option<&str>) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.begin_immediate_transaction().await?;
+        let updated = tx
+            .execute(
+                "UPDATE bugs
+                    SET security_eval_requested = 1,
+                        security_eval_attempts = 0
+                  WHERE id = ?1
+                    AND duplicate_of_id IS NULL
+                    AND lifecycle_status IN ('open', 'fixed', 'closed')",
+                libsql::params![id],
+            )
+            .await?;
+        if updated == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let clean_reason = reason.map(str::trim).filter(|s| !s.is_empty());
+        let content = match clean_reason {
+            Some(r) => format!("Security re-evaluation requested: {r}"),
+            None => "Security re-evaluation requested".to_string(),
+        };
+        let mut data = serde_json::json!({
+            "field": "security_evaluation",
+            "action": "requested",
+        });
+        if let Some(r) = clean_reason {
+            data["reason"] = serde_json::json!(r);
+        }
+        self.with_connection((*tx).clone())
+            .insert_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "audit".to_string(),
+                    tool: self.bug_tool.clone(),
+                    author: Some(self.bug_actor.clone()),
+                    model: self.bug_model.clone(),
+                    created_at: now,
+                    content: Some(content),
+                    data_json: Some(data),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Marks canonical verified bugs for forced security re-evaluation (for
+    /// example after a threat-model update via `sashiko bugs evaluate-security --re-evaluate`).
+    pub async fn queue_bugs_for_security_reeval(&self, limit: Option<usize>) -> Result<usize> {
+        let updated = if let Some(max_rows) = limit {
+            if max_rows == 0 {
+                return Ok(0);
+            }
+            self.execute(
+                "UPDATE bugs
+                    SET security_eval_requested = 1,
+                        security_eval_attempts = 0
+                  WHERE id IN (
+                      SELECT id FROM bugs
+                       WHERE duplicate_of_id IS NULL
+                         AND pipeline_state = 'succeeded'
+                         AND lifecycle_status IN ('open', 'fixed', 'closed')
+                       ORDER BY CASE lifecycle_status
+                                    WHEN 'open' THEN 0
+                                    WHEN 'fixed' THEN 1
+                                    ELSE 2
+                                END ASC,
+                                severity_int DESC,
+                                id DESC
+                       LIMIT ?1
+                  )",
+                libsql::params![max_rows as i64],
+            )
+            .await?
+        } else {
+            self.execute(
+                "UPDATE bugs
+                    SET security_eval_requested = 1,
+                        security_eval_attempts = 0
+                  WHERE duplicate_of_id IS NULL
+                    AND pipeline_state = 'succeeded'
+                    AND lifecycle_status IN ('open', 'fixed', 'closed')",
+                (),
+            )
+            .await?
+        };
+        Ok(updated as usize)
+    }
+
     pub async fn list_bugs(&self, params: ListBugsParams<'_>) -> Result<(Vec<Bug>, usize)> {
         let limit_val = params.limit.unwrap_or(50) as i64;
         let page_val = params.page.unwrap_or(1) as i64;
@@ -6537,6 +7027,29 @@ impl Database {
             query_params.push(libsql::Value::Integer(min_sev as i64));
         }
 
+        if let Some(min_sec_tenths) = params.min_security_score_tenths {
+            conditions.push("security_score_tenths >= ?".into());
+            query_params.push(libsql::Value::Integer(i64::from(min_sec_tenths)));
+        }
+
+        if let Some(classes) = params.security_classes {
+            if classes.is_empty() {
+                return Ok((Vec::new(), 0));
+            }
+            let mut unique: Vec<&'static str> = Vec::with_capacity(3);
+            for cls in classes {
+                let s = cls.as_str();
+                if !unique.contains(&s) {
+                    unique.push(s);
+                }
+            }
+            let placeholders = vec!["?"; unique.len()].join(", ");
+            conditions.push(format!("security_class IN ({placeholders})").into());
+            for s in unique {
+                query_params.push(libsql::Value::Text(s.to_string()));
+            }
+        }
+
         if let Some(status) = params.lifecycle_status {
             conditions.push("lifecycle_status = ?".into());
             query_params.push(libsql::Value::Text(status.as_str().to_string()));
@@ -6576,6 +7089,10 @@ impl Database {
         let order_clause = match params.sort_by.map(|s| s.to_ascii_lowercase()).as_deref() {
             // Sorts straight off the projected column, which idx_bugs_severity covers.
             Some("severity") => format!("ORDER BY severity_int {}, id {}", sort_dir, sort_dir),
+            Some("security_score") | Some("security") => format!(
+                "ORDER BY security_score_tenths IS NULL, security_score_tenths {}, severity_int DESC, id {}",
+                sort_dir, sort_dir
+            ),
             Some("title") | Some("problem") => {
                 format!("ORDER BY title {}, created_at DESC, id DESC", sort_dir)
             }
@@ -29417,7 +29934,7 @@ mod tests {
         let db = setup_db().await;
         let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
         let version: u32 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
 
         for (table, expected_cols) in [
             (
@@ -35216,5 +35733,297 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
             .unwrap();
         let prio2: i64 = row2.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(prio2, 400);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_v21_bug_security_evaluation_and_trigger() -> Result<()> {
+        use crate::security_eval::{
+            RawCvssV4Metrics, RawMetricJustifications, RawSecurityEvaluationOutput, SecurityClass,
+            SecurityEvaluation, SecurityRating,
+        };
+
+        let db = setup_db().await;
+
+        let mut cols = db.conn.query("PRAGMA table_info(bugs)", ()).await?;
+        let mut col_names = Vec::new();
+        while let Some(row) = cols.next().await? {
+            col_names.push(row.get::<String>(1)?);
+        }
+        for expected in [
+            "security_score_tenths",
+            "security_class",
+            "cvss_vector",
+            "security_eval_attempts",
+            "security_eval_requested",
+        ] {
+            assert!(
+                col_names.iter().any(|c| c == expected),
+                "expected column {expected} on bugs, found {col_names:?}"
+            );
+        }
+
+        for expected_idx in [
+            "idx_bugs_security_score",
+            "idx_bugs_security_class",
+            "idx_bugs_security_backfill",
+        ] {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+                    libsql::params![expected_idx],
+                )
+                .await?;
+            let count: i64 = rows.next().await?.unwrap().get(0)?;
+            assert_eq!(count, 1, "expected index {expected_idx} to exist");
+        }
+
+        let bug: NewBug = serde_json::from_value(json!({
+            "bugid": "linux-sec-001",
+            "title": "net/ipv6: slab-out-of-bounds write in ipv6_push_frag_opts",
+            "lifecycle_status": "open",
+            "pipeline_state": "succeeded"
+        }))?;
+        let id = db.create_bug(&bug).await?;
+
+        assert!(
+            db.request_bug_security_eval(id, Some("Threat model updated"))
+                .await?
+        );
+        let requested_bug = db.get_bug(id).await?.unwrap();
+        assert!(requested_bug.security_eval_requested());
+        assert!(requested_bug.security_evaluation().is_none());
+
+        let claimed = db
+            .claim_bug_for_security_eval("sec-worker-1", 300, 3)
+            .await?
+            .expect("should claim queued open bug");
+        assert_eq!(claimed.id, id);
+
+        let eval = SecurityEvaluation::from_raw_output(
+            RawSecurityEvaluationOutput {
+                security_class: "vulnerability".to_string(),
+                trust_boundary: Some("Remote unauthenticated IPv6 packet -> kernel".to_string()),
+                attacker_model: Some("Remote network peer sending crafted fragments".to_string()),
+                summary: "Remote unauthenticated heap out-of-bounds write in IPv6 option parsing."
+                    .to_string(),
+                cvss_v4: Some(RawCvssV4Metrics {
+                    av: "N".to_string(),
+                    ac: "L".to_string(),
+                    at: "N".to_string(),
+                    pr: "N".to_string(),
+                    ui: "N".to_string(),
+                    vc: "H".to_string(),
+                    vi: "H".to_string(),
+                    va: "H".to_string(),
+                    sc: "N".to_string(),
+                    si: "N".to_string(),
+                    sa: "N".to_string(),
+                    ..Default::default()
+                }),
+                metric_justifications: Some(RawMetricJustifications {
+                    exploitability: "Triggered directly by inbound IPv6 fragments without auth."
+                        .to_string(),
+                    vulnerable_system_impact:
+                        "Kernel heap corruption enables arbitrary code execution and panic."
+                            .to_string(),
+                    subsequent_system_impact: "No cross-host or hypervisor escape.".to_string(),
+                }),
+            },
+            Some("deadbeef1234".to_string()),
+            Some("cafebabe5678".to_string()),
+        )
+        .expect("valid security evaluation");
+
+        let recorded = db
+            .with_bug_claim(id, "sec-worker-1")
+            .with_bug_actor(
+                "sashiko",
+                "sashiko:linux_bug:security_eval",
+                Some("test-model".to_string()),
+            )
+            .record_bug_security_evaluation(
+                id,
+                SecurityEvaluationRecordParams {
+                    evaluation: &eval,
+                    logs: Some("[{\"turn\":1}]"),
+                    tokens_in: Some(500),
+                    tokens_out: Some(120),
+                    tokens_cached: Some(100),
+                    release_lease: true,
+                },
+            )
+            .await?;
+        assert!(recorded);
+
+        // Verify trigger projection and lease release on raw row.
+        let mut proj_rows = db
+            .conn
+            .query(
+                "SELECT security_score_tenths, security_class, cvss_vector, security_eval_requested, locked_by
+                   FROM bugs WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        let proj = proj_rows.next().await?.unwrap();
+        assert_eq!(proj.get::<i64>(0)?, i64::from(eval.score_tenths));
+        assert_eq!(proj.get::<String>(1)?, "vulnerability");
+        assert_eq!(proj.get::<Option<String>>(2)?, eval.cvss_vector.clone());
+        assert_eq!(proj.get::<i64>(3)?, 0);
+        assert_eq!(proj.get::<Option<String>>(4)?, None);
+
+        // Verify Bug accessors and bug_evidence projection.
+        let hydrated = db.get_bug(id).await?.unwrap();
+        assert_eq!(hydrated.security_score_tenths(), Some(eval.score_tenths));
+        assert_eq!(hydrated.security_rating(), Some(SecurityRating::Critical));
+        assert_eq!(
+            hydrated.security_class(),
+            Some(SecurityClass::Vulnerability)
+        );
+        assert_eq!(hydrated.cvss_vector(), eval.cvss_vector);
+        assert!(!hydrated.security_eval_requested());
+
+        let evidence = db.bug_evidence(&db.bug_family(id, false).await?).await?;
+        let activity = evidence["activity"].as_array().unwrap();
+        let sec_event = activity
+            .iter()
+            .find(|ev| ev["kind"] == "security_evaluation")
+            .expect("security_evaluation event present in activity");
+        assert_eq!(sec_event["security_class"], "vulnerability");
+        assert_eq!(sec_event["security_rating"], "Critical");
+        assert_eq!(sec_event["has_logs"], true);
+        assert!(sec_event.get("logs").is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_security_eval_claim_priority_and_list_filters() -> Result<()> {
+        use crate::security_eval::{
+            RawSecurityEvaluationOutput, SecurityClass, SecurityEvaluation,
+        };
+
+        let db = setup_db().await;
+        let mk_bug = |bugid: &str, status: &str, state: &str, dup: Option<i64>| -> NewBug {
+            serde_json::from_value(json!({
+                "bugid": bugid,
+                "title": format!("Bug {bugid}"),
+                "lifecycle_status": status,
+                "pipeline_state": state,
+                "duplicate_of_id": dup
+            }))
+            .unwrap()
+        };
+
+        let closed_id = db
+            .create_bug(&mk_bug("linux-closed", "closed", "succeeded", None))
+            .await?;
+        let fixed_id = db
+            .create_bug(&mk_bug("linux-fixed", "fixed", "succeeded", None))
+            .await?;
+        let open_low = db
+            .create_bug(&mk_bug("linux-open-low", "open", "succeeded", None))
+            .await?;
+        let open_high = db
+            .create_bug(&mk_bug("linux-open-high", "open", "succeeded", None))
+            .await?;
+        db.add_bug_enrichment(
+            open_high,
+            &NewBugEnrichment {
+                kind: "severity_calibration".to_string(),
+                tool: "test".to_string(),
+                data_json: Some(json!({"severity": "High", "severity_int": 3})),
+                ..Default::default()
+            },
+        )
+        .await?;
+        // Dismissed and duplicate bugs must never be claimed for security evaluation.
+        let _dismissed = db
+            .create_bug(&mk_bug("linux-dismissed", "dismissed", "succeeded", None))
+            .await?;
+        let _dup = db
+            .create_bug(&mk_bug(
+                "linux-dup",
+                "duplicate",
+                "succeeded",
+                Some(open_high),
+            ))
+            .await?;
+
+        // Manual request on closed_id jumps ahead of unrequested open bugs.
+        assert!(db.request_bug_security_eval(closed_id, None).await?);
+
+        let non_sec = SecurityEvaluation::from_raw_output(
+            RawSecurityEvaluationOutput {
+                security_class: "not_security".to_string(),
+                summary: "Dead code cleanup only.".to_string(),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let hardening = SecurityEvaluation::from_raw_output(
+            RawSecurityEvaluationOutput {
+                security_class: "hardening".to_string(),
+                trust_boundary: Some("Kernel stack".to_string()),
+                summary: "Missing defense-in-depth bounds assertion.".to_string(),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut claim_order = Vec::new();
+        for (idx, eval_to_write) in [(0, &non_sec), (1, &hardening), (2, &non_sec), (3, &non_sec)] {
+            let worker = format!("w-{idx}");
+            let b = db
+                .claim_bug_for_security_eval(&worker, 300, 3)
+                .await?
+                .expect("expected claimable bug");
+            claim_order.push(b.id);
+            db.with_bug_claim(b.id, &worker)
+                .record_bug_security_evaluation(
+                    b.id,
+                    SecurityEvaluationRecordParams {
+                        evaluation: eval_to_write,
+                        logs: None,
+                        tokens_in: None,
+                        tokens_out: None,
+                        tokens_cached: None,
+                        release_lease: true,
+                    },
+                )
+                .await?;
+        }
+        assert_eq!(claim_order, vec![closed_id, open_high, open_low, fixed_id]);
+        assert!(
+            db.claim_bug_for_security_eval("w-none", 300, 3)
+                .await?
+                .is_none()
+        );
+
+        // Verify security_classes filter and security_score sort on list_bugs.
+        let (hardening_bugs, hardening_total) = db
+            .list_bugs(ListBugsParams {
+                security_classes: Some(&[SecurityClass::Hardening]),
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(hardening_total, 1);
+        assert_eq!(hardening_bugs[0].id, open_high);
+
+        // Queueing re-evaluation re-enables claiming already-evaluated canonical bugs.
+        let queued = db.queue_bugs_for_security_reeval(Some(2)).await?;
+        assert_eq!(queued, 2);
+        let reclaimed = db
+            .claim_bug_for_security_eval("w-reeval", 300, 3)
+            .await?
+            .expect("re-queued bug should be claimable");
+        assert_eq!(reclaimed.id, open_high);
+
+        Ok(())
     }
 }

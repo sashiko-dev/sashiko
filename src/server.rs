@@ -2739,6 +2739,7 @@ async fn list_bugs(
             sort_by: query.sort_by.as_deref(),
             sort_order: query.sort_order.as_deref(),
             visibility: principal.visibility(&scope),
+            ..Default::default()
         })
         .await
     {
