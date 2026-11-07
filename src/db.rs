@@ -7380,7 +7380,7 @@ impl Database {
         }))
     }
 
-    pub async fn get_review_stats(&self) -> Result<serde_json::Value> {
+    pub async fn get_review_stats(&self) -> Result<crate::api::ReviewStats> {
         let mut total_rows = self
             .conn
             .query(
@@ -7434,15 +7434,15 @@ impl Database {
             let tokens_out: i64 = row.get(5).unwrap_or(0);
             let tokens_cached: i64 = row.get(6).unwrap_or(0);
 
-            stats.push(json!({
-                "provider": provider.unwrap_or_default(),
-                "model": model.unwrap_or_default(),
-                "status": status.unwrap_or_default(),
-                "count": count,
-                "tokens_in": tokens_in,
-                "tokens_out": tokens_out,
-                "tokens_cached": tokens_cached
-            }));
+            stats.push(crate::api::ReviewGroupStats {
+                provider: provider.unwrap_or_default(),
+                model: model.unwrap_or_default(),
+                status: status.unwrap_or_default(),
+                count,
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+            });
         }
 
         let bug_sql = "WITH last_bugs AS (
@@ -7472,18 +7472,18 @@ impl Database {
                 (0, 0, 0, 0, 0)
             };
 
-        Ok(json!({
-            "total_reviews": total_reviews,
-            "total_failures": total_failures,
-            "reviews": stats,
-            "bug_tokens": {
-                "bugs_analyzed": bug_count,
-                "enrichment_stages": bug_stage_count,
-                "tokens_in": bug_tokens_in,
-                "tokens_out": bug_tokens_out,
-                "tokens_cached": bug_tokens_cached
-            }
-        }))
+        Ok(crate::api::ReviewStats {
+            total_reviews,
+            total_failures,
+            reviews: stats,
+            bug_tokens: crate::api::BugTokenStats {
+                bugs_analyzed: bug_count,
+                enrichment_stages: bug_stage_count,
+                tokens_in: bug_tokens_in,
+                tokens_out: bug_tokens_out,
+                tokens_cached: bug_tokens_cached,
+            },
+        })
     }
 
     pub async fn get_tool_usage_stats(&self) -> Result<serde_json::Value> {
@@ -25449,15 +25449,12 @@ mod tests {
         assert_eq!(ai_row.get::<i64>(2).unwrap(), 500 + 200 + 150);
         assert_eq!(ai_row.get::<i64>(3).unwrap(), 3000 + 1000 + 1500);
 
-        let review_stats = db.get_review_stats().await.unwrap();
-        assert_eq!(review_stats["bug_tokens"]["bugs_analyzed"], 1);
-        assert_eq!(review_stats["bug_tokens"]["enrichment_stages"], 3);
-        assert_eq!(review_stats["bug_tokens"]["tokens_in"], 4000 + 1500 + 2000);
-        assert_eq!(review_stats["bug_tokens"]["tokens_out"], 500 + 200 + 150);
-        assert_eq!(
-            review_stats["bug_tokens"]["tokens_cached"],
-            3000 + 1000 + 1500
-        );
+        let bug_tokens = db.get_review_stats().await.unwrap().bug_tokens;
+        assert_eq!(bug_tokens.bugs_analyzed, 1);
+        assert_eq!(bug_tokens.enrichment_stages, 3);
+        assert_eq!(bug_tokens.tokens_in, 4000 + 1500 + 2000);
+        assert_eq!(bug_tokens.tokens_out, 500 + 200 + 150);
+        assert_eq!(bug_tokens.tokens_cached, 3000 + 1000 + 1500);
 
         // Verify enrichments timeline length and chronological order
         assert_eq!(bug.enrichments.len(), 9);

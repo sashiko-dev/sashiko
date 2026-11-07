@@ -380,3 +380,39 @@ pub struct CreateApiTokenRequest {
     pub max_bug_access: Option<String>,
     pub expires_in_days: Option<u64>,
 }
+
+/// Review statistics served by GET /api/stats/reviews and rendered as
+/// gauges by the Prometheus endpoint.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ReviewStats {
+    /// Reviews no longer queued: every status except Pending and In Review.
+    pub total_reviews: i64,
+    /// Reviews whose status names a failure or an error.
+    pub total_failures: i64,
+    /// Totals per provider, model and status among the latest 1000 reviews.
+    pub reviews: Vec<ReviewGroupStats>,
+    /// Enrichment token usage among the latest 1000 bugs.
+    pub bug_tokens: BugTokenStats,
+}
+
+/// Review count and token totals for one provider, model and status group.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ReviewGroupStats {
+    pub provider: String,
+    pub model: String,
+    pub status: String,
+    pub count: i64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub tokens_cached: i64,
+}
+
+/// Enrichment stage counts and token totals among the latest 1000 bugs.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BugTokenStats {
+    pub bugs_analyzed: i64,
+    pub enrichment_stages: i64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub tokens_cached: i64,
+}
