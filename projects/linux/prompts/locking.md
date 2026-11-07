@@ -419,8 +419,8 @@ different nesting levels (e.g., parent/child inode locks). Up to
 `MAX_LOCKDEP_SUBCLASSES` (8) levels. Subclass 0 is the default; higher
 values indicate deeper nesting.
 
-**Sparse annotations**: `__must_hold(lock)`, `__acquires(lock)`,
-`__releases(lock)`. Mismatched annotations cause `sparse` context
+**Context analysis annotations**: `__must_hold(lock)`, `__acquires(lock)`,
+`__releases(lock)`. Mismatched annotations cause Clang context analysis
 imbalance warnings. Verify annotations match actual lock behavior.
 
 ## 15. Lockdep Lock Pinning
