@@ -1022,6 +1022,48 @@ pub struct CustomRemoteSettings {
     pub url: String,
     pub check_all_branches: bool,
     pub only_branches: Option<Vec<String>>,
+    #[serde(default)]
+    pub branch_patterns: Option<Vec<String>>,
+}
+
+impl CustomRemoteSettings {
+    /// Returns the refspecs to configure and fetch for this custom remote,
+    /// or Some(vec![]) if all branches should be fetched without restriction
+    /// (restoring default wildcard refspecs).
+    pub fn refspecs(&self) -> Option<Vec<String>> {
+        let has_patterns = self
+            .branch_patterns
+            .as_deref()
+            .is_some_and(|p| !p.is_empty());
+
+        if has_patterns {
+            let mut specs = Vec::new();
+            if let Some(patterns) = &self.branch_patterns {
+                for p in patterns {
+                    if crate::git_ops::is_valid_refspec_pattern(p) {
+                        specs.push(format!(
+                            "+refs/heads/{}:refs/remotes/{}/{}",
+                            p, self.name, p
+                        ));
+                    }
+                }
+            }
+            if let Some(only) = &self.only_branches {
+                for b in only {
+                    let b = b.trim();
+                    if !b.is_empty() {
+                        let spec = format!("+refs/heads/{}:refs/remotes/{}/{}", b, self.name, b);
+                        if !specs.contains(&spec) {
+                            specs.push(spec);
+                        }
+                    }
+                }
+            }
+            Some(specs)
+        } else {
+            Some(Vec::new())
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1501,6 +1543,34 @@ impl Settings {
                     "[review.priority_rules] invalid regex {:?}: {}",
                     rule.regex, e
                 ));
+            }
+        }
+        if let Some(custom_remotes) = &self.git.custom_remotes {
+            for remote in custom_remotes {
+                if let Some(patterns) = &remote.branch_patterns {
+                    for pattern in patterns {
+                        if !crate::git_ops::is_valid_refspec_pattern(pattern) {
+                            return Err(format!(
+                                "[git.custom_remotes] invalid branch_pattern '{}' for remote '{}': \
+                                 refspec patterns must contain exactly one '*' wildcard and must not \
+                                 contain '?', spaces, or invalid ref characters",
+                                pattern, remote.name
+                            ));
+                        }
+                    }
+                }
+                if let Some(branches) = &remote.only_branches {
+                    for branch in branches {
+                        if !crate::git_ops::is_valid_branch_name(branch) {
+                            return Err(format!(
+                                "[git.custom_remotes] invalid only_branches entry '{}' for remote '{}': \
+                                 branch names must not be empty or contain spaces, wildcards ('*', '?'), \
+                                 or invalid ref characters",
+                                branch, remote.name
+                            ));
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -2717,5 +2787,105 @@ concurrency = 4
         std::fs::write(&path, typo_toml).unwrap();
         let err = Settings::load(Some(&path)).unwrap_err().to_string();
         assert!(err.contains("unknown field `explicit_prompt_cachng`"));
+    }
+
+    #[test]
+    fn test_custom_remote_branch_patterns_deserialization() {
+        let toml = r#"
+            repository_path = "/tmp/linux"
+            [[custom_remotes]]
+            name = "net-next"
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git"
+            check_all_branches = true
+            branch_patterns = ["linux-*.y", "net-*"]
+            only_branches = ["main"]
+        "#;
+        let git: GitSettings = toml::from_str(toml).unwrap();
+        let remotes = git.custom_remotes.unwrap();
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].name, "net-next");
+        assert_eq!(
+            remotes[0].branch_patterns,
+            Some(vec!["linux-*.y".to_string(), "net-*".to_string(),])
+        );
+
+        let refspecs = remotes[0].refspecs().unwrap();
+        assert_eq!(
+            refspecs,
+            vec![
+                "+refs/heads/linux-*.y:refs/remotes/net-next/linux-*.y",
+                "+refs/heads/net-*:refs/remotes/net-next/net-*",
+                "+refs/heads/main:refs/remotes/net-next/main",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_custom_remote_refspecs_empty_when_branch_patterns_unset() {
+        let toml = r#"
+            repository_path = "/tmp/linux"
+            [[custom_remotes]]
+            name = "cel"
+            url = "git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"
+            check_all_branches = false
+            only_branches = ["nfsd-next", "nfsd-testing"]
+        "#;
+        let git: GitSettings = toml::from_str(toml).unwrap();
+        let remotes = git.custom_remotes.unwrap();
+        assert_eq!(remotes[0].refspecs(), Some(vec![]));
+    }
+
+    #[test]
+    fn test_custom_remote_branch_patterns_validation_rejects_invalid_refspec() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Settings.toml");
+        let toml = r#"
+            [ai]
+            provider = "gemini"
+            model = "gemini-2.5-pro"
+            [review]
+            concurrency = 1
+            worktree_dir = "review_trees"
+            [database]
+            url = "sashiko.db"
+            [git]
+            repository_path = "linux"
+            [[git.custom_remotes]]
+            name = "invalid-remote"
+            url = "https://git.kernel.org/repo.git"
+            check_all_branches = true
+            branch_patterns = ["valid-branch", "feat-?"]
+        "#;
+        std::fs::write(&path, toml).unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        let err = settings.validate_for_daemon().unwrap_err();
+        assert!(err.contains("[git.custom_remotes] invalid branch_pattern"));
+    }
+
+    #[test]
+    fn test_custom_remote_only_branches_validation_rejects_invalid_refspec() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Settings.toml");
+        let toml = r#"
+            [ai]
+            provider = "gemini"
+            model = "gemini-2.5-pro"
+            [review]
+            concurrency = 1
+            worktree_dir = "review_trees"
+            [database]
+            url = "sashiko.db"
+            [git]
+            repository_path = "linux"
+            [[git.custom_remotes]]
+            name = "invalid-remote"
+            url = "https://git.kernel.org/repo.git"
+            check_all_branches = false
+            only_branches = ["valid-branch", "bad branch with spaces"]
+        "#;
+        std::fs::write(&path, toml).unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        let err = settings.validate_for_daemon().unwrap_err();
+        assert!(err.contains("[git.custom_remotes] invalid only_branches entry"));
     }
 }

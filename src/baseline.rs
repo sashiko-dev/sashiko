@@ -399,10 +399,16 @@ impl BaselineRegistry {
         // with the topic branch once the maintainer rebases.
         if let Some(custom_remotes) = &self.custom_remotes {
             for remote in custom_remotes {
-                // Fetch to ensure we have the latest branches (Issue 1)
-                if let Err(e) =
-                    crate::git_ops::ensure_remote(&self.repo_path, &remote.name, &remote.url, false)
-                        .await
+                let refspecs = remote.refspecs();
+
+                // Ensure remote is configured without blocking review dispatch on routine sync
+                if let Err(e) = crate::git_ops::ensure_remote_if_missing(
+                    &self.repo_path,
+                    &remote.name,
+                    &remote.url,
+                    refspecs.as_deref(),
+                )
+                .await
                 {
                     warn!(
                         "Failed to ensure custom remote {}: {}. Using local branches.",
@@ -410,10 +416,37 @@ impl BaselineRegistry {
                     );
                 }
 
-                if remote.check_all_branches {
+                let branch_patterns = remote.branch_patterns.as_deref().filter(|p| !p.is_empty());
+                let only_branches = remote.only_branches.as_deref().filter(|b| !b.is_empty());
+
+                let mut matched_any = false;
+                if let Some(patterns) = branch_patterns {
+                    match crate::git_ops::get_remote_branches(&self.repo_path, &remote.name).await {
+                        Ok(branches) => {
+                            let filtered = branches
+                                .into_iter()
+                                .filter(|b| crate::git_ops::matches_branch_pattern(b, patterns));
+                            for branch in filtered {
+                                matched_any = true;
+                                candidates.push(BaselineResolution::RemoteTarget {
+                                    url: remote.url.clone(),
+                                    name: remote.name.clone(),
+                                    branch: Some(branch),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to get remote branches for {}: {}. Continuing.",
+                                remote.name, e
+                            );
+                        }
+                    }
+                } else if remote.check_all_branches {
                     match crate::git_ops::get_remote_branches(&self.repo_path, &remote.name).await {
                         Ok(branches) => {
                             for branch in branches {
+                                matched_any = true;
                                 candidates.push(BaselineResolution::RemoteTarget {
                                     url: remote.url.clone(),
                                     name: remote.name.clone(),
@@ -430,8 +463,8 @@ impl BaselineRegistry {
                     }
                 }
 
-                // Change else if to if (Issue 3)
-                if let Some(branches) = &remote.only_branches {
+                // only_branches is additive: append explicitly configured branches
+                if let Some(branches) = only_branches {
                     for branch in branches {
                         candidates.push(BaselineResolution::RemoteTarget {
                             url: remote.url.clone(),
@@ -439,6 +472,12 @@ impl BaselineRegistry {
                             branch: Some(branch.clone()),
                         });
                     }
+                } else if !matched_any && !remote.check_all_branches && branch_patterns.is_none() {
+                    candidates.push(BaselineResolution::RemoteTarget {
+                        url: remote.url.clone(),
+                        name: remote.name.clone(),
+                        branch: None,
+                    });
                 }
             }
         }
@@ -1567,6 +1606,7 @@ F: patterns/
                 url: dummy_url,
                 check_all_branches: false,
                 only_branches: Some(vec!["master".to_string()]),
+                branch_patterns: None,
             }]),
             repo_path: repo_path.to_path_buf(),
             mainline_remote: None,
@@ -1597,6 +1637,207 @@ F: patterns/
             pos_next,
             candidate_names
         );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_custom_remotes_branch_patterns() {
+        use crate::settings::CustomRemoteSettings;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        crate::git_cmd::in_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .unwrap();
+        std::fs::write(repo_path.join("file.txt"), "hello").unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["add", "file.txt"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["commit", "-m", "init"])
+            .output()
+            .unwrap();
+
+        for branch in &["6.18/dev", "6.18/prod", "other/feature"] {
+            crate::git_cmd::in_dir(repo_path)
+                .args(["branch", branch])
+                .output()
+                .unwrap();
+        }
+
+        let client_dir = tempfile::tempdir().unwrap();
+        let client_path = client_dir.path();
+        crate::git_cmd::in_dir(client_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(client_path)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(client_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .unwrap();
+
+        let dummy_url = repo_path.to_str().unwrap().to_string();
+        let mut remote_map = HashMap::new();
+        remote_map.insert(dummy_url.clone(), "custom".to_string());
+
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map,
+            custom_remotes: Some(vec![CustomRemoteSettings {
+                name: "custom".to_string(),
+                url: dummy_url,
+                check_all_branches: true,
+                only_branches: None,
+                branch_patterns: Some(vec!["6.18/*".to_string()]),
+            }]),
+            repo_path: client_path.to_path_buf(),
+            mainline_remote: None,
+        };
+
+        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let candidate_branches: Vec<String> = candidates
+            .iter()
+            .filter_map(|c| match c {
+                BaselineResolution::RemoteTarget { name, branch, .. } if name == "custom" => {
+                    branch.clone()
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(candidate_branches.contains(&"6.18/dev".to_string()));
+        assert!(candidate_branches.contains(&"6.18/prod".to_string()));
+        assert!(!candidate_branches.contains(&"other/feature".to_string()));
+        assert!(!candidate_branches.contains(&"main".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_custom_remotes_additive_only_branches() {
+        use crate::settings::CustomRemoteSettings;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        crate::git_cmd::in_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .unwrap();
+        std::fs::write(repo_path.join("file.txt"), "hello").unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["add", "file.txt"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["commit", "-m", "init"])
+            .output()
+            .unwrap();
+
+        for branch in &["6.18/dev", "explicit-topic", "other/feature"] {
+            crate::git_cmd::in_dir(repo_path)
+                .args(["branch", branch])
+                .output()
+                .unwrap();
+        }
+
+        let client_dir = tempfile::tempdir().unwrap();
+        let client_path = client_dir.path();
+        crate::git_cmd::in_dir(client_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(client_path)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(client_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .unwrap();
+
+        let dummy_url = repo_path.to_str().unwrap().to_string();
+        let mut remote_map = HashMap::new();
+        remote_map.insert(dummy_url.clone(), "custom".to_string());
+
+        // branch_patterns matches 6.18/dev, only_branches adds explicit-topic
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map,
+            custom_remotes: Some(vec![CustomRemoteSettings {
+                name: "custom".to_string(),
+                url: dummy_url,
+                check_all_branches: false,
+                only_branches: Some(vec!["explicit-topic".to_string()]),
+                branch_patterns: Some(vec!["6.18/*".to_string()]),
+            }]),
+            repo_path: client_path.to_path_buf(),
+            mainline_remote: None,
+        };
+
+        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let candidate_branches: Vec<String> = candidates
+            .iter()
+            .filter_map(|c| match c {
+                BaselineResolution::RemoteTarget { name, branch, .. } if name == "custom" => {
+                    branch.clone()
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(candidate_branches.contains(&"6.18/dev".to_string()));
+        assert!(candidate_branches.contains(&"explicit-topic".to_string()));
+        assert!(!candidate_branches.contains(&"other/feature".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_custom_remotes_empty_lists_fallback_to_default() {
+        use crate::settings::CustomRemoteSettings;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: Some(vec![CustomRemoteSettings {
+                name: "custom".to_string(),
+                url: "https://example.com/repo.git".to_string(),
+                check_all_branches: false,
+                only_branches: Some(vec![]),
+                branch_patterns: Some(vec![]),
+            }]),
+            repo_path: repo_path.to_path_buf(),
+            mainline_remote: None,
+        };
+
+        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let has_default = candidates.iter().any(|c| match c {
+            BaselineResolution::RemoteTarget { name, branch, .. } => {
+                name == "custom" && branch.is_none()
+            }
+            _ => false,
+        });
+
+        assert!(has_default, "empty lists must fall back to default branch");
     }
 
     /// Runs git in the test repository and returns its trimmed stdout.

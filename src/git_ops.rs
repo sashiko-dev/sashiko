@@ -536,6 +536,24 @@ impl GitWorktree {
     }
 }
 
+/// Matches a branch name against a list of branch patterns.
+/// Each pattern is either an exact branch name or contains at most one
+/// '*' wildcard (e.g. "linux-*.y", "v6.18/*").
+pub fn matches_branch_pattern(branch: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        if pattern == branch {
+            return true;
+        }
+        if let Some((prefix, suffix)) = pattern.split_once('*') {
+            branch.starts_with(prefix)
+                && branch.len() >= prefix.len() + suffix.len()
+                && branch[prefix.len()..].ends_with(suffix)
+        } else {
+            false
+        }
+    })
+}
+
 #[allow(dead_code)]
 pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
     let output = crate::git_cmd::in_dir_async(repo_path)
@@ -1269,7 +1287,20 @@ pub async fn ensure_remote(
     url: &str,
     force_fetch: bool,
 ) -> Result<()> {
-    match refresh_remote(repo_path, name, url, force_fetch).await? {
+    ensure_remote_with_refspecs(repo_path, name, url, force_fetch, None).await
+}
+
+/// Like ensure_remote, but optionally limits the fetch to specific
+/// refspecs. When refspecs is Some, only the listed refs are fetched
+/// instead of all remote branches.
+pub async fn ensure_remote_with_refspecs(
+    repo_path: &Path,
+    name: &str,
+    url: &str,
+    force_fetch: bool,
+    refspecs: Option<&[String]>,
+) -> Result<()> {
+    match refresh_remote_with_refspecs(repo_path, name, url, force_fetch, refspecs).await? {
         FetchOutcome::BackedOff => Err(anyhow::anyhow!(
             "Remote {} failed recently, backing off",
             name
@@ -1290,6 +1321,227 @@ pub async fn refresh_remote(
     url: &str,
     force_fetch: bool,
 ) -> Result<FetchOutcome> {
+    refresh_remote_with_refspecs(repo_path, name, url, force_fetch, None).await
+}
+
+/// Returns true if a branch pattern conforms to valid Git refspec syntax.
+///
+/// Refspec patterns must contain exactly one asterisk wildcard. Question mark
+/// wildcards, spaces, multiple asterisks, and invalid ref characters are rejected.
+pub fn is_valid_refspec_pattern(pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern.contains('?') {
+        return false;
+    }
+    if pattern.chars().filter(|&c| c == '*').count() != 1 {
+        return false;
+    }
+    if pattern.contains("..")
+        || pattern.contains('@')
+        || pattern.contains('\\')
+        || pattern.contains(':')
+        || pattern.contains('^')
+        || pattern.contains('~')
+        || pattern.contains('[')
+        || pattern.starts_with('/')
+        || pattern.ends_with('/')
+        || pattern.contains(".lock")
+    {
+        return false;
+    }
+    if pattern
+        .chars()
+        .any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
+    {
+        return false;
+    }
+    true
+}
+
+/// Returns true if a branch name conforms to valid Git branch naming rules.
+///
+/// Literal branch names must not contain wildcards ('*', '?'), spaces, or invalid ref characters.
+pub fn is_valid_branch_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if name.contains('*') || name.contains('?') {
+        return false;
+    }
+    if name.contains("..")
+        || name.contains('@')
+        || name.contains('\\')
+        || name.contains(':')
+        || name.contains('^')
+        || name.contains('~')
+        || name.contains('[')
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.contains(".lock")
+    {
+        return false;
+    }
+    if name
+        .chars()
+        .any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
+    {
+        return false;
+    }
+    true
+}
+
+/// Checks whether any ref exists under refs/remotes/<name>/.
+async fn has_remote_refs(repo_path: &Path, name: &str) -> bool {
+    let head_ref = format!("refs/remotes/{}/HEAD", name);
+    if let Ok(status) = crate::git_cmd::in_dir_async(repo_path)
+        .args(["show-ref", "--verify", "-q", &head_ref])
+        .status()
+        .await
+        && status.success()
+    {
+        return true;
+    }
+    let remote_pattern = format!("refs/remotes/{}/", name);
+    if let Ok(output) = crate::git_cmd::in_dir_async(repo_path)
+        .args(["for-each-ref", "--count=1", &remote_pattern])
+        .output()
+        .await
+    {
+        return output.status.success() && !output.stdout.is_empty();
+    }
+    false
+}
+
+fn normalize_git_url(url: &str) -> &str {
+    let mut u = url.trim();
+    if let Some(stripped) = u.strip_prefix("git://") {
+        u = stripped;
+    } else if let Some(stripped) = u.strip_prefix("https://") {
+        u = stripped;
+    } else if let Some(stripped) = u.strip_prefix("http://") {
+        u = stripped;
+    } else if let Some(stripped) = u.strip_prefix("ssh://") {
+        u = stripped;
+    }
+    u = u.trim_end_matches('/');
+    u = u.strip_suffix(".git").unwrap_or(u);
+    u
+}
+
+/// Compares two git remote URLs for semantic equivalence, ignoring schemes
+/// (git:// vs https:// vs http://), trailing slashes, and trailing .git suffixes.
+pub fn are_git_urls_equivalent(a: &str, b: &str) -> bool {
+    let a_trim = a.trim();
+    let b_trim = b.trim();
+    a_trim == b_trim || normalize_git_url(a_trim) == normalize_git_url(b_trim)
+}
+
+/// Deletes all local tracking refs under refs/remotes/<name>/.
+async fn delete_remote_tracking_refs(repo_path: &Path, name: &str) -> Result<()> {
+    let prefix = format!("refs/remotes/{}/", name);
+    let out = crate::git_cmd::in_dir_async(repo_path)
+        .args(["for-each-ref", "--format=%(refname)", &prefix])
+        .output()
+        .await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow!(
+            "Failed to list remote refs for {}: {}",
+            name,
+            stderr.trim()
+        ));
+    }
+    let refs = String::from_utf8_lossy(&out.stdout);
+    let mut stdin_input = String::new();
+    for refname in refs.lines() {
+        let refname = refname.trim();
+        if !refname.is_empty() {
+            stdin_input.push_str(&format!("delete {}\n", refname));
+        }
+    }
+    if !stdin_input.is_empty() {
+        use tokio::io::AsyncWriteExt;
+        let mut child = crate::git_cmd::in_dir_async(repo_path)
+            .args(["update-ref", "--stdin", "--no-deref"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(stdin_input.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        }
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "Failed to delete old remote refs for {}: {}",
+                name,
+                stderr.trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Policy controlling when remote refresh initiates a network fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteFetchPolicy {
+    /// Only fetch if the remote is missing, its URL changed, or it has no local refs.
+    /// If the remote is already present locally with valid refs, skip network I/O.
+    IfMissing,
+    /// Standard sync policy: fetch if interval elapsed, remote is missing, or URL changed.
+    IfIntervalElapsed,
+    /// Unconditionally fetch from the remote.
+    Force,
+}
+
+/// Like refresh_remote, but optionally passes explicit refspecs to git fetch.
+pub async fn refresh_remote_with_refspecs(
+    repo_path: &Path,
+    name: &str,
+    url: &str,
+    force_fetch: bool,
+    refspecs: Option<&[String]>,
+) -> Result<FetchOutcome> {
+    let policy = if force_fetch {
+        RemoteFetchPolicy::Force
+    } else {
+        RemoteFetchPolicy::IfIntervalElapsed
+    };
+    refresh_remote_with_policy(repo_path, name, url, policy, refspecs).await
+}
+
+/// Ensures a remote is configured locally and has refs available, fetching
+/// only if the remote is new, its URL changed, or no local refs exist yet.
+/// When refs already exist locally, skips network I/O completely.
+pub async fn ensure_remote_if_missing(
+    repo_path: &Path,
+    name: &str,
+    url: &str,
+    refspecs: Option<&[String]>,
+) -> Result<()> {
+    match refresh_remote_with_policy(repo_path, name, url, RemoteFetchPolicy::IfMissing, refspecs)
+        .await?
+    {
+        FetchOutcome::BackedOff => Err(anyhow::anyhow!(
+            "Remote {} failed recently, backing off",
+            name
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Refreshes a remote according to the specified fetch policy.
+pub async fn refresh_remote_with_policy(
+    repo_path: &Path,
+    name: &str,
+    url: &str,
+    policy: RemoteFetchPolicy,
+    refspecs: Option<&[String]>,
+) -> Result<FetchOutcome> {
     // 1. Validate repo_path to prevent git from traversing up to parent repos
     if !repo_path.join(".git").exists() && !repo_path.join("HEAD").exists() {
         return Err(anyhow::anyhow!(
@@ -1303,39 +1555,88 @@ pub async fn refresh_remote(
     let _guard = lock.lock().await;
 
     let mut just_added = false;
+    let mut refspecs_changed = false;
+    let mut url_changed = false;
 
     // 2. Check if exists (requires global config lock)
     {
         let global_lock = get_global_config_lock();
         let _global_guard = global_lock.lock().await;
 
+        let config_url_key = format!("remote.{}.url", name);
         let check = crate::git_cmd::in_dir_async(repo_path)
-            .args(["remote", "get-url", name])
+            .args(["config", "--get", &config_url_key])
             .output()
             .await?;
 
-        if check.status.success() {
-            // Check if URL matches, if not update it
+        let old_url = if check.status.success() {
             let current_url = String::from_utf8_lossy(&check.stdout).trim().to_string();
-            if current_url != url {
-                info!(
-                    "Updating remote URL for {} from {} to {}",
-                    name,
-                    redact_secret(&current_url),
-                    redact_secret(url)
-                );
-                let update = crate::git_cmd::in_dir_async(repo_path)
-                    .args(["remote", "set-url", name, url])
-                    .output()
-                    .await?;
-                if !update.status.success() {
-                    return Err(anyhow!(
-                        "Failed to update remote URL: {}",
-                        redact_secret(String::from_utf8_lossy(&update.stderr).trim())
-                    ));
+            if !are_git_urls_equivalent(&current_url, url) {
+                url_changed = true;
+            }
+            Some(current_url)
+        } else {
+            just_added = true;
+            None
+        };
+
+        // Configure fetch refspecs in .git/config. If selective refspecs are
+        // provided, configure them; otherwise ensure the default wildcard refspec
+        // is restored. Compare against current configuration to avoid unnecessary
+        // writes across await points.
+        let config_key = format!("remote.{}.fetch", name);
+        let current_out = crate::git_cmd::in_dir_async(repo_path)
+            .args(["config", "--get-all", &config_key])
+            .output()
+            .await?;
+
+        let current_refspecs: Vec<String> = if current_out.status.success() {
+            String::from_utf8_lossy(&current_out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let default_refspec = format!("+refs/heads/*:refs/remotes/{}/*", name);
+        let target_refspecs: Option<Vec<&str>> = match refspecs {
+            Some(specs) if !specs.is_empty() => Some(specs.iter().map(String::as_str).collect()),
+            Some(_) => Some(vec![default_refspec.as_str()]),
+            None => {
+                if current_refspecs.is_empty() {
+                    Some(vec![default_refspec.as_str()])
+                } else {
+                    None
                 }
             }
-        } else {
+        };
+
+        if let Some(target) = target_refspecs.as_ref() {
+            let target_refspecs_owned: Vec<String> =
+                target.iter().map(|s| (*s).to_string()).collect();
+
+            if current_refspecs != target_refspecs_owned {
+                refspecs_changed = true;
+            }
+        }
+
+        // Delete old tracking refs and clear timestamps BEFORE updating config,
+        // so that a failure during deletion or task cancellation leaves the old config
+        // intact rather than leaving stale refs paired with new config.
+        // For 'origin', never delete tracking refs (e.g. mirror clone transitioning to upstream).
+        if (url_changed || refspecs_changed) && name != "origin" {
+            delete_remote_tracking_refs(repo_path, name).await?;
+        }
+        if url_changed || refspecs_changed {
+            let timestamp_dir = repo_path.join(".sashiko/fetch_timestamps");
+            let _ = std::fs::remove_file(timestamp_dir.join(name));
+            let _ = std::fs::remove_file(timestamp_dir.join(format!("{}.fail", name)));
+        }
+
+        if just_added {
             info!("Adding remote {} ({})", name, redact_secret(url));
             let add = crate::git_cmd::in_dir_async(repo_path)
                 .args(["remote", "add", name, url])
@@ -1350,7 +1651,57 @@ pub async fn refresh_remote(
                     ));
                 }
             }
-            just_added = true;
+        } else if url_changed {
+            if let Some(ref current_url) = old_url {
+                info!(
+                    "Updating remote URL for {} from {} to {}",
+                    name,
+                    redact_secret(current_url),
+                    redact_secret(url)
+                );
+            }
+            let update = crate::git_cmd::in_dir_async(repo_path)
+                .args(["remote", "set-url", name, url])
+                .output()
+                .await?;
+            if !update.status.success() {
+                return Err(anyhow!(
+                    "Failed to update remote URL: {}",
+                    redact_secret(String::from_utf8_lossy(&update.stderr).trim())
+                ));
+            }
+        }
+
+        if refspecs_changed && let Some(target) = target_refspecs {
+            let unset = crate::git_cmd::in_dir_async(repo_path)
+                .args(["config", "--unset-all", &config_key])
+                .output()
+                .await?;
+            if !unset.status.success()
+                && unset.status.code() != Some(5)
+                && unset.status.code() != Some(1)
+            {
+                let stderr = String::from_utf8_lossy(&unset.stderr);
+                return Err(anyhow!(
+                    "Failed to reset fetch refspecs for {}: {}",
+                    name,
+                    redact_secret(stderr.trim())
+                ));
+            }
+            for spec in &target {
+                let add_spec = crate::git_cmd::in_dir_async(repo_path)
+                    .args(["config", "--add", &config_key, spec])
+                    .output()
+                    .await?;
+                if !add_spec.status.success() {
+                    let stderr = String::from_utf8_lossy(&add_spec.stderr);
+                    return Err(anyhow!(
+                        "Failed to configure fetch refspec for {}: {}",
+                        name,
+                        redact_secret(stderr.trim())
+                    ));
+                }
+            }
         }
     } // Release global lock
 
@@ -1377,23 +1728,55 @@ pub async fn refresh_remote(
         None => false,
     };
 
-    // Check if HEAD exists
-    let head_ref = format!("refs/remotes/{}/HEAD", name);
-    let head_exists = crate::git_cmd::in_dir_async(repo_path)
-        .args(["show-ref", "--verify", "-q", &head_ref])
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // Check if any remote refs exist locally
+    let has_refs = has_remote_refs(repo_path, name).await;
 
     // The local ref stands in for a fetch that fails, or is backed
-    // off, only while it is recent enough.
+    // off, only while it is recent enough, and neither refspecs nor URL have changed.
+    // For 'origin', URL change from a seed mirror to upstream does not invalidate
+    // existing mirror-seeded refs, which remain usable if upstream is unreachable.
     let max_stale_age = std::time::Duration::from_secs(86400); // 24 hours
-    let can_fallback = head_exists
+    let can_fallback = has_refs
+        && !refspecs_changed
+        && (!url_changed || name == "origin")
         && match age {
             Some(a) => a < max_stale_age,
-            None => false,
+            None => name == "origin",
         };
+
+    let force_fetch = policy == RemoteFetchPolicy::Force;
+
+    let should_fetch = match policy {
+        RemoteFetchPolicy::Force => true,
+        RemoteFetchPolicy::IfMissing => just_added || url_changed || refspecs_changed || !has_refs,
+        RemoteFetchPolicy::IfIntervalElapsed => {
+            if just_added || url_changed || refspecs_changed || !has_refs {
+                true
+            } else {
+                let fetch_interval = if url.contains("akpm/mm") || url.contains("linux-next") {
+                    std::time::Duration::from_secs(300)
+                } else {
+                    std::time::Duration::from_secs(3600)
+                };
+                match age {
+                    Some(a) => a > fetch_interval,
+                    None => true,
+                }
+            }
+        }
+    };
+
+    if !should_fetch {
+        let reason = if policy == RemoteFetchPolicy::IfMissing {
+            "local refs available"
+        } else if force_fetch {
+            "forced but recently fetched"
+        } else {
+            "fresh"
+        };
+        debug!("Skipping fetch for {} ({})", name, reason);
+        return Ok(FetchOutcome::Skipped);
+    }
 
     if failed_recently && !force_fetch {
         if !can_fallback {
@@ -1405,30 +1788,6 @@ pub async fn refresh_remote(
         let reason = "failed recently, backing off";
         debug!("Skipping fetch for {} ({})", name, reason);
         return Ok(FetchOutcome::BackedOff);
-    }
-
-    let should_fetch = if just_added || !head_exists || force_fetch {
-        true
-    } else {
-        let fetch_interval = if url.contains("akpm/mm") || url.contains("linux-next") {
-            std::time::Duration::from_secs(300)
-        } else {
-            std::time::Duration::from_secs(3600)
-        };
-        match age {
-            Some(a) => a > fetch_interval,
-            None => true,
-        }
-    };
-
-    if !should_fetch {
-        let reason = if force_fetch {
-            "forced but recently fetched"
-        } else {
-            "fresh"
-        };
-        debug!("Skipping fetch for {} ({})", name, reason);
-        return Ok(FetchOutcome::Skipped);
     }
 
     let mut fetch_ok = false;
@@ -1443,9 +1802,14 @@ pub async fn refresh_remote(
             fetch_args.push("--no-tags");
         }
         fetch_args.push(name);
+        if let Some(specs) = refspecs {
+            for spec in specs {
+                fetch_args.push(spec.as_str());
+            }
+        }
 
         // Dynamically scale timeout: 30 minutes for heavy initial fetches, 5 minutes for routine updates
-        let timeout_duration = if just_added || !head_exists {
+        let timeout_duration = if just_added || !has_refs {
             std::time::Duration::from_secs(1800)
         } else {
             std::time::Duration::from_secs(300)
@@ -2769,5 +3133,488 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_is_valid_refspec_pattern() {
+        // Valid patterns (must contain exactly one '*')
+        assert!(is_valid_refspec_pattern("linux-*.y"));
+        assert!(is_valid_refspec_pattern("v6.18/*"));
+        assert!(is_valid_refspec_pattern("*-next"));
+        assert!(is_valid_refspec_pattern("net-*"));
+
+        // Invalid patterns: no asterisk (exact branch names belong in only_branches)
+        assert!(!is_valid_refspec_pattern("main"));
+        assert!(!is_valid_refspec_pattern("for-next"));
+
+        // Invalid patterns: multiple asterisks
+        assert!(!is_valid_refspec_pattern("linux-*-*.y"));
+        assert!(!is_valid_refspec_pattern("*/*"));
+
+        // Invalid patterns: question mark
+        assert!(!is_valid_refspec_pattern("feat-?"));
+
+        // Invalid patterns: spaces and invalid git ref characters
+        assert!(!is_valid_refspec_pattern("feat branch*"));
+        assert!(!is_valid_refspec_pattern("feat..branch*"));
+        assert!(!is_valid_refspec_pattern("feat~1*"));
+        assert!(!is_valid_refspec_pattern("feat:branch*"));
+        assert!(!is_valid_refspec_pattern("/start-slash*"));
+        assert!(!is_valid_refspec_pattern("end-slash/*/"));
+        assert!(!is_valid_refspec_pattern("branch.lock*"));
+    }
+
+    #[test]
+    fn test_is_valid_branch_name() {
+        // Valid literal branch names
+        assert!(is_valid_branch_name("main"));
+        assert!(is_valid_branch_name("master"));
+        assert!(is_valid_branch_name("for-next"));
+        assert!(is_valid_branch_name("v6.18/dev"));
+
+        // Invalid branch names: wildcards
+        assert!(!is_valid_branch_name("linux-*.y"));
+        assert!(!is_valid_branch_name("feat-?"));
+
+        // Invalid branch names: spaces and invalid git ref characters
+        assert!(!is_valid_branch_name("feat branch"));
+        assert!(!is_valid_branch_name("feat..branch"));
+        assert!(!is_valid_branch_name("feat~1"));
+        assert!(!is_valid_branch_name("feat:branch"));
+        assert!(!is_valid_branch_name("/start-slash"));
+        assert!(!is_valid_branch_name("end-slash/"));
+        assert!(!is_valid_branch_name("branch.lock"));
+    }
+
+    #[test]
+    fn test_matches_branch_pattern() {
+        let patterns = vec![
+            "main".to_string(),
+            "linux-*.y".to_string(),
+            "v6.18/*".to_string(),
+            "*-next".to_string(),
+        ];
+
+        // Exact match
+        assert!(matches_branch_pattern("main", &patterns));
+        assert!(!matches_branch_pattern("master", &patterns));
+
+        // Wildcard prefix/suffix
+        assert!(matches_branch_pattern("linux-6.12.y", &patterns));
+        assert!(matches_branch_pattern("linux-6.6.y", &patterns));
+        assert!(!matches_branch_pattern("linux-6.12", &patterns));
+
+        // Prefix wildcard
+        assert!(matches_branch_pattern("v6.18/dev", &patterns));
+        assert!(matches_branch_pattern("v6.18/prod", &patterns));
+        assert!(!matches_branch_pattern("v6.19/dev", &patterns));
+
+        // Suffix wildcard
+        assert!(matches_branch_pattern("net-next", &patterns));
+        assert!(matches_branch_pattern("bpf-next", &patterns));
+        assert!(!matches_branch_pattern("net-fixes", &patterns));
+    }
+
+    #[tokio::test]
+    async fn test_ensure_remote_with_refspecs_limits_fetch() -> Result<()> {
+        let source_dir = tempfile::tempdir()?;
+        let source_path = source_dir.path();
+
+        crate::git_cmd::in_dir(source_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()?;
+        crate::git_cmd::in_dir(source_path)
+            .args(["config", "user.name", "Test"])
+            .output()?;
+        crate::git_cmd::in_dir(source_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()?;
+        std::fs::write(source_path.join("file.txt"), "hello")?;
+        crate::git_cmd::in_dir(source_path)
+            .args(["add", "file.txt"])
+            .output()?;
+        crate::git_cmd::in_dir(source_path)
+            .args(["commit", "-m", "init"])
+            .output()?;
+
+        for b in &["v6.18/dev", "v6.18/prod", "other/feature"] {
+            crate::git_cmd::in_dir(source_path)
+                .args(["branch", b])
+                .output()?;
+        }
+
+        let consumer_dir = tempfile::tempdir()?;
+        let consumer_path = consumer_dir.path();
+        crate::git_cmd::in_dir(consumer_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()?;
+
+        let source_url = source_path.to_str().unwrap();
+        let refspecs = vec!["+refs/heads/v6.18/*:refs/remotes/test_remote/v6.18/*".to_string()];
+
+        ensure_remote_with_refspecs(
+            consumer_path,
+            "test_remote",
+            source_url,
+            true,
+            Some(&refspecs),
+        )
+        .await?;
+
+        let branches = get_remote_branches(consumer_path, "test_remote").await?;
+        assert!(branches.contains(&"v6.18/dev".to_string()));
+        assert!(branches.contains(&"v6.18/prod".to_string()));
+        assert!(!branches.contains(&"other/feature".to_string()));
+        assert!(!branches.contains(&"main".to_string()));
+
+        let config_out = crate::git_cmd::in_dir(consumer_path)
+            .args(["config", "--get-all", "remote.test_remote.fetch"])
+            .output()?;
+        let config_str = String::from_utf8_lossy(&config_out.stdout);
+        assert!(config_str.contains("+refs/heads/v6.18/*:refs/remotes/test_remote/v6.18/*"));
+
+        // Updating refspecs forces a fetch and updates .git/config
+        let updated_refspecs =
+            vec!["+refs/heads/other/*:refs/remotes/test_remote/other/*".to_string()];
+        ensure_remote_with_refspecs(
+            consumer_path,
+            "test_remote",
+            source_url,
+            false,
+            Some(&updated_refspecs),
+        )
+        .await?;
+
+        let branches = get_remote_branches(consumer_path, "test_remote").await?;
+        assert!(branches.contains(&"other/feature".to_string()));
+
+        let config_out = crate::git_cmd::in_dir(consumer_path)
+            .args(["config", "--get-all", "remote.test_remote.fetch"])
+            .output()?;
+        let config_str = String::from_utf8_lossy(&config_out.stdout);
+        assert!(config_str.contains("+refs/heads/other/*:refs/remotes/test_remote/other/*"));
+        assert!(!config_str.contains("+refs/heads/v6.18/*"));
+
+        // Calling with refspecs = None preserves existing selective refspecs
+        ensure_remote_with_refspecs(consumer_path, "test_remote", source_url, false, None).await?;
+        let config_out = crate::git_cmd::in_dir(consumer_path)
+            .args(["config", "--get-all", "remote.test_remote.fetch"])
+            .output()?;
+        let config_str = String::from_utf8_lossy(&config_out.stdout);
+        assert!(config_str.contains("+refs/heads/other/*:refs/remotes/test_remote/other/*"));
+
+        // Setting refspecs to Some(&[]) restores default wildcard refspec
+        ensure_remote_with_refspecs(consumer_path, "test_remote", source_url, false, Some(&[]))
+            .await?;
+
+        let config_out = crate::git_cmd::in_dir(consumer_path)
+            .args(["config", "--get-all", "remote.test_remote.fetch"])
+            .output()?;
+        let config_str = String::from_utf8_lossy(&config_out.stdout);
+        assert_eq!(
+            config_str.trim(),
+            "+refs/heads/*:refs/remotes/test_remote/*"
+        );
+
+        let branches = get_remote_branches(consumer_path, "test_remote").await?;
+        assert!(branches.contains(&"main".to_string()));
+        assert!(branches.contains(&"v6.18/dev".to_string()));
+        assert!(branches.contains(&"other/feature".to_string()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_remote_if_missing_skips_fetch_when_refs_exist() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path();
+
+        crate::git_cmd::in_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.name", "Test"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()?;
+        std::fs::write(repo_path.join("file.txt"), "hello")?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["add", "file.txt"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["commit", "-m", "init"])
+            .output()?;
+
+        // Create a local remote ref
+        let remote_ref = "refs/remotes/myremote/main";
+        crate::git_cmd::in_dir(repo_path)
+            .args(["update-ref", remote_ref, "HEAD"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args([
+                "remote",
+                "add",
+                "myremote",
+                "https://invalid.domain.test/repo.git",
+            ])
+            .output()?;
+
+        // ensure_remote_if_missing should succeed without network I/O because local ref exists
+        let res = ensure_remote_if_missing(
+            repo_path,
+            "myremote",
+            "https://invalid.domain.test/repo.git",
+            None,
+        )
+        .await;
+        assert!(res.is_ok());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_remote_if_missing_succeeds_when_backed_off_with_local_refs() -> Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path();
+
+        crate::git_cmd::in_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.name", "Test"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()?;
+        std::fs::write(repo_path.join("file.txt"), "hello")?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["add", "file.txt"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["commit", "-m", "init"])
+            .output()?;
+
+        // Create local remote ref
+        let remote_ref = "refs/remotes/backed_off_remote/main";
+        crate::git_cmd::in_dir(repo_path)
+            .args(["update-ref", remote_ref, "HEAD"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args([
+                "remote",
+                "add",
+                "backed_off_remote",
+                "https://invalid.domain.test/repo.git",
+            ])
+            .output()?;
+
+        // Create a recent failure timestamp file to simulate a background sync failure
+        let timestamp_dir = repo_path.join(".sashiko/fetch_timestamps");
+        std::fs::create_dir_all(&timestamp_dir)?;
+        std::fs::write(timestamp_dir.join("backed_off_remote.fail"), "failed")?;
+
+        // ensure_remote_if_missing must skip fetch and succeed because local refs exist
+        let res = ensure_remote_if_missing(
+            repo_path,
+            "backed_off_remote",
+            "https://invalid.domain.test/repo.git",
+            None,
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "expected success when local refs exist despite recent failure backoff"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remote_url_change_clears_old_refs_and_timestamps() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path();
+
+        crate::git_cmd::in_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.name", "Test"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()?;
+        std::fs::write(repo_path.join("file.txt"), "hello")?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["add", "file.txt"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["commit", "-m", "init"])
+            .output()?;
+
+        // Create local remote ref and add remote
+        crate::git_cmd::in_dir(repo_path)
+            .args([
+                "remote",
+                "add",
+                "changing_remote",
+                "https://old.domain.test/repo.git",
+            ])
+            .output()?;
+        let remote_ref = "refs/remotes/changing_remote/old_branch";
+        crate::git_cmd::in_dir(repo_path)
+            .args(["update-ref", remote_ref, "HEAD"])
+            .output()?;
+
+        // Create timestamp files
+        let timestamp_dir = repo_path.join(".sashiko/fetch_timestamps");
+        std::fs::create_dir_all(&timestamp_dir)?;
+        let ts_file = timestamp_dir.join("changing_remote");
+        let fail_file = timestamp_dir.join("changing_remote.fail");
+        std::fs::write(&ts_file, "ok")?;
+        std::fs::write(&fail_file, "fail")?;
+
+        // Create a second local temporary repository to serve as the new URL
+        let temp_dir2 = tempfile::tempdir()?;
+        let repo2_path = temp_dir2.path();
+        crate::git_cmd::in_dir(repo2_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()?;
+        crate::git_cmd::in_dir(repo2_path)
+            .args(["config", "user.name", "Test 2"])
+            .output()?;
+        crate::git_cmd::in_dir(repo2_path)
+            .args(["config", "user.email", "test2@example.com"])
+            .output()?;
+        std::fs::write(repo2_path.join("file2.txt"), "hello2")?;
+        crate::git_cmd::in_dir(repo2_path)
+            .args(["add", "file2.txt"])
+            .output()?;
+        crate::git_cmd::in_dir(repo2_path)
+            .args(["commit", "-m", "init 2"])
+            .output()?;
+
+        let new_url = repo2_path.to_str().unwrap();
+
+        // Calling refresh_remote_with_policy with a new URL
+        let _ = refresh_remote_with_policy(
+            repo_path,
+            "changing_remote",
+            new_url,
+            RemoteFetchPolicy::IfMissing,
+            None,
+        )
+        .await;
+
+        // Verify that old ref from the previous URL was cleared
+        let old_ref_out = crate::git_cmd::in_dir(repo_path)
+            .args([
+                "rev-parse",
+                "--verify",
+                "refs/remotes/changing_remote/old_branch",
+            ])
+            .output()?;
+        assert!(!old_ref_out.status.success());
+
+        // Verify that the new URL's ref was fetched
+        let new_ref_out = crate::git_cmd::in_dir(repo_path)
+            .args(["rev-parse", "--verify", "refs/remotes/changing_remote/main"])
+            .output()?;
+        assert!(new_ref_out.status.success());
+
+        // Verify that old timestamp and fail files were cleared
+        assert!(!fail_file.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_origin_url_change_preserves_tracking_refs_on_failure() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path();
+
+        crate::git_cmd::in_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.name", "Test"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()?;
+        std::fs::write(repo_path.join("file.txt"), "hello")?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["add", "file.txt"])
+            .output()?;
+        crate::git_cmd::in_dir(repo_path)
+            .args(["commit", "-m", "init"])
+            .output()?;
+
+        // Simulate a mirror clone of origin
+        crate::git_cmd::in_dir(repo_path)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://mirror.domain.test/gcc.git",
+            ])
+            .output()?;
+        let origin_ref = "refs/remotes/origin/master";
+        crate::git_cmd::in_dir(repo_path)
+            .args(["update-ref", origin_ref, "HEAD"])
+            .output()?;
+
+        // Repoint origin to an unreachable upstream URL with force_fetch
+        let upstream_url = "https://unreachable.domain.invalid/gcc.git";
+        let res = refresh_remote_with_policy(
+            repo_path,
+            "origin",
+            upstream_url,
+            RemoteFetchPolicy::Force,
+            None,
+        )
+        .await;
+
+        // Force fetch from unreachable URL returns StaleLocalRef due to can_fallback
+        assert!(matches!(res, Ok(FetchOutcome::StaleLocalRef(_))));
+
+        // Mirror tracking refs should NOT have been deleted
+        let ref_check = crate::git_cmd::in_dir(repo_path)
+            .args(["rev-parse", "--verify", origin_ref])
+            .output()?;
+        assert!(
+            ref_check.status.success(),
+            "origin tracking ref must be preserved when repointing from seed mirror"
+        );
+
+        // ensure_remote_if_missing should succeed using preserved refs
+        let ensure_res = ensure_remote_if_missing(repo_path, "origin", upstream_url, None).await;
+        assert!(
+            ensure_res.is_ok(),
+            "ensure_remote_if_missing must succeed when origin refs are preserved"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_are_git_urls_equivalent() {
+        assert!(are_git_urls_equivalent(
+            "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+            "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+        ));
+        assert!(are_git_urls_equivalent(
+            "https://github.com/torvalds/linux.git",
+            "https://github.com/torvalds/linux"
+        ));
+        assert!(are_git_urls_equivalent(
+            "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+            "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux/"
+        ));
+        assert!(!are_git_urls_equivalent(
+            "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+            "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git"
+        ));
     }
 }
