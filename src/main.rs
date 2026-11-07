@@ -6672,12 +6672,23 @@ mod tests {
         submission_id: &str,
         messages: &[&[u8]],
     ) {
+        ingest_api_messages_at(db, source, submission_id, messages, 2000).await;
+    }
+
+    #[cfg(feature = "server")]
+    async fn ingest_api_messages_at(
+        db: &Database,
+        source: MessageSource,
+        submission_id: &str,
+        messages: &[&[u8]],
+        received_date: i64,
+    ) {
         let policy = sashiko::email_policy::EmailPolicyConfig::default();
         let review_settings = Settings::new().unwrap().review;
 
         for raw in messages {
             let (mut metadata, patch) = sashiko::patch::parse_email(raw).unwrap();
-            metadata.received_date = Some(2000);
+            metadata.received_date = Some(received_date);
             let article = ParsedArticle {
                 group: "api-submit".to_string(),
                 article_id: submission_id.to_string(),
