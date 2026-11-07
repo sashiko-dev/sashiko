@@ -546,6 +546,284 @@ impl BugWorker {
         }
     }
 
+    fn security_eval_tool_name(project: crate::project::ProjectId) -> &'static str {
+        match project {
+            crate::project::ProjectId::Linux => "sashiko:linux_bug:security_eval",
+            crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug:security_eval",
+            crate::project::ProjectId::Gcc => "sashiko:gcc_bug:security_eval",
+            crate::project::ProjectId::Qemu => "sashiko:qemu_bug:security_eval",
+        }
+    }
+
+    /// Evaluates up to `max_bugs` canonical bugs queued or pending security
+    /// scoring, running up to `concurrency` evaluations in parallel and
+    /// returning `(succeeded, failed)`.
+    pub async fn evaluate_bugs_security_batch(
+        &self,
+        max_bugs: usize,
+        concurrency: usize,
+    ) -> (usize, usize) {
+        if max_bugs == 0 {
+            return (0, 0);
+        }
+        let worker_concurrency = concurrency.max(1).min(max_bugs);
+        let lease_ttl_seconds = clamp_lease_ttl_seconds(self.settings.lease_ttl_seconds);
+        let max_attempts = self.settings.max_attempts.max(1);
+        let repo_path = std::path::PathBuf::from(&self.repo_path);
+        let cached_tm = if !self.repo_path.is_empty() && repo_path.exists() {
+            crate::threat_model::KernelThreatModel::load(&repo_path)
+                .await
+                .map(Arc::new)
+        } else {
+            None
+        };
+
+        let claimed_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let succeeded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut handles = Vec::with_capacity(worker_concurrency);
+        for _ in 0..worker_concurrency {
+            let worker = self.clone();
+            let repo = repo_path.clone();
+            let tm = cached_tm.clone();
+            let claimed_counter = Arc::clone(&claimed_counter);
+            let succeeded = Arc::clone(&succeeded);
+            let failed = Arc::clone(&failed);
+
+            handles.push(tokio::spawn(async move {
+                loop {
+                    let prev = claimed_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if prev >= max_bugs {
+                        break;
+                    }
+                    let claim_id = new_claim_id(&worker.worker_id);
+                    let claim_started = tokio::time::Instant::now();
+                    let bug = match worker
+                        .db
+                        .claim_bug_for_security_eval(&claim_id, lease_ttl_seconds, max_attempts)
+                        .await
+                    {
+                        Ok(Some(b)) => b,
+                        Ok(None) => break,
+                        Err(e) => {
+                            error!("Failed to claim bug for security evaluation: {}", e);
+                            failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                    };
+
+                    if worker
+                        .run_claimed_security_eval(
+                            &bug,
+                            &claim_id,
+                            claim_started,
+                            lease_ttl_seconds,
+                            &repo,
+                            tm.as_deref(),
+                            true,
+                        )
+                        .await
+                        .is_some()
+                    {
+                        succeeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            if let Err(e) = handle.await {
+                error!("Security evaluation worker task panicked: {}", e);
+            }
+        }
+
+        let ok_count = succeeded.load(std::sync::atomic::Ordering::Relaxed);
+        let err_count = failed.load(std::sync::atomic::Ordering::Relaxed);
+        if ok_count > 0 || err_count > 0 {
+            info!(
+                "Bug security evaluation batch finished: {} succeeded, {} failed",
+                ok_count, err_count
+            );
+        }
+        (ok_count, err_count)
+    }
+
+    /// Evaluates a single canonical bug identified by public `<project>-<uuid>`
+    /// (or numeric row ID) synchronously under a lease.
+    pub async fn evaluate_single_bug_security(
+        &self,
+        bug_ref: &str,
+    ) -> anyhow::Result<(crate::db::Bug, crate::security_eval::SecurityEvaluation)> {
+        let trimmed = bug_ref.trim();
+        let target = match self.db.get_bug_by_bugid(trimmed).await? {
+            Some(b) => b,
+            None => {
+                if let Ok(num_id) = trimmed.parse::<i64>() {
+                    self.db
+                        .get_bug(num_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("bug {} not found", trimmed))?
+                } else {
+                    anyhow::bail!("bug {} not found", trimmed);
+                }
+            }
+        };
+        if target.pipeline_state != crate::db::BugPipelineState::Succeeded
+            || target.duplicate_of_id.is_some()
+        {
+            anyhow::bail!(
+                "bug {} is not a canonical verified bug (state: {}, duplicate_of_id: {:?})",
+                target.bugid,
+                target.pipeline_state,
+                target.duplicate_of_id
+            );
+        }
+
+        let lease_ttl_seconds = clamp_lease_ttl_seconds(self.settings.lease_ttl_seconds);
+        let claim_id = new_claim_id(&self.worker_id);
+        let claim_started = tokio::time::Instant::now();
+        let claimed = self
+            .db
+            .claim_specific_bug_for_security_eval(target.id, &claim_id, lease_ttl_seconds)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "bug {} is currently leased by another worker; try again once its active analysis completes",
+                    target.bugid
+                )
+            })?;
+
+        let repo_path = std::path::PathBuf::from(&self.repo_path);
+        let eval = self
+            .run_claimed_security_eval(
+                &claimed,
+                &claim_id,
+                claim_started,
+                lease_ttl_seconds,
+                &repo_path,
+                None,
+                true,
+            )
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!("security evaluation failed for bug {}", claimed.bugid)
+            })?;
+
+        let refreshed = self
+            .db
+            .get_bug_on_write_conn(claimed.id)
+            .await?
+            .unwrap_or(claimed);
+        Ok((refreshed, eval))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_claimed_security_eval(
+        &self,
+        bug: &crate::db::Bug,
+        claim_id: &str,
+        claim_started: tokio::time::Instant,
+        lease_ttl_seconds: i64,
+        repo_path: &std::path::Path,
+        cached_tm: Option<&crate::threat_model::KernelThreatModel>,
+        release_lease: bool,
+    ) -> Option<crate::security_eval::SecurityEvaluation> {
+        let effective_project = crate::workflows::linux_bug::infer_project_from_bug_or_tool(
+            Some(&bug.bugid),
+            None,
+            self.project,
+        );
+        let scoped_db = self.db.with_bug_claim(bug.id, claim_id).with_bug_actor(
+            "sashiko",
+            Self::security_eval_tool_name(effective_project),
+            Some(self.provider.get_capabilities().model_name),
+        );
+
+        let eval_res = run_while_leased(
+            crate::workflows::linux_bug::evaluate_bug_security_for_project(
+                self.provider.as_ref(),
+                repo_path,
+                bug,
+                effective_project,
+                cached_tm,
+            ),
+            maintain_lease(
+                &scoped_db,
+                bug.id,
+                claim_id,
+                lease_ttl_seconds,
+                lease_deadline(claim_started, lease_ttl_seconds),
+            ),
+        )
+        .await;
+
+        let Some(eval_res) = eval_res else {
+            warn!(
+                "Cancelled security evaluation of bug {} after losing its lease",
+                bug.bugid
+            );
+            return None;
+        };
+
+        match eval_res {
+            Ok(session_result) => {
+                let logs = serde_json::to_string(&session_result.history).ok();
+                match scoped_db
+                    .record_bug_security_evaluation(
+                        bug.id,
+                        crate::db::SecurityEvaluationRecordParams {
+                            evaluation: &session_result.output,
+                            logs: logs.as_deref(),
+                            tokens_in: Some(session_result.usage.prompt_tokens),
+                            tokens_out: Some(session_result.usage.completion_tokens),
+                            tokens_cached: session_result.usage.cached_tokens,
+                            release_lease,
+                        },
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        info!(
+                            "Evaluated security of bug {}: {} {:.1} ({})",
+                            bug.bugid,
+                            session_result.output.qualitative_rating,
+                            session_result.output.score,
+                            session_result.output.security_class
+                        );
+                        Some(session_result.output)
+                    }
+                    Ok(false) => {
+                        warn!(
+                            "Could not persist security evaluation for bug {} (lease or state changed)",
+                            bug.bugid
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Database error persisting security evaluation for bug {}: {}",
+                            bug.bugid, e
+                        );
+                        if release_lease {
+                            let _ = scoped_db.release_security_eval_lease(bug.id, 60).await;
+                        }
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Security evaluation failed for bug {}: {}", bug.bugid, e);
+                if release_lease {
+                    let _ = scoped_db.release_security_eval_lease(bug.id, 60).await;
+                }
+                None
+            }
+        }
+    }
+
     pub async fn run(&self) {
         let concurrency = self.settings.concurrency.max(1);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
@@ -553,9 +831,12 @@ impl BugWorker {
         let max_attempts = self.settings.max_attempts.max(1);
         let fix_check_enabled = self.settings.fix_check_enabled;
         let fix_check_interval = self.settings.fix_check_interval_seconds;
+        let security_eval_enabled = self.settings.security_eval_enabled;
+        let security_eval_interval = self.settings.security_eval_interval_seconds;
+        let security_eval_batch_size = self.settings.security_eval_batch_size.max(1);
 
         info!(
-            "Starting Bug Worker as {} (project {}, concurrency {}, lease {}s renewed every {}s, {} attempts max, fix check enabled: {}, interval {}s)...",
+            "Starting Bug Worker as {} (project {}, concurrency {}, lease {}s renewed every {}s, {} attempts max, fix check: {}/{}s, security eval: {}/{}s batch {})...",
             self.worker_id,
             self.project.as_str(),
             concurrency,
@@ -563,7 +844,10 @@ impl BugWorker {
             ((lease_ttl_seconds as u64) / 3).clamp(1, BUG_LEASE_RENEW_INTERVAL_SECONDS),
             max_attempts,
             fix_check_enabled,
-            fix_check_interval
+            fix_check_interval,
+            security_eval_enabled,
+            security_eval_interval,
+            security_eval_batch_size
         );
         if let Err(e) = self.db.recover_stale_running_bugs().await {
             error!(
@@ -573,6 +857,8 @@ impl BugWorker {
         }
         let mut last_fix_check: Option<tokio::time::Instant> = None;
         let mut fix_check_handle: Option<tokio::task::JoinHandle<usize>> = None;
+        let mut last_security_eval: Option<tokio::time::Instant> = None;
+        let mut security_eval_handle: Option<tokio::task::JoinHandle<(usize, usize)>> = None;
 
         loop {
             if fix_check_handle.as_ref().is_some_and(|h| h.is_finished())
@@ -592,6 +878,30 @@ impl BugWorker {
                 let worker = self.clone();
                 fix_check_handle = Some(tokio::spawn(async move {
                     worker.check_open_bugs_upstream().await
+                }));
+            }
+
+            if security_eval_handle
+                .as_ref()
+                .is_some_and(|h| h.is_finished())
+                && let Some(handle) = security_eval_handle.take()
+                && let Err(e) = handle.await
+            {
+                error!("Background bug security evaluation task failed: {}", e);
+            }
+
+            if security_eval_enabled
+                && security_eval_interval > 0
+                && security_eval_handle.is_none()
+                && last_security_eval
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(security_eval_interval))
+            {
+                last_security_eval = Some(tokio::time::Instant::now());
+                let worker = self.clone();
+                security_eval_handle = Some(tokio::spawn(async move {
+                    worker
+                        .evaluate_bugs_security_batch(security_eval_batch_size, concurrency)
+                        .await
                 }));
             }
 
@@ -757,8 +1067,52 @@ impl BugWorker {
         };
 
         match analysis {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
                 info!("Successfully processed bug {}: {}", bug.bugid, outcome);
+                if self.settings.security_eval_enabled
+                    && let crate::api::BugOutcome::NewlyDiscovered {
+                        bug: ref mut discovered_bug,
+                    } = outcome
+                {
+                    let sec_started = tokio::time::Instant::now();
+                    match db
+                        .renew_bug_lease(discovered_bug.id, claim_id, lease_ttl_seconds)
+                        .await
+                    {
+                        Ok(true) => {
+                            let repo_path = std::path::PathBuf::from(&self.repo_path);
+                            if self
+                                .run_claimed_security_eval(
+                                    discovered_bug,
+                                    claim_id,
+                                    sec_started,
+                                    lease_ttl_seconds,
+                                    &repo_path,
+                                    None,
+                                    false,
+                                )
+                                .await
+                                .is_some()
+                                && let Ok(Some(refreshed)) =
+                                    db.get_bug_on_write_conn(discovered_bug.id).await
+                            {
+                                *discovered_bug = refreshed;
+                            }
+                        }
+                        Ok(false) => {
+                            warn!(
+                                "Skipping inline security evaluation for {}: lease expired before start; background sweep will evaluate it",
+                                discovered_bug.bugid
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to renew lease before inline security evaluation of {}: {}",
+                                discovered_bug.bugid, e
+                            );
+                        }
+                    }
+                }
                 // The workflow records the outcome; this only
                 // drops the claim so the row stops looking
                 // like it is still being worked on.

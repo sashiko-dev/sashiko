@@ -15,6 +15,7 @@
 //! Threat-model-gated security classification and deterministic FIRST CVSS v4.0
 //! vector construction and scoring for canonical Sashiko bugs.
 
+use cvss::v3::Vector as VectorV3;
 use cvss::v4::Vector;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -271,7 +272,7 @@ impl UserInteraction {
 
 /// CVSS v4.0 Confidentiality / Integrity / Availability impact level (`VC`, `VI`,
 /// `VA`, `SC`, `SI`, `SA`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ImpactLevel {
     /// None (`N`)
     N,
@@ -494,6 +495,50 @@ impl CvssV4Metrics {
             rating: SecurityRating::from_score_tenths(clamped_tenths),
         })
     }
+
+    /// Deterministically projects these validated CVSS v4.0 metrics onto their
+    /// canonical FIRST CVSS v3.1 Base vector and score for CNA interoperability.
+    pub fn compute_cvss_v31_equivalent(&self) -> Result<ComputedCvssV4, String> {
+        let ac =
+            if matches!(self.ac, AttackComplexity::H) || matches!(self.at, AttackRequirements::P) {
+                "H"
+            } else {
+                "L"
+            };
+        let ui = if matches!(self.ui, UserInteraction::N) {
+            "N"
+        } else {
+            "R"
+        };
+        let scope_changed = self.sc.is_non_zero() || self.si.is_non_zero() || self.sa.is_non_zero();
+        let scope = if scope_changed { "C" } else { "U" };
+        let c = self.vc.max(self.sc).code();
+        let i = self.vi.max(self.si).code();
+        let a = self.va.max(self.sa).code();
+
+        let raw = format!(
+            "CVSS:3.1/AV:{}/AC:{}/PR:{}/UI:{}/S:{}/C:{}/I:{}/A:{}",
+            self.av.code(),
+            ac,
+            self.pr.code(),
+            ui,
+            scope,
+            c,
+            i,
+            a,
+        );
+        let vector = VectorV3::from_str(&raw)
+            .map_err(|e| format!("failed to construct valid CVSS v3.1 vector from {raw}: {e}"))?;
+        let canonical = vector.to_string();
+        let val = vector.score().value().clamp(0.0, 10.0);
+        let score_tenths = ((val * 10.0).round() as u8).min(100);
+        Ok(ComputedCvssV4 {
+            vector_string: canonical,
+            score_tenths,
+            score: f64::from(score_tenths) / 10.0,
+            rating: SecurityRating::from_score_tenths(score_tenths),
+        })
+    }
 }
 
 /// Code-grounded justifications for CVSS v4.0 metric groups.
@@ -514,6 +559,10 @@ pub struct SecurityEvaluation {
     pub qualitative_rating: SecurityRating,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cvss_vector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cvss_v31_vector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cvss_v31_score: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_boundary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -669,6 +718,8 @@ impl SecurityEvaluation {
                     score_tenths: 0,
                     qualitative_rating: SecurityRating::None,
                     cvss_vector: None,
+                    cvss_v31_vector: None,
+                    cvss_v31_score: None,
                     trust_boundary,
                     attacker_model,
                     summary,
@@ -715,6 +766,7 @@ impl SecurityEvaluation {
 
         let justifications = validate_justifications(raw_justifications)?;
         let computed = metrics.compute_score()?;
+        let computed_v31 = metrics.compute_cvss_v31_equivalent()?;
 
         Ok(Self {
             security_class: SecurityClass::Vulnerability,
@@ -722,6 +774,8 @@ impl SecurityEvaluation {
             score_tenths: computed.score_tenths,
             qualitative_rating: computed.rating,
             cvss_vector: Some(computed.vector_string),
+            cvss_v31_vector: Some(computed_v31.vector_string),
+            cvss_v31_score: Some(computed_v31.score),
             trust_boundary,
             attacker_model,
             summary,
@@ -1084,5 +1138,65 @@ mod tests {
         assert!(parse_security_score_tenths("7.55").is_err());
         assert!(parse_security_score_tenths("NaN").is_err());
         assert!(parse_security_score_tenths("inf").is_err());
+    }
+
+    #[test]
+    fn computes_cvss_v31_equivalent_vectors_and_scores() {
+        let eval = SecurityEvaluation::from_raw_output(
+            RawSecurityEvaluationOutput {
+                security_class: "vulnerability".to_string(),
+                trust_boundary: Some("Unprivileged local syscall boundary".to_string()),
+                attacker_model: Some("Unprivileged local user".to_string()),
+                summary: "Use-after-free in local socket close path.".to_string(),
+                cvss_v4: Some(RawCvssV4Metrics {
+                    av: "L".to_string(),
+                    ac: "L".to_string(),
+                    at: "N".to_string(),
+                    pr: "L".to_string(),
+                    ui: "N".to_string(),
+                    vc: "H".to_string(),
+                    vi: "H".to_string(),
+                    va: "H".to_string(),
+                    sc: "N".to_string(),
+                    si: "N".to_string(),
+                    sa: "N".to_string(),
+                    ..Default::default()
+                }),
+                metric_justifications: Some(sample_justifications()),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            eval.cvss_v31_vector.as_deref(),
+            Some("CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H")
+        );
+        assert_eq!(eval.cvss_v31_score, Some(7.8));
+
+        // AT:P maps to AC:H, UI:A maps to UI:R, and SC/SI/SA!=N maps to S:C.
+        let vm_escape = RawCvssV4Metrics {
+            av: "L".to_string(),
+            ac: "L".to_string(),
+            at: "P".to_string(),
+            pr: "L".to_string(),
+            ui: "A".to_string(),
+            vc: "N".to_string(),
+            vi: "N".to_string(),
+            va: "N".to_string(),
+            sc: "H".to_string(),
+            si: "H".to_string(),
+            sa: "H".to_string(),
+            ..Default::default()
+        }
+        .into_validated()
+        .unwrap()
+        .compute_cvss_v31_equivalent()
+        .unwrap();
+        assert_eq!(
+            vm_escape.vector_string,
+            "CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:C/C:H/I:H/A:H"
+        );
+        assert_eq!(vm_escape.score_tenths, 75);
     }
 }
