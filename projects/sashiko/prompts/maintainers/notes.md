@@ -7,6 +7,7 @@ paths = [
     "projects/qemu/prompts/maintainers/",
     "projects/sashiko/prompts/maintainers/",
     "projects/sashiko/prompts/notes/",
+    "projects/zephyr/prompts/maintainers/",
     "src/notes/",
     "src/workflows/code_notes.rs",
     "src/workflows/notes_agenda.rs",
