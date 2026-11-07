@@ -430,6 +430,66 @@ enum Commands {
         #[arg(long, hide = true, value_delimiter = ',')]
         stages: Option<Vec<String>>,
     },
+
+    /// Offline maintenance and security evaluation for the bugs database
+    Bugs {
+        #[command(subcommand)]
+        command: BugsMainCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BugsMainCommand {
+    /// Evaluate canonical bugs for security importance and CVSS v4.0 scores
+    EvaluateSecurity {
+        /// Evaluate a single bug by public <project>-<uuid> identifier (or numeric ID)
+        #[arg(long)]
+        bug: Option<String>,
+
+        /// Maximum number of bugs to evaluate in batch mode
+        #[arg(long, default_value_t = 50, conflicts_with_all = ["bug", "all"])]
+        limit: usize,
+
+        /// Evaluate all eligible bugs in the database
+        #[arg(long, conflicts_with = "bug")]
+        all: bool,
+
+        /// Re-evaluate bugs that already have a security score
+        #[arg(long, conflicts_with = "bug")]
+        re_evaluate: bool,
+
+        /// Override concurrent security evaluation workers
+        #[arg(long)]
+        concurrency: Option<usize>,
+
+        /// Explicit database path override (defaults to [database] url in Settings.toml)
+        #[arg(long)]
+        db: Option<PathBuf>,
+
+        /// Override the target git repository path
+        #[arg(short = 'r', long)]
+        repo: Option<PathBuf>,
+
+        /// Path to settings file
+        #[arg(long)]
+        settings: Option<PathBuf>,
+
+        /// AI provider override
+        #[arg(long)]
+        ai_provider: Option<String>,
+
+        /// AI model override
+        #[arg(short = 'm', long = "model", visible_alias = "ai-model")]
+        model: Option<String>,
+
+        /// Reasoning effort mode override (low, mid, high, or dynamic)
+        #[arg(long)]
+        effort: Option<EffortMode>,
+
+        /// Output format
+        #[arg(long, default_value = "text")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -531,6 +591,22 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             effort: effort.or(cli.effort),
             ..Default::default()
         },
+        Some(Commands::Bugs {
+            command:
+                BugsMainCommand::EvaluateSecurity {
+                    repo,
+                    ai_provider,
+                    model,
+                    effort,
+                    ..
+                },
+        }) => Overrides {
+            repository_path: repo.as_deref().map(path_string),
+            ai_provider: ai_provider.clone(),
+            ai_model: model.clone(),
+            effort: effort.or(cli.effort),
+            ..Default::default()
+        },
         None => Overrides {
             no_ai: cli.no_ai,
             effort: cli.effort,
@@ -627,7 +703,10 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     let named_settings = match &cli.command {
         Some(Commands::Review { settings, .. })
         | Some(Commands::Benchmark { settings, .. })
-        | Some(Commands::Scan { settings, .. }) => settings.clone(),
+        | Some(Commands::Scan { settings, .. })
+        | Some(Commands::Bugs {
+            command: BugsMainCommand::EvaluateSecurity { settings, .. },
+        }) => settings.clone(),
         _ => None,
     };
     let settings_path = Settings::resolve_path(named_settings.as_deref());
@@ -635,9 +714,12 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Determine log level
     let log_kind = match &cli.command {
-        Some(Commands::Review { .. } | Commands::Notes { .. } | Commands::Scan { .. }) => {
-            sashiko::logging::LogCommandKind::InteractiveCli
-        }
+        Some(
+            Commands::Review { .. }
+            | Commands::Notes { .. }
+            | Commands::Scan { .. }
+            | Commands::Bugs { .. },
+        ) => sashiko::logging::LogCommandKind::InteractiveCli,
         Some(Commands::Repo { .. }) => sashiko::logging::LogCommandKind::RepoSync,
         Some(Commands::Worker { .. }) => sashiko::logging::LogCommandKind::Worker,
         _ => sashiko::logging::LogCommandKind::Daemon,
@@ -939,6 +1021,54 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     return Err(
                         "this build has no benchmark runner; rebuild with --features server".into(),
+                    );
+                }
+            }
+            Commands::Bugs {
+                command:
+                    BugsMainCommand::EvaluateSecurity {
+                        bug,
+                        limit,
+                        all,
+                        re_evaluate,
+                        concurrency,
+                        db,
+                        format,
+                        ..
+                    },
+            } => {
+                let settings =
+                    settings_result.map_err(|e| format_settings_load_error(&settings_path, &e))?;
+                #[cfg(feature = "server")]
+                {
+                    return handle_bugs_evaluate_security_command(
+                        project,
+                        bug.clone(),
+                        if *all { usize::MAX } else { *limit },
+                        *re_evaluate,
+                        *concurrency,
+                        db.clone(),
+                        settings,
+                        *format,
+                    )
+                    .await;
+                }
+                #[cfg(not(feature = "server"))]
+                {
+                    let _ = (
+                        project,
+                        bug,
+                        limit,
+                        all,
+                        re_evaluate,
+                        concurrency,
+                        db,
+                        settings,
+                        format,
+                    );
+                    return Err(
+                        "this build has no database bug evaluator; rebuild with --features server"
+                            .into(),
                     );
                 }
             }
@@ -3536,6 +3666,122 @@ async fn handle_scan_command(
         std::process::exit(code);
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "server")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_bugs_evaluate_security_command(
+    project: ProjectId,
+    bug: Option<String>,
+    limit: usize,
+    re_evaluate: bool,
+    concurrency_override: Option<usize>,
+    db_override: Option<PathBuf>,
+    mut settings: Settings,
+    format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(db_path) = db_override {
+        settings.database.url = db_path.to_string_lossy().into_owned();
+    }
+    if settings.database.url.trim().is_empty() {
+        return Err(
+            "[database] url must be set in Settings.toml or supplied via --db <PATH>".into(),
+        );
+    }
+
+    let db = Arc::new(Database::new(&settings.database).await?);
+    db.migrate().await?;
+
+    let provider = sashiko::ai::create_provider(&settings)?;
+    let concurrency = concurrency_override
+        .unwrap_or(settings.linux_bug.concurrency)
+        .max(1);
+    let worker = sashiko::worker::bug_worker::BugWorker::new(
+        db.clone(),
+        provider,
+        settings.git.repository_path.clone(),
+    )
+    .with_project(project)
+    .with_settings(settings.linux_bug.clone());
+
+    exit_on_interrupt(false);
+
+    if let Some(bug_ref) = bug {
+        let res = worker.evaluate_single_bug_security(&bug_ref).await;
+        sashiko::ai::cli_common::kill_live_groups();
+        let (updated_bug, evaluation) = res?;
+        match format {
+            OutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "bugid": updated_bug.bugid,
+                        "title": updated_bug.problem(),
+                        "lifecycle_status": updated_bug.lifecycle_status,
+                        "security_evaluation": evaluation,
+                    }))?
+                );
+            }
+            OutputFormat::Text => {
+                println!(
+                    "{}: {} {:.1} ({})",
+                    updated_bug.bugid,
+                    evaluation.qualitative_rating,
+                    evaluation.score,
+                    evaluation.security_class
+                );
+                if let Some(ref vec) = evaluation.cvss_vector {
+                    println!("  CVSS v4.0: {vec}");
+                }
+                if let (Some(v31_vec), Some(v31_score)) =
+                    (&evaluation.cvss_v31_vector, evaluation.cvss_v31_score)
+                {
+                    println!("  CVSS v3.1: {v31_vec} ({v31_score:.1})");
+                }
+                println!("  Summary:   {}", evaluation.summary);
+            }
+        }
+        return Ok(());
+    }
+
+    let queued_for_reeval = if re_evaluate {
+        let queue_cap = if limit == usize::MAX {
+            None
+        } else {
+            Some(limit)
+        };
+        db.queue_bugs_for_security_reeval(queue_cap).await?
+    } else {
+        0
+    };
+
+    let (succeeded, failed) = worker
+        .evaluate_bugs_security_batch(limit, concurrency)
+        .await;
+    sashiko::ai::cli_common::kill_live_groups();
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "queued_for_reevaluation": queued_for_reeval,
+                    "succeeded": succeeded,
+                    "failed": failed,
+                }))?
+            );
+        }
+        OutputFormat::Text => {
+            if re_evaluate {
+                println!("Queued {queued_for_reeval} bug(s) for security re-evaluation.");
+            }
+            println!("Security evaluation complete: {succeeded} succeeded, {failed} failed.");
+        }
+    }
+
+    if failed > 0 && succeeded == 0 {
+        return Err(format!("all {failed} security evaluation(s) failed").into());
+    }
     Ok(())
 }
 
@@ -6987,6 +7233,59 @@ mod tests {
                 assert!(matches!(format, OutputFormat::Json));
             }
             _ => panic!("expected scan command"),
+        }
+    }
+
+    #[test]
+    fn test_bugs_evaluate_security_cli_parses_overrides() {
+        let args = [
+            "sashiko",
+            "bugs",
+            "evaluate-security",
+            "--all",
+            "--re-evaluate",
+            "--concurrency",
+            "16",
+            "--db",
+            "/tmp/bugs.db",
+            "--repo",
+            "/tmp/linux",
+            "-m",
+            "gemini-3-flash-preview",
+            "--effort",
+            "high",
+            "--format",
+            "json",
+        ];
+        let cli = Cli::parse_from(args);
+        let overrides = cli_overrides(&cli);
+        assert_eq!(overrides.repository_path.as_deref(), Some("/tmp/linux"));
+        assert_eq!(
+            overrides.ai_model.as_deref(),
+            Some("gemini-3-flash-preview")
+        );
+        assert_eq!(overrides.effort, Some(EffortMode::High));
+        match cli.command {
+            Some(Commands::Bugs {
+                command:
+                    BugsMainCommand::EvaluateSecurity {
+                        bug,
+                        all,
+                        re_evaluate,
+                        concurrency,
+                        db,
+                        format,
+                        ..
+                    },
+            }) => {
+                assert!(bug.is_none());
+                assert!(all);
+                assert!(re_evaluate);
+                assert_eq!(concurrency, Some(16));
+                assert_eq!(db.as_deref(), Some(Path::new("/tmp/bugs.db")));
+                assert!(matches!(format, OutputFormat::Json));
+            }
+            _ => panic!("expected bugs evaluate-security command"),
         }
     }
 
