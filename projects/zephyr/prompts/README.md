@@ -32,10 +32,14 @@ over these notes.
 ## Editing
 
 Prompt content is embedded in the binary at build time and installed to
-`$XDG_DATA_HOME/sashiko/prompts/<revision>/zephyr/`. The revision includes a
-fingerprint of this tree, so editing a file here produces a new revision
-directory and the change takes effect on the next run. No manual reinstall is
-needed.
+`$XDG_DATA_HOME/sashiko/prompts/<revision>/zephyr/`. After editing a file here,
+rebuild and run the new binary. If using the installed `sashiko` command, repeat
+the installation command in [the setup guide](../../../docs/zephyr-review.md#setup).
+The new binary installs its updated bundle into a directory named by the new
+content fingerprint; an existing binary continues to use its embedded version.
+
+For prompt iteration without rebuilding, pass `--prompts` with the absolute path
+to this directory when running a review from the Zephyr checkout.
 
 ## Writing a new maintainer note
 
