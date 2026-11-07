@@ -1834,7 +1834,8 @@ async fn submit_scan_candidates(
             options.repo_path.to_string_lossy().to_string(),
         )
         .with_project(crate::project::ProjectId::Linux)
-        .with_settings(settings.linux_bug.clone()),
+        .with_settings(settings.linux_bug.clone())
+        .with_effort(options.effort.or_else(|| settings.effective_effort())),
     );
     let attributed_db = std::sync::Arc::new(attributed_db);
     let verify_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(options.concurrency.max(1)));
