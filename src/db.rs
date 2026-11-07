@@ -8895,8 +8895,18 @@ impl Database {
                 || existing_total == 1
                 || total_parts == 1;
 
+            // The new singleton and the message that defines this patchset are
+            // a cover (0) and a patch (1), in either arrival order.
+            let is_cover_patch_pair =
+                total_parts == 1 && matches!((part_index, existing_subject_index), (0, 1) | (1, 0));
+            // A cover (0/1) and a patch (1/1) in one thread group even when
+            // their authors differ. The rule applies to every source: all
+            // messages of an API submission share one thread, and a 1/1 sent
+            // into a 0/1 cover's mailing-list thread is taken as its patch.
+            let is_cover_patch_pair_in_thread =
+                same_thread && existing_total == 1 && is_cover_patch_pair;
             let author_or_series_match = if strict_author {
-                author_match
+                author_match || is_cover_patch_pair_in_thread
             } else {
                 author_match || series_match
             };
@@ -8943,18 +8953,8 @@ impl Database {
             let is_singleton = total_parts == 1;
             // For singletons, we require the subject to be somewhat similar to avoid merging unrelated patches.
             let subject_match = if is_singleton {
-                if subject == existing_subject {
-                    true
-                } else {
-                    // Allow merging 0/1 (cover) and 1/1 (patch) even if subjects differ
-                    if (part_index == 0 && existing_subject_index == 1)
-                        || (part_index == 1 && existing_subject_index == 0)
-                    {
-                        true
-                    } else {
-                        clean_new == clean_old
-                    }
-                }
+                // A 0/1 cover and its 1/1 patch merge even when subjects differ.
+                subject == existing_subject || is_cover_patch_pair || clean_new == clean_old
             } else {
                 // For series:
                 // If we are replacing/matching the SAME index as the one that defined the patchset subject,
@@ -8979,7 +8979,13 @@ impl Database {
             // Thread Enforcement: To prevent cross-thread "stealing" of patches for resends of the same series,
             // we strictly require multi-part series patches to belong to the same thread,
             // unless they share a git send-email Message-ID prefix indicating they were sent together unthreaded.
-            let thread_compatible = same_thread || is_singleton || msgid_prefix_match;
+            // A cover/patch pair of singletons is the exception to the
+            // singleton leniency: it must be tied together by thread or by a
+            // common send-email batch, never by author and time alone.
+            let thread_compatible = same_thread
+                || msgid_prefix_match
+                || patches_reply_to_new_cover
+                || (is_singleton && !is_cover_patch_pair);
             let is_same_series_redelivery =
                 is_duplicate && same_thread && total_parts == existing_total;
 

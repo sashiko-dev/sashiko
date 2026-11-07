@@ -1289,72 +1289,29 @@ async fn run_daemon(
                         only_subjects,
                         submitted_at,
                     } => {
-                        let messages = sashiko::ingestor::split_mbox(raw.as_bytes());
-                        let count = messages.len();
-
-                        if count > 100 {
-                            error!(
-                                "Too many messages in mbox submission: {} (limit 100)",
-                                count
-                            );
-                            return;
-                        }
-
-                        info!("Processing {} messages from raw mbox submission", count);
-
-                        for msg_raw in messages {
-                            let msg_id = sashiko::ingestor::extract_message_id(&msg_raw);
-                            let group_clone = group.clone();
-                            let tx_clone = tx.clone();
-                            let baseline_clone = baseline.clone();
-                            let skip_subjects_clone = skip_subjects.clone();
-                            let only_subjects_clone = only_subjects.clone();
-
-                            // Offload parsing
-                            let parse_result = tokio::task::spawn_blocking(move || {
-                                sashiko::patch::parse_email(&msg_raw)
-                            })
-                            .await;
-
-                            match parse_result {
-                                Ok(Ok((metadata, patch_opt))) => {
-                                    // Do not override group "api-submit" to allow grouping logic to trigger
-                                    let effective_group = group_clone;
-
-                                    if let Err(e) = tx_clone
-                                        .send(ParsedArticle {
-                                            group: effective_group,
-                                            article_id: submission_id.clone(),
-                                            source,
-                                            metadata: {
-                                                let mut m = metadata;
-                                                if submitted_at.is_some() {
-                                                    m.received_date = submitted_at;
-                                                }
-                                                Some(m)
-                                            },
-                                            patch: patch_opt,
-                                            baseline: baseline_clone,
-                                            failed_error: None,
-                                            skip_filters: skip_subjects_clone,
-                                            only_filters: only_subjects_clone,
-                                            mr_url: None,
-                                            mr_title: None,
-                                            mr_number: None,
-                                            receipt: None,
-                                        })
-                                        .await
-                                    {
+                        let submission = RawMboxSubmission {
+                            raw,
+                            submission_id,
+                            source,
+                            group,
+                            baseline,
+                            skip_subjects,
+                            only_subjects,
+                            submitted_at,
+                        };
+                        // Offload parsing
+                        let articles =
+                            tokio::task::spawn_blocking(move || submission.into_articles()).await;
+                        match articles {
+                            Ok(Some(articles)) => {
+                                for article in articles {
+                                    if let Err(e) = tx.send(article).await {
                                         error!("Failed to send parsed article: {}", e);
                                     }
                                 }
-                                Ok(Err(e)) => {
-                                    debug!("Parse error for {}: {}", msg_id, e);
-                                }
-                                Err(e) => {
-                                    error!("Join error in parser: {}", e);
-                                }
                             }
+                            Ok(None) => {}
+                            Err(e) => error!("Join error in parser: {}", e),
                         }
                     }
                     Event::ArticleFetched {
@@ -4932,6 +4889,73 @@ fn resolve_root_msg_id(source: MessageSource, article_id: &str) -> String {
     }
 }
 
+/// A raw mbox accepted over the API, before it is split into articles.
+#[cfg(feature = "server")]
+struct RawMboxSubmission {
+    raw: String,
+    submission_id: String,
+    source: MessageSource,
+    group: String,
+    baseline: Option<String>,
+    skip_subjects: Option<Vec<String>>,
+    only_subjects: Option<Vec<String>>,
+    submitted_at: Option<i64>,
+}
+
+#[cfg(feature = "server")]
+impl RawMboxSubmission {
+    /// Splits and parses the mbox into articles that all carry the submission
+    /// ID, which is what lets the grouping logic tie the messages together.
+    /// Returns None when the mbox exceeds the message limit.
+    fn into_articles(self) -> Option<Vec<ParsedArticle>> {
+        let messages = sashiko::ingestor::split_mbox(self.raw.as_bytes());
+        let count = messages.len();
+        if count > 100 {
+            error!(
+                "Too many messages in mbox submission: {} (limit 100)",
+                count
+            );
+            return None;
+        }
+        info!("Processing {} messages from raw mbox submission", count);
+
+        let mut articles = Vec::with_capacity(count);
+        for msg_raw in messages {
+            match sashiko::patch::parse_email(&msg_raw) {
+                Ok((mut metadata, patch)) => {
+                    if self.submitted_at.is_some() {
+                        metadata.received_date = self.submitted_at;
+                    }
+                    articles.push(ParsedArticle {
+                        // The group stays "api-submit" so grouping logic triggers.
+                        group: self.group.clone(),
+                        article_id: self.submission_id.clone(),
+                        source: self.source,
+                        metadata: Some(metadata),
+                        patch,
+                        baseline: self.baseline.clone(),
+                        failed_error: None,
+                        skip_filters: self.skip_subjects.clone(),
+                        only_filters: self.only_subjects.clone(),
+                        mr_url: None,
+                        mr_title: None,
+                        mr_number: None,
+                        receipt: None,
+                    });
+                }
+                Err(e) => {
+                    debug!(
+                        "Parse error for {}: {}",
+                        sashiko::ingestor::extract_message_id(&msg_raw),
+                        e
+                    );
+                }
+            }
+        }
+        Some(articles)
+    }
+}
+
 #[cfg(feature = "server")]
 fn is_strict_author(source: MessageSource, total_parts: u32) -> bool {
     match source {
@@ -5030,6 +5054,9 @@ fn should_start_nntp_ingestor(settings: &Settings) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "server")]
+    mod api_injection;
+
     use super::*;
 
     #[test]
@@ -6616,11 +6643,7 @@ mod tests {
     }
 
     #[cfg(feature = "server")]
-    async fn ingest_api_submission(
-        source: MessageSource,
-        submission_id: &str,
-        messages: &[&[u8]],
-    ) -> Database {
+    async fn test_db() -> Database {
         let db = Database::new(&sashiko::settings::DatabaseSettings {
             url: ":memory:".to_string(),
             token: String::new(),
@@ -6628,12 +6651,44 @@ mod tests {
         .await
         .unwrap();
         db.migrate().await.unwrap();
+        db
+    }
+
+    #[cfg(feature = "server")]
+    async fn ingest_api_submission(
+        source: MessageSource,
+        submission_id: &str,
+        messages: &[&[u8]],
+    ) -> Database {
+        let db = test_db().await;
+        ingest_api_messages(&db, source, submission_id, messages).await;
+        db
+    }
+
+    #[cfg(feature = "server")]
+    async fn ingest_api_messages(
+        db: &Database,
+        source: MessageSource,
+        submission_id: &str,
+        messages: &[&[u8]],
+    ) {
+        ingest_api_messages_at(db, source, submission_id, messages, 2000).await;
+    }
+
+    #[cfg(feature = "server")]
+    async fn ingest_api_messages_at(
+        db: &Database,
+        source: MessageSource,
+        submission_id: &str,
+        messages: &[&[u8]],
+        received_date: i64,
+    ) {
         let policy = sashiko::email_policy::EmailPolicyConfig::default();
         let review_settings = Settings::new().unwrap().review;
 
         for raw in messages {
             let (mut metadata, patch) = sashiko::patch::parse_email(raw).unwrap();
-            metadata.received_date = Some(2000);
+            metadata.received_date = Some(received_date);
             let article = ParsedArticle {
                 group: "api-submit".to_string(),
                 article_id: submission_id.to_string(),
@@ -6650,11 +6705,10 @@ mod tests {
                 receipt: None,
             };
             assert_eq!(
-                process_parsed_article(&db, article, None, &policy, &[], &review_settings).await,
+                process_parsed_article(db, article, None, &policy, &[], &review_settings).await,
                 ProcessStatus::Ingested
             );
         }
-        db
     }
 
     #[cfg(feature = "server")]
