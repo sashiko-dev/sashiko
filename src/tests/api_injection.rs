@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Expected API injection behavior, including executable specifications of gaps.
+//! Expected API injection grouping behavior.
 //!
-//! Run the known failures with:
-//! cargo test --bin sashiko tests::api_injection -- --ignored
-//! Validate a fix against the controls and known failures together with:
-//! cargo test --bin sashiko tests::api_injection -- --include-ignored
-//! Ignored cases assert the desired behavior, rather than accepting a split or
-//! a cross-submission merge as correct. Remove each ignore when its bug is fixed.
+//! Each case asserts the desired grouping, so a split or a cross-submission
+//! merge fails the test. Run them with:
+//! cargo test --bin sashiko tests::api_injection
 //! The parent module also covers bare singletons and same-author, same-subject
 //! 0/1 submissions in both arrival orders.
 //! This module also checks late covers, redelivery, and interleaved multipart
@@ -172,25 +169,21 @@ async fn same_author_different_subjects_patch_first() {
 }
 
 #[tokio::test]
-#[ignore = "Known bug: strict singleton author matching splits an injected 0/1 and 1/1"]
 async fn different_authors_same_subject_cover_first() {
     assert_singleton_groups(AUTHOR, COVER_TITLE, ArrivalOrder::CoverFirst).await;
 }
 
 #[tokio::test]
-#[ignore = "Known bug: strict singleton author matching splits an injected 0/1 and 1/1"]
 async fn different_authors_same_subject_patch_first() {
     assert_singleton_groups(AUTHOR, COVER_TITLE, ArrivalOrder::PatchFirst).await;
 }
 
 #[tokio::test]
-#[ignore = "Known bug: strict singleton author matching splits an injected 0/1 and 1/1"]
 async fn different_authors_different_subjects_cover_first() {
     assert_singleton_groups(AUTHOR, "Independent patch title", ArrivalOrder::CoverFirst).await;
 }
 
 #[tokio::test]
-#[ignore = "Known bug: strict singleton author matching splits an injected 0/1 and 1/1"]
 async fn different_authors_different_subjects_patch_first() {
     assert_singleton_groups(AUTHOR, "Independent patch title", ArrivalOrder::PatchFirst).await;
 }
@@ -394,7 +387,6 @@ async fn same_author_cover_after_review_keeps_completed_review() {
 }
 
 #[tokio::test]
-#[ignore = "Known bug: strict author matching rejects a different-author cover after review"]
 async fn different_author_cover_after_review_keeps_completed_review() {
     assert_late_cover_preserves_review(AUTHOR).await;
 }
@@ -495,7 +487,6 @@ async fn assert_singleton_groups_with_gap(author: &str, order: ArrivalOrder, gap
 }
 
 #[tokio::test]
-#[ignore = "Known bug: strict singleton author matching splits an injected 0/1 and 1/1"]
 async fn different_authors_group_regardless_of_arrival_gap() {
     for gap in ARRIVAL_GAPS {
         for order in [ArrivalOrder::CoverFirst, ArrivalOrder::PatchFirst] {
@@ -632,13 +623,11 @@ async fn http_submit_same_author_patch_first_groups() {
 }
 
 #[tokio::test]
-#[ignore = "Known bug: strict singleton author matching splits an injected 0/1 and 1/1"]
 async fn http_submit_different_authors_cover_first_groups() {
     assert_http_submission_groups(AUTHOR, ArrivalOrder::CoverFirst).await;
 }
 
 #[tokio::test]
-#[ignore = "Known bug: strict singleton author matching splits an injected 0/1 and 1/1"]
 async fn http_submit_different_authors_patch_first_groups() {
     assert_http_submission_groups(AUTHOR, ArrivalOrder::PatchFirst).await;
 }
