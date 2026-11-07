@@ -3155,6 +3155,7 @@ impl Reviewer {
                                             patch_id: Some(patch_id),
                                             baseline_sha: Some(baseline_ref.to_string()),
                                             review_id: Some(review_id),
+                                            min_severity: None,
                                         };
                                         let repo_path = std::path::PathBuf::from(
                                             &ctx.settings.git.repository_path,
