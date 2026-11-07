@@ -30,16 +30,17 @@ use crate::workflow::{
 };
 use crate::workflows::guard::{normalize_guide_name, normalize_stage_name};
 use crate::workflows::linux_patch_review::{
-    AnalysisStage, ConsolidationStage, LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES,
-    PlanningOutput, PostVerificationOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
-    VerificationOutput, append_stage_dismissed_concerns_with_prompts,
-    append_stage_items_with_prompts, apply_planning_stage_output,
-    apply_post_verification_stage_output, apply_verification_stage_output,
-    batch_inconclusive_concerns_by_severity, build_stage_efforts_schema, collect_stage_prompts,
+    AnalysisStage, COMBINED_ANALYSIS_SHORT_LABEL, COMBINED_ANALYSIS_STAGE_NAME, ConsolidationStage,
+    LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES, PlanningOutput, PostVerificationOutput,
+    SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput, VerificationOutput,
+    append_stage_dismissed_concerns_with_prompts, append_stage_items_with_prompts,
+    apply_planning_stage_output, apply_post_verification_stage_output,
+    apply_verification_stage_output, batch_inconclusive_concerns_by_severity,
+    build_combined_analysis_stage, build_stage_efforts_schema, collect_stage_prompts,
     extra_prompt_paths_for_items, extra_prompt_paths_for_state, format_planning_feedback,
-    format_post_verification_feedback, format_verification_stage_feedback, resolve_stage_effort,
-    validate_planning_stage_efforts, validate_post_verification_batch_items,
-    validate_verification_stage_output,
+    format_post_verification_feedback, format_verification_stage_feedback,
+    resolve_combined_stage_effort, resolve_stage_effort, validate_planning_stage_efforts,
+    validate_post_verification_batch_items, validate_verification_stage_output,
 };
 
 use crate::workflows::qemu_patch_review::{
@@ -476,6 +477,9 @@ pub fn stage_short_label(name: &str) -> Option<&'static str> {
     if let Some(def) = analysis_stage_by_name(name) {
         return Some(def.short);
     }
+    if normalize_stage_name(name) == COMBINED_ANALYSIS_STAGE_NAME {
+        return Some(COMBINED_ANALYSIS_SHORT_LABEL);
+    }
     consolidation_stage_by_name(name).map(|s| s.short)
 }
 
@@ -558,7 +562,7 @@ pub fn planning_stage_with_effort(
             reasoning_effort: effort.map(crate::ai::EffortMode::lightweight_stage_effort),
             ..Default::default()
         })
-        .skip_if(|s| s.manual_stages.is_some())
+        .skip_if(|s| s.cheap_mode || s.manual_stages.is_some())
         .reduce(move |state, out: PlanningOutput| {
             apply_planning_stage_output(
                 ANALYSIS_STAGES,
@@ -642,14 +646,54 @@ pub fn resolve_analysis_stages_with_options(
         ANALYSIS_STAGES.iter().map(|d| d.name.to_string()).collect()
     };
 
-    let mut stages = Vec::new();
+    let mut use_combined = state.cheap_mode;
+    let mut selected_defs = Vec::new();
     for name in selected_stages {
+        if normalize_stage_name(&name) == COMBINED_ANALYSIS_STAGE_NAME {
+            use_combined = true;
+            for def in ANALYSIS_STAGES {
+                if !selected_defs
+                    .iter()
+                    .any(|d: &&AnalysisStage| d.name == def.name)
+                {
+                    selected_defs.push(def);
+                }
+            }
+            continue;
+        }
         match analysis_stage_by_name(&name) {
             Some(def) => {
-                let effort = resolve_stage_effort(state, def.name);
-                stages.push(analysis_stage(def, max_turns, temperature, effort));
+                if !selected_defs
+                    .iter()
+                    .any(|d: &&AnalysisStage| d.name == def.name)
+                {
+                    selected_defs.push(def);
+                }
             }
             None => tracing::warn!("Ignoring unknown Zephyr review stage {:?}", name),
+        }
+    }
+
+    let mut stages = Vec::new();
+    if use_combined {
+        if !selected_defs.is_empty() {
+            let effort = resolve_combined_stage_effort(state);
+            stages.push(build_combined_analysis_stage(
+                selected_defs,
+                zephyr_system_prompt,
+                CONCERN_JSON_SCHEMA_EXAMPLE,
+                false,
+                validate_concerns_output,
+                format_concerns_feedback,
+                max_turns,
+                temperature,
+                effort,
+            ));
+        }
+    } else {
+        for def in selected_defs {
+            let effort = resolve_stage_effort(state, def.name);
+            stages.push(analysis_stage(def, max_turns, temperature, effort));
         }
     }
     stages
@@ -1211,7 +1255,7 @@ mod tests {
     #[tokio::test]
     async fn test_workflow_runs_planning_and_core_stages_on_a_clean_patch() {
         struct CleanProvider {
-            calls: std::sync::Mutex<usize>,
+            prompts: std::sync::Mutex<Vec<String>>,
         }
 
         #[async_trait::async_trait]
@@ -1220,7 +1264,13 @@ mod tests {
                 &self,
                 request: crate::ai::AiRequest,
             ) -> anyhow::Result<crate::ai::AiResponse> {
-                *self.calls.lock().unwrap() += 1;
+                self.prompts.lock().unwrap().push(
+                    request
+                        .messages
+                        .iter()
+                        .filter_map(|m| m.content.as_deref())
+                        .collect(),
+                );
                 let body = if request.response_format.is_some() {
                     r#"{"relevant_stages": []}"#
                 } else {
@@ -1246,7 +1296,7 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let provider = std::sync::Arc::new(CleanProvider {
-            calls: std::sync::Mutex::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
         });
         let tools =
             std::sync::Arc::new(crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf()));
@@ -1265,7 +1315,43 @@ mod tests {
 
         // planning + goal, implementation, execution-flow; the empty analysis
         // results exit before verification and report.
-        assert_eq!(*provider.calls.lock().unwrap(), 4);
+        assert_eq!(provider.prompts.lock().unwrap().len(), 4);
+
+        for manual in [
+            None,
+            Some(vec!["concurrency".to_string(), "configuration".to_string()]),
+        ] {
+            provider.prompts.lock().unwrap().clear();
+            let mut state = ZephyrPatchReviewState {
+                cheap_mode: true,
+                manual_stages: manual.clone(),
+                ..Default::default()
+            };
+            crate::workflow::WorkflowEngine::execute(&wf, &env, &mut state, None)
+                .await
+                .unwrap();
+            let prompts = provider.prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 1, "cheap mode must skip planning");
+            for def in ANALYSIS_STAGES {
+                let selected = manual
+                    .as_ref()
+                    .is_none_or(|stages| stages.iter().any(|s| s == def.name));
+                assert_eq!(
+                    prompts[0].contains(&format!("<analysis_domain name=\"{}\"", def.name)),
+                    selected,
+                    "{}",
+                    def.name
+                );
+            }
+        }
+        assert_eq!(
+            stage_short_label("analysis"),
+            Some(COMBINED_ANALYSIS_SHORT_LABEL)
+        );
+        assert_eq!(
+            crate::workflows::planned_stages_from(crate::project::ProjectId::Zephyr, &["analysis"]),
+            ["analysis", "verification", "post-verification", "report"]
+        );
     }
 
     #[tokio::test]
@@ -1451,6 +1537,7 @@ mod tests {
 
     async fn run_two_concern_review(
         skip_report: bool,
+        cheap_mode: bool,
     ) -> (ZephyrPatchReviewState, Vec<&'static str>) {
         let temp_dir = tempfile::tempdir().unwrap();
         let provider = std::sync::Arc::new(TwoConcernProvider {
@@ -1467,6 +1554,7 @@ mod tests {
         let wf = build_zephyr_patch_review_workflow_with_options(1, 0.0);
         let mut state = ZephyrPatchReviewState {
             skip_report,
+            cheap_mode,
             ..Default::default()
         };
         crate::workflow::WorkflowEngine::execute(&wf, &env, &mut state, None)
@@ -1478,7 +1566,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_workflow_reports_concerns_confirmed_by_either_verification_stage() {
-        let (state, stages) = run_two_concern_review(false).await;
+        let (state, stages) = run_two_concern_review(false, false).await;
 
         assert_eq!(
             stages
@@ -1504,8 +1592,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cheap_mode_keeps_both_verification_stages_and_report() {
+        let (state, stages) = run_two_concern_review(false, true).await;
+        assert_eq!(
+            stages,
+            [
+                "execution-flow",
+                "verification",
+                "post-verification",
+                "report"
+            ]
+        );
+        assert_eq!(state.findings.len(), 2);
+        assert!(state.review_inline.contains("[HIGH]"));
+    }
+
+    #[tokio::test]
     async fn test_skip_report_keeps_findings_and_omits_the_report_stage() {
-        let (state, stages) = run_two_concern_review(true).await;
+        let (state, stages) = run_two_concern_review(true, false).await;
 
         assert_eq!(state.findings.len(), 2);
         assert!(!stages.contains(&"report"));

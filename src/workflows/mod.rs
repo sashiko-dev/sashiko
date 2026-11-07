@@ -162,7 +162,9 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
         ProjectId::Zephyr => {
             let mut planned: Vec<String> = stage_names
                 .iter()
-                .filter(|n| zephyr_patch_review::analysis_stage_by_name(n).is_some())
+                .filter(|n| {
+                    zephyr_patch_review::analysis_stage_by_name(n).is_some() || is_combined(n)
+                })
                 .map(|n| n.to_string())
                 .collect();
             if !planned.is_empty() {
