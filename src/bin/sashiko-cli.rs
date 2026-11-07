@@ -245,13 +245,29 @@ enum BugCommands {
         #[arg(long)]
         severity: Option<String>,
 
-        /// Filter by lifecycle status (new, confirmed, fixed, dismissed, duplicate)
+        /// Filter by minimum CVSS v4.0 security score (0.0 to 10.0)
+        #[arg(long)]
+        min_security_score: Option<String>,
+
+        /// Filter by security classification (vulnerability, hardening, not_security; comma-separated)
+        #[arg(long)]
+        security_class: Option<String>,
+
+        /// Filter by lifecycle status (new, open, fixed, closed, dismissed, duplicate)
         #[arg(long)]
         status: Option<String>,
 
         /// Full-text search query
         #[arg(long, short = 'q')]
         query: Option<String>,
+
+        /// Sort field (severity, security_score, created_at, discoveries, status, assignee, problem)
+        #[arg(long)]
+        sort_by: Option<String>,
+
+        /// Sort direction (asc, desc)
+        #[arg(long)]
+        sort_order: Option<String>,
 
         /// Page number
         #[arg(long, default_value_t = 1)]
@@ -271,7 +287,7 @@ enum BugCommands {
         /// Bug identifier (<project>-<uuid> or numeric ID)
         id: String,
 
-        /// Action to perform (comment, close, dismiss, assign, mark_duplicate)
+        /// Action to perform (comment, close, dismiss, assign, mark_duplicate, evaluate_security)
         #[arg(long)]
         action: String,
 
@@ -535,6 +551,55 @@ fn bug_query_param(id: &str) -> (&'static str, String) {
     }
 }
 
+fn format_bug_security_badge(bug: &Value) -> String {
+    match bug["security_class"].as_str() {
+        Some("vulnerability") => {
+            let rating = bug["security_rating"].as_str().unwrap_or("Vuln");
+            if let Some(score) = bug["security_score"].as_f64() {
+                format!("{} {:.1}", rating, score)
+            } else {
+                rating.to_string()
+            }
+        }
+        Some("hardening") => "Hardening".to_string(),
+        Some("not_security") => "Not Security".to_string(),
+        _ if bug["security_eval_requested"].as_bool() == Some(true) => "Queued".to_string(),
+        _ => "-".to_string(),
+    }
+}
+
+fn format_bug_security_detail(bug: &Value) -> Option<String> {
+    let cls = bug["security_class"].as_str();
+    let queued = bug["security_eval_requested"].as_bool() == Some(true);
+    let summary = bug["security_summary"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut line = match cls {
+        Some("vulnerability") => {
+            let rating = bug["security_rating"].as_str().unwrap_or("Vulnerability");
+            let score = bug["security_score"].as_f64().unwrap_or(0.0);
+            match bug["cvss_vector"].as_str().filter(|s| !s.is_empty()) {
+                Some(vec_str) => format!("{} ({:.1}/10.0, {})", rating, score, vec_str),
+                None => format!("{} ({:.1}/10.0)", rating, score),
+            }
+        }
+        Some("hardening") => "Hardening (0.0/10.0)".to_string(),
+        Some("not_security") => "Not Security (0.0/10.0)".to_string(),
+        _ if queued => return Some("Queued for evaluation".to_string()),
+        _ => return None,
+    };
+    if queued {
+        line.push_str(" [re-evaluation queued]");
+    }
+    if let Some(sum) = summary {
+        line.push_str(" — ");
+        line.push_str(sum);
+    }
+    Some(line)
+}
+
 async fn handle_bugs(
     client: &Client,
     base_url: &str,
@@ -545,8 +610,12 @@ async fn handle_bugs(
         BugCommands::List {
             subsystem,
             severity,
+            min_security_score,
+            security_class,
             status,
             query,
+            sort_by,
+            sort_order,
             page,
             per_page,
         } => {
@@ -560,11 +629,23 @@ async fn handle_bugs(
             if let Some(sev) = severity {
                 req = req.query(&[("min_severity", sev)]);
             }
+            if let Some(min_sec) = min_security_score {
+                req = req.query(&[("min_security_score", min_sec)]);
+            }
+            if let Some(sec_cls) = security_class {
+                req = req.query(&[("security_class", sec_cls)]);
+            }
             if let Some(st) = status {
                 req = req.query(&[("lifecycle_status", st)]);
             }
             if let Some(q) = query {
                 req = req.query(&[("q", q)]);
+            }
+            if let Some(sb) = sort_by {
+                req = req.query(&[("sort_by", sb)]);
+            }
+            if let Some(so) = sort_order {
+                req = req.query(&[("sort_order", so)]);
             }
             let resp = check_response(req.send().await?).await?;
             let body: Value = resp.json().await?;
@@ -596,7 +677,11 @@ async fn handle_bugs(
                         let sev = bug["severity"].as_str().unwrap_or("unknown");
                         let st = bug["lifecycle_status"].as_str().unwrap_or("unknown");
                         let title = bug["title"].as_str().unwrap_or("(untitled)");
-                        println!("  {} [{:<8}] ({:<9}) {}", label, sev, st, title);
+                        let sec_tag = format_bug_security_badge(bug);
+                        println!(
+                            "  {} [{:<8}] [{:<12}] ({:<9}) {}",
+                            label, sev, sec_tag, st, title
+                        );
                     }
                 }
             }
@@ -629,6 +714,9 @@ async fn handle_bugs(
                     let st = body["lifecycle_status"].as_str().unwrap_or("unknown");
                     println!("{}: {}", label, title);
                     println!("Severity: {} | Status: {}", sev, st);
+                    if let Some(sec_line) = format_bug_security_detail(&body) {
+                        println!("Security: {}", sec_line);
+                    }
                     if let Some(desc) = body["description"]
                         .as_str()
                         .or_else(|| body["report"].as_str())
@@ -660,7 +748,7 @@ async fn handle_bugs(
                     })?;
                     map.insert("content".to_string(), Value::String(text));
                 }
-                "close" | "dismiss" => {
+                "close" | "dismiss" | "evaluate_security" => {
                     if assignee.is_some() || duplicate_of.is_some() {
                         anyhow::bail!(
                             "Action '{}' does not accept --assignee or --duplicate-of",
@@ -714,7 +802,7 @@ async fn handle_bugs(
                 }
                 _ => {
                     anyhow::bail!(
-                        "Unsupported bug action '{}'. Valid actions: comment, close, dismiss, mark_duplicate, assign",
+                        "Unsupported bug action '{}'. Valid actions: comment, close, dismiss, mark_duplicate, assign, evaluate_security",
                         action
                     );
                 }
@@ -2753,6 +2841,85 @@ mod tests {
             } if id == "linux-123e4567-e89b-12d3-a456-426614174000"
                 && dup == "linux-00000000-0000-0000-0000-000000000001"
         ));
+
+        let sec_list = Cli::try_parse_from([
+            "sashiko-cli",
+            "bugs",
+            "list",
+            "--min-security-score",
+            "7.0",
+            "--security-class",
+            "vulnerability",
+            "--sort-by",
+            "security_score",
+            "--sort-order",
+            "desc",
+        ])
+        .unwrap();
+        assert!(matches!(
+            sec_list.command,
+            Commands::Bugs {
+                action: BugCommands::List {
+                    min_security_score: Some(ref score),
+                    security_class: Some(ref cls),
+                    sort_by: Some(ref sb),
+                    sort_order: Some(ref so),
+                    ..
+                }
+            } if score == "7.0"
+                && cls == "vulnerability"
+                && sb == "security_score"
+                && so == "desc"
+        ));
+
+        let eval_sec_action = Cli::try_parse_from([
+            "sashiko-cli",
+            "bugs",
+            "action",
+            "linux-123e4567-e89b-12d3-a456-426614174000",
+            "--action",
+            "evaluate_security",
+            "--comment",
+            "Updated threat model",
+        ])
+        .unwrap();
+        assert!(matches!(
+            eval_sec_action.command,
+            Commands::Bugs {
+                action: BugCommands::Action {
+                    ref action,
+                    comment: Some(ref reason),
+                    ..
+                }
+            } if action == "evaluate_security" && reason == "Updated threat model"
+        ));
+
+        assert_eq!(
+            format_bug_security_badge(&json!({
+                "security_class": "vulnerability",
+                "security_rating": "Critical",
+                "security_score": 9.3
+            })),
+            "Critical 9.3"
+        );
+        assert_eq!(
+            format_bug_security_badge(&json!({ "security_class": "not_security" })),
+            "Not Security"
+        );
+        assert_eq!(
+            format_bug_security_detail(&json!({
+                "security_class": "vulnerability",
+                "security_rating": "High",
+                "security_score": 8.5,
+                "cvss_vector": "CVSS:4.0/AV:L/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+                "security_summary": "Local privilege escalation.",
+                "security_eval_requested": true
+            }))
+            .as_deref(),
+            Some(
+                "High (8.5/10.0, CVSS:4.0/AV:L/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N) [re-evaluation queued] — Local privilege escalation."
+            )
+        );
 
         let token_cmd = Cli::try_parse_from([
             "sashiko-cli",
