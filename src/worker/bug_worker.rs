@@ -88,6 +88,27 @@ enum FixCheckClassification {
     DeferredForNextSweep,
 }
 
+#[derive(Clone, Copy)]
+enum SecurityLeasePolicy {
+    KeepOuterLease,
+    ReleaseWithBackoff,
+    ReleaseImmediate,
+}
+
+impl SecurityLeasePolicy {
+    const fn releases_on_finish(self) -> bool {
+        matches!(self, Self::ReleaseWithBackoff | Self::ReleaseImmediate)
+    }
+
+    const fn failure_cooldown_secs(self) -> Option<i64> {
+        match self {
+            Self::KeepOuterLease => None,
+            Self::ReleaseWithBackoff => Some(60),
+            Self::ReleaseImmediate => Some(0),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BugWorker {
     db: Arc<Database>,
@@ -621,7 +642,7 @@ impl BugWorker {
                             lease_ttl_seconds,
                             &repo,
                             tm.as_deref(),
-                            true,
+                            SecurityLeasePolicy::ReleaseWithBackoff,
                         )
                         .await
                         .is_some()
@@ -681,6 +702,18 @@ impl BugWorker {
                 target.duplicate_of_id
             );
         }
+        if !matches!(
+            target.lifecycle_status,
+            crate::db::BugLifecycleStatus::Open
+                | crate::db::BugLifecycleStatus::Fixed
+                | crate::db::BugLifecycleStatus::Closed
+        ) {
+            anyhow::bail!(
+                "bug {} has lifecycle status '{}' and is not eligible for security evaluation",
+                target.bugid,
+                target.lifecycle_status
+            );
+        }
 
         let lease_ttl_seconds = clamp_lease_ttl_seconds(self.settings.lease_ttl_seconds);
         let claim_id = new_claim_id(&self.worker_id);
@@ -705,7 +738,7 @@ impl BugWorker {
                 lease_ttl_seconds,
                 &repo_path,
                 None,
-                true,
+                SecurityLeasePolicy::ReleaseImmediate,
             )
             .await
             .ok_or_else(|| {
@@ -729,7 +762,7 @@ impl BugWorker {
         lease_ttl_seconds: i64,
         repo_path: &std::path::Path,
         cached_tm: Option<&crate::threat_model::KernelThreatModel>,
-        release_lease: bool,
+        lease_policy: SecurityLeasePolicy,
     ) -> Option<crate::security_eval::SecurityEvaluation> {
         let effective_project = crate::workflows::linux_bug::infer_project_from_bug_or_tool(
             Some(&bug.bugid),
@@ -780,7 +813,7 @@ impl BugWorker {
                             tokens_in: Some(session_result.usage.prompt_tokens),
                             tokens_out: Some(session_result.usage.completion_tokens),
                             tokens_cached: session_result.usage.cached_tokens,
-                            release_lease,
+                            release_lease: lease_policy.releases_on_finish(),
                         },
                     )
                     .await
@@ -807,8 +840,10 @@ impl BugWorker {
                             "Database error persisting security evaluation for bug {}: {}",
                             bug.bugid, e
                         );
-                        if release_lease {
-                            let _ = scoped_db.release_security_eval_lease(bug.id, 60).await;
+                        if let Some(cooldown) = lease_policy.failure_cooldown_secs() {
+                            let _ = scoped_db
+                                .release_security_eval_lease(bug.id, cooldown)
+                                .await;
                         }
                         None
                     }
@@ -816,8 +851,10 @@ impl BugWorker {
             }
             Err(e) => {
                 warn!("Security evaluation failed for bug {}: {}", bug.bugid, e);
-                if release_lease {
-                    let _ = scoped_db.release_security_eval_lease(bug.id, 60).await;
+                if let Some(cooldown) = lease_policy.failure_cooldown_secs() {
+                    let _ = scoped_db
+                        .release_security_eval_lease(bug.id, cooldown)
+                        .await;
                 }
                 None
             }
@@ -1089,7 +1126,7 @@ impl BugWorker {
                                     lease_ttl_seconds,
                                     &repo_path,
                                     None,
-                                    false,
+                                    SecurityLeasePolicy::KeepOuterLease,
                                 )
                                 .await
                                 .is_some()
@@ -1675,5 +1712,139 @@ mod tests {
 
         handle.abort();
         provider.release_gate.notify_waiters();
+    }
+
+    struct FailOnceThenRecordEffortProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for FailOnceThenRecordEffortProvider {
+        async fn generate_content(
+            &self,
+            _req: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            let call_num = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_num == 0 {
+                anyhow::bail!("transient provider error");
+            }
+            Ok(crate::ai::AiResponse {
+                content: Some(
+                    serde_json::json!({
+                        "security_class": "not_security",
+                        "trust_boundary": null,
+                        "attacker_model": null,
+                        "summary": "Pure build fix with zero runtime security impact.",
+                        "cvss_v4": null,
+                        "metric_justifications": null
+                    })
+                    .to_string(),
+                ),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "gemini-4-argon".to_string(),
+                context_window_size: 8192,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn single_bug_security_eval_rejects_dismissed_allows_retry_and_forwards_effort() {
+        let db = Arc::new(
+            Database::new(&crate::settings::DatabaseSettings {
+                url: ":memory:".into(),
+                token: String::new(),
+            })
+            .await
+            .unwrap(),
+        );
+        db.migrate().await.unwrap();
+
+        let dismissed_id = db
+            .create_bug(&crate::db::NewBug {
+                bugid: "linux-sec-dismissed".to_string(),
+                title: "dismissed bug".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::Dismissed,
+                pipeline_state: crate::db::BugPipelineState::Succeeded,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 1000,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(dismissed_id > 0);
+
+        let open_id = db
+            .create_bug(&crate::db::NewBug {
+                bugid: "linux-sec-open".to_string(),
+                title: "open bug".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::Open,
+                pipeline_state: crate::db::BugPipelineState::Succeeded,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 1001,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(open_id > 0);
+
+        let provider = Arc::new(FailOnceThenRecordEffortProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker = BugWorker::new(db.clone(), provider.clone(), String::new());
+
+        let dismissed_err = worker
+            .evaluate_single_bug_security("linux-sec-dismissed")
+            .await
+            .expect_err("dismissed bug must be rejected");
+        assert!(
+            dismissed_err
+                .to_string()
+                .contains("has lifecycle status 'dismissed'"),
+            "unexpected error: {dismissed_err}"
+        );
+
+        let first_err = worker
+            .evaluate_single_bug_security("linux-sec-open")
+            .await
+            .expect_err("first attempt fails transiently");
+        assert!(
+            first_err.to_string().contains("security evaluation failed"),
+            "unexpected error: {first_err}"
+        );
+
+        // Immediate retry must succeed without hitting a false active-lease error.
+        let (updated, eval) = worker
+            .evaluate_single_bug_security("linux-sec-open")
+            .await
+            .expect("immediate retry should succeed");
+        assert_eq!(updated.security_score_tenths(), Some(0));
+        assert_eq!(
+            eval.security_class,
+            crate::security_eval::SecurityClass::NotSecurity
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 }
