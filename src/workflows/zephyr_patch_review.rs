@@ -1435,7 +1435,7 @@ mod tests {
             }
         }
 
-        for fail_post in [false, true] {
+        for (fail_post, cheap_mode) in [(false, false), (true, false), (false, true)] {
             let dir = tempfile::tempdir().unwrap();
             let provider = std::sync::Arc::new(FaultProvider {
                 fail_post,
@@ -1448,22 +1448,34 @@ mod tests {
                 context_tag: None,
             };
             let workflow = build_zephyr_patch_review_workflow_with_options(1, 0.0);
-            let mut state = ZephyrPatchReviewState::default();
+            let mut state = ZephyrPatchReviewState {
+                cheap_mode,
+                ..Default::default()
+            };
             let error = crate::workflow::WorkflowEngine::execute(&workflow, &env, &mut state, None)
                 .await
                 .expect_err("a partial stage failure must not produce a clean review");
             let failed_stage = if fail_post {
                 "post-verification"
+            } else if cheap_mode {
+                "analysis"
             } else {
                 "goal"
             };
             assert!(format!("{error:#}").contains(failed_stage), "{error:#}");
-            assert!(
-                provider
-                    .successful_analysis
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    > 0
-            );
+            if cheap_mode {
+                let message = format!("{error:#}");
+                assert!(message.contains("All 1 parallel stages failed under BestEffort policy"));
+                assert!(message.contains("stage 'analysis'"));
+            }
+            if !cheap_mode {
+                assert!(
+                    provider
+                        .successful_analysis
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        > 0
+                );
+            }
             if fail_post {
                 assert_eq!(
                     state.post_verification_dismissed.len(),
