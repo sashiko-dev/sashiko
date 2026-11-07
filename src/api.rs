@@ -142,6 +142,8 @@ pub struct BugListQuery {
     pub subsystems: Option<String>,
     pub min_severity: Option<String>,
     pub severity: Option<String>,
+    pub min_security_score: Option<String>,
+    pub security_class: Option<String>,
     /// Triage state. Also accepts the historical `status` spelling.
     #[serde(alias = "status")]
     pub lifecycle_status: Option<String>,
@@ -359,6 +361,10 @@ pub enum BugAction {
     /// absent, empty, or null.
     Assign {
         assignee: Option<String>,
+        reason: Option<String>,
+    },
+    /// Queues a canonical verified bug for security evaluation or re-evaluation.
+    EvaluateSecurity {
         reason: Option<String>,
     },
 }

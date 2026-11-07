@@ -1542,6 +1542,23 @@ async fn redact_embedded_bugs(
     Ok(())
 }
 
+fn attach_security_fields(
+    bug: &crate::db::Bug,
+    val: &mut serde_json::Value,
+    include_full_evaluation: bool,
+) {
+    val["security_score"] = serde_json::to_value(bug.security_score()).unwrap();
+    val["security_score_tenths"] = serde_json::to_value(bug.security_score_tenths()).unwrap();
+    val["security_rating"] = serde_json::to_value(bug.security_rating()).unwrap();
+    val["security_class"] = serde_json::to_value(bug.security_class()).unwrap();
+    val["cvss_vector"] = serde_json::to_value(bug.cvss_vector()).unwrap();
+    val["security_summary"] = serde_json::to_value(bug.security_summary()).unwrap();
+    val["security_eval_requested"] = serde_json::Value::Bool(bug.security_eval_requested());
+    if include_full_evaluation {
+        val["security_evaluation"] = serde_json::to_value(bug.security_evaluation()).unwrap();
+    }
+}
+
 async fn get_bug(
     principal: Result<Principal, (StatusCode, &'static str)>,
     State(state): State<Arc<AppState>>,
@@ -1566,6 +1583,7 @@ async fn get_bug(
     val["tokens_in"] = serde_json::Value::Number(bug.tokens_in().into());
     val["tokens_out"] = serde_json::Value::Number(bug.tokens_out().into());
     val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
+    attach_security_fields(&bug, &mut val, true);
 
     attach_duplicate_relations(&state, &principal, &bug, &mut val).await?;
     val["can_comment"] = serde_json::Value::Bool(!state.read_only && access.can_comment());
@@ -2707,6 +2725,40 @@ async fn list_bugs(
         Some(Err(_)) => return Err(StatusCode::BAD_REQUEST),
         None => None,
     };
+    let min_security_score_tenths = match query
+        .min_security_score
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => match crate::security_eval::parse_security_score_tenths(raw) {
+            Ok(tenths) => Some(tenths),
+            Err(_) => return Err(StatusCode::BAD_REQUEST),
+        },
+        None => None,
+    };
+    let parsed_security_classes: Option<Vec<crate::security_eval::SecurityClass>> = match query
+        .security_class
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => {
+            let mut classes = Vec::new();
+            for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                match part.parse::<crate::security_eval::SecurityClass>() {
+                    Ok(cls) => classes.push(cls),
+                    Err(_) => return Err(StatusCode::BAD_REQUEST),
+                }
+            }
+            if classes.is_empty() {
+                None
+            } else {
+                Some(classes)
+            }
+        }
+        None => None,
+    };
     let assignee = query
         .assignee
         .as_deref()
@@ -2726,6 +2778,8 @@ async fn list_bugs(
             page: Some(page as u32),
             limit: Some(per_page as u32),
             min_severity: min_sev,
+            min_security_score_tenths,
+            security_classes: parsed_security_classes.as_deref(),
             subsystem: if parsed_subsystems.is_none() {
                 query.subsystem.as_deref()
             } else {
@@ -2739,7 +2793,6 @@ async fn list_bugs(
             sort_by: query.sort_by.as_deref(),
             sort_order: query.sort_order.as_deref(),
             visibility: principal.visibility(&scope),
-            ..Default::default()
         })
         .await
     {
@@ -2771,6 +2824,7 @@ async fn list_bugs(
                 val["tokens_in"] = serde_json::Value::Number(bug.tokens_in().into());
                 val["tokens_out"] = serde_json::Value::Number(bug.tokens_out().into());
                 val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
+                attach_security_fields(bug, &mut val, false);
                 val.as_object_mut().map(|obj| obj.remove("enrichments"));
                 val["evidence"] = summaries.remove(&bug.id).unwrap_or_else(|| serde_json::json!({"count": 0, "models": [], "tools": [], "unknown_models": 0}));
                 val.as_object_mut().unwrap().remove("raw_input");
@@ -2871,7 +2925,8 @@ fn required_access(action: &BugAction) -> BugAccess {
         BugAction::Close { .. }
         | BugAction::Dismiss { .. }
         | BugAction::MarkDuplicate { .. }
-        | BugAction::Assign { .. } => BugAccess::Manage,
+        | BugAction::Assign { .. }
+        | BugAction::EvaluateSecurity { .. } => BugAccess::Manage,
     }
 }
 
@@ -3176,6 +3231,32 @@ async fn bug_action(
             db.assign_bug(bug.id, assignee, reason.as_deref(), email.as_ref())
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        BugAction::EvaluateSecurity { reason } => {
+            if bug.pipeline_state != crate::db::BugPipelineState::Succeeded
+                || bug.duplicate_of_id.is_some()
+                || !matches!(
+                    bug.lifecycle_status,
+                    crate::db::BugLifecycleStatus::Open
+                        | crate::db::BugLifecycleStatus::Fixed
+                        | crate::db::BugLifecycleStatus::Closed
+                )
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Only verified canonical bugs (open, fixed, or closed) can be queued for security evaluation".into(),
+                ));
+            }
+            let queued = db
+                .request_bug_security_eval(bug.id, reason.as_deref())
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if !queued {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Only verified canonical bugs (open, fixed, or closed) can be queued for security evaluation".into(),
+                ));
+            }
         }
     }
 
@@ -6607,6 +6688,327 @@ F:	*
         .unwrap_or_else(|r| panic!("redelivery failed with status {}", r.status()));
         assert_eq!(resp2["status"], "accepted");
         assert!(db.lock_pending_fetch_queue().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_bug_security_api_filtering_sorting_and_reeval_action() {
+        const SECRET: &str = "bug-sec-api-secret-12345678901234567890";
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let make_bug =
+            |bugid: &str, title: &str, status: crate::db::BugLifecycleStatus| crate::db::NewBug {
+                bugid: bugid.to_string(),
+                title: title.to_string(),
+                lifecycle_status: status,
+                pipeline_state: crate::db::BugPipelineState::Succeeded,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 1_762_345_000,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![crate::db::AttributedSubsystem::from_maintainers(
+                    "BTRFS FILE SYSTEM",
+                )],
+            };
+
+        let crit_id = db
+            .create_bug(&make_bug(
+                "linux-sec-crit",
+                "Remote heap OOB write",
+                crate::db::BugLifecycleStatus::Open,
+            ))
+            .await
+            .unwrap();
+        let non_id = db
+            .create_bug(&make_bug(
+                "linux-sec-non",
+                "Root module unload leak",
+                crate::db::BugLifecycleStatus::Open,
+            ))
+            .await
+            .unwrap();
+        let _pend_id = db
+            .create_bug(&make_bug(
+                "linux-sec-pend",
+                "Unevaluated open bug",
+                crate::db::BugLifecycleStatus::Open,
+            ))
+            .await
+            .unwrap();
+        let _dismissed_id = db
+            .create_bug(&make_bug(
+                "linux-sec-dismissed",
+                "Dismissed false positive",
+                crate::db::BugLifecycleStatus::Dismissed,
+            ))
+            .await
+            .unwrap();
+
+        let vuln_eval = crate::security_eval::SecurityEvaluation::from_raw_output(
+            crate::security_eval::RawSecurityEvaluationOutput {
+                security_class: "vulnerability".to_string(),
+                trust_boundary: Some("Network peer to host kernel".to_string()),
+                attacker_model: Some("Unauthenticated remote client".to_string()),
+                summary: "Unauthenticated network peer triggers kernel heap out-of-bounds write."
+                    .to_string(),
+                cvss_v4: Some(crate::security_eval::RawCvssV4Metrics {
+                    av: "N".to_string(),
+                    ac: "L".to_string(),
+                    at: "N".to_string(),
+                    pr: "N".to_string(),
+                    ui: "N".to_string(),
+                    vc: "H".to_string(),
+                    vi: "H".to_string(),
+                    va: "H".to_string(),
+                    sc: "N".to_string(),
+                    si: "N".to_string(),
+                    sa: "N".to_string(),
+                    ..Default::default()
+                }),
+                metric_justifications: Some(crate::security_eval::RawMetricJustifications {
+                    exploitability: "Remote packet parsed before authentication.".to_string(),
+                    vulnerable_system_impact: "Arbitrary kernel heap corruption.".to_string(),
+                    subsequent_system_impact: "Host kernel only.".to_string(),
+                }),
+            },
+            Some("deadbeef".to_string()),
+            Some("cafebabe".to_string()),
+        )
+        .unwrap();
+        assert!(
+            db.record_bug_security_evaluation(
+                crit_id,
+                crate::db::SecurityEvaluationRecordParams {
+                    evaluation: &vuln_eval,
+                    logs: None,
+                    tokens_in: Some(100),
+                    tokens_out: Some(50),
+                    tokens_cached: None,
+                    release_lease: false,
+                },
+            )
+            .await
+            .unwrap()
+        );
+
+        let non_eval = crate::security_eval::SecurityEvaluation::from_raw_output(
+            crate::security_eval::RawSecurityEvaluationOutput {
+                security_class: "not_security".to_string(),
+                trust_boundary: None,
+                attacker_model: None,
+                summary: "Requires CAP_SYS_MODULE root privileges during module teardown."
+                    .to_string(),
+                cvss_v4: None,
+                metric_justifications: None,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            db.record_bug_security_evaluation(
+                non_id,
+                crate::db::SecurityEvaluationRecordParams {
+                    evaluation: &non_eval,
+                    logs: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    tokens_cached: None,
+                    release_lease: false,
+                },
+            )
+            .await
+            .unwrap()
+        );
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.testing_mode = false;
+        settings.server.jwt_secret = Some(SECRET.to_string());
+        settings.server.acl.admins = vec!["operator@example.org".to_string()];
+        settings.server.acl.security = vec!["sec-reader@example.org".to_string()];
+        settings.server.read_only = false;
+        let settings = Arc::new(settings);
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            settings,
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            ServerOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let token = |email: &str| {
+            crate::auth::create_token(email, SECRET, Some("session".to_string()), 3600).unwrap()
+        };
+        let operator = token("operator@example.org");
+        let sec_reader = token("sec-reader@example.org");
+
+        // Sort descending by security_score: 9.3, 0.0, null.
+        let sorted: serde_json::Value = client
+            .get(format!(
+                "http://{}/api/bugs?lifecycle_status=open&sort_by=security_score&sort_order=desc",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", operator))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let sorted_ids: Vec<&str> = sorted["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["bugid"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            sorted_ids,
+            vec!["linux-sec-crit", "linux-sec-non", "linux-sec-pend"]
+        );
+
+        // Filter min_security_score=7.0 -> only linux-sec-crit.
+        let high_only: serde_json::Value = client
+            .get(format!(
+                "http://{}/api/bugs?lifecycle_status=open&min_security_score=7.0",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", operator))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(high_only["total"], 1);
+        assert_eq!(high_only["items"][0]["bugid"], "linux-sec-crit");
+        assert_eq!(high_only["items"][0]["security_score"], 9.3);
+        assert_eq!(high_only["items"][0]["security_rating"], "Critical");
+        assert_eq!(high_only["items"][0]["security_class"], "vulnerability");
+
+        // Filter comma-separated security_class=not_security,hardening -> only linux-sec-non.
+        let non_sec_only: serde_json::Value = client
+            .get(format!(
+                "http://{}/api/bugs?lifecycle_status=open&security_class=not_security,hardening",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", operator))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(non_sec_only["total"], 1);
+        assert_eq!(non_sec_only["items"][0]["bugid"], "linux-sec-non");
+
+        // Invalid filter inputs return 400 Bad Request.
+        for bad_q in ["min_security_score=10.5", "security_class=bogus"] {
+            let bad = client
+                .get(format!("http://{}/api/bugs?{}", addr, bad_q))
+                .header("Authorization", format!("Bearer {}", operator))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "{}", bad_q);
+        }
+
+        // Comment-only principal (acl.security) cannot trigger evaluate_security.
+        let denied_reeval = client
+            .post(format!(
+                "http://{}/api/bug/action?bugid=linux-sec-crit",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", sec_reader))
+            .json(&serde_json::json!({
+                "action": "evaluate_security",
+                "reason": "Updated threat model"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied_reeval.status(), StatusCode::FORBIDDEN);
+
+        // Dismissed bug rejects evaluate_security with 400 Bad Request.
+        let bad_dismissed = client
+            .post(format!(
+                "http://{}/api/bug/action?bugid=linux-sec-dismissed",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", operator))
+            .json(&serde_json::json!({ "action": "evaluate_security" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_dismissed.status(), StatusCode::BAD_REQUEST);
+
+        // Operator queues evaluate_security and GET /api/bug reflects the queued state + full evaluation.
+        let ok_reeval = client
+            .post(format!(
+                "http://{}/api/bug/action?bugid=linux-sec-crit",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", operator))
+            .json(&serde_json::json!({
+                "action": "evaluate_security",
+                "reason": "Updated threat model"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_reeval.status(), StatusCode::OK);
+
+        let detail: serde_json::Value = client
+            .get(format!("http://{}/api/bug?bugid=linux-sec-crit", addr))
+            .header("Authorization", format!("Bearer {}", operator))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail["security_eval_requested"], true);
+        assert_eq!(
+            detail["security_evaluation"]["cvss_vector"],
+            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+        );
+        let audit_msgs: Vec<&str> = detail["evidence"]["activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "audit")
+            .filter_map(|e| e["content"].as_str())
+            .collect();
+        assert!(
+            audit_msgs
+                .iter()
+                .any(|m| m.contains("Security re-evaluation requested: Updated threat model"))
+        );
     }
 }
 

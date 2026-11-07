@@ -609,7 +609,7 @@
             view: 'list', listMode: 'patchsets', currentPage: 1, perPage: 50, totalPages: 1,
             searchQuery: '', selectedIndex: -1, stats: null, mailingLists: [], mailingListsLoaded: false,
             selectedList: '', bugSubsystem: '', bugSubsystemsList: [], selectedSubsystems: null,
-            bugMinSeverity: '', bugLifecycleStatus: 'open', bugAssignee: '', bugSortBy: 'severity', bugSortOrder: 'desc',
+            bugMinSeverity: '', bugSecurityFilter: '', bugLifecycleStatus: 'open', bugAssignee: '', bugSortBy: 'severity', bugSortOrder: 'desc',
             patchsetId: null, patchsetPage: 1, patchsetTotalPages: 1, patchsetLimit: 50,
             settings: { theme: 'auto', colorblind: false }, statsData: null, activeCharts: []
         };
@@ -1192,6 +1192,73 @@
             return SEVERITY_COLORS[String(sev || '').toLowerCase()] || 'var(--sev-unknown)';
         }
 
+        function renderSecurityCell(bug) {
+            const cls = bug.security_class;
+            if (!cls) {
+                return bug.security_eval_requested
+                    ? '<span class="text-muted-sm" title="Queued for security evaluation">Queued</span>'
+                    : '<span class="text-muted-sm" title="Not yet evaluated">-</span>';
+            }
+            const tip = bug.security_summary || '';
+            if (cls === 'vulnerability') {
+                const rating = bug.security_rating || 'Low';
+                const scoreStr = typeof bug.security_score === 'number' ? bug.security_score.toFixed(1) : '0.0';
+                const color = getSeverityColor(rating);
+                const fullTip = [bug.cvss_vector, tip].filter(Boolean).join(' — ');
+                return `<span style="color: ${color}; font-weight: bold;" title="${escapeHtml(fullTip)}">${escapeHtml(rating)} ${escapeHtml(scoreStr)}</span>`;
+            }
+            const label = cls === 'hardening' ? 'Hardening' : 'Not Security';
+            return `<span class="text-muted-sm" title="${escapeHtml(tip)}">${label}</span>`;
+        }
+
+        function renderSecurityMetaValue(data) {
+            const cls = data.security_class;
+            const queuedHtml = data.security_eval_requested
+                ? ' <span class="tag" style="font-size:0.8em; color:var(--status-inreview); border:1px solid var(--status-inreview); background:transparent;">Re-evaluation queued</span>'
+                : '';
+            if (!cls) {
+                return `<span class="status-placeholder">${data.security_eval_requested ? 'Queued for evaluation' : 'Pending evaluation'}</span>`;
+            }
+            if (cls === 'vulnerability') {
+                const rating = data.security_rating || 'Low';
+                const scoreStr = typeof data.security_score === 'number' ? data.security_score.toFixed(1) : '0.0';
+                const color = getSeverityColor(rating);
+                const vecHtml = data.cvss_vector
+                    ? ` <code>${escapeHtml(data.cvss_vector)}</code> <button class="copy-btn" data-copy="${escapeHtml(data.cvss_vector)}" title="Copy CVSS v4.0 vector">Copy</button>`
+                    : '';
+                return `<span class="tag" style="border:1px solid ${color}; color:${color}; font-weight:bold; background:transparent;">${escapeHtml(rating)} (${escapeHtml(scoreStr)}/10.0)</span>${vecHtml}${queuedHtml}`;
+            }
+            const label = cls === 'hardening' ? 'Hardening (0.0/10.0)' : 'Not Security (0.0/10.0)';
+            return `<span class="tag" style="border:1px solid var(--border); color:var(--text-muted); background:transparent;">${label}</span>${queuedHtml}`;
+        }
+
+        function renderSecurityAnalysisMeta(item) {
+            if (item.kind !== 'security_evaluation') return '';
+            const parts = [];
+            if (item.security_class === 'vulnerability') {
+                const rating = item.security_rating || 'Low';
+                const scoreStr = typeof item.security_score === 'number' ? item.security_score.toFixed(1) : '0.0';
+                const color = getSeverityColor(rating);
+                parts.push(`<div class="review-meta-label">CVSS v4.0:</div><div><span style="color:${color}; font-weight:bold;">${escapeHtml(rating)} (${escapeHtml(scoreStr)}/10.0)</span>${item.cvss_vector ? ` <code>${escapeHtml(item.cvss_vector)}</code> <button class="copy-btn" data-copy="${escapeHtml(item.cvss_vector)}" title="Copy CVSS v4.0 vector">Copy</button>` : ''}</div>`);
+            } else if (item.security_class) {
+                const label = item.security_class === 'hardening' ? 'Hardening (0.0/10.0)' : 'Not Security (0.0/10.0)';
+                parts.push(`<div class="review-meta-label">Classification:</div><div>${escapeHtml(label)}</div>`);
+            }
+            if (item.trust_boundary) {
+                parts.push(`<div class="review-meta-label">Boundary:</div><div>${escapeHtml(item.trust_boundary)}</div>`);
+            }
+            if (item.attacker_model) {
+                parts.push(`<div class="review-meta-label">Attacker:</div><div>${escapeHtml(item.attacker_model)}</div>`);
+            }
+            const just = item.metric_justifications;
+            if (just && typeof just === 'object') {
+                if (just.exploitability) parts.push(`<div class="review-meta-label">Exploitability:</div><div>${escapeHtml(just.exploitability)}</div>`);
+                if (just.vulnerable_system_impact) parts.push(`<div class="review-meta-label">System Impact:</div><div>${escapeHtml(just.vulnerable_system_impact)}</div>`);
+                if (just.subsequent_system_impact) parts.push(`<div class="review-meta-label">Subsequent:</div><div>${escapeHtml(just.subsequent_system_impact)}</div>`);
+            }
+            return parts.join('');
+        }
+
         const BUG_LIFECYCLE_BADGES = {
             'new': { label: 'New', cls: 'status-New', color: 'var(--status-pending)' },
             'open': { label: 'Open', cls: 'status-Open', color: 'var(--status-pending)' },
@@ -1567,6 +1634,14 @@
                             <option value="Medium" ${state.bugMinSeverity === 'Medium' ? 'selected' : ''}>Medium+</option>
                             <option value="Low" ${state.bugMinSeverity === 'Low' ? 'selected' : ''}>Low+</option>
                         </select>
+                        <select id="bugSecuritySelector" onchange="setBugFilter('security', this.value)">
+                            <option value="" ${!state.bugSecurityFilter ? 'selected' : ''}>All Security</option>
+                            <option value="score:9.0" ${state.bugSecurityFilter === 'score:9.0' ? 'selected' : ''}>CVSS Critical (9.0+)</option>
+                            <option value="score:7.0" ${state.bugSecurityFilter === 'score:7.0' ? 'selected' : ''}>CVSS High+ (7.0+)</option>
+                            <option value="score:4.0" ${state.bugSecurityFilter === 'score:4.0' ? 'selected' : ''}>CVSS Medium+ (4.0+)</option>
+                            <option value="class:vulnerability" ${state.bugSecurityFilter === 'class:vulnerability' ? 'selected' : ''}>Vulnerabilities</option>
+                            <option value="class:not_security,hardening" ${state.bugSecurityFilter === 'class:not_security,hardening' ? 'selected' : ''}>Non-Security / Hardening</option>
+                        </select>
                         <select id="bugStatusSelector" onchange="setBugFilter('lifecycle_status', this.value)">
                             <option value="" ${!state.bugLifecycleStatus ? 'selected' : ''}>All Statuses</option>
                             <option value="new" ${state.bugLifecycleStatus === 'new' ? 'selected' : ''}>New</option>
@@ -1610,7 +1685,7 @@
                     const wStyle = width ? `width:${width}; ` : '';
                     return `<th style="${wStyle}cursor:pointer; user-select:none;" onclick="toggleBugSort('${field}')" title="Sort by ${label}">${label}${ind}</th>`;
                 };
-                thead.innerHTML = `<tr>${sortTh('problem', 'Problem')}${sortTh('severity', 'Severity', '100px')}${sortTh('discoveries', 'Discoveries', '100px')}${sortTh('created_at', 'Date', '100px')}${sortTh('assignee', 'Assignee', '150px')}${sortTh('status', 'Status', '80px')}</tr>`;
+                thead.innerHTML = `<tr>${sortTh('problem', 'Problem')}${sortTh('severity', 'Severity', '100px')}${sortTh('security_score', 'Security', '115px')}${sortTh('discoveries', 'Discoveries', '100px')}${sortTh('created_at', 'Date', '100px')}${sortTh('assignee', 'Assignee', '150px')}${sortTh('status', 'Status', '80px')}</tr>`;
             } else {
                 thead.innerHTML = `<tr><th>Subject</th><th style="width:180px">Author</th><th style="width:100px">Date</th><th style="width:30px"></th></tr>`;
             }
@@ -1681,6 +1756,13 @@
                     url += `&subsystem=${encodeURIComponent(state.bugSubsystem)}`;
                 }
                 if (state.bugMinSeverity) url += `&min_severity=${encodeURIComponent(state.bugMinSeverity)}`;
+                if (state.bugSecurityFilter) {
+                    if (state.bugSecurityFilter.startsWith('score:')) {
+                        url += `&min_security_score=${encodeURIComponent(state.bugSecurityFilter.substring(6))}`;
+                    } else if (state.bugSecurityFilter.startsWith('class:')) {
+                        url += `&security_class=${encodeURIComponent(state.bugSecurityFilter.substring(6))}`;
+                    }
+                }
                 if (state.bugLifecycleStatus) url += `&lifecycle_status=${encodeURIComponent(state.bugLifecycleStatus)}`;
                 if (state.bugAssignee) url += `&assignee=${encodeURIComponent(state.bugAssignee)}`;
                 if (state.bugSortBy) url += `&sort_by=${encodeURIComponent(state.bugSortBy)}`;
@@ -1762,6 +1844,7 @@
                         row.innerHTML = `
                             <td><div>${escapeHtml(p.problem) || '(no description)'}</div>${tagsHtml}${fixedByHtml}</td>
                             <td style="line-height:1.2;">${sevHtml}</td>
+                            <td style="line-height:1.2;">${renderSecurityCell(p)}</td>
                             <td title="${escapeHtml(discoveriesTitle)}">${discoveriesCount}</td>
                             <td style="line-height:1.2;">${renderDateCell(p.created_at || p.date)}</td>
                             <td title="${escapeHtml(p.assignee || 'Unassigned')}">${p.assignee ? escapeHtml(p.assignee.split('@')[0]) : '<span class="text-muted-sm">Unassigned</span>'}</td>
@@ -1936,6 +2019,7 @@
         function setBugFilter(key, value) {
             if (key === 'subsystem') state.bugSubsystem = value.trim();
             if (key === 'min_severity') state.bugMinSeverity = value;
+            if (key === 'security') state.bugSecurityFilter = value;
             if (key === 'lifecycle_status') {
                 state.bugLifecycleStatus = value;
                 loadBugSubsystems(true).then(renderSubsystemDropdown);
@@ -1952,14 +2036,18 @@
             if (state.listMode === 'bugs') {
                 state.bugSubsystem = '';
                 state.bugMinSeverity = '';
+                state.bugSecurityFilter = '';
                 state.bugLifecycleStatus = 'open';
                 state.bugAssignee = '';
                 state.bugSortBy = 'severity';
                 state.bugSortOrder = 'desc';
                 state.selectedSubsystems = state.bugSubsystemsList.length > 0 ? new Set(state.bugSubsystemsList.map(s => s.name)) : null;
                 renderSubsystemDropdown();
+                updateTableHeader();
                 const sevSel = document.getElementById('bugSeveritySelector');
                 if (sevSel) sevSel.value = '';
+                const secSel = document.getElementById('bugSecuritySelector');
+                if (secSel) secSel.value = '';
                 const statSel = document.getElementById('bugStatusSelector');
                 if (statSel) statSel.value = 'open';
                 const assigneeInput = document.getElementById('bugAssigneeFilter');
@@ -2786,6 +2874,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         ${!['closed', 'fixed'].includes(data.lifecycle_status) ? `<div class="subsystem-item" onclick="openBugActionModal('close', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Close bug</div>` : ''}
                         ${data.lifecycle_status !== 'dismissed' ? `<div class="subsystem-item" onclick="openBugActionModal('dismiss', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Dismiss finding</div>` : ''}
                         ${data.lifecycle_status !== 'duplicate' ? `<div class="subsystem-item" onclick="openBugActionModal('mark_duplicate', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Mark as duplicate</div>` : ''}
+                        ${!['dismissed', 'duplicate'].includes(data.lifecycle_status) && data.pipeline_state === 'succeeded' ? `<div class="subsystem-item" onclick="openBugActionModal('evaluate_security', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Re-evaluate security</div>` : ''}
                     </div>
                 </details>
             ` : `<button class="btn" disabled title="${escapeHtml(getManageDisabledTitle())}">Change Status ▾</button>`;
@@ -2823,8 +2912,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const analysisPanelHtml = analysis.length > 0 ? `
                 <div class="section" id="bug-panel-analysis" data-bug-panel="analysis" role="tabpanel" aria-labelledby="bug-tab-analysis" ${activeTab === 'analysis' ? '' : 'hidden'}>
                     <h2 style="margin-top:0;">Analysis &amp; Verification (${analysis.length})</h2>
-                    <p class="text-muted-sm" style="margin-bottom: 12px;">Automated bug verification, origin discovery, and severity calibration stages.</p>
-                    ${analysis.map(a => renderBugActivityCard(a, bugid, (a.kind || 'analysis').replace(/_run$/, '').replace(/_/g, ' '))).join('')}
+                    <p class="text-muted-sm" style="margin-bottom: 12px;">Automated bug verification, origin discovery, severity calibration, and CVSS v4.0 security evaluation stages.</p>
+                    ${analysis.map(a => renderBugActivityCard(a, bugid, (a.kind || 'analysis').replace(/_run$/, '').replace(/_/g, ' '), {
+                        extraMetaHtml: renderSecurityAnalysisMeta(a)
+                    })).join('')}
                 </div>
             ` : '';
 
@@ -2873,6 +2964,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 <div class="section">
                     <div class="kv"><div class="label">Bug ID:</div><div><code>${escapeHtml(bugid)}</code> <button class="copy-btn" data-copy="${escapeHtml(bugid)}" title="Copy bug ID">Copy</button><button id="btn-copy-bug-link" class="copy-btn" data-copy="${escapeHtml(bugUrl)}" data-hint="Public link to this bug report — safe to share and use for Fixes: tags" aria-label="Copy Link — Public link to this bug report, safe to share and use for Fixes: tags">Copy Link</button><a id="btn-bug-markdown" class="copy-btn" href="${escapeHtml(bugMarkdownUrl)}" target="_blank" rel="noopener noreferrer" data-hint="Raw bug report and patch trailer guidance in Markdown — ready to use as an AI agent prompt" aria-label="Markdown — Raw bug report and patch trailer guidance in Markdown, ready to use as an AI agent prompt">Markdown</a></div></div>
                     <div class="kv"><div class="label">Severity:</div><div><span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold; background:transparent;">${escapeHtml(severity)}</span></div></div>
+                    <div class="kv"><div class="label">Security:</div><div>${renderSecurityMetaValue(data)}</div></div>
                     <div class="kv"><div class="label">Status:</div><div><span class="status-badge ${status.cls}">${status.label}</span></div></div>
                     <div class="kv"><div class="label">Assignee:</div><div>${data.assignee ? `${escapeHtml(data.assignee)}${data.assigned_at ? ` <span class="text-muted-sm">since ${formatDate(data.assigned_at, true)}</span>` : ''}` : '<span class="text-muted-sm">Unassigned</span>'}</div></div>
                     <div class="kv"><div class="label">Discoveries:</div><div>${evidence.count} (${evidence.tools.length} ${evidence.tools.length === 1 ? 'tool' : 'tools'}, ${evidence.models.length} ${evidence.models.length === 1 ? 'model' : 'models'})</div></div>
@@ -4287,7 +4379,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 close: ['Close Bug', 'Reason (optional):', 'Why is this being closed?'],
                 dismiss: ['Dismiss Bug', 'Reason (optional):', 'Why is this being dismissed?'],
                 mark_duplicate: ['Mark as Duplicate', 'Reason (optional):', 'Explain why it is a duplicate...'],
-                assign: ['Assign Bug', 'Reason (optional):', 'Why is this being assigned? If the assignee is notified by email, this note is included.']
+                assign: ['Assign Bug', 'Reason (optional):', 'Why is this being assigned? If the assignee is notified by email, this note is included.'],
+                evaluate_security: ['Re-evaluate Security', 'Reason (optional):', 'Why should security importance and CVSS v4.0 score be re-evaluated?']
             };
             const [title, label, placeholder] = ACTION_CONFIG[action] || ['Action', 'Reason (optional):', ''];
             titleEl.textContent = title;
@@ -4324,7 +4417,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             if (action === 'comment') {
                 if (!reason) return showErr('Comment content is required.');
                 payload.content = reason;
-            } else if (action === 'close' || action === 'dismiss') {
+            } else if (action === 'close' || action === 'dismiss' || action === 'evaluate_security') {
                 if (reason) payload.reason = reason;
             } else if (action === 'mark_duplicate') {
                 const dupIdStr = document.getElementById('bugActionDuplicateId').value.trim();

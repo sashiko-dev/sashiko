@@ -226,6 +226,66 @@ sashiko-cli local HEAD --custom-prompt "Focus on locking correctness" \
 sashiko-cli --format json local HEAD --force-local
 ```
 
+### bugs
+
+Query, inspect, and triage canonical bugs on a running Sashiko daemon (requires
+an API or session token via `--token` or `SASHIKO_API_TOKEN` for restricted
+views and mutations).
+
+```
+sashiko-cli bugs list [OPTIONS]
+sashiko-cli bugs show <ID>
+sashiko-cli bugs action <ID> --action <ACTION> [OPTIONS]
+```
+
+**`bugs list` options:**
+
+| Flag | Description |
+|------|-------------|
+| `--subsystem <NAME>` | Filter by MAINTAINERS subsystem title. |
+| `--severity <LEVEL>` | Filter by minimum engineering severity (`low`, `medium`, `high`, `critical`). |
+| `--min-security-score <SCORE>` | Filter by minimum CVSS v4.0 security score (`0.0` to `10.0`). |
+| `--security-class <CLASS>` | Filter by security classification (`vulnerability`, `hardening`, `not_security`; comma-separated). |
+| `--status <STATUS>` | Filter by lifecycle status (`new`, `open`, `fixed`, `closed`, `dismissed`, `duplicate`). |
+| `-q, --query <TEXT>` | Full-text search query. |
+| `--sort-by <FIELD>` | Sort field (`severity`, `security_score`, `created_at`, `discoveries`, `status`, `assignee`, `problem`). |
+| `--sort-order <ORDER>` | Sort direction (`asc`, `desc`). |
+| `--page <N>` | Page number (default: 1). |
+| `--per-page <N>` | Items per page (default: 20). |
+
+**`bugs action` options:**
+
+| Flag | Description |
+|------|-------------|
+| `--action <ACTION>` | Action to perform: `comment`, `close`, `dismiss`, `assign`, `mark_duplicate`, or `evaluate_security`. |
+| `--comment <TEXT>` | Comment body (for `comment`) or optional reason (for `close`, `dismiss`, `assign`, `mark_duplicate`, `evaluate_security`). |
+| `--assignee <EMAIL>` | Assignee email address for `assign` (or `""` to unassign). |
+| `--duplicate-of <ID>` | Canonical `<project>-<uuid>` or numeric ID for `mark_duplicate`. |
+
+### Offline Bug Security Evaluation (`sashiko bugs evaluate-security`)
+
+Evaluate or backfill CVSS v4.0 security importance directly against the local
+SQLite database and repository without starting the full daemon:
+
+```
+sashiko bugs evaluate-security [OPTIONS]
+```
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--bug <ID>` | Evaluate a specific canonical bug (`<project>-<uuid>` or numeric ID), forcing evaluation even if already scored. |
+| `--limit <N>` | Maximum number of canonical bugs to evaluate in this sweep (`0` exits after migrations/queuing). |
+| `--re-evaluate` | Queue existing canonical bugs (`open`, `fixed`, `closed`) for fresh security re-evaluation before running. |
+| `--concurrency <N>` | Number of concurrent security evaluation workers (overrides `linux_bug.concurrency`). |
+| `--db <PATH>` | Override SQLite database path. |
+| `-r, --repo <PATH>` | Override git repository path. |
+| `--settings <PATH>` | Override `Settings.toml` path. |
+| `--ai-provider <PROVIDER>` | AI provider override. |
+| `-m, --model <MODEL>` | AI model override (alias: `--ai-model`). |
+| `--effort <MODE>` | Reasoning effort override (`low`, `mid`, `high`, or `dynamic`). |
+
 ### Active Codebase Scanning (`sashiko scan`)
 
 In addition to patch review, the `sashiko` binary provides an active codebase

@@ -515,6 +515,37 @@ fn push_metadata_section(
         }
         _ => out.push_str(&format!("- **Severity**: {}\n", sev.as_str())),
     }
+    if let Some(eval) = bug.security_evaluation() {
+        let summary = single_line(&eval.summary);
+        match eval.security_class {
+            crate::security_eval::SecurityClass::Vulnerability => {
+                if let Some(ref vec_str) = eval.cvss_vector {
+                    out.push_str(&format!(
+                        "- **Security**: {} ({:.1}/10.0, `{}`) — {}\n",
+                        eval.qualitative_rating.as_str(),
+                        eval.score,
+                        single_line(vec_str),
+                        summary
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "- **Security**: {} ({:.1}/10.0) — {}\n",
+                        eval.qualitative_rating.as_str(),
+                        eval.score,
+                        summary
+                    ));
+                }
+            }
+            crate::security_eval::SecurityClass::Hardening
+            | crate::security_eval::SecurityClass::NotSecurity => {
+                out.push_str(&format!(
+                    "- **Security**: {} (0.0/10.0) — {}\n",
+                    eval.security_class.label(),
+                    summary
+                ));
+            }
+        }
+    }
     if !bug.subsystems.is_empty() {
         let subs: Vec<String> = bug
             .subsystems
@@ -1202,5 +1233,59 @@ mod tests {
         assert!(md.contains("`sashiko review --project sashiko --agent HEAD`"));
         assert!(!md.contains("coding-assistants.rst"));
         assert!(!md.contains("checkpatch.pl"));
+    }
+
+    #[test]
+    fn test_render_bug_markdown_includes_security_evaluation_metadata() {
+        let mut vuln_bug = sample_bug("linux-sec00001");
+        vuln_bug.enrichments.push(enrichment(
+            "security_evaluation",
+            Some("Unauthenticated SMB2 client triggers kernel heap out-of-bounds write."),
+            Some(json!({
+                "security_class": "vulnerability",
+                "score": 9.3,
+                "score_tenths": 93,
+                "qualitative_rating": "Critical",
+                "cvss_vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+                "summary": "Unauthenticated SMB2 client triggers kernel heap out-of-bounds write."
+            })),
+        ));
+
+        let vuln_md = render_bug_markdown(&BugMarkdownContext {
+            bug: &vuln_bug,
+            base_url: "https://sashiko.dev",
+            reported_by: "Sashiko <sashiko@sashiko.dev>",
+            project: ProjectId::Linux,
+            canonical_duplicate: None,
+            activity: &[],
+        });
+        assert!(vuln_md.contains(
+            "- **Security**: Critical (9.3/10.0, `CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N`) — Unauthenticated SMB2 client triggers kernel heap out-of-bounds write."
+        ));
+
+        let mut non_sec_bug = sample_bug("linux-sec00002");
+        non_sec_bug.enrichments.push(enrichment(
+            "security_evaluation",
+            Some("Module unload path requires root CAP_SYS_MODULE."),
+            Some(json!({
+                "security_class": "not_security",
+                "score": 0.0,
+                "score_tenths": 0,
+                "qualitative_rating": "None",
+                "summary": "Module unload path requires root CAP_SYS_MODULE."
+            })),
+        ));
+
+        let non_sec_md = render_bug_markdown(&BugMarkdownContext {
+            bug: &non_sec_bug,
+            base_url: "https://sashiko.dev",
+            reported_by: "Sashiko <sashiko@sashiko.dev>",
+            project: ProjectId::Linux,
+            canonical_duplicate: None,
+            activity: &[],
+        });
+        assert!(non_sec_md.contains(
+            "- **Security**: Not Security (0.0/10.0) — Module unload path requires root CAP_SYS_MODULE."
+        ));
     }
 }
