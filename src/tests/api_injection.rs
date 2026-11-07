@@ -20,10 +20,11 @@
 //! The parent module also covers bare singletons and same-author, same-subject
 //! 0/1 submissions in both arrival orders.
 //! This module also checks late covers, redelivery, and interleaved multipart
-//! submissions, and drives the /api/submit handler end to end.
+//! submissions, drives the /api/submit handler end to end, and checks how
+//! threaded and unthreaded mailing-list cover/patch pairs group.
 
 use super::{
-    Database, Event, MessageSource, ProcessStatus, RawMboxSubmission, Settings,
+    Database, Event, MessageSource, ParsedArticle, ProcessStatus, RawMboxSubmission, Settings,
     ingest_api_messages, ingest_api_messages_at, ingest_api_submission, process_parsed_article,
     test_db,
 };
@@ -297,6 +298,17 @@ async fn sequential_submissions_with_same_author_and_subject_stay_separate() {
     assert_isolated_singletons(&db).await;
 }
 
+#[tokio::test]
+async fn interleaved_submissions_with_same_author_and_subject_keep_both_covers() {
+    let a = singleton(COVER_A, PATCH_A, BOT, COVER_TITLE);
+    let b = singleton(COVER_B, PATCH_B, BOT, COVER_TITLE);
+    let db = ingest_api_submission(MessageSource::ApiInject, SUBMISSION_A, &[&a[0]]).await;
+    ingest_api_messages(&db, MessageSource::ApiInject, SUBMISSION_B, &[&b[0]]).await;
+    ingest_api_messages(&db, MessageSource::ApiInject, SUBMISSION_A, &[&a[1]]).await;
+    ingest_api_messages(&db, MessageSource::ApiInject, SUBMISSION_B, &[&b[1]]).await;
+    assert_isolated_singletons(&db).await;
+}
+
 /// Checks that submission A's cover is still waiting for its patch and that
 /// submission B's patch formed its own patchset.
 async fn assert_cover_left_waiting(db: &Database) {
@@ -316,6 +328,17 @@ async fn assert_cover_left_waiting(db: &Database) {
     assert!(a["patches"].as_array().unwrap().is_empty());
     let b_id = assert_submission(db, SUBMISSION_B, &[PATCH_B], PATCH_B).await;
     assert_ne!(a_id, b_id);
+}
+
+/// A same-author patch replying to a different cover must not be pulled into
+/// submission A by author and time.
+#[tokio::test]
+async fn unrelated_patch_does_not_complete_another_submissions_cover() {
+    let a = singleton(COVER_A, PATCH_A, BOT, COVER_TITLE);
+    let b = singleton(COVER_B, PATCH_B, BOT, "Unrelated patch");
+    let db = ingest_api_submission(MessageSource::ApiInject, SUBMISSION_A, &[&a[0]]).await;
+    ingest_api_messages(&db, MessageSource::ApiInject, SUBMISSION_B, &[&b[1]]).await;
+    assert_cover_left_waiting(&db).await;
 }
 
 async fn finish_review(db: &Database, patchset: i64) -> serde_json::Value {
@@ -630,4 +653,75 @@ async fn http_submit_different_authors_cover_first_groups() {
 #[tokio::test]
 async fn http_submit_different_authors_patch_first_groups() {
     assert_http_submission_groups(AUTHOR, ArrivalOrder::PatchFirst).await;
+}
+
+/// Feeds messages through the mailing list path, where threads come from the
+/// messages' own reply headers rather than from an API submission ID.
+async fn ingest_list_messages(db: &Database, messages: &[&[u8]]) {
+    let policy = sashiko::email_policy::EmailPolicyConfig::default();
+    let review_settings = Settings::new().unwrap().review;
+    for (article, raw) in messages.iter().enumerate() {
+        let (mut metadata, patch) = sashiko::patch::parse_email(raw).unwrap();
+        metadata.received_date = Some(2000);
+        let article = ParsedArticle {
+            group: "test.list".to_string(),
+            article_id: article.to_string(),
+            source: MessageSource::Nntp,
+            metadata: Some(metadata),
+            patch,
+            baseline: None,
+            failed_error: None,
+            skip_filters: None,
+            only_filters: None,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            receipt: None,
+        };
+        assert_eq!(
+            process_parsed_article(db, article, None, &policy, &[], &review_settings).await,
+            ProcessStatus::Ingested
+        );
+    }
+}
+
+/// The cover/patch thread rule is not limited to API submissions: an
+/// unthreaded 0/1 and 1/1 from a mailing list, sharing only author and time,
+/// stay in separate patchsets.
+#[tokio::test]
+async fn unthreaded_mailing_list_cover_and_patch_stay_separate() {
+    let cover = message(
+        COVER_A,
+        BOT,
+        &format!("[PATCH 0/1] {COVER_TITLE}"),
+        None,
+        COVER_BODY,
+    );
+    let patch = message(
+        PATCH_A,
+        BOT,
+        "[PATCH 1/1] Independent patch title",
+        None,
+        DIFF,
+    );
+    for order in [ArrivalOrder::CoverFirst, ArrivalOrder::PatchFirst] {
+        let db = test_db().await;
+        ingest_list_messages(&db, &order.messages(&[cover.clone(), patch.clone()])).await;
+        assert_eq!(db.count_patchsets(None, None).await.unwrap(), 2);
+        assert_ne!(
+            db.find_patchset_id_by_msgid(COVER_A).await.unwrap(),
+            db.find_patchset_id_by_msgid(PATCH_A).await.unwrap()
+        );
+    }
+}
+
+/// A threaded 0/1 and 1/1 from a mailing list still group as before.
+#[tokio::test]
+async fn threaded_mailing_list_cover_and_patch_group() {
+    let messages = singleton(COVER_A, PATCH_A, BOT, "Independent patch title");
+    for order in [ArrivalOrder::CoverFirst, ArrivalOrder::PatchFirst] {
+        let db = test_db().await;
+        ingest_list_messages(&db, &order.messages(&messages)).await;
+        assert_eq!(db.count_patchsets(None, None).await.unwrap(), 1);
+    }
 }

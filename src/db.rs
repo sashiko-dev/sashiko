@@ -8979,7 +8979,13 @@ impl Database {
             // Thread Enforcement: To prevent cross-thread "stealing" of patches for resends of the same series,
             // we strictly require multi-part series patches to belong to the same thread,
             // unless they share a git send-email Message-ID prefix indicating they were sent together unthreaded.
-            let thread_compatible = same_thread || is_singleton || msgid_prefix_match;
+            // A cover/patch pair of singletons is the exception to the
+            // singleton leniency: it must be tied together by thread or by a
+            // common send-email batch, never by author and time alone.
+            let thread_compatible = same_thread
+                || msgid_prefix_match
+                || patches_reply_to_new_cover
+                || (is_singleton && !is_cover_patch_pair);
             let is_same_series_redelivery =
                 is_duplicate && same_thread && total_parts == existing_total;
 
