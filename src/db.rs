@@ -6725,7 +6725,7 @@ impl Database {
                     AND duplicate_of_id IS NULL
                     AND pipeline_state = 'succeeded'
                     AND lifecycle_status IN ('open', 'fixed', 'closed')
-                    AND (lease_expires_at IS NULL OR lease_expires_at <= ?3)",
+                    AND (locked_by IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?3)",
                 libsql::params![worker_id, now.saturating_add(ttl), now, bug_id],
             )
             .await?;
