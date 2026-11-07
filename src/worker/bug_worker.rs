@@ -116,6 +116,7 @@ pub struct BugWorker {
     repo_path: String,
     project: crate::project::ProjectId,
     settings: crate::settings::LinuxBugSettings,
+    effort: Option<crate::ai::EffortMode>,
     /// Identifies this worker in the lease it takes, so that a lease which
     /// never gets released can be traced back to a process.
     worker_id: String,
@@ -134,6 +135,7 @@ impl BugWorker {
                 max_attempts: BUG_MAX_ATTEMPTS,
                 ..Default::default()
             },
+            effort: None,
             worker_id: format!(
                 "{}:{}",
                 std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string()),
@@ -157,6 +159,11 @@ impl BugWorker {
 
     pub fn with_settings(mut self, settings: crate::settings::LinuxBugSettings) -> Self {
         self.settings = settings;
+        self
+    }
+
+    pub fn with_effort(mut self, effort: Option<crate::ai::EffortMode>) -> Self {
+        self.effort = effort;
         self
     }
 
@@ -776,12 +783,13 @@ impl BugWorker {
         );
 
         let eval_res = run_while_leased(
-            crate::workflows::linux_bug::evaluate_bug_security_for_project(
+            crate::workflows::linux_bug::evaluate_bug_security_for_project_with_effort(
                 self.provider.as_ref(),
                 repo_path,
                 bug,
                 effective_project,
                 cached_tm,
+                self.effort,
             ),
             maintain_lease(
                 &scoped_db,
@@ -1716,14 +1724,19 @@ mod tests {
 
     struct FailOnceThenRecordEffortProvider {
         calls: std::sync::atomic::AtomicUsize,
+        observed_efforts: std::sync::Mutex<Vec<Option<crate::ai::ReasoningEffort>>>,
     }
 
     #[async_trait::async_trait]
     impl AiProvider for FailOnceThenRecordEffortProvider {
         async fn generate_content(
             &self,
-            _req: crate::ai::AiRequest,
+            req: crate::ai::AiRequest,
         ) -> anyhow::Result<crate::ai::AiResponse> {
+            self.observed_efforts
+                .lock()
+                .unwrap()
+                .push(req.reasoning_effort);
             let call_num = self.calls.fetch_add(1, Ordering::SeqCst);
             if call_num == 0 {
                 anyhow::bail!("transient provider error");
@@ -1812,8 +1825,10 @@ mod tests {
 
         let provider = Arc::new(FailOnceThenRecordEffortProvider {
             calls: std::sync::atomic::AtomicUsize::new(0),
+            observed_efforts: std::sync::Mutex::new(Vec::new()),
         });
-        let worker = BugWorker::new(db.clone(), provider.clone(), String::new());
+        let worker = BugWorker::new(db.clone(), provider.clone(), String::new())
+            .with_effort(Some(crate::ai::EffortMode::High));
 
         let dismissed_err = worker
             .evaluate_single_bug_security("linux-sec-dismissed")
@@ -1845,6 +1860,14 @@ mod tests {
             eval.security_class,
             crate::security_eval::SecurityClass::NotSecurity
         );
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        let efforts = provider.observed_efforts.lock().unwrap().clone();
+        assert_eq!(
+            efforts,
+            vec![
+                Some(crate::ai::ReasoningEffort::High),
+                Some(crate::ai::ReasoningEffort::High),
+            ]
+        );
     }
 }

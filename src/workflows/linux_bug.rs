@@ -5360,6 +5360,7 @@ struct SecurityEvalSession<'a> {
     context_tag: Option<String>,
     last_turn_tool_calls: Vec<(String, Value)>,
     project: ProjectId,
+    reasoning_effort: Option<crate::ai::ReasoningEffort>,
 }
 
 #[cfg(feature = "server")]
@@ -5590,6 +5591,10 @@ impl LlmSession for SecurityEvalSession<'_> {
         self.context_tag.clone()
     }
 
+    fn reasoning_effort(&self) -> Option<crate::ai::ReasoningEffort> {
+        self.reasoning_effort
+    }
+
     fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
         let text = response.content.as_deref().unwrap_or("");
         let parsed: crate::security_eval::RawSecurityEvaluationOutput =
@@ -5614,6 +5619,28 @@ pub async fn evaluate_bug_security_for_project(
     bug: &Bug,
     project: ProjectId,
     cached_threat_model: Option<&crate::threat_model::KernelThreatModel>,
+) -> Result<crate::ai::session::SessionResult<crate::security_eval::SecurityEvaluation>> {
+    evaluate_bug_security_for_project_with_effort(
+        provider,
+        repo_path,
+        bug,
+        project,
+        cached_threat_model,
+        None,
+    )
+    .await
+}
+
+/// Evaluates the security importance and deterministic CVSS v4.0 score of a
+/// canonical `Bug` with an optional [`crate::ai::EffortMode`] override.
+#[cfg(feature = "server")]
+pub async fn evaluate_bug_security_for_project_with_effort(
+    provider: &dyn AiProvider,
+    repo_path: &std::path::Path,
+    bug: &Bug,
+    project: ProjectId,
+    cached_threat_model: Option<&crate::threat_model::KernelThreatModel>,
+    effort: Option<crate::ai::EffortMode>,
 ) -> Result<crate::ai::session::SessionResult<crate::security_eval::SecurityEvaluation>> {
     let files = extract_security_eval_files(bug);
     let eval_sha = if repo_path.as_os_str().is_empty() || !repo_path.exists() {
@@ -5661,6 +5688,7 @@ pub async fn evaluate_bug_security_for_project(
         context_tag: Some("bug_security_eval".to_string()),
         last_turn_tool_calls: Vec::new(),
         project,
+        reasoning_effort: effort.map(crate::ai::EffortMode::verification_stage_effort),
     };
 
     let runner = SessionRunner::new(provider).with_max_turns(5);

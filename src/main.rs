@@ -1801,7 +1801,8 @@ async fn run_daemon(
                 settings.git.repository_path.clone(),
             )
             .with_project(project)
-            .with_settings(settings.linux_bug.clone()),
+            .with_settings(settings.linux_bug.clone())
+            .with_effort(settings.effective_effort()),
         );
         Some(spawn_supervised_worker("BugWorker", move || {
             let worker = Arc::clone(&bug_worker);
@@ -3703,7 +3704,8 @@ async fn handle_bugs_evaluate_security_command(
         settings.git.repository_path.clone(),
     )
     .with_project(project)
-    .with_settings(settings.linux_bug.clone());
+    .with_settings(settings.linux_bug.clone())
+    .with_effort(settings.effective_effort());
 
     exit_on_interrupt(false);
 
