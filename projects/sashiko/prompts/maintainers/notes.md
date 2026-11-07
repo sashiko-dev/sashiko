@@ -31,12 +31,19 @@ symbols = [
   `symbols` to specific subsystem types or functions (never short or generic
   identifiers such as `"err"`, `"db"`, `"lock*"`, or `"get_*"` that match
   unrelated diffs).
+  A named API family such as `k_sem_*` or `DT_INST_*` can be a specific trigger
+  when the note governs that family's synchronization or Devicetree contract.
+  Usage across many files alone is not evidence of unrelated selection; name a
+  matched API or diff to which the note's rules do not apply.
 - **Human policy only, no volatile code facts:** Maintainer notes record
   subjective maintainer preferences, architectural policies, coding conventions,
   and narrowly-scoped false-positive suppression rules. Flag any maintainer note
   addition that restates volatile codebase implementation facts (such as struct
   fields, helper call chains, or lock internals) that belong in generated code
   notes (`notes/<set>/units/*.md`).
+  A documented API contract and the public API names needed to apply it are
+  acceptable when the note cites its source and requires target-tree checking.
+  Distinguish that contract from an example relying on one helper's current body.
 - **Narrow suppression preconditions:** Any rule instructing reviewers not to
   report a pattern must state the exact preconditions under which the pattern is
   safe so real bugs are not blanket-suppressed.
