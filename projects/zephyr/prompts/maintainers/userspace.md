@@ -29,7 +29,7 @@ Source: doc/kernel/usermode/syscalls.rst.
   the two: every user pointer, buffer size, and kernel object the implementation
   uses must be validated by the verifier.
 - General parameter checks belong in the implementation, usually through
-  `CHECKIF()`, and return an error, as `z_impl_k_sem_init()` does for its limit.
+  `CHECKIF()`, and return an error.
   Do not ask for them in the verifier. Only checks enforced solely for user mode
   go there, and those return a value where possible.
 - Kernel object pointers are checked with `K_SYSCALL_OBJ()`, or its `_INIT` and
