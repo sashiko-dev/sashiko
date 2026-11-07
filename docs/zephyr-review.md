@@ -63,6 +63,9 @@ sashiko review --project zephyr --settings ~/.config/sashiko-zephyr.toml 0c4382a
 # Review a range; each commit is checked separately
 sashiko review --project zephyr --settings ~/.config/sashiko-zephyr.toml HEAD~3..HEAD
 
+# Combine analysis domains into one pass; keep verification stages
+sashiko review --project zephyr --settings ~/.config/sashiko-zephyr.toml --cheap HEAD
+
 # Also report bugs that existed before the change
 sashiko review --project zephyr --settings ~/.config/sashiko-zephyr.toml --report-preexisting HEAD
 
@@ -100,8 +103,8 @@ review cannot see datasheets or modules outside the tree, and it does not run CI
 
 ## What the review covers
 
-Three stages always run: `goal`, `implementation`, and `execution-flow`. A planning
-stage adds these when the patch calls for them:
+By default, three analysis stages always run: `goal`, `implementation`, and
+`execution-flow`. A planning stage adds these when the patch calls for them:
 
 | Stage | Looks for |
 |---|---|
@@ -109,6 +112,9 @@ stage adds these when the patch calls for them:
 | `concurrency` | Blocking in the wrong execution context, locks, SMP, workqueues, unbounded work in ISRs |
 | `configuration` | Kconfig, Devicetree, and CMake logic that disagrees with the code it gates |
 | `security` | Untrusted input from peers, system call verification, flash and update paths |
+
+With `--cheap`, one combined analysis pass covers all seven domains and skips
+planning. Verification and post-verification still run for the resulting findings.
 
 Findings are checked against the policy in
 [`projects/zephyr/prompts/`](../projects/zephyr/prompts/README.md). Each maintainer

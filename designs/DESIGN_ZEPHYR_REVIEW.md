@@ -85,6 +85,11 @@ Optional stages are optional during planning. Every selected analysis stage and
 post-verification batch must finish; a stage error fails the review rather than
 allowing partial output to be reported as clean.
 
+The shared `--cheap` option skips planning and combines the selected analysis
+domains into one pass, including Zephyr's configuration and execution-context
+checks. Verification, post-verification and reporting keep the same proof bar
+and failure behavior. Manual stage selection still limits the combined pass.
+
 Each section names its source in the Zephyr tree. A rule that could not be traced
 to the tree was left out, which is also why nothing is said about `z_` prefixes:
 the documentation does not define them as private.
