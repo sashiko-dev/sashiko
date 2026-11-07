@@ -31,10 +31,6 @@ Source: doc/contribute/guidelines.rst (Commit Message Guidelines, DCO Sign-Off);
 
 Source: doc/contribute/style/code.rst; doc/contribute/coding_guidelines/index.rst.
 
-- Style follows the Linux kernel coding style with Zephyr's exceptions, such as
-  braces on every `if`, `else`, `do`, `while`, `for`, and `switch` body, and a
-  100-column limit. CI enforces these; at most Low severity, and only for new
-  code. The guide does not require fixing existing code the change does not touch.
 - Rule A.1: function and structure declarations in headers are not conditionally
   compiled. Fields inside a structure may be, to save memory. This keeps
   `if (IS_ENABLED(CONFIG_FOO))` usable.
