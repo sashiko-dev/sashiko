@@ -5030,6 +5030,9 @@ fn should_start_nntp_ingestor(settings: &Settings) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "server")]
+    mod api_injection;
+
     use super::*;
 
     #[test]
@@ -6616,11 +6619,7 @@ mod tests {
     }
 
     #[cfg(feature = "server")]
-    async fn ingest_api_submission(
-        source: MessageSource,
-        submission_id: &str,
-        messages: &[&[u8]],
-    ) -> Database {
+    async fn test_db() -> Database {
         let db = Database::new(&sashiko::settings::DatabaseSettings {
             url: ":memory:".to_string(),
             token: String::new(),
@@ -6628,6 +6627,27 @@ mod tests {
         .await
         .unwrap();
         db.migrate().await.unwrap();
+        db
+    }
+
+    #[cfg(feature = "server")]
+    async fn ingest_api_submission(
+        source: MessageSource,
+        submission_id: &str,
+        messages: &[&[u8]],
+    ) -> Database {
+        let db = test_db().await;
+        ingest_api_messages(&db, source, submission_id, messages).await;
+        db
+    }
+
+    #[cfg(feature = "server")]
+    async fn ingest_api_messages(
+        db: &Database,
+        source: MessageSource,
+        submission_id: &str,
+        messages: &[&[u8]],
+    ) {
         let policy = sashiko::email_policy::EmailPolicyConfig::default();
         let review_settings = Settings::new().unwrap().review;
 
@@ -6650,11 +6670,10 @@ mod tests {
                 receipt: None,
             };
             assert_eq!(
-                process_parsed_article(&db, article, None, &policy, &[], &review_settings).await,
+                process_parsed_article(db, article, None, &policy, &[], &review_settings).await,
                 ProcessStatus::Ingested
             );
         }
-        db
     }
 
     #[cfg(feature = "server")]
