@@ -27,6 +27,13 @@ Source: doc/hardware/cache/guide.rst.
 - With runtime maintenance, flush with `sys_cache_data_flush_range()` after the CPU
   writes data a peripheral will read, before starting the transfer. A write-through
   cache does not need this flush.
+- Trace when a buffer becomes reachable by the ISR or DMA engine: storing a
+  shared pointer, submitting a descriptor, or enabling a transfer can publish it.
+  Judge cache maintenance order against that publication and the first device
+  access. Its placement inside a lock is not by itself a correctness defect.
+  Dismissing a race requires proving that every competing path cannot access the
+  buffer until maintenance finishes; a pointer store alone does not prove that
+  earlier descriptors or aliases cannot reach it.
 - Invalidate with `sys_cache_data_invd_range()` a buffer a peripheral has written
   to, before the CPU reads it. Report a read of DMA data with no invalidate on a
   cached buffer, when the configuration can have data caches enabled.

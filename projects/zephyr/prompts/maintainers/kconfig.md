@@ -44,14 +44,23 @@ Source: doc/build/kconfig/tips.rst (select pitfalls, select recommendations).
 ## Defaults set outside the base definition
 
 Source: doc/build/kconfig/setting.rst (Multiple symbol definitions);
-doc/build/kconfig/extensions.rst (configdefault).
+doc/build/kconfig/extensions.rst (configdefault);
+doc/build/kconfig/tips.rst ((Lack of) conditional includes).
 
 - Each definition of a symbol is independent, and the symbol can be `y` if the
   conditions of any definition hold. A plain `config FOO` with a `default` in a
-  `Kconfig.defconfig` file therefore weakens the `depends on` lines of the base
-  definition. Use `configdefault FOO`, or repeat the dependencies. Report a new
-  plain definition that drops a dependency, and name the configuration that now
-  reaches the symbol.
+  `Kconfig.defconfig` file can therefore weaken the dependencies of the base
+  definition. Include enclosing `if` and `menu` dependencies and the conditions
+  inherited through `source` when comparing definitions. Use `configdefault FOO`,
+  or retain the effective dependencies. Report a dropped dependency only after
+  naming a configuration that satisfies the complete new definition and reaches
+  a concrete failure; apply the CI exclusion in `false-positive-guide.md` when
+  that failure is caught at build time.
+- For a changed default, trace the first satisfied default and any explicit
+  assignment in the affected board or application configuration. Read its DTS
+  and overlays before claiming that a timer or device disappears. A deliberate
+  policy change alone is not a defect; identify an affected configuration and
+  the behavior it loses.
 
 ## Enabling drivers from Devicetree
 
