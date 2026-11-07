@@ -113,7 +113,7 @@ pub fn knowledge_items(records: &[CorpusRecord]) -> Vec<KnowledgeItem> {
             )
         })
         .collect();
-    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.sort_by_key(|entry| entry.0);
     keyed.into_iter().map(|(_, item)| item).collect()
 }
 
@@ -297,7 +297,7 @@ fn merge_themes(themes: &[Theme], out: ThemesOutput) -> Vec<Theme> {
         .map(|t| {
             let mut members: Vec<&Theme> =
                 t.members.iter().filter_map(|&m| themes.get(m)).collect();
-            members.sort_by(|a, b| b.count.cmp(&a.count));
+            members.sort_by_key(|m| std::cmp::Reverse(m.count));
             Theme {
                 count: members.iter().map(|m| m.count).sum(),
                 examples: members

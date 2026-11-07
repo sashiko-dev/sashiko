@@ -449,7 +449,7 @@ pub async fn build_scan_chunks_for_file_with_limit(
         )
         .await
     {
-        for (chunk, prefetched) in chunks.iter_mut().zip(prefetched_blocks.into_iter()) {
+        for (chunk, prefetched) in chunks.iter_mut().zip(prefetched_blocks) {
             chunk.prefetched_headers = prefetched;
         }
     }

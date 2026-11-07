@@ -2316,10 +2316,7 @@ impl Reviewer {
         embargo_until: Option<i64>,
     ) -> Vec<String> {
         let mut failures = Vec::new();
-        loop {
-            let Some(job) = queue.lock().await.pop() else {
-                break;
-            };
+        while let Some(job) = queue.lock().await.pop() {
             match Self::check_patchset_claim_active_with_retry(&ctx.db, patchset_id).await {
                 Ok(true) => {}
                 Ok(false) => {
