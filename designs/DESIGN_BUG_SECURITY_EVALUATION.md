@@ -81,17 +81,19 @@ mutually exclusive categories under the project's threat model:
 
 Project-specific trust boundaries:
 
-- **Linux (`ProjectId::Linux`)**: Governed verbatim by
+- **Linux (`ProjectId::Linux`)**: Informed by
   `Documentation/process/threat-model.rst` (loaded from mainline via
-  `KernelThreatModel::load`, plus virtualization guest-to-host/hypervisor
-  isolation). Issues requiring `root` or administrative capabilities
-  (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_SYS_RAWIO`, `CAP_SYS_MODULE`),
-  `debugfs`/staging/experimental/debug-only Kconfigs, administrator-mounted
-  crafted filesystem images, physically modified or emulated non-conforming
-  hardware, physical access without configured IOMMU defenses, lab-only
-  probabilistic attacks, random padding/pointer leaks without boundary breach,
-  and `kselftests`/build scripts are `not_security` (or `hardening` when purely
-  defense-in-depth).
+  `KernelThreatModel::load`) and Linux Kernel CNA CVSS scoring practice. Any
+  concrete defect with Confidentiality, Integrity, or Availability impact
+  (memory corruption, OOB/uninitialized disclosure, crash/deadlock/leak, silent
+  data corruption, or virtualization/IOMMU/DMA isolation breach across guest,
+  nested L2->L1, or device boundaries) is classified as `vulnerability`, with
+  access preconditions (`CAP_SYS_ADMIN` / VFS root-only `sysfs` `store` /
+  `debugfs` / `tracefs` -> `PR:H`, crafted mounted image -> `UI:A`, physical bus
+  manipulation -> `AV:P`) encoded in the CVSS metrics rather than zeroing the
+  bug. Build/Kconfig fixes, dead code, docs/`kselftests`, and pure stat/telemetry
+  quirks with zero CIA impact are `not_security`; provably redundant checks
+  dominated by an existing guard are `hardening`.
 - **QEMU (`ProjectId::Qemu`)**: Security boundaries are untrusted guest-to-host
   escapes or host DoS across virtualization configurations (`KVM`, `Xen`, and
   explicitly security-supported virtual devices) and untrusted network/image
@@ -149,7 +151,9 @@ and extracts:
 - `score: f64` (`f64::from(score_tenths) / 10.0`)
 - `qualitative_rating: SecurityRating` (`None` `0.0`, `Low` `0.1–3.9`,
   `Medium` `4.0–6.9`, `High` `7.0–8.9`, `Critical` `9.0–10.0`)
-- `cvss_vector: Option<String>` (canonical `Vector::to_string()`)
+- `cvss_vector: Option<String>` (canonical `CVSS:4.0/...` `Vector::to_string()`)
+- `cvss_v31_vector: Option<String>` and `cvss_v31_score: Option<f64>`
+  (deterministic projection onto `cvss::v3_1::Vector` for CNA interoperability)
 
 Validation rules enforced before accepting LLM output (returning specific retry
 instructions on violation):
@@ -182,10 +186,12 @@ Each completed evaluation inserts one `bug_enrichments` row with
   ```json
   {
     "security_class": "vulnerability",
-    "score": 7.8,
-    "score_tenths": 78,
+    "score": 8.5,
+    "score_tenths": 85,
     "qualitative_rating": "High",
     "cvss_vector": "CVSS:4.0/AV:L/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+    "cvss_v31_vector": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+    "cvss_v31_score": 7.8,
     "trust_boundary": "Unprivileged local user syscall ioctl -> kernel heap",
     "attacker_model": "Local unprivileged user able to open /dev/...",
     "summary": "...",
@@ -203,7 +209,7 @@ Each completed evaluation inserts one `bug_enrichments` row with
 ### 4.2 Projected Columns, Indexes & Trigger on `bugs`
 
 Migration `src/migrations/021_bug_security_evaluation.sql` (`PRAGMA user_version = 21`)
-adds five columns to `bugs`:
+adds six columns to `bugs`:
 
 ```sql
 ALTER TABLE bugs ADD COLUMN security_score_tenths INTEGER
@@ -211,6 +217,7 @@ ALTER TABLE bugs ADD COLUMN security_score_tenths INTEGER
 ALTER TABLE bugs ADD COLUMN security_class TEXT
     CHECK (security_class IS NULL OR security_class IN ('vulnerability', 'hardening', 'not_security'));
 ALTER TABLE bugs ADD COLUMN cvss_vector TEXT;
+ALTER TABLE bugs ADD COLUMN security_evaluated_at INTEGER;
 ALTER TABLE bugs ADD COLUMN security_eval_attempts INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE bugs ADD COLUMN security_eval_requested INTEGER NOT NULL DEFAULT 0
     CHECK (security_eval_requested IN (0, 1));
