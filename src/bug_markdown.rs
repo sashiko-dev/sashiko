@@ -283,6 +283,8 @@ pub fn target_project_for_bug(settings: &Settings, bugid: &str) -> ProjectId {
         ProjectId::Qemu
     } else if lower.starts_with("gcc-") {
         ProjectId::Gcc
+    } else if lower.starts_with("zephyr-") {
+        ProjectId::Zephyr
     } else {
         settings.project.kind.unwrap_or_default()
     }
@@ -820,6 +822,28 @@ mod tests {
             tokens_out: None,
             tokens_cached: None,
             logs: None,
+        }
+    }
+
+    #[test]
+    fn zephyr_bug_prefix_overrides_missing_or_different_project_configuration() {
+        let bug = sample_bug("zephyr-7f9a2c4b");
+        for configured in [None, Some(ProjectId::Linux), Some(ProjectId::Sashiko)] {
+            let mut settings = Settings::new().unwrap();
+            settings.project.kind = configured;
+            let project = target_project_for_bug(&settings, " ZEPHYR-7f9a2c4b ");
+            assert_eq!(project, ProjectId::Zephyr);
+            let md = render_bug_markdown(&BugMarkdownContext {
+                bug: &bug,
+                base_url: "https://example.org",
+                reported_by: "Sashiko <sashiko@example.org>",
+                project,
+                canonical_duplicate: None,
+                activity: &[],
+            });
+            assert!(md.contains("# Fix Zephyr Bug:"));
+            assert!(!md.contains("Documentation/process/submitting-patches.rst"));
+            assert!(!md.contains("KUnit"));
         }
     }
 
