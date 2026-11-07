@@ -1006,6 +1006,12 @@ impl AiProvider for StdioGeminiClient {
 
 // --- Translation Helpers ---
 
+/// Gemini 3 and later reject a step whose first `functionCall` has no signature (a 400).
+/// A call it did not sign, such as one replayed from another model's turn, is
+/// sent with the dummy signature the Gemini API documents for that case, which
+/// skips the check.
+const SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
 #[cfg(test)]
 pub(crate) fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
     translate_ai_request_with_options(
@@ -1105,7 +1111,7 @@ pub(crate) fn translate_ai_request_with_options(
                     });
                 }
                 if let Some(tool_calls) = msg.tool_calls {
-                    for call in tool_calls {
+                    for (i, call) in tool_calls.into_iter().enumerate() {
                         let call_id = if !call.id.is_empty() && call.id != call.function_name {
                             call_id_to_name.insert(call.id.clone(), call.function_name.clone());
                             Some(call.id)
@@ -1115,7 +1121,8 @@ pub(crate) fn translate_ai_request_with_options(
                         let sig = call
                             .thought_signature
                             .filter(|s| !s.is_empty())
-                            .or_else(|| pending_signature.take());
+                            .or_else(|| pending_signature.take())
+                            .or_else(|| (i == 0).then(|| SKIP_THOUGHT_SIGNATURE.to_string()));
                         parts.push(Part::FunctionCall {
                             function_call: FunctionCall {
                                 id: call_id,
@@ -2111,6 +2118,50 @@ mod tests {
         } else {
             panic!("Expected FunctionCall part second");
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_ai_request_unsigned_tool_calls_skip_validation() -> Result<()> {
+        // A turn replayed from another model's recording arrives with no
+        // signatures; only the step's first call needs one.
+        let call = |id: &str| ToolCall {
+            id: id.to_string(),
+            function_name: "git_log".to_string(),
+            arguments: json!({}),
+            thought_signature: None,
+        };
+        let request = AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::Assistant,
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![call("call_1"), call("call_2")]),
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+            reasoning_effort: None,
+        };
+
+        let gemini_req = translate_ai_request(request)?;
+
+        let sigs: Vec<Option<&str>> = gemini_req.contents[0]
+            .parts
+            .iter()
+            .map(|p| match p {
+                Part::FunctionCall {
+                    thought_signature, ..
+                } => thought_signature.as_deref(),
+                _ => panic!("Expected only FunctionCall parts"),
+            })
+            .collect();
+        assert_eq!(sigs, vec![Some(SKIP_THOUGHT_SIGNATURE), None]);
 
         Ok(())
     }
