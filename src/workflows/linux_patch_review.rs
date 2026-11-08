@@ -581,6 +581,16 @@ pub(crate) fn validate_locations_side(
     Ok(())
 }
 
+/// Whether a dismissed concern carries the content the validators require:
+/// non-empty `description` and `reasoning` strings.
+pub fn dismissed_concern_has_content(item: &Value) -> bool {
+    ["description", "reasoning"].iter().all(|key| {
+        item.get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    })
+}
+
 fn validate_concerns_output(
     output: &StageConcernsOutput,
     _state: &LinuxPatchReviewState,
@@ -607,18 +617,16 @@ fn validate_concerns_output(
     }
 
     for (idx, dismissed) in output.dismissed_concerns.iter().enumerate() {
-        let has_desc = dismissed
-            .get("description")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_reasoning = dismissed
-            .get("reasoning")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        if !has_desc || !has_reasoning {
-            return Err(format!(
-                "dismissed_concerns[{idx}] must have non-empty 'description' and 'reasoning' strings proving why the candidate concern does not apply."
-            ));
+        if !dismissed.is_object() {
+            return Err(format!("dismissed_concerns[{idx}] must be a JSON object."));
+        }
+        if !dismissed_concern_has_content(dismissed) {
+            // A dismissal without description or reasoning asserts nothing
+            // about why the candidate concern fails to apply. Dropping it is
+            // lossless - downstream stages keep treating the candidate as
+            // unresolved - while failing the stage under BestEffort would
+            // discard every real concern it reported.
+            continue;
         }
         if let Some(locations) = dismissed.get("locations").and_then(Value::as_array) {
             validate_locations_side(locations, "dismissed_concerns", idx)?;
@@ -1573,6 +1581,12 @@ pub fn append_stage_dismissed_concerns_with_prompts(
     prompts: &[String],
 ) {
     for item in src {
+        // Mirrors the stage validators: a dismissal without description and
+        // reasoning is never recorded, so review threads do not carry
+        // entries that assert nothing about the candidate they dismiss.
+        if !dismissed_concern_has_content(item) {
+            continue;
+        }
         let next_id = format!("D{}", dest.len().saturating_add(1));
         let mut obj = item.clone();
         if let Some(map) = obj.as_object_mut() {
@@ -4340,6 +4354,68 @@ mod tests {
             assert_eq!(f["cluster_ids"], json!(["G1"]));
         }
     }
+
+    #[test]
+    fn test_validate_concerns_output_drops_contentless_dismissals() {
+        let proof_location = json!({
+            "file": "drivers/hid/hid-asus.c",
+            "function_or_symbol": "asus_probe",
+            "side": "REVISION",
+            "code_snippet": "return 0;"
+        });
+        let state = LinuxPatchReviewState::default();
+        let output = StageConcernsOutput {
+            concerns: Vec::new(),
+            dismissed_concerns: vec![
+                json!({"description": "", "reasoning": "because"}),
+                json!({"description": "desc", "reasoning": "   "}),
+                json!({"type": "skeleton", "locations": [proof_location.clone()]}),
+                json!({
+                    "description": "lock already held by the caller",
+                    "reasoning": "the caller holds it across the call",
+                    "locations": [proof_location]
+                }),
+            ],
+        };
+        assert!(validate_concerns_output(&output, &state).is_ok());
+    }
+
+    #[test]
+    fn test_validate_concerns_output_still_requires_dismissal_proof() {
+        let state = LinuxPatchReviewState::default();
+        let output = StageConcernsOutput {
+            concerns: Vec::new(),
+            dismissed_concerns: vec![json!({
+                "description": "lock already held by the caller",
+                "reasoning": "the caller holds it across the call"
+            })],
+        };
+        let err = validate_concerns_output(&output, &state).unwrap_err();
+        assert!(
+            err.contains("must include at least one entry in 'locations'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_append_stage_dismissed_concerns_drops_contentless_entries() {
+        let mut dest = Vec::new();
+        let src = vec![
+            json!({"description": "real", "reasoning": "why"}),
+            json!({"description": "", "reasoning": "why"}),
+            json!({"type": "stub"}),
+        ];
+        append_stage_dismissed_concerns_with_prompts(
+            &mut dest,
+            &src,
+            "hardware",
+            &["g".to_string()],
+        );
+        assert_eq!(dest.len(), 1);
+        assert_eq!(dest[0]["id"], json!("D1"));
+        assert_eq!(dest[0]["stage"], json!("hardware"));
+    }
+
     #[test]
     fn test_each_stage_declares_whether_it_needs_the_commit_message() {
         // This was a numeric range in a free function, which kept compiling
@@ -5227,7 +5303,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stage_outputs_do_not_match_inner_location_on_malformed_outer_json() {
+    fn test_unescaped_quotes_repair_outer_object_not_other_stage_shapes() {
         let malformed_with_inner_location = r#"{
   "concerns": [
     {
@@ -5249,12 +5325,27 @@ mod tests {
   "dismissed_concerns": []
 }"#;
 
-        let err = crate::workflow::output::parse_json_from_text::<StageConcernsOutput>(
+        // The unescaped quotes inside the reasoning prose used to make the
+        // whole object unparseable and kill the stage after three retries;
+        // the repair pass recovers the full object with every field intact.
+        let parsed = crate::workflow::output::parse_json_from_text::<StageConcernsOutput>(
             malformed_with_inner_location,
         )
-        .expect_err("malformed outer JSON must not match inner location as StageConcernsOutput");
-        assert!(err.contains("line 6"));
+        .expect("unescaped inner quotes must be repaired, not rejected");
+        assert_eq!(parsed.concerns.len(), 1);
+        assert_eq!(parsed.concerns[0]["description"], "Missing core dependency");
+        assert_eq!(
+            parsed.concerns[0]["reasoning"],
+            "It omits \"core\" and \"std\" from deps."
+        );
+        assert_eq!(
+            parsed.concerns[0]["locations"][0]["file"],
+            "scripts/generate_rust_analyzer.py"
+        );
+        assert_eq!(parsed.concerns[0]["locations"][0]["line"], json!(149));
 
+        // A parseable outer object must still not masquerade as another
+        // stage's output shape just because it parses.
         assert!(
             crate::workflow::output::parse_json_from_text::<VerificationOutput>(
                 malformed_with_inner_location
@@ -5275,6 +5366,46 @@ mod tests {
         .expect("PostVerificationOutput should default omitted dismissed_concerns");
         assert_eq!(omitted_dismissed.findings.len(), 1);
         assert!(omitted_dismissed.dismissed_concerns.is_empty());
+    }
+
+    #[test]
+    fn test_unrecoverable_outer_json_rejects_the_inner_location_shape() {
+        // The reasoning string never closes, so no repair reading exists
+        // and the outer object stays unparseable. The valid location object
+        // nested inside it must not be accepted as any stage's output
+        // shape, and the original parse error must surface.
+        let unrecoverable = r#"{
+  "concerns": [
+    {
+      "type": "Configuration Bug",
+      "preexisting": false,
+      "locations": [
+        {
+          "file": "scripts/generate_rust_analyzer.py",
+          "function_or_symbol": "generate_crates",
+          "line": 149,
+          "code_snippet": "append_crate(\"quote\", ...)",
+          "why_this_location_matters": "Missing core dependency"
+        }
+      ],
+      "reasoning": "It omits core and std from deps.
+}"#;
+
+        let err =
+            crate::workflow::output::parse_json_from_text::<StageConcernsOutput>(unrecoverable)
+                .expect_err("an unrepairable outer object must surface its parse error");
+        assert!(err.contains("EOF while parsing a string"), "{err}");
+
+        assert!(
+            crate::workflow::output::parse_json_from_text::<VerificationOutput>(unrecoverable)
+                .is_err(),
+            "unrecoverable outer JSON must not match inner location as VerificationOutput"
+        );
+        assert!(
+            crate::workflow::output::parse_json_from_text::<PostVerificationOutput>(unrecoverable)
+                .is_err(),
+            "unrecoverable outer JSON must not match inner location as PostVerificationOutput"
+        );
     }
 
     #[test]

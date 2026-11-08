@@ -558,6 +558,40 @@ pub struct OpenAiCompatSettings {
     pub api: Option<String>,
 }
 
+/// No `Default` derive: `prompt_caching` defaults on through the serde
+/// attribute when the key is absent, and a derived `Default` would quietly
+/// disagree with it.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+#[allow(unused)]
+pub struct MistralSettings {
+    /// Chat completions endpoint: the API host, any `…/v1` root, or the
+    /// full `…/v1/chat/completions` URL. Any other path is rejected at
+    /// startup.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Completion token cap, thinking included. The prompt plus
+    /// `max_tokens` may not exceed the model's context length.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Context window override; defaults to 1M tokens on the hosted
+    /// zai-glm models and 128k (`131_072`) on everything else.
+    #[serde(default)]
+    pub context_window_size: Option<usize>,
+    /// Reasoning effort sent as the `reasoning_effort` request field when a
+    /// stage does not specify one: `"none"`, `"minimal"`, `"low"`,
+    /// `"medium"`, `"high"`, `"xhigh"`, or `"max"`. Leave unset for the
+    /// model default.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Route requests sharing a prompt prefix — every tool round of a
+    /// session, and every session of a review stage — to Mistral's prompt
+    /// cache with a stable `prompt_cache_key`, so the repeated prefix bills
+    /// at 10% of the input price instead of full price on every round.
+    #[serde(default = "default_prompt_caching")]
+    pub prompt_caching: bool,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
@@ -737,6 +771,7 @@ pub struct AiSettings {
     #[cfg(feature = "vertex")]
     pub vertex: Option<VertexSettings>,
     pub openai_compat: Option<OpenAiCompatSettings>,
+    pub mistral: Option<MistralSettings>,
     pub ollama: Option<OllamaSettings>,
     pub vllm: Option<VllmSettings>,
     pub kiro_cli: Option<KiroCliSettings>,
@@ -1776,6 +1811,37 @@ mod tests {
         assert!(settings.database.url.is_empty());
         assert!(settings.git.repository_path.is_empty());
         assert!(settings.validate_for_daemon().is_err());
+    }
+
+    /// The `[ai.mistral]` table accepts its five knobs and nothing else, so
+    /// a mistyped key fails the load instead of silently doing nothing.
+    #[test]
+    fn test_mistral_settings_parse() {
+        let empty: MistralSettings = toml::from_str("").unwrap();
+        assert_eq!(
+            (empty.base_url, empty.max_tokens),
+            (None, None),
+            "all knobs default to the provider's own choices"
+        );
+        assert!(
+            empty.prompt_caching,
+            "prompt caching routes repeated prefixes to the cache, so it defaults on"
+        );
+
+        let full: MistralSettings = toml::from_str(
+            "base_url = \"https://gw.example/api/v1\"\nmax_tokens = 4096\ncontext_window_size = 200000\neffort = \"low\"\nprompt_caching = false",
+        )
+        .unwrap();
+        assert_eq!(full.base_url.as_deref(), Some("https://gw.example/api/v1"));
+        assert_eq!(full.max_tokens, Some(4096));
+        assert_eq!(full.context_window_size, Some(200_000));
+        assert_eq!(full.effort.as_deref(), Some("low"));
+        assert!(!full.prompt_caching);
+
+        let error = toml::from_str::<MistralSettings>("bogus = true")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field `bogus`"), "{error}");
     }
 
     /// A local review's own reduced shape ignored keys it did not know, so a
