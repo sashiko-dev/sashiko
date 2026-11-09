@@ -104,14 +104,28 @@ pub fn detached_async() -> tokio::process::Command {
 }
 
 tokio::task_local! {
-    static ISOLATE_PROCESSES: ();
+    static ISOLATE_PROCESSES: Isolation;
+}
+
+#[derive(Clone, Copy)]
+enum Isolation {
+    Cancellable,
+    SharedWriter,
 }
 
 /// Daemon preparation owns its Git hooks and transports. Other callers retain
 /// the foreground process group for terminal prompts and terminal signals.
 #[allow(dead_code)]
 pub(crate) async fn with_isolated_processes<F: std::future::Future>(future: F) -> F::Output {
-    ISOLATE_PROCESSES.scope((), future).await
+    ISOLATE_PROCESSES
+        .scope(Isolation::Cancellable, future)
+        .await
+}
+
+pub(crate) async fn with_shared_writer_processes<F: std::future::Future>(future: F) -> F::Output {
+    ISOLATE_PROCESSES
+        .scope(Isolation::SharedWriter, future)
+        .await
 }
 
 pub(crate) fn processes_are_isolated() -> bool {
@@ -160,8 +174,44 @@ pub(crate) async fn output(
     command: &mut tokio::process::Command,
     input: Option<&[u8]>,
 ) -> std::io::Result<std::process::Output> {
+    output_with_limit(command, input, None).await
+}
+
+/// Limit both output streams of a read-only query. Exceeding either limit
+/// cancels the command rather than returning a silently truncated response.
+pub(crate) async fn output_limited(
+    command: &mut tokio::process::Command,
+    max_bytes: usize,
+) -> std::io::Result<std::process::Output> {
+    output_with_limit(command, None, Some(max_bytes)).await
+}
+
+async fn read_output(
+    pipe: impl tokio::io::AsyncRead + Unpin,
+    max_bytes: Option<usize>,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let limit = match max_bytes {
+        Some(limit) => limit.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid Git output limit")
+        })? as u64,
+        None => u64::MAX,
+    };
+    let mut bytes = Vec::new();
+    pipe.take(limit).read_to_end(&mut bytes).await?;
+    if max_bytes.is_some_and(|limit| bytes.len() > limit) {
+        return Err(std::io::Error::other("Git output limit exceeded"));
+    }
+    Ok(bytes)
+}
+
+async fn output_with_limit(
+    command: &mut tokio::process::Command,
+    input: Option<&[u8]>,
+    max_bytes: Option<usize>,
+) -> std::io::Result<std::process::Output> {
     use std::process::Stdio;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     command
         .stdin(if input.is_some() {
@@ -177,8 +227,15 @@ pub(crate) async fn output(
     } else {
         command.spawn()?
     };
-    let mut group =
-        crate::process_group::GroupGuard::new(child.id().filter(|_| isolated).map(|id| id as i32));
+    let pgid = child.id().filter(|_| isolated).map(|id| id as i32);
+    let mut group = if ISOLATE_PROCESSES
+        .try_with(|mode| matches!(mode, Isolation::SharedWriter))
+        .unwrap_or(false)
+    {
+        crate::process_group::GroupGuard::shared_writer(pgid)
+    } else {
+        crate::process_group::GroupGuard::new(pgid)
+    };
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -192,12 +249,13 @@ pub(crate) async fn output(
         Ok::<_, std::io::Error>(result)
     };
     let read = async {
-        let (Some(mut stdout), Some(mut stderr)) = (stdout, stderr) else {
+        let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
             return Err(std::io::Error::other("Git output pipes are missing"));
         };
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        tokio::try_join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err))?;
-        Ok::<_, std::io::Error>((out, err))
+        tokio::try_join!(
+            read_output(stdout, max_bytes),
+            read_output(stderr, max_bytes)
+        )
     };
     let (write_result, (stdout, stderr), status) =
         tokio::try_join!(write, read, wait_for_exit(&mut child, &mut group, isolated))?;
@@ -285,6 +343,37 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_output_rejects_excess_on_either_stream() -> anyhow::Result<()> {
+        for isolated in [false, true] {
+            for redirect in ["", ">&2"] {
+                let mut command = tokio::process::Command::new("sh");
+                command.kill_on_drop(true).args([
+                    "-c",
+                    &format!("head -c 1048576 /dev/zero {redirect}; exec sleep 300"),
+                ]);
+                let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    if isolated {
+                        with_isolated_processes(output_limited(&mut command, 4096)).await
+                    } else {
+                        output_limited(&mut command, 4096).await
+                    }
+                })
+                .await?;
+                assert_eq!(result.unwrap_err().to_string(), "Git output limit exceeded");
+            }
+        }
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .kill_on_drop(true)
+            .args(["-c", "printf done; printf warn >&2"]);
+        let output = output_limited(&mut command, 4).await?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"done");
+        assert_eq!(output.stderr, b"warn");
         Ok(())
     }
 

@@ -419,6 +419,8 @@ pass.
 | `worktree_dir` | string | -- | Directory for git worktrees used during daemon reviews. The daemon empties it on startup, so it must hold nothing else. |
 | `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). Idle wait time spent parked on shared rate limits (RPS/TPM pacing or 429 backoff) while no requests of this review are in flight is credited back to the deadline. |
 | `max_retries` | integer | `3` | Retry count on transient failures. |
+| `preparation_timeout_seconds` | positive integer | `1800` | Maximum time per daemon preparation attempt, before AI execution, excluding cleanup. Covers input loading, baseline/prerequisite resolution, checkout and patch application. Each cleanup has a separate 120-second budget and pauses the preparation deadline. See the [configuration fragment](examples/review-preparation.example.toml). |
+| `preparation_max_retries` | integer | `3` | Additional preparation attempts after a timeout, using fresh worktrees after cleanup and 5-second incremental backoff capped at 30 seconds. Set to `0` to disable retries. Cleanup failures stop retries; ordinary application failures do not consume this retry budget. Independent of AI retries. |
 | `max_lines_changed` | integer | `10000` | Skip patches with more changed lines than this. |
 | `max_files_touched` | integer | `200` | Skip patches touching more files than this. |
 | `ignore_files` | list | `[]` | File patterns to skip during review (e.g. `MAINTAINERS`). |

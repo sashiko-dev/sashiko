@@ -2136,12 +2136,83 @@
             `;
         }
 
+        function preparationProgress(data) {
+            try {
+                const entries = JSON.parse(data.baseline_logs || 'null');
+                if (!Array.isArray(entries)) return null;
+                return entries.findLast(entry => entry?.preparation)?.preparation || null;
+            } catch (_) { return null; }
+        }
+
+        function patchsetFailureTitle(data) {
+            if (data.reviews?.length > 0) return 'Review Failed';
+            return preparationProgress(data) ? 'Review Preparation Failed' : 'Ingestion Failed';
+        }
+
+        function renderPreparationProgress(data, now = Date.now() / 1000) {
+            const progress = preparationProgress(data);
+            if (!progress) return '';
+            const number = value => Number.isFinite(Number(value)) ? Number(value) : 0;
+            const active = data.status === 'In Review' && ['running', 'retry_waiting'].includes(progress.status);
+            const labels = { running: 'Preparing', retry_waiting: 'Waiting to retry', ready: 'Ready for AI review', no_baseline: 'No applicable baseline', failed: 'Failed' };
+            const label = !active && ['running', 'retry_waiting'].includes(progress.status) ? 'Interrupted' : (labels[progress.status] || 'Unknown');
+            const end = active ? now : number(progress.finished_at);
+            const elapsed = end > 0 ? `${Math.max(0, Math.floor(end - number(progress.stage_started_at)))} seconds` : 'Not running';
+            const retry = active && progress.status === 'retry_waiting'
+                ? `<div class="kv"><div class="label">Retry in:</div><div>${Math.max(0, Math.ceil(number(progress.retry_at) - now))} seconds</div></div>` : '';
+            const history = Array.isArray(progress.timed_out_attempts) ? progress.timed_out_attempts.map(attempt =>
+                `<li>Attempt ${number(attempt.attempt)} timed out: ${escapeHtml(attempt.stage_label || 'Unknown stage')} (${escapeHtml(formatDate(attempt.timed_out_at, true))})</li>`
+            ).join('') : '';
+            return `<div class="section"><h2>Review preparation — ${escapeHtml(label)}</h2>
+                <div class="kv"><div class="label">Stage:</div><div>${escapeHtml(progress.stage_label || 'Unknown')}</div></div>
+                <div class="kv"><div class="label">Attempt:</div><div>${number(progress.attempt)} / ${number(progress.total_attempts)}</div></div>
+                <div class="kv"><div class="label">Stage started:</div><div>${escapeHtml(formatDate(progress.stage_started_at, true))}</div></div>
+                <div class="kv"><div class="label">Stage elapsed:</div><div>${elapsed}</div></div>
+                <div class="kv"><div class="label">Attempt timeout:</div><div>${number(progress.timeout_seconds)} seconds</div></div>
+                ${retry}${history ? `<h3>Earlier timeouts</h3><ul>${history}</ul>` : ''}
+                </div>`;
+        }
+
+        function pollPreparation(data, id, query) {
+            const progress = preparationProgress(data);
+            // Reruns pass through queued states, and terminal preparation
+            // progress can precede metadata publication or belong to an old run.
+            if (!['Pending', 'Awaiting Review', 'In Review'].includes(data.status)) return;
+            const element = document.getElementById('preparation-progress');
+            if (!element) return;
+            setTimeout(async () => {
+                if (document.getElementById('preparation-progress') !== element) return;
+                try {
+                    const response = await fetch(`/api/patchset?id=${encodeURIComponent(id)}&limit=1`, { signal: AbortSignal.timeout(15000) });
+                    if (document.getElementById('preparation-progress') !== element) return;
+                    if (!response.ok) throw new Error('Progress refresh failed');
+                    const current = await response.json();
+                    if (document.getElementById('preparation-progress') !== element) return;
+                    const next = preparationProgress(current);
+                    const metadataChanged = ['baseline', 'model_name', 'provider', 'prompts_git_hash']
+                        .some(key => JSON.stringify(current[key]) !== JSON.stringify(data[key]));
+                    if (current.status !== data.status || metadataChanged ||
+                        (next?.status === 'ready' && progress?.status !== 'ready')) {
+                        await renderPatchsetView(id, query);
+                        return;
+                    }
+                    element.innerHTML = renderPreparationProgress(current);
+                    pollPreparation(current, id, query);
+                } catch (_) {
+                    if (document.getElementById('preparation-progress') === element) pollPreparation(data, id, query);
+                }
+            }, 10000);
+        }
+
         async function renderPatchsetView(id, query = {}) {
+            const viewHash = window.location.hash;
             const page = parseInt(query.page) || 1;
             const limit = parseInt(query.limit) || 50;
             const res = await fetch(`/api/patchset?id=${encodeURIComponent(id)}&page=${page}&limit=${limit}`);
             if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
             const data = await res.json();
+
+            if (window.location.hash !== viewHash) return;
 
             state.patchsetId = id;
             state.patchsetPage = data.page || page;
@@ -2304,7 +2375,7 @@
             const threadHtml = isGitSubmission ? '' : renderThreadTree(data.thread);
             const mailingLists = data.mailing_lists || data.subsystems;
             const mailingListsHtml = mailingLists?.length > 0 ? mailingLists.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : '-';
-            const failureTitle = data.reviews?.length > 0 ? 'Review Failed' : 'Ingestion Failed';
+            const failureTitle = patchsetFailureTitle(data);
             const failureHtml = data.failed_reason ? `<div class="section error-banner" style="margin-bottom:16px;"><h3 style="margin-top:0; color:var(--error-title);">${failureTitle}</h3><div>${escapeHtml(data.failed_reason)}</div></div>` : '';
 
             const modelName = data.model_name || '-';
@@ -2328,6 +2399,7 @@
                     if (Array.isArray(logs)) {
                         isJson = true;
                         const rows = logs.map((item, idx) => {
+                            if (item.preparation) return '';
                             const badgeCls = item.status === 'Applied' ? 'status-Applied' : item.status === 'Skipped' ? 'status-Skipped' : 'status-Failed';
                             const badgeLabel = item.status === 'Applied' || item.status === 'Skipped' ? item.status : 'Failed';
                             return `<tr><td class="bl-table-cell">${escapeHtml(item.baseline)}</td><td class="bl-table-cell"><span class="status-badge ${badgeCls}">${badgeLabel}</span></td><td class="bl-table-cell" style="text-align:right;"><a href="#/log/baseline/${encodeURIComponent(data.id || data.message_id)}/${idx}" style="font-weight:600; color:var(--text-muted); text-decoration:none; font-size:0.85em;" onmouseover="this.style.color='var(--link)'" onmouseout="this.style.color='var(--text-muted)'">View Log</a></td></tr>`;
@@ -2432,6 +2504,7 @@
                 </div>
                 ${data.mr_url ? `<div class="section"><h2>Merge Request</h2><div style="padding: 12px; background: var(--card-bg); border-radius: 6px; border: 1px solid var(--border);"><a href="${escapeHtml(data.mr_url)}" target="_blank" rel="noopener noreferrer" style="color: var(--link); text-decoration: none; font-weight: 500;">${escapeHtml(data.mr_url)} ↗</a></div></div>` : ''}
                 ${threadHtml ? `<div class="section"><h2>Thread</h2>${threadHtml}</div>` : ''}
+                <div id="preparation-progress">${renderPreparationProgress(data)}</div>
                 ${baselineLogsHtml}
                 ${preexistingBugsHtml}
                 <div class="section">
@@ -2442,6 +2515,7 @@
                 </div>
             `;
 
+            pollPreparation(data, id, query);
             if (query.patch || query.part) {
                 setTimeout(() => {
                     let el = query.part ? document.querySelector(`[data-part="${query.part}"]`) : null;

@@ -27,28 +27,45 @@ pub fn spawn(cmd: &mut Command) -> std::io::Result<Child> {
 /// Signal the whole group, having spawned its leader with `process_group(0)`
 /// so that the group holds the child and its descendants and nothing else.
 pub(crate) fn kill_group(pgid: i32) {
-    // Guard `pgid > 1` so `kill_process_group` (`kill(-pgid, SIGKILL)`) can
+    signal_group(pgid, rustix::process::Signal::KILL);
+}
+
+pub(crate) fn terminate_group(pgid: i32) {
+    signal_group(pgid, rustix::process::Signal::TERM);
+}
+
+fn signal_group(pgid: i32, signal: rustix::process::Signal) {
+    // Guard `pgid > 1` so `kill_process_group` (`kill(-pgid, signal)`) can
     // never target the caller's group (`0`), all user processes (`1`), or a
     // negated PID.
     if pgid > 1
         && let Some(pid) = rustix::process::Pid::from_raw(pgid)
     {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        let _ = rustix::process::kill_process_group(pid, signal);
     }
 }
 
 /// Groups still running, for a shutdown that never unwinds.
 pub(crate) static LIVE_GROUPS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+/// Shared Git writers need their signal handlers to remove repository locks.
+pub(crate) static SHARED_WRITER_GROUPS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
 /// Kill every child process group still running.
 ///
 /// For a signal handler that exits the process without dropping the futures
 /// holding the children. A terminal signal no longer reaches these groups,
 /// and their guards never run on std::process::exit.
+/// Shared Git writers receive SIGTERM so their lockfile cleanup can run.
 pub fn kill_live_groups() {
-    let groups = std::mem::take(&mut *LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner()));
-    for pgid in groups {
+    let mut groups = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+    for pgid in groups.drain(..) {
         kill_group(pgid);
+    }
+    let mut writers = SHARED_WRITER_GROUPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for pgid in writers.drain(..) {
+        terminate_group(pgid);
     }
 }
 
@@ -57,22 +74,33 @@ pub fn kill_live_groups() {
 /// The group must not be signalled once its leader has been reaped, because
 /// the pid is then free for reuse, so `disarm` follows the wait and `kill`
 /// precedes it.
-pub(crate) struct GroupGuard(Option<i32>);
+pub(crate) struct GroupGuard {
+    pgid: Option<i32>,
+    registry: &'static Mutex<Vec<i32>>,
+}
 
 impl GroupGuard {
     pub(crate) fn new(pgid: Option<i32>) -> Self {
+        Self::register(pgid, &LIVE_GROUPS)
+    }
+
+    pub(crate) fn shared_writer(pgid: Option<i32>) -> Self {
+        Self::register(pgid, &SHARED_WRITER_GROUPS)
+    }
+
+    fn register(pgid: Option<i32>, registry: &'static Mutex<Vec<i32>>) -> Self {
         if let Some(pgid) = pgid {
-            LIVE_GROUPS
+            registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(pgid);
         }
-        Self(pgid)
+        Self { pgid, registry }
     }
 
     pub(crate) fn disarm(&mut self) -> Option<i32> {
-        let pgid = self.0.take()?;
-        LIVE_GROUPS
+        let pgid = self.pgid.take()?;
+        self.registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|g| *g != pgid);

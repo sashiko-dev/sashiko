@@ -1170,6 +1170,13 @@ pub struct ReviewSettings {
     pub worktree_dir: Option<String>,
     #[serde(default = "default_review_timeout")]
     pub timeout_seconds: u64,
+    /// Deadline for one daemon preparation attempt, separate from AI execution.
+    /// Cleanup pauses this deadline and has its own bounded budget.
+    #[serde(default = "default_preparation_timeout")]
+    pub preparation_timeout_seconds: std::num::NonZeroU64,
+    /// Additional fresh-worktree attempts after a preparation timeout.
+    #[serde(default = "default_max_retries")]
+    pub preparation_max_retries: u32,
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     #[serde(default = "default_max_lines_changed")]
@@ -1282,6 +1289,11 @@ fn default_max_files_touched() -> usize {
 
 fn default_review_timeout() -> u64 {
     3600
+}
+
+fn default_preparation_timeout() -> std::num::NonZeroU64 {
+    // The constant default is statically nonzero.
+    std::num::NonZeroU64::new(1800).expect("1800 is nonzero")
 }
 
 fn default_max_retries() -> u32 {
@@ -1907,6 +1919,8 @@ mod tests {
         assert_eq!(settings.review.concurrency, 8);
         // Defaults, as they do for the daemon.
         assert_eq!(settings.review.timeout_seconds, 3600);
+        assert_eq!(settings.review.preparation_timeout_seconds.get(), 1800);
+        assert_eq!(settings.review.preparation_max_retries, 3);
         assert_eq!(settings.server.port, 8080);
         // And the sections it does not have read as absent rather than as an
         // error. The daemon checks for them itself.
@@ -1938,6 +1952,19 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn preparation_settings_require_a_positive_timeout() {
+        let parse =
+            |extra: &str| toml::from_str::<ReviewSettings>(&format!("concurrency = 1\n{extra}"));
+        assert!(parse("preparation_timeout_seconds = 0").is_err());
+        assert!(parse("preparation_timeout_seconds = -1").is_err());
+        let settings =
+            parse("preparation_timeout_seconds = 60\npreparation_max_retries = 0").unwrap();
+        assert_eq!(settings.preparation_timeout_seconds.get(), 60);
+        assert_eq!(settings.preparation_max_retries, 0);
+        assert_eq!(settings.max_retries, 3);
     }
 
     /// The daemon cannot run on a file a local review is happy with, and says so
