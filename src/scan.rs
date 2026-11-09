@@ -1835,7 +1835,8 @@ async fn submit_scan_candidates(
         )
         .with_project(crate::project::ProjectId::Linux)
         .with_settings(settings.linux_bug.clone())
-        .with_effort(options.effort.or_else(|| settings.effective_effort())),
+        .with_effort(options.effort.or_else(|| settings.effective_effort()))
+        .with_max_interactions(settings.ai.max_interactions),
     );
     let attributed_db = std::sync::Arc::new(attributed_db);
     let verify_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(options.concurrency.max(1)));

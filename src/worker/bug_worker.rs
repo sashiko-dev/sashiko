@@ -117,6 +117,7 @@ pub struct BugWorker {
     project: crate::project::ProjectId,
     settings: crate::settings::LinuxBugSettings,
     effort: Option<crate::ai::EffortMode>,
+    max_interactions: usize,
     /// Identifies this worker in the lease it takes, so that a lease which
     /// never gets released can be traced back to a process.
     worker_id: String,
@@ -136,6 +137,7 @@ impl BugWorker {
                 ..Default::default()
             },
             effort: None,
+            max_interactions: crate::workflows::linux_bug::DEFAULT_SECURITY_EVAL_MAX_TURNS,
             worker_id: format!(
                 "{}:{}",
                 std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string()),
@@ -164,6 +166,11 @@ impl BugWorker {
 
     pub fn with_effort(mut self, effort: Option<crate::ai::EffortMode>) -> Self {
         self.effort = effort;
+        self
+    }
+
+    pub fn with_max_interactions(mut self, max_interactions: usize) -> Self {
+        self.max_interactions = max_interactions.max(1);
         self
     }
 
@@ -783,13 +790,14 @@ impl BugWorker {
         );
 
         let eval_res = run_while_leased(
-            crate::workflows::linux_bug::evaluate_bug_security_for_project_with_effort(
+            crate::workflows::linux_bug::evaluate_bug_security_for_project_with_options(
                 self.provider.as_ref(),
                 repo_path,
                 bug,
                 effective_project,
                 cached_tm,
                 self.effort,
+                self.max_interactions,
             ),
             maintain_lease(
                 &scoped_db,
@@ -1827,8 +1835,14 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
             observed_efforts: std::sync::Mutex::new(Vec::new()),
         });
-        let worker = BugWorker::new(db.clone(), provider.clone(), String::new())
-            .with_effort(Some(crate::ai::EffortMode::High));
+        let default_worker = BugWorker::new(db.clone(), provider.clone(), String::new());
+        assert_eq!(
+            default_worker.max_interactions,
+            crate::workflows::linux_bug::DEFAULT_SECURITY_EVAL_MAX_TURNS
+        );
+        let worker = default_worker
+            .with_effort(Some(crate::ai::EffortMode::High))
+            .with_max_interactions(100);
 
         let dismissed_err = worker
             .evaluate_single_bug_security("linux-sec-dismissed")

@@ -1802,7 +1802,8 @@ async fn run_daemon(
             )
             .with_project(project)
             .with_settings(settings.linux_bug.clone())
-            .with_effort(settings.effective_effort()),
+            .with_effort(settings.effective_effort())
+            .with_max_interactions(settings.ai.max_interactions),
         );
         Some(spawn_supervised_worker("BugWorker", move || {
             let worker = Arc::clone(&bug_worker);
@@ -3705,7 +3706,8 @@ async fn handle_bugs_evaluate_security_command(
     )
     .with_project(project)
     .with_settings(settings.linux_bug.clone())
-    .with_effort(settings.effective_effort());
+    .with_effort(settings.effective_effort())
+    .with_max_interactions(settings.ai.max_interactions);
 
     exit_on_interrupt(false);
 
