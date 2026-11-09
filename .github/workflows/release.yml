@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Git tag to build and publish release tarballs for'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Release Tarballs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine Release Tag
+        id: vars
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.vars.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Ensure Packaging Script Exists
+        shell: bash
+        run: |
+          if [ ! -f ./scripts/package-release.sh ]; then
+            git checkout "${{ github.sha }}" -- \
+              scripts/package-release.sh
+          fi
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build and Package Release Tarballs
+        shell: bash
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          chmod +x ./scripts/package-release.sh
+          ./scripts/package-release.sh "$TAG"
+
+      - name: Publish GitHub Release and Assets
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; uploading assets..."
+            gh release upload "$TAG" dist/* --clobber
+          else
+            echo "Creating release $TAG..."
+            gh release create "$TAG" \
+              --title "Sashiko ${TAG}" \
+              --generate-notes \
+              dist/*
+          fi
