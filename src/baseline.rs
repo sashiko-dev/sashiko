@@ -1774,6 +1774,8 @@ F: patterns/
                 branch_patterns: Some(vec!["6.18/*".to_string()]),
             }]),
             repo_path: client_path.to_path_buf(),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: None,
         };
 
@@ -1860,6 +1862,8 @@ F: patterns/
                 branch_patterns: Some(vec!["6.18/*".to_string()]),
             }]),
             repo_path: client_path.to_path_buf(),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: None,
         };
 
@@ -1896,6 +1900,8 @@ F: patterns/
                 branch_patterns: Some(vec![]),
             }]),
             repo_path: repo_path.to_path_buf(),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: None,
         };
 
