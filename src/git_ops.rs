@@ -70,6 +70,19 @@ impl GitWorktree {
         if commit_hash.is_empty() || commit_hash.starts_with('-') {
             return Err(anyhow!("Invalid commit revision: {}", commit_hash));
         }
+        let mut worktree = Self::allocate(repo_path, parent_dir).await?;
+        if let Err(error) = worktree.populate(commit_hash).await {
+            if let Err(cleanup_error) = worktree.remove().await {
+                warn!("Failed to clean up unpopulated worktree: {}", cleanup_error);
+            }
+            return Err(error);
+        }
+        Ok(worktree)
+    }
+
+    /// Allocate before starting cancellable Git operations so the caller can
+    /// retain ownership and explicitly clean up an interrupted checkout.
+    pub(crate) async fn allocate(repo_path: &Path, parent_dir: Option<&Path>) -> Result<Self> {
         let parent_owned = parent_dir.map(|p| p.to_path_buf());
         let temp_dir = tokio::task::spawn_blocking(move || -> Result<TempDir> {
             if let Some(parent) = parent_owned {
@@ -85,102 +98,67 @@ impl GitWorktree {
         })
         .await??;
         let path = temp_dir.path().to_path_buf();
-        // Wrap temp_dir in GitWorktree before the first await after creation so
-        // any error or cancellation during setup offloads TempDir cleanup (and
-        // worktree unregistration once registered) via Drop::drop.
-        let mut worktree = Self {
+        Ok(Self {
             dir: Some(temp_dir),
-            path: path.clone(),
+            path,
             repo_path: repo_path.to_path_buf(),
             is_managed: false,
-        };
+        })
+    }
 
-        debug!("Creating worktree at {:?}", path);
+    /// Register and populate a newly allocated worktree. On error or future
+    /// cancellation, the owner must call remove before reusing its resources.
+    pub(crate) async fn populate(&mut self, commit_hash: &str) -> Result<()> {
+        if commit_hash.is_empty() || commit_hash.starts_with('-') {
+            return Err(anyhow!("Invalid commit revision: {}", commit_hash));
+        }
+        debug!("Creating worktree at {:?}", self.path);
 
         // Split worktree creation into two phases:
         // 1) metadata update (under lock, fast)
         // 2) file checkout (no lock, parallelizable)
-        let add_res = {
+        let output = {
             let lock = get_worktree_lock();
             let _guard = lock.lock().await;
-            worktree.is_managed = true;
-            crate::git_cmd::in_dir_async(repo_path)
+            self.is_managed = true;
+            crate::git_cmd::in_dir_async(&self.repo_path)
                 .args(["-c", "safe.bareRepository=all"])
                 .arg("worktree")
                 .arg("add")
                 .arg("--detach")
                 .arg("--no-checkout")
                 .arg("--")
-                .arg(&path)
+                .arg(&self.path)
                 .arg(commit_hash)
                 .output()
-                .await
-        };
-
-        let output = match add_res {
-            Ok(out) => out,
-            Err(e) => {
-                if let Err(cleanup_err) = worktree.remove().await {
-                    warn!(
-                        "Failed to clean up worktree {:?} after worktree add I/O error: {}",
-                        path, cleanup_err
-                    );
-                }
-                return Err(e.into());
-            }
+                .await?
         };
 
         if !output.status.success() {
-            let err = anyhow!(
+            return Err(anyhow!(
                 "Failed to create worktree: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
-            );
-            if let Err(cleanup_err) = worktree.remove().await {
-                warn!(
-                    "Failed to clean up worktree {:?} after failed add: {}",
-                    path, cleanup_err
-                );
-            }
-            return Err(err);
+            ));
         }
 
         // `commit_hash` is verified not to start with `-` above, and trailing
         // `--` prevents it from being interpreted as a pathspec on both
         // Git 2.39 and newer releases (`git reset` on Git 2.39 rejects
         // `--end-of-options`).
-        let output = match crate::git_cmd::in_dir_async(&path)
+        let output = crate::git_cmd::in_dir_async(&self.path)
             .args(["-c", "safe.bareRepository=all"])
             .args(["reset", "--hard", commit_hash, "--"])
             .output()
-            .await
-        {
-            Ok(out) => out,
-            Err(e) => {
-                if let Err(cleanup_err) = worktree.remove().await {
-                    warn!(
-                        "Failed to clean up worktree {:?} after reset I/O error: {}",
-                        path, cleanup_err
-                    );
-                }
-                return Err(e.into());
-            }
-        };
+            .await?;
 
         if !output.status.success() {
-            let err = anyhow!(
+            return Err(anyhow!(
                 "Failed to populate worktree: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
-            );
-            if let Err(cleanup_err) = worktree.remove().await {
-                warn!(
-                    "Failed to clean up worktree {:?} after failed reset: {}",
-                    path, cleanup_err
-                );
-            }
-            return Err(err);
+            ));
         }
 
-        Ok(worktree)
+        Ok(())
     }
 
     pub async fn new_scratch_clone(
@@ -2282,6 +2260,53 @@ mod tests {
         run_test_git(repo.path(), &["add", "value.txt"]).await?;
         run_test_git(repo.path(), &["commit", "-q", "-s", "-m", "base"]).await?;
         Ok(repo)
+    }
+
+    #[tokio::test]
+    async fn allocated_worktree_survives_cancelled_population() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        let parent = tempfile::tempdir()?;
+        let mut worktree = GitWorktree::allocate(repo.path(), Some(parent.path())).await?;
+        let path = worktree.path.clone();
+        let lock = get_worktree_lock();
+        let guard = lock.lock().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                worktree.populate("HEAD"),
+            )
+            .await
+            .is_err()
+        );
+        drop(guard);
+        assert!(path.exists(), "the caller still owns the checkout");
+        worktree.remove().await?;
+        assert!(!path.exists());
+
+        let mut next = GitWorktree::allocate(repo.path(), Some(parent.path())).await?;
+        assert_ne!(path, next.path);
+        next.populate("HEAD").await?;
+        assert_eq!(
+            std::fs::read_to_string(next.path.join("value.txt"))?,
+            "base\n"
+        );
+        next.remove().await?;
+        assert_eq!(std::fs::read_dir(parent.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn allocated_worktree_cleans_up_population_error() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        let parent = tempfile::tempdir()?;
+        let mut worktree = GitWorktree::allocate(repo.path(), Some(parent.path())).await?;
+        let path = worktree.path.clone();
+        assert!(worktree.populate("missing-ref").await.is_err());
+        worktree.remove().await?;
+        assert!(!path.exists());
+        let registered = run_test_git(repo.path(), &["worktree", "list", "--porcelain"]).await?;
+        assert!(!registered.contains(&path.to_string_lossy().to_string()));
+        Ok(())
     }
 
     #[tokio::test]
