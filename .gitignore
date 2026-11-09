@@ -6,6 +6,7 @@
 *.db.bak
 .cargo/config.toml
 target/
+dist/
 archives/
 third_party/linux/
 third_party/sashiko/
