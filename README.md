@@ -71,7 +71,7 @@ Local review reads each commit in the range from git, without a scratch clone or
 
 ### Review Quality
 
-In benchmarks against the last 1,000 unfiltered upstream commits with `Fixes:` tags, Sashiko (with Gemini 4 Argon, high reasoning effort) detected **67.3%** of bugs that had originally passed human review and been merged into mainline. Based on manual sampling, the false-positive rate is under **20%** (mostly gray-area concerns).
+In benchmarks against the last 1,000 unfiltered upstream commits with `Fixes:` tags, Sashiko (with Gemini 4 Argon, high reasoning effort) detected **67.5%** of bugs that had originally passed human review and been merged into mainline. Based on manual sampling, the false-positive rate is under **20%** (mostly gray-area concerns).
 
 As with any LLM-based tool, Sashiko's output is probabilistic and may vary across runs on the same input.
 
