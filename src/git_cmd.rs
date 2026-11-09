@@ -103,12 +103,281 @@ pub fn detached_async() -> tokio::process::Command {
     command
 }
 
+tokio::task_local! {
+    static ISOLATE_PROCESSES: ();
+}
+
+/// Daemon preparation owns its Git hooks and transports. Other callers retain
+/// the foreground process group for terminal prompts and terminal signals.
+#[allow(dead_code)]
+pub(crate) async fn with_isolated_processes<F: std::future::Future>(future: F) -> F::Output {
+    ISOLATE_PROCESSES.scope((), future).await
+}
+
+pub(crate) fn processes_are_isolated() -> bool {
+    ISOLATE_PROCESSES.try_with(|_| ()).is_ok()
+}
+
+/// Observe exit without releasing the leader's PID, then stop any descendants
+/// still holding pipes before reaping it. Waiting for EOF first can deadlock
+/// with a hook waiting for the Git process to disappear.
+async fn wait_for_exit(
+    child: &mut tokio::process::Child,
+    group: &mut crate::process_group::GroupGuard,
+    isolated: bool,
+) -> std::io::Result<std::process::ExitStatus> {
+    if isolated {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        let pid = child
+            .id()
+            .and_then(|id| Pid::from_raw(id as i32))
+            .ok_or_else(|| std::io::Error::other("Git child has no PID"))?;
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+        loop {
+            match waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            ) {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    signal.recv().await;
+                }
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        // The unreaped leader still reserves the group ID. No group signal
+        // may follow child.wait(), which releases that reservation.
+        group.kill();
+    }
+    child.wait().await
+}
+
+/// Feed stdin, drain both output pipes, and observe exit concurrently. Only
+/// daemon preparation isolates the process group; cancellation elsewhere keeps
+/// the existing kill-on-drop policy without changing terminal job control.
+pub(crate) async fn output(
+    command: &mut tokio::process::Command,
+    input: Option<&[u8]>,
+) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let isolated = processes_are_isolated();
+    let mut child = if isolated {
+        crate::process_group::spawn(command)?
+    } else {
+        command.spawn()?
+    };
+    let mut group =
+        crate::process_group::GroupGuard::new(child.id().filter(|_| isolated).map(|id| id as i32));
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let write = async move {
+        let result = match (stdin, input) {
+            (Some(mut stdin), Some(input)) => stdin.write_all(input).await,
+            _ => Ok(()),
+        };
+        // A rejected patch can close stdin early. Collect its exit status and
+        // stderr before deciding whether BrokenPipe is an operation error.
+        Ok::<_, std::io::Error>(result)
+    };
+    let read = async {
+        let (Some(mut stdout), Some(mut stderr)) = (stdout, stderr) else {
+            return Err(std::io::Error::other("Git output pipes are missing"));
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        tokio::try_join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err))?;
+        Ok::<_, std::io::Error>((out, err))
+    };
+    let (write_result, (stdout, stderr), status) =
+        tokio::try_join!(write, read, wait_for_exit(&mut child, &mut group, isolated))?;
+    if let Err(error) = write_result
+        && (error.kind() != std::io::ErrorKind::BrokenPipe || status.success())
+    {
+        return Err(error);
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+pub(crate) trait GitCommandExt {
+    fn output_cancellable(
+        &mut self,
+    ) -> impl std::future::Future<Output = std::io::Result<std::process::Output>> + Send;
+}
+
+impl GitCommandExt for tokio::process::Command {
+    fn output_cancellable(
+        &mut self,
+    ) -> impl std::future::Future<Output = std::io::Result<std::process::Output>> + Send {
+        output(self, None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::ffi::OsStr;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn cancellable_output_drains_while_writing_input() -> anyhow::Result<()> {
+        let repo = tempfile::tempdir()?;
+        let mut command = in_dir_async(repo.path());
+        command.args([
+            "-c",
+            "alias.pipe-test=!head -c 262144 /dev/zero; cat >/dev/null",
+            "pipe-test",
+        ]);
+        let input = vec![b'x'; 262144];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            with_isolated_processes(output(&mut command, Some(&input))),
+        )
+        .await??;
+        assert!(result.status.success());
+        assert_eq!(result.stdout.len(), 262144);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn early_stdin_close_preserves_failure_but_rejects_incomplete_success()
+    -> anyhow::Result<()> {
+        let input = vec![b'x'; 1024 * 1024];
+        for isolated in [false, true] {
+            for exit in [0, 42] {
+                let mut command = tokio::process::Command::new("sh");
+                command.kill_on_drop(true).args([
+                    "-c",
+                    &format!(
+                        "exec 0<&-; printf stdout-marker; printf stderr-marker >&2; exit {exit}"
+                    ),
+                ]);
+                let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    if isolated {
+                        with_isolated_processes(output(&mut command, Some(&input))).await
+                    } else {
+                        output(&mut command, Some(&input)).await
+                    }
+                })
+                .await?;
+                if exit == 0 {
+                    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+                } else {
+                    let result = result?;
+                    assert_eq!(result.status.code(), Some(exit));
+                    assert_eq!(result.stdout, b"stdout-marker");
+                    assert_eq!(result.stderr, b"stderr-marker");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_isolation_is_scoped_to_preparation() -> anyhow::Result<()> {
+        for isolated in [false, true] {
+            let mut command = tokio::process::Command::new("sh");
+            command.args(["-c", "ps -o pgid= -p $$"]);
+            let result = if isolated {
+                with_isolated_processes(output(&mut command, None)).await?
+            } else {
+                output(&mut command, None).await?
+            };
+            assert!(result.status.success());
+            let group: i32 = String::from_utf8(result.stdout)?.trim().parse()?;
+            assert_eq!(group != rustix::process::getpgrp().as_raw_pid(), isolated);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exit_is_observed_while_descendants_hold_output_pipes() -> anyhow::Result<()> {
+        for isolated in [false, true] {
+            let mut command = tokio::process::Command::new("sh");
+            command.kill_on_drop(true).args([
+                "-c",
+                "parent=$$; (while kill -0 \"$parent\" 2>/dev/null; do sleep .01; done) & printf done",
+            ]);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                if isolated {
+                    with_isolated_processes(output(&mut command, None)).await
+                } else {
+                    output(&mut command, None).await
+                }
+            })
+            .await??;
+            assert!(result.status.success());
+            assert_eq!(result.stdout, b"done");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_kills_descendants_and_unregisters_the_group() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let pids_path = directory.path().join("pids");
+        let mut command = tokio::process::Command::new("sh");
+        command.env("PID_FILE", &pids_path).args([
+            "-c",
+            "sleep 300 & child=$!; printf '%s %s\\n' \"$$\" \"$child\" > \"$PID_FILE\"; wait",
+        ]);
+        let pids = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            tokio::select! {
+                result = with_isolated_processes(output(&mut command, None)) => {
+                    panic!("stalled command returned: {result:?}");
+                }
+                pids = async {
+                    loop {
+                        let pids: Vec<i32> = std::fs::read_to_string(&pids_path)
+                            .unwrap_or_default().split_whitespace()
+                            .filter_map(|pid| pid.parse().ok()).collect();
+                        if pids.len() == 2 { break pids; }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                } => pids,
+            }
+        })
+        .await?;
+        assert!(
+            !crate::process_group::LIVE_GROUPS
+                .lock()
+                .unwrap()
+                .contains(&pids[0])
+        );
+        for pid in pids {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+                    if stat.is_err()
+                        || stat.is_ok_and(|s| {
+                            s.rsplit_once(") ")
+                                .is_some_and(|(_, rest)| rest.starts_with('Z'))
+                        })
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+        }
+        Ok(())
+    }
 
     /// The marker that must only ever appear in this module.
     const RAW_CONSTRUCTOR: &str = "Command::new(\"git\")";

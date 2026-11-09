@@ -27,12 +27,11 @@
 //! otherwise names whichever provider the code happens to live next to.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::Value;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tracing::{debug, warn};
 
 use crate::ai::{AiRequest, AiResponse, AiRole, AiUsage, ToolCall};
@@ -200,90 +199,10 @@ impl std::fmt::Display for CliIoError {
     }
 }
 
-/// Spawn a CLI in a process group of its own, so a timeout can take down the
-/// whole tree.
-///
-/// `codex` and `copilot` install as node wrappers that run the real binary as
-/// a grandchild.  Killing the child alone leaves that grandchild attached to
-/// the same pipes and billing against the same subscription until it notices
-/// they are gone, which measured at over a minute past the kill.  A group of
-/// its own also keeps the CLI off this process's group, so a signal aimed at
-/// the daemon's terminal does not reach a review mid-flight.
-///
-/// `write_prompt_and_wait()` signals the group this establishes; a child
-/// spawned any other way must not be passed to it.
-pub fn spawn_cli(cmd: &mut Command) -> std::io::Result<Child> {
-    cmd.process_group(0).kill_on_drop(true).spawn()
-}
-
-/// Signal the whole group, having spawned its leader with `process_group(0)`
-/// so that the group holds the CLI and its descendants and nothing else.
-fn kill_group(pgid: i32) {
-    // Guard `pgid > 1` so `kill_process_group` (`kill(-pgid, SIGKILL)`) can
-    // never target the caller's group (`0`), all user processes (`1`), or a
-    // negated PID.
-    if pgid > 1
-        && let Some(pid) = rustix::process::Pid::from_raw(pgid)
-    {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
-}
-
-/// The groups of every CLI still running, for a shutdown that never unwinds.
-static LIVE_GROUPS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
-
-/// Kill every CLI group still running.
-///
-/// For a signal handler that exits the process without dropping the futures
-/// holding the children.  `spawn_cli` puts the CLI in a group of its own, so
-/// a Ctrl-C aimed at the terminal no longer reaches it, and the drop path of
-/// `write_prompt_and_wait()` never runs on `std::process::exit`.
-pub fn kill_live_groups() {
-    let groups = std::mem::take(&mut *LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner()));
-    for pgid in groups {
-        kill_group(pgid);
-    }
-}
-
-/// Kills the group on drop unless the child was reaped first.
-///
-/// The group must not be signalled once its leader has been reaped, because
-/// the pid is then free for reuse, so `disarm` follows the wait and `kill`
-/// precedes it.
-struct GroupGuard(Option<i32>);
-
-impl GroupGuard {
-    fn new(pgid: Option<i32>) -> Self {
-        if let Some(pgid) = pgid {
-            LIVE_GROUPS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(pgid);
-        }
-        Self(pgid)
-    }
-
-    fn disarm(&mut self) -> Option<i32> {
-        let pgid = self.0.take()?;
-        LIVE_GROUPS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|g| *g != pgid);
-        Some(pgid)
-    }
-
-    fn kill(&mut self) {
-        if let Some(pgid) = self.disarm() {
-            kill_group(pgid);
-        }
-    }
-}
-
-impl Drop for GroupGuard {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
+use crate::process_group::GroupGuard;
+#[cfg(test)]
+use crate::process_group::{LIVE_GROUPS, kill_group};
+pub use crate::process_group::{kill_live_groups, spawn as spawn_cli};
 
 /// End a child the drain has given up on, and reap it.
 ///

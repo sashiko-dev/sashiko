@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::git_cmd::GitCommandExt;
 use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
@@ -130,7 +131,7 @@ impl GitWorktree {
                 .arg("--")
                 .arg(&self.path)
                 .arg(commit_hash)
-                .output()
+                .output_cancellable()
                 .await?
         };
 
@@ -148,7 +149,7 @@ impl GitWorktree {
         let output = crate::git_cmd::in_dir_async(&self.path)
             .args(["-c", "safe.bareRepository=all"])
             .args(["reset", "--hard", commit_hash, "--"])
-            .output()
+            .output_cancellable()
             .await?;
 
         if !output.status.success() {
@@ -289,19 +290,7 @@ impl GitWorktree {
         if three_way {
             cmd.arg("--3way");
         }
-        let mut child = cmd
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(patch_content.as_bytes()).await?;
-        }
-
-        Ok(child.wait_with_output().await?)
+        Ok(crate::git_cmd::output(&mut cmd, Some(patch_content.as_bytes())).await?)
     }
 
     async fn abort_git_am(&self) {
@@ -309,7 +298,7 @@ impl GitWorktree {
             .args(["-c", "safe.bareRepository=all"])
             .arg("am")
             .arg("--abort")
-            .output()
+            .output_cancellable()
             .await;
     }
 
@@ -417,7 +406,7 @@ impl GitWorktree {
         debug!("Resetting worktree to {}", ref_name);
         let output = crate::git_cmd::in_dir_async(&self.path)
             .args(["reset", "--hard", ref_name])
-            .output()
+            .output_cancellable()
             .await?;
 
         if !output.status.success() {
@@ -430,7 +419,7 @@ impl GitWorktree {
         // Also clean untracked files to be safe
         let clean_output = crate::git_cmd::in_dir_async(&self.path)
             .args(["clean", "-fdx"])
-            .output()
+            .output_cancellable()
             .await?;
 
         if !clean_output.status.success() {
@@ -486,7 +475,7 @@ impl GitWorktree {
                 .arg("-f")
                 .arg("--")
                 .arg(&self.path)
-                .output()
+                .output_cancellable()
                 .await?;
             if rm_out.status.success() {
                 rm_out
@@ -499,7 +488,7 @@ impl GitWorktree {
                 crate::git_cmd::in_dir_async(&self.repo_path)
                     .args(["-c", "safe.bareRepository=all"])
                     .args(["worktree", "prune"])
-                    .output()
+                    .output_cancellable()
                     .await?
             }
         };
@@ -1127,7 +1116,7 @@ fn get_global_config_lock() -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
-fn get_worktree_lock() -> Arc<AsyncMutex<()>> {
+pub(crate) fn get_worktree_lock() -> Arc<AsyncMutex<()>> {
     static WORKTREE_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
     WORKTREE_LOCK
         .get_or_init(|| Arc::new(AsyncMutex::new(())))
@@ -1188,11 +1177,11 @@ async fn fetch_remote(
     args: &[&str],
     timeout: std::time::Duration,
 ) -> std::result::Result<(), String> {
-    let fetch_future = crate::git_cmd::in_dir_async(repo_path)
+    let mut command = crate::git_cmd::in_dir_async(repo_path);
+    let fetch_future = command
         .args(GIT_PROTOCOL_RESTRICTIONS)
         .args(args)
-        .kill_on_drop(true)
-        .output();
+        .output_cancellable();
 
     match tokio::time::timeout(timeout, fetch_future).await {
         Ok(Ok(fetch)) => {
@@ -1974,7 +1963,7 @@ pub async fn get_commit_hash(path: &Path, ref_name: &str) -> Result<String> {
     let output = crate::git_cmd::in_dir_async(path)
         .args(["rev-parse", "--verify", "--end-of-options"])
         .arg(format!("{ref_name}^{{commit}}"))
-        .output()
+        .output_cancellable()
         .await?;
 
     if output.status.success() {
