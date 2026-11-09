@@ -432,8 +432,7 @@ impl GitWorktree {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub async fn remove(mut self) -> Result<()> {
+    pub(crate) async fn remove_directory(&mut self) -> Result<()> {
         // Delete the checkout directory on the blocking pool before acquiring
         // `get_worktree_lock()` so recursive filesystem deletion runs
         // concurrently without holding the global worktree mutex. Because
@@ -443,25 +442,28 @@ impl GitWorktree {
         // after `dir.close()` and only needs to unlink the small
         // `$GIT_DIR/worktrees/<name>` administrative entry.
         if let Some(dir) = self.dir.take() {
-            let path = self.path.clone();
-            match tokio::task::spawn_blocking(move || dir.close()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Ok(Err(e)) => {
-                    warn!(
-                        "Failed to remove temporary worktree directory {:?}: {}",
-                        path, e
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Blocking task removing temporary worktree directory {:?} failed: {}",
-                        path, e
-                    );
-                }
+            match tokio::task::spawn_blocking(move || dir.close()).await? {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Pruning metadata cannot make failed filesystem cleanup a
+                // success. Callers must not start another attempt after this.
+                Err(e) => return Err(e.into()),
             }
         }
-        if !std::mem::replace(&mut self.is_managed, false) {
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn remove(mut self) -> Result<()> {
+        let directory = self.remove_directory().await;
+        // Even a failed checkout deletion must not skip unregistering it.
+        // Preserve that failure so callers do not retry into another checkout.
+        let registration = self.remove_registration().await;
+        directory.and(registration)
+    }
+
+    async fn remove_registration(&mut self) -> Result<()> {
+        if !self.is_managed {
             return Ok(());
         }
         debug!("Removing worktree at {:?}", self.path);
@@ -499,6 +501,7 @@ impl GitWorktree {
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
+        self.is_managed = false;
         Ok(())
     }
 }
@@ -2295,6 +2298,29 @@ mod tests {
         assert!(!path.exists());
         let registered = run_test_git(repo.path(), &["worktree", "list", "--porcelain"]).await?;
         assert!(!registered.contains(&path.to_string_lossy().to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_directory_cleanup_is_not_reported_as_success() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        let parent = tempfile::tempdir()?;
+        for managed in [false, true] {
+            let mut worktree = GitWorktree::allocate(repo.path(), Some(parent.path())).await?;
+            if managed {
+                worktree.populate("HEAD").await?;
+            }
+            let path = worktree.path.clone();
+            // A non-directory deterministically makes TempDir::close fail,
+            // including when the test is run with elevated filesystem access.
+            std::fs::remove_dir_all(&path)?;
+            std::fs::write(&path, b"not a directory")?;
+            assert!(worktree.remove().await.is_err());
+            assert!(path.is_file());
+            let registered =
+                run_test_git(repo.path(), &["worktree", "list", "--porcelain"]).await?;
+            assert!(!registered.contains(&path.to_string_lossy().to_string()));
+        }
         Ok(())
     }
 
