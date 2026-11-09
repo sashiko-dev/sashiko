@@ -5610,6 +5610,11 @@ impl LlmSession for SecurityEvalSession<'_> {
     }
 }
 
+/// Default turn budget for [`SecurityEvalSession`], matching Sashiko's default
+/// `ai.max_interactions` (`100`).
+#[cfg(feature = "server")]
+pub const DEFAULT_SECURITY_EVAL_MAX_TURNS: usize = 100;
+
 /// Evaluates the security importance and deterministic CVSS v4.0 score of a
 /// canonical `Bug` against the repository source code at its pre-fix commit.
 #[cfg(feature = "server")]
@@ -5620,13 +5625,14 @@ pub async fn evaluate_bug_security_for_project(
     project: ProjectId,
     cached_threat_model: Option<&crate::threat_model::KernelThreatModel>,
 ) -> Result<crate::ai::session::SessionResult<crate::security_eval::SecurityEvaluation>> {
-    evaluate_bug_security_for_project_with_effort(
+    evaluate_bug_security_for_project_with_options(
         provider,
         repo_path,
         bug,
         project,
         cached_threat_model,
         None,
+        DEFAULT_SECURITY_EVAL_MAX_TURNS,
     )
     .await
 }
@@ -5641,6 +5647,30 @@ pub async fn evaluate_bug_security_for_project_with_effort(
     project: ProjectId,
     cached_threat_model: Option<&crate::threat_model::KernelThreatModel>,
     effort: Option<crate::ai::EffortMode>,
+) -> Result<crate::ai::session::SessionResult<crate::security_eval::SecurityEvaluation>> {
+    evaluate_bug_security_for_project_with_options(
+        provider,
+        repo_path,
+        bug,
+        project,
+        cached_threat_model,
+        effort,
+        DEFAULT_SECURITY_EVAL_MAX_TURNS,
+    )
+    .await
+}
+
+/// Evaluates the security importance and deterministic CVSS v4.0 score of a
+/// canonical `Bug` with explicit effort and `max_turns` (`ai.max_interactions`).
+#[cfg(feature = "server")]
+pub async fn evaluate_bug_security_for_project_with_options(
+    provider: &dyn AiProvider,
+    repo_path: &std::path::Path,
+    bug: &Bug,
+    project: ProjectId,
+    cached_threat_model: Option<&crate::threat_model::KernelThreatModel>,
+    effort: Option<crate::ai::EffortMode>,
+    max_turns: usize,
 ) -> Result<crate::ai::session::SessionResult<crate::security_eval::SecurityEvaluation>> {
     let files = extract_security_eval_files(bug);
     let eval_sha = if repo_path.as_os_str().is_empty() || !repo_path.exists() {
@@ -5691,16 +5721,8 @@ pub async fn evaluate_bug_security_for_project_with_effort(
         reasoning_effort: effort.map(crate::ai::EffortMode::verification_stage_effort),
     };
 
-    let runner = SessionRunner::new(provider).with_max_turns(5);
-    const SECURITY_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-    tokio::time::timeout(SECURITY_EVAL_TIMEOUT, runner.run(&mut session))
-        .await
-        .with_context(|| {
-            format!(
-                "Security evaluation for bug {} timed out after {:?}",
-                bug.bugid, SECURITY_EVAL_TIMEOUT
-            )
-        })?
+    let runner = SessionRunner::new(provider).with_max_turns(max_turns.max(1));
+    runner.run(&mut session).await
 }
 
 #[cfg(all(test, feature = "server"))]
