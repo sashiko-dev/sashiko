@@ -587,6 +587,7 @@ impl BugWorker {
             crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug:security_eval",
             crate::project::ProjectId::Gcc => "sashiko:gcc_bug:security_eval",
             crate::project::ProjectId::Qemu => "sashiko:qemu_bug:security_eval",
+            crate::project::ProjectId::Zephyr => "sashiko:zephyr_bug:security_eval",
         }
     }
 
