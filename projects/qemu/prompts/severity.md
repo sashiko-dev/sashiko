@@ -63,6 +63,9 @@ auditable.
       in a state the guest can observe as wrong.
     - Missing vmstate field versioning or a subsection guard that breaks
       incoming migration for a supported machine type.
+    - Missing or clearly broken `Signed-off-by` trailer in the commit message
+      (missing DCO sign-off, missing or placeholder email address, bot identity,
+      or handle/username instead of a real human name).
 
 ## Medium
 
@@ -74,8 +77,7 @@ auditable.
     - A boundary condition mishandled only for rare but valid values.
     - `Error **errp` set after a failure return on a path whose failure a
       caller cannot currently observe.
-    - Commit hygiene: missing `Signed-off-by`, or a body that restates the
-      diff without explaining why.
+    - Commit hygiene: a body that restates the diff without explaining why.
 
 ## Low
 
