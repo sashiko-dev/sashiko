@@ -55,6 +55,7 @@ fn request_with_content(content: String) -> AiRequest {
         response_format: None,
         context_tag: None,
         reasoning_effort: None,
+        conversation_id: None,
     }
 }
 

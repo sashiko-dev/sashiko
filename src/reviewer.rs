@@ -5225,6 +5225,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
                                 response_format: None,
                                 context_tag: None,
                                 reasoning_effort: None,
+                                conversation_id: None,
                             })
                             .await?;
 
@@ -5297,6 +5298,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             response_format: None,
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         };
         let line = serde_json::to_string(&crate::ai::forget_envelope(&request))?;
         let mock_script = format!(
@@ -6032,9 +6034,6 @@ fi
     }
 
     async fn run_two_request_mock(settings: Settings, provider: Arc<dyn AiProvider>) -> Result<()> {
-        let temp_dir = tempdir()?;
-        let bin_path = temp_dir.path().join("mock_review");
-
         // Mock binary: sends two consecutive AI requests then a final result.
         let mock_script = r#"#!/bin/bash
 read -r input || exit 1
@@ -6046,6 +6045,17 @@ read -r ai_response || exit 1
 case "$ai_response" in *'"type":"error"'*) while read -r _; do :; done; exit 1 ;; esac
 echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
 "#;
+        run_mock_child(settings, provider, mock_script).await
+    }
+
+    /// Runs the parent side of a review against a scripted child.
+    async fn run_mock_child(
+        settings: Settings,
+        provider: Arc<dyn AiProvider>,
+        mock_script: &str,
+    ) -> Result<()> {
+        let temp_dir = tempdir()?;
+        let bin_path = temp_dir.path().join("mock_review");
         crate::test_support::write_executable_script(&bin_path, mock_script);
 
         let db = Arc::new(Database::new(&settings.database).await?);
@@ -6098,6 +6108,58 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
         )
         .await
         .map(|_| ())
+    }
+
+    /// Records the conversation ID of every request the parent forwards.
+    #[derive(Default)]
+    struct ConversationIdRecorder {
+        ids: std::sync::Mutex<Vec<Option<uuid::Uuid>>>,
+    }
+
+    #[async_trait]
+    impl AiProvider for ConversationIdRecorder {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.ids.lock().unwrap().push(request.conversation_id);
+            Ok(AiResponse {
+                content: Some("ok".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parent_forwards_the_child_conversation_id() -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        let id = uuid::Uuid::new_v4();
+        let script = format!(
+            r#"#!/bin/bash
+read -r input || exit 1
+echo '{{"type": "ai_request", "tx_id": 1, "payload": {{"messages": [{{"role": "user", "content": "first"}}], "conversation_id": "{id}"}}}}'
+read -r ai_response || exit 1
+echo '{{"type": "ai_request", "tx_id": 2, "payload": {{"messages": [{{"role": "user", "content": "second"}}]}}}}'
+read -r ai_response || exit 1
+echo '{{"patchset_id": 1, "patches": [{{"index": 1, "status": "applied"}}]}}'
+"#
+        );
+        let provider = Arc::new(ConversationIdRecorder::default());
+
+        run_mock_child(settings, provider.clone(), &script).await?;
+
+        let ids = provider.ids.lock().unwrap().clone();
+        assert_eq!(ids, vec![Some(id), None]);
+        Ok(())
     }
 
     #[tokio::test]

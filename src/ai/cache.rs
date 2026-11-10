@@ -125,6 +125,9 @@ impl CachingAiProvider {
         // Strip nondeterministic fields
         if let serde_json::Value::Object(ref mut map) = val {
             map.remove("context_tag");
+            // Ignore the conversation ID so identical requests from different
+            // conversations share a cache key.
+            map.remove("conversation_id");
             // The system prompt's date would make every day's keys differ. Only
             // the first date is today's: a later one is part of the patch.
             if let Some(system) = map.get_mut("system")
@@ -866,6 +869,32 @@ mod tests {
             2,
             "a replaying run is served the recorded answer"
         );
+    }
+
+    #[tokio::test]
+    async fn test_the_conversation_id_does_not_reach_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("response_cache.db");
+        let provider = CachingAiProvider::new(
+            Arc::new(RejectedAnswers {
+                calls: Arc::new(AtomicU64::new(0)),
+            }),
+            path.to_str().unwrap(),
+            30,
+        )
+        .await
+        .unwrap();
+        let key = |conversation_id: Option<uuid::Uuid>| {
+            provider.compute_cache_key(&AiRequest {
+                system: Some("Review this.".to_string()),
+                conversation_id,
+                ..Default::default()
+            })
+        };
+
+        let unset = key(None);
+        assert_eq!(key(Some(uuid::Uuid::new_v4())), unset);
+        assert_eq!(key(Some(uuid::Uuid::new_v4())), unset);
     }
 
     #[tokio::test]
