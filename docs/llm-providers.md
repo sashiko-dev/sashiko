@@ -641,6 +641,25 @@ extraData = { clientName = "sashiko", sessionId = "review" }
 Unlike header values, body fields are read from the settings file, so
 do not put credentials in them.
 
+**Services that cache prompts per replica:**
+
+Each turn of a review stage resends the previous turn's input, so a
+service with prompt caching can serve most of it from cache. Some
+services keep that cache on each replica, and they route requests that
+share a value in a client-supplied header to the same replica. If your
+provider documents such a header, name it under `[ai.openai_compat]`:
+
+```toml
+[ai.openai_compat]
+session_affinity_header = "x-session-affinity"
+```
+
+Each stage conversation then sends its own random ID in that header,
+in the form `sashiko-conversation-<uuid>`. The ID stays the same for
+every turn and retry of the conversation. It never appears in the prompt
+or in the response cache key, so enabling the setting keeps cached
+responses valid.
+
 `api` in the same table picks the endpoint. It defaults to `"chat"`,
 which is `/v1/chat/completions` and the only endpoint a third-party
 compatible provider serves. Set it to `"responses"` to reach OpenAI's
@@ -666,7 +685,8 @@ per endpoint, so a project can be told it has no access to the gpt-5.4
 family on chat completions while `/v1/responses` answers normally.
 Everything else in `[ai.openai_compat]` applies to both, except
 `send_reasoning_content`, `send_empty_tool_call_content`,
-`extra_headers`, and `extra_body`, which shape a chat completion only.
+`extra_headers`, `session_affinity_header`, and `extra_body`, which shape
+a chat completion only.
 Setting any of them with `api = "responses"` is refused at startup
 rather than ignored.
 
