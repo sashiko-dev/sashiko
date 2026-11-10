@@ -528,6 +528,7 @@ mod tests {
                 response_format: None,
                 context_tag: None,
                 reasoning_effort: None,
+                conversation_id: None,
             },
             false,
             1024,
@@ -835,6 +836,7 @@ mod tests {
             response_format: None,
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         };
 
         let vertex_req = claude_request_body(&ai_req, false, 4096, None, None).unwrap();
@@ -869,6 +871,7 @@ mod tests {
             response_format: None,
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         };
 
         let vertex_req = claude_request_body(

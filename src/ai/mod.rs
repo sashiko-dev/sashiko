@@ -267,6 +267,11 @@ pub struct AiRequest {
     /// Optional per-request reasoning / thinking effort override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Random ID shared by every request of one stage conversation. It is
+    /// never part of the prompt; a provider may send it as routing
+    /// metadata so the conversation reaches a replica with a warm cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<uuid::Uuid>,
 }
 
 tokio::task_local! {
@@ -1586,6 +1591,30 @@ mod tests {
     }
 
     #[test]
+    fn test_ai_request_conversation_id_wire_format() -> Result<()> {
+        let id = uuid::Uuid::new_v4();
+        let request = AiRequest {
+            conversation_id: Some(id),
+            ..Default::default()
+        };
+        let payload = serde_json::to_value(&request)?;
+        assert_eq!(payload["conversation_id"], id.to_string());
+        let parsed: AiRequest = serde_json::from_value(payload)?;
+        assert_eq!(parsed.conversation_id, Some(id));
+
+        let unset = serde_json::to_value(AiRequest::default())?;
+        assert!(unset.get("conversation_id").is_none());
+        let parsed: AiRequest = serde_json::from_value(json!({"messages": []}))?;
+        assert_eq!(parsed.conversation_id, None);
+
+        // The parent reads this from the review child: only a UUID may
+        // pass, since the value ends up in an HTTP header.
+        let malformed = json!({"messages": [], "conversation_id": "x\r\nInjected: 1"});
+        assert!(serde_json::from_value::<AiRequest>(malformed).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn test_ai_request_contract() -> Result<()> {
         let request = AiRequest {
             system: None,
@@ -1602,6 +1631,7 @@ mod tests {
             response_format: Some(AiResponseFormat::Text),
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         };
 
         // This matches the format used in StdioGeminiClient and expected by the Worker

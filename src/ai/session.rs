@@ -274,6 +274,9 @@ impl<'a> SessionRunner<'a> {
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
+        // Reuse one ID for all turns and retries so the provider can send
+        // them to the same replica.
+        let conversation_id = uuid::Uuid::new_v4();
 
         let make_failure = |message: String,
                             history: Vec<AiMessage>,
@@ -336,6 +339,7 @@ impl<'a> SessionRunner<'a> {
                 response_format: session.response_format(),
                 context_tag: session.context_tag(),
                 reasoning_effort: session.reasoning_effort(),
+                conversation_id: Some(conversation_id),
             };
 
             // Kept so that a rejected answer can be forgotten below.
@@ -635,6 +639,160 @@ mod tests {
         fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
             Ok(response.content.clone().unwrap_or_default())
         }
+    }
+
+    /// Answers from a script and records each request's conversation ID.
+    struct RecordingProvider {
+        responses: Mutex<VecDeque<AiResponse>>,
+        conversation_ids: Mutex<Vec<Option<uuid::Uuid>>>,
+    }
+
+    impl RecordingProvider {
+        fn new(responses: Vec<AiResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                conversation_ids: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn conversation_ids(&self) -> Vec<Option<uuid::Uuid>> {
+            self.conversation_ids.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AiProvider for RecordingProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.conversation_ids
+                .lock()
+                .unwrap()
+                .push(request.conversation_id);
+            // An empty script answers every request with the same text.
+            Ok(self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| text_response("done")))
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "recording".to_string(),
+                context_window_size: 4096,
+            }
+        }
+    }
+
+    fn text_response(content: &str) -> AiResponse {
+        AiResponse {
+            content: Some(content.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            usage: None,
+            truncated: false,
+        }
+    }
+
+    /// Rejects every answer other than "valid", forcing a validation retry.
+    struct StrictSession;
+
+    #[async_trait]
+    impl LlmSession for StrictSession {
+        type Output = String;
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "initial prompt".to_string()
+        }
+
+        async fn call_tool(&mut self, _name: &str, _args: Value) -> Result<Value> {
+            Ok(serde_json::json!({"result": "success"}))
+        }
+
+        fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+            match response.content.as_deref() {
+                Some("valid") => Ok("valid".to_string()),
+                _ => Err(ValidationError::FormatViolation("not valid".to_string())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_keeps_one_conversation_id_across_turns_and_retries() {
+        let tool_turn = AiResponse {
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: serde_json::json!({}),
+                thought_signature: None,
+            }]),
+            ..text_response("")
+        };
+        let provider = RecordingProvider::new(vec![
+            tool_turn,
+            text_response("rejected"),
+            text_response("valid"),
+        ]);
+
+        let result = SessionRunner::new(&provider)
+            .run(&mut StrictSession)
+            .await
+            .unwrap();
+        assert_eq!(result.output, "valid");
+
+        let ids = provider.conversation_ids();
+        assert_eq!(ids.len(), 3, "tool turn, rejected answer, retry");
+        assert!(ids[0].is_some(), "the runner assigns an ID");
+        assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
+    }
+
+    /// Waits until two requests arrive before answering either.
+    /// This ensures the test runs both sessions at the same time.
+    struct RendezvousProvider {
+        barrier: tokio::sync::Barrier,
+        recorder: RecordingProvider,
+    }
+
+    #[async_trait]
+    impl AiProvider for RendezvousProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.barrier.wait().await;
+            self.recorder.generate_content(request).await
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            self.recorder.get_capabilities()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_gives_overlapping_conversations_their_own_ids() {
+        let provider = RendezvousProvider {
+            barrier: tokio::sync::Barrier::new(2),
+            recorder: RecordingProvider::new(Vec::new()),
+        };
+        let runner = SessionRunner::new(&provider);
+        let (mut first, mut second) = (DummySession, DummySession);
+
+        // Both requests must reach the barrier before either can continue.
+        // If the sessions run one after the other, the test times out.
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(runner.run(&mut first), runner.run(&mut second))
+        })
+        .await
+        .expect("both sessions are in flight at once");
+        a.unwrap();
+        b.unwrap();
+
+        let ids = provider.recorder.conversation_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(Option::is_some));
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[tokio::test]

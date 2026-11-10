@@ -450,6 +450,7 @@ mod tests {
             response_format: None,
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         };
 
         let ollama_req = translate_ollama_request(request, 128_000, 4096, None)?;
@@ -489,6 +490,7 @@ mod tests {
             response_format: None,
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         };
 
         let ollama_req = translate_ollama_request(request, 128_000, 4096, None)?;
@@ -623,6 +625,7 @@ mod tests {
             response_format: None,
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         };
 
         let ollama_req = translate_ollama_request(request, 128_000, 2048, None)?;
@@ -651,6 +654,7 @@ mod tests {
             response_format: None,
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         };
 
         let ollama_req = translate_ollama_request(request, 128_000, 2048, None)?;
