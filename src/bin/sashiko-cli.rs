@@ -295,6 +295,10 @@ enum BugCommands {
         #[arg(long)]
         comment: Option<String>,
 
+        /// Comment type for `comment` action (comment, proposed_fix, reproducer)
+        #[arg(long)]
+        kind: Option<String>,
+
         /// Assignee email (for assign action)
         #[arg(long)]
         assignee: Option<String>,
@@ -731,6 +735,7 @@ async fn handle_bugs(
             id,
             action,
             comment,
+            kind,
             assignee,
             duplicate_of,
         } => {
@@ -747,11 +752,25 @@ async fn handle_bugs(
                         anyhow::anyhow!("Action 'comment' requires non-empty --comment")
                     })?;
                     map.insert("content".to_string(), Value::String(text));
+                    if let Some(raw_kind) = kind {
+                        let parsed = sashiko::api::BugCommentKind::parse(&raw_kind).ok_or_else(
+                            || {
+                                anyhow::anyhow!(
+                                    "Unsupported comment kind '{}'. Valid kinds: comment, proposed_fix, reproducer",
+                                    raw_kind
+                                )
+                            },
+                        )?;
+                        map.insert(
+                            "kind".to_string(),
+                            Value::String(parsed.as_str().to_string()),
+                        );
+                    }
                 }
                 "close" | "dismiss" | "evaluate_security" => {
-                    if assignee.is_some() || duplicate_of.is_some() {
+                    if kind.is_some() || assignee.is_some() || duplicate_of.is_some() {
                         anyhow::bail!(
-                            "Action '{}' does not accept --assignee or --duplicate-of",
+                            "Action '{}' does not accept --kind, --assignee, or --duplicate-of",
                             action
                         );
                     }
@@ -760,8 +779,10 @@ async fn handle_bugs(
                     }
                 }
                 "mark_duplicate" => {
-                    if assignee.is_some() {
-                        anyhow::bail!("Action 'mark_duplicate' does not accept --assignee");
+                    if kind.is_some() || assignee.is_some() {
+                        anyhow::bail!(
+                            "Action 'mark_duplicate' does not accept --kind or --assignee"
+                        );
                     }
                     let dup = duplicate_of
                         .filter(|s| !s.trim().is_empty())
@@ -782,8 +803,8 @@ async fn handle_bugs(
                     }
                 }
                 "assign" => {
-                    if duplicate_of.is_some() {
-                        anyhow::bail!("Action 'assign' does not accept --duplicate-of");
+                    if kind.is_some() || duplicate_of.is_some() {
+                        anyhow::bail!("Action 'assign' does not accept --kind or --duplicate-of");
                     }
                     let raw = assignee.ok_or_else(|| {
                         anyhow::anyhow!(
@@ -2840,6 +2861,35 @@ mod tests {
                 }
             } if id == "linux-123e4567-e89b-12d3-a456-426614174000"
                 && dup == "linux-00000000-0000-0000-0000-000000000001"
+        ));
+
+        let comment_kind_action = Cli::try_parse_from([
+            "sashiko-cli",
+            "bugs",
+            "action",
+            "linux-123e4567-e89b-12d3-a456-426614174000",
+            "--action",
+            "comment",
+            "--kind",
+            "reproducer",
+            "--comment",
+            "repro.c",
+        ])
+        .unwrap();
+        assert!(matches!(
+            comment_kind_action.command,
+            Commands::Bugs {
+                action: BugCommands::Action {
+                    ref id,
+                    ref action,
+                    kind: Some(ref kind),
+                    comment: Some(ref comment),
+                    ..
+                }
+            } if id == "linux-123e4567-e89b-12d3-a456-426614174000"
+                && action == "comment"
+                && kind == "reproducer"
+                && comment == "repro.c"
         ));
 
         let sec_list = Cli::try_parse_from([

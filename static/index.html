@@ -2892,7 +2892,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             const fixesPanelHtml = fixes.length > 0 ? `
                 <div class="section" id="bug-panel-fixes" data-bug-panel="fixes" role="tabpanel" aria-labelledby="bug-tab-fixes" ${activeTab === 'fixes' ? '' : 'hidden'}>
-                    <h2 style="margin-top:0;">Fixes &amp; Patches (${fixes.length})</h2>
+                    <div class="controls" style="justify-content:space-between; margin-bottom: 12px;">
+                        <h2 style="border:none; margin:0; padding:0;">Fixes &amp; Patches (${fixes.length})</h2>
+                        ${canComment ? `<button class="primary" onclick="openBugActionModal('comment', '${id}', 'proposed_fix')">Add Proposed Fix</button>` : ''}
+                    </div>
                     <p class="text-muted-sm" style="margin-bottom: 12px;">Proposed patches, fix commits, and resolution candidates.</p>
                     ${fixes.map(f => renderBugActivityCard(f, bugid, (f.kind || 'fix').replace(/_/g, ' '), {
                         extraMetaHtml: (f.fixed_in_commit || f.commit_sha)
@@ -2903,8 +2906,11 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             const reproducersPanelHtml = reproducers.length > 0 ? `
                 <div class="section" id="bug-panel-reproducers" data-bug-panel="reproducers" role="tabpanel" aria-labelledby="bug-tab-reproducers" ${activeTab === 'reproducers' ? '' : 'hidden'}>
-                    <h2 style="margin-top:0;">Reproducers (${reproducers.length})</h2>
-                    <p class="text-muted-sm" style="margin-bottom: 12px;">Programs, scripts, and testcases to reproduce the defect.</p>
+                    <div class="controls" style="justify-content:space-between; margin-bottom: 12px;">
+                        <h2 style="border:none; margin:0; padding:0;">Reproducers (${reproducers.length})</h2>
+                        ${canComment ? `<button class="primary" onclick="openBugActionModal('comment', '${id}', 'reproducer')">Add Reproducer</button>` : ''}
+                    </div>
+                    <p class="text-muted-sm" style="margin-bottom: 12px;">Programs, scripts, and testcases to reproduce the defect. Visible only to signed-in users.</p>
                     ${reproducers.map(r => renderBugActivityCard(r, bugid, (r.kind || 'reproducer').replace(/_/g, ' '), { mono: true })).join('')}
                 </div>
             ` : '';
@@ -3022,6 +3028,15 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             <div style="margin-bottom: 6px;"><strong>Assignee email:</strong></div>
                             <input type="email" id="bugActionAssignee" placeholder="developer@example.org" oninput="saveBugActionDraft()" style="width: 100%; max-width: 400px;">
                             <div style="font-size: 0.85em; color: var(--text-muted); margin-top: 4px;">Leave empty to unassign.</div>
+                        </div>
+                        <div id="bugActionCommentKindSection" style="display: none; margin-bottom: 12px;">
+                            <div style="margin-bottom: 6px;"><strong>Comment type:</strong></div>
+                            <select id="bugActionCommentKind" onchange="saveBugActionDraft(); updateBugCommentKindHint();" style="width: 100%; max-width: 400px;">
+                                <option value="comment">Comment</option>
+                                <option value="proposed_fix">Proposed Fix</option>
+                                <option value="reproducer">Reproducer</option>
+                            </select>
+                            <div id="bugActionCommentKindHint" style="font-size: 0.85em; color: var(--text-muted); margin-top: 4px;"></div>
                         </div>
                         <div style="margin-bottom: 6px;"><strong id="bugActionReasonLabel">Reason / Comment:</strong></div>
                         <textarea id="bugActionReason" oninput="saveBugActionDraft()" placeholder="Add reasoning or context..."></textarea>
@@ -4318,7 +4333,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const action = typeEl.value;
             const draft = getBugActionDraft(idEl.value);
             draft.reasons[action] = reasonEl.value;
-            if (action === 'mark_duplicate') {
+            if (action === 'comment') {
+                const kindEl = document.getElementById('bugActionCommentKind');
+                if (kindEl) draft.commentKind = kindEl.value;
+            } else if (action === 'mark_duplicate') {
                 const dupEl = document.getElementById('bugActionDuplicateId');
                 if (dupEl) draft.duplicateId = dupEl.value;
             } else if (action === 'assign') {
@@ -4331,8 +4349,27 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const draft = state.bugActionDrafts?.[String(id || '')];
             if (!draft) return;
             if (draft.reasons) delete draft.reasons[action];
+            if (action === 'comment') delete draft.commentKind;
             if (action === 'mark_duplicate') delete draft.duplicateId;
             if (action === 'assign') delete draft.assignee;
+        }
+
+        function updateBugCommentKindHint() {
+            const kindEl = document.getElementById('bugActionCommentKind');
+            const hintEl = document.getElementById('bugActionCommentKindHint');
+            const reasonArea = document.getElementById('bugActionReason');
+            if (!kindEl || !hintEl) return;
+            const kind = kindEl.value;
+            if (kind === 'proposed_fix') {
+                hintEl.textContent = 'Shown under the Fixes tab as a proposed fix.';
+                if (reasonArea) reasonArea.placeholder = 'Paste proposed patch or fix description...';
+            } else if (kind === 'reproducer') {
+                hintEl.textContent = 'Shown under the Reproducers tab. Hidden from unauthenticated visitors (including direct UUID links).';
+                if (reasonArea) reasonArea.placeholder = 'Paste reproducer program, script, or steps...';
+            } else {
+                hintEl.textContent = 'Shown under the Comments tab.';
+                if (reasonArea) reasonArea.placeholder = 'Type your comment...';
+            }
         }
 
         function checkBugActionAllowed(action) {
@@ -4344,7 +4381,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             return canPerformBugActions() ? null : getActionDisabledTitle();
         }
 
-        function openBugActionModal(action, id) {
+        function openBugActionModal(action, id, commentKind) {
             const deniedMsg = checkBugActionAllowed(action);
             if (deniedMsg) { alert(deniedMsg); return; }
 
@@ -4355,6 +4392,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const draft = getBugActionDraft(id);
             const dupInput = document.getElementById('bugActionDuplicateId');
             const assignInput = document.getElementById('bugActionAssignee');
+            const kindSelect = document.getElementById('bugActionCommentKind');
             const reasonArea = document.getElementById('bugActionReason');
 
             document.getElementById('bugActionType').value = action;
@@ -4362,14 +4400,19 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             reasonArea.value = (draft.reasons && draft.reasons[action]) || '';
             dupInput.value = draft.duplicateId || '';
             assignInput.value = draft.assignee !== undefined ? draft.assignee : (state.currentBugAssignee || '');
+            if (kindSelect) {
+                kindSelect.value = commentKind || draft.commentKind || 'comment';
+            }
             document.getElementById('bugActionError').style.display = 'none';
             document.getElementById('bugActionSubmitBtn').disabled = false;
 
             const titleEl = document.getElementById('bugActionTitle');
             const reasonLabelEl = document.getElementById('bugActionReasonLabel');
+            const commentKindSection = document.getElementById('bugActionCommentKindSection');
             const dupSection = document.getElementById('bugActionDuplicateSection');
             const assignSection = document.getElementById('bugActionAssignSection');
 
+            if (commentKindSection) commentKindSection.style.display = action === 'comment' ? 'block' : 'none';
             dupSection.style.display = action === 'mark_duplicate' ? 'block' : 'none';
             assignSection.style.display = action === 'assign' ? 'block' : 'none';
             const focusTarget = action === 'mark_duplicate' ? dupInput : action === 'assign' ? assignInput : reasonArea;
@@ -4386,6 +4429,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             titleEl.textContent = title;
             reasonLabelEl.textContent = label;
             reasonArea.placeholder = placeholder;
+            if (action === 'comment') updateBugCommentKindHint();
 
             panel.style.display = 'block';
             panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -4417,6 +4461,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             if (action === 'comment') {
                 if (!reason) return showErr('Comment content is required.');
                 payload.content = reason;
+                const kindEl = document.getElementById('bugActionCommentKind');
+                if (kindEl && kindEl.value) payload.kind = kindEl.value;
             } else if (action === 'close' || action === 'dismiss' || action === 'evaluate_security') {
                 if (reason) payload.reason = reason;
             } else if (action === 'mark_duplicate') {
@@ -4447,7 +4493,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 }
                 closeBugActionModal();
                 clearBugActionDraft(id, action);
-                await renderBugView(id, action === 'comment' ? 'comments' : undefined);
+                const nextTab = action === 'comment'
+                    ? (payload.kind === 'proposed_fix' ? 'fixes' : payload.kind === 'reproducer' ? 'reproducers' : 'comments')
+                    : undefined;
+                await renderBugView(id, nextTab);
             } catch (e) {
                 showErr(e.message);
             }
