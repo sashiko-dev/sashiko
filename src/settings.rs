@@ -540,6 +540,11 @@ pub struct OpenAiCompatSettings {
     /// header named here replaces the one Sashiko would send.
     #[serde(default)]
     pub extra_headers: std::collections::BTreeMap<String, String>,
+    /// Optional header carrying a random ID for each stage conversation.
+    /// Providers can use the ID to send all turns to the same replica
+    /// and reuse its prompt cache. No header is sent when unset.
+    #[serde(default)]
+    pub session_affinity_header: Option<String>,
     /// Top-level JSON fields added to every request body, for gateways
     /// that expect client metadata in the payload. Fields Sashiko sets
     /// itself are rejected rather than overridden.

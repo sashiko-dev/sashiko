@@ -967,6 +967,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                                 &c.extra_headers,
                                 |var| std::env::var(var).ok(),
                             )?)?
+                            .with_session_affinity_header(c.session_affinity_header.as_deref())?
                             .with_extra_body(c.extra_body.clone())?,
                         None => provider,
                     };
@@ -986,6 +987,10 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                                 c.send_empty_tool_call_content,
                             ),
                             ("extra_headers", !c.extra_headers.is_empty()),
+                            (
+                                "session_affinity_header",
+                                c.session_affinity_header.is_some(),
+                            ),
                             ("extra_body", !c.extra_body.is_empty()),
                         ];
                         if let Some((name, _)) = ignored.iter().find(|(_, set)| *set) {
@@ -1875,6 +1880,7 @@ mod tests {
             send_empty_tool_call_content: false,
             api: api.map(str::to_string),
             service_tier: None,
+            session_affinity_header: None,
         };
 
         settings.ai.openai_compat = Some(compat(None));
@@ -1909,6 +1915,7 @@ mod tests {
                 send_empty_tool_call_content: false,
                 api: Some(api.to_string()),
                 service_tier: Some(crate::settings::ServiceTier::Flex),
+                session_affinity_header: None,
             });
 
             settings.ai.provider = "openai".to_string();
@@ -1947,6 +1954,7 @@ mod tests {
             send_empty_tool_call_content: false,
             api: Some("responses".to_string()),
             service_tier: None,
+            session_affinity_header: None,
         };
 
         let mut with_headers = compat.clone();
@@ -1958,6 +1966,14 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(error.contains("extra_headers"), "{error}");
+
+        let mut with_affinity = compat.clone();
+        with_affinity.session_affinity_header = Some("x-session-affinity".to_string());
+        let error = match create_provider(&settings.with_compat(with_affinity)) {
+            Ok(_) => panic!("api = \"responses\" must refuse session_affinity_header"),
+            Err(e) => e.to_string(),
+        };
+        assert!(error.contains("session_affinity_header"), "{error}");
 
         let mut with_body = compat.clone();
         with_body
