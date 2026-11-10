@@ -1604,6 +1604,11 @@ async fn get_bug(
     Ok(Json(val))
 }
 
+/// Reproducer-like enrichment kinds gated behind authenticated access.
+fn is_reproducer_enrichment_kind(kind: &str) -> bool {
+    matches!(kind, "reproducer" | "testcase" | "poc")
+}
+
 /// Loads a bug's deduplicated family evidence with interaction logs omitted and
 /// inaccessible duplicate counterparts redacted.
 async fn load_redacted_bug_evidence(
@@ -1634,14 +1639,22 @@ async fn load_redacted_bug_evidence(
         .bug_evidence(&family)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if !principal.has_global_bug_visibility()
+    let hide_candidates = !principal.has_global_bug_visibility();
+    let hide_reproducers = !principal.is_authenticated();
+    if (hide_candidates || hide_reproducers)
         && let Some(activity) = evidence.get_mut("activity").and_then(|a| a.as_array_mut())
     {
         activity.retain(|e| {
-            !matches!(
-                e.get("kind").and_then(|k| k.as_str()),
-                Some("candidate" | "raw_candidate")
-            )
+            let Some(kind) = e.get("kind").and_then(|k| k.as_str()) else {
+                return true;
+            };
+            if hide_candidates && matches!(kind, "candidate" | "raw_candidate") {
+                return false;
+            }
+            if hide_reproducers && is_reproducer_enrichment_kind(kind) {
+                return false;
+            }
+            true
         });
     }
     Ok(evidence)
@@ -1782,6 +1795,10 @@ async fn get_bug_enrichments(
     if !principal.has_global_bug_visibility() {
         bug.enrichments
             .retain(|e| e.kind != "candidate" && e.kind != "raw_candidate");
+    }
+    if !principal.is_authenticated() {
+        bug.enrichments
+            .retain(|e| !is_reproducer_enrichment_kind(&e.kind));
     }
     let refs = referenced_duplicate_ids(&bug);
     let readable_refs = readable_bug_ids(&state, &principal, &refs).await?;
@@ -3118,7 +3135,7 @@ async fn bug_action(
     let model = payload.model.filter(|s| !s.trim().is_empty());
     let db = state.db.with_bug_actor(&actor, tool, model);
     match payload.action {
-        BugAction::Comment { content } => {
+        BugAction::Comment { content, kind } => {
             if content.trim().is_empty() {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -3128,7 +3145,7 @@ async fn bug_action(
             db.add_bug_enrichment(
                 bug.id,
                 &crate::db::NewBugEnrichment {
-                    kind: "comment".into(),
+                    kind: kind.as_str().into(),
                     content: Some(content),
                     ..Default::default()
                 },
@@ -6005,6 +6022,199 @@ mod tests {
             disabled_analyze.text().await.unwrap(),
             "Linux bug tracking is disabled on this server."
         );
+    }
+
+    #[tokio::test]
+    async fn comment_types_and_reproducer_login_gating() {
+        const SECRET: &str = "bug-repro-test-key-12345678901234567890";
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let bug_id = db
+            .create_bug(&crate::db::NewBug {
+                bugid: "linux-repro01".to_string(),
+                title: "resource leak in widget_close()".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::New,
+                pipeline_state: crate::db::BugPipelineState::Pending,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 123456,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![crate::db::AttributedSubsystem::from_maintainers(
+                    "NETWORKING [GENERAL]",
+                )],
+            })
+            .await
+            .unwrap();
+        db.add_bug_enrichment(
+            bug_id,
+            &crate::db::NewBugEnrichment {
+                kind: "testcase".into(),
+                tool: "ci".into(),
+                content: Some("TESTCASE_FIXTURE_MARKER".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.add_bug_enrichment(
+            bug_id,
+            &crate::db::NewBugEnrichment {
+                kind: "poc".into(),
+                tool: "manual".into(),
+                content: Some("MINIMAL_REPRO_MARKER".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.testing_mode = false;
+        settings.server.jwt_secret = Some(SECRET.to_string());
+        settings.server.acl.admins = vec!["operator@example.org".to_string()];
+        settings.server.read_only = false;
+        let settings = Arc::new(settings);
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            settings,
+            db,
+            event_tx,
+            fetch_tx,
+            ServerOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let operator_tok =
+            crate::auth::create_token("operator@example.org", SECRET, Some("session".into()), 3600)
+                .unwrap();
+        let stranger_tok =
+            crate::auth::create_token("stranger@example.org", SECRET, Some("session".into()), 3600)
+                .unwrap();
+
+        // Operator attaches default comment, proposed_fix, and reproducer comments.
+        for (payload, expected_kind) in [
+            (
+                serde_json::json!({"action": "comment", "content": "PLAIN_COMMENT_TEXT"}),
+                "comment",
+            ),
+            (
+                serde_json::json!({"action": "comment", "kind": "proposed_fix", "content": "PROPOSED_FIX_PATCH_TEXT"}),
+                "proposed_fix",
+            ),
+            (
+                serde_json::json!({"action": "comment", "kind": "reproducer", "content": "REPRODUCER_FIXTURE_MARKER"}),
+                "reproducer",
+            ),
+        ] {
+            let res = client
+                .post(format!(
+                    "http://{}/api/bug/action?bugid=linux-repro01",
+                    addr
+                ))
+                .header("Authorization", format!("Bearer {}", operator_tok))
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200, "failed posting {expected_kind}");
+        }
+
+        // Verify invalid comment kind is rejected.
+        let invalid_kind = client
+            .post(format!(
+                "http://{}/api/bug/action?bugid=linux-repro01",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", operator_tok))
+            .json(&serde_json::json!({"action": "comment", "kind": "unknown_kind", "content": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid_kind.status(), 422);
+
+        // Anonymous direct-UUID capability reads see comment and proposed_fix,
+        // but must NEVER see reproducer/testcase/poc entries.
+        for bearer in [None, Some("nonsense".to_string())] {
+            let mut req = client.get(format!("http://{}/api/bug?bugid=linux-repro01", addr));
+            if let Some(ref b) = bearer {
+                req = req.header("Authorization", format!("Bearer {}", b));
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            let activity_str = body["evidence"]["activity"].to_string();
+            assert!(activity_str.contains("PLAIN_COMMENT_TEXT"));
+            assert!(activity_str.contains("PROPOSED_FIX_PATCH_TEXT"));
+            assert!(!activity_str.contains("REPRODUCER_FIXTURE_MARKER"));
+            assert!(!activity_str.contains("TESTCASE_FIXTURE_MARKER"));
+            assert!(!activity_str.contains("MINIMAL_REPRO_MARKER"));
+
+            let mut md_req = client.get(format!("http://{}/bug/linux-repro01.md", addr));
+            if let Some(ref b) = bearer {
+                md_req = md_req.header("Authorization", format!("Bearer {}", b));
+            }
+            let md = md_req.send().await.unwrap().text().await.unwrap();
+            assert!(md.contains("PLAIN_COMMENT_TEXT"));
+            assert!(md.contains("PROPOSED_FIX_PATCH_TEXT"));
+            assert!(!md.contains("REPRODUCER_FIXTURE_MARKER"));
+            assert!(!md.contains("TESTCASE_FIXTURE_MARKER"));
+            assert!(!md.contains("MINIMAL_REPRO_MARKER"));
+        }
+
+        // Logged-in users (both direct-UUID capability reader and operator) DO see reproducers.
+        for tok in [&stranger_tok, &operator_tok] {
+            let body: serde_json::Value = client
+                .get(format!("http://{}/api/bug?bugid=linux-repro01", addr))
+                .header("Authorization", format!("Bearer {}", tok))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let activity_str = body["evidence"]["activity"].to_string();
+            assert!(activity_str.contains("PLAIN_COMMENT_TEXT"));
+            assert!(activity_str.contains("PROPOSED_FIX_PATCH_TEXT"));
+            assert!(activity_str.contains("REPRODUCER_FIXTURE_MARKER"));
+            assert!(activity_str.contains("TESTCASE_FIXTURE_MARKER"));
+            assert!(activity_str.contains("MINIMAL_REPRO_MARKER"));
+
+            let md = client
+                .get(format!("http://{}/bug/linux-repro01", addr) + ".md")
+                .header("Authorization", format!("Bearer {}", tok))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(md.contains("REPRODUCER_FIXTURE_MARKER"));
+        }
     }
 
     #[test]

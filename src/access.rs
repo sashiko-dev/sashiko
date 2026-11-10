@@ -166,6 +166,8 @@ impl BugAccess {
 #[derive(Debug, Clone, Default)]
 pub struct Principal {
     email: String,
+    /// Whether the caller proved an authenticated identity (or testing mode).
+    authenticated: bool,
     /// Sashiko operator. Manage on every bug.
     operator: bool,
     /// Kernel security list member. Comment on every bug.
@@ -203,6 +205,7 @@ impl Principal {
             .unwrap_or_default();
         Self {
             email: email.trim().to_string(),
+            authenticated: true,
             operator,
             security: acl.is_security(email),
             global_maintainer: maintainers.is_some_and(|index| index.is_global_maintainer(email)),
@@ -224,6 +227,12 @@ impl Principal {
             self.may_create = false;
         }
         self
+    }
+
+    /// Whether this principal proved an authenticated identity (rather than an
+    /// anonymous capability read).
+    pub fn is_authenticated(&self) -> bool {
+        self.authenticated
     }
 
     /// Whether this principal is a configured Sashiko operator.
@@ -356,6 +365,7 @@ impl Principal {
     /// address was proved.
     fn testing_operator() -> Self {
         Self {
+            authenticated: true,
             operator: true,
             may_create: true,
             ..Self::default()
@@ -901,6 +911,10 @@ F:	*/
             none_token.access_to_with_bugid(&btrfs(), true),
             BugAccess::None
         );
+
+        assert!(!Principal::anonymous().is_authenticated());
+        assert!(davem.is_authenticated());
+        assert!(!Principal::resolve("clm@fb.com", &acl_cfg, Some(&idx)).is_authenticated());
     }
 
     #[test]

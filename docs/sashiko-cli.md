@@ -259,6 +259,8 @@ sashiko-cli bugs action <ID> --action <ACTION> [OPTIONS]
 |------|-------------|
 | `--action <ACTION>` | Action to perform: `comment`, `close`, `dismiss`, `assign`, `mark_duplicate`, or `evaluate_security`. |
 | `--comment <TEXT>` | Comment body (for `comment`) or optional reason (for `close`, `dismiss`, `assign`, `mark_duplicate`, `evaluate_security`). |
+| `--comment-file <PATH>` | Read comment/reproducer/patch body from `<PATH>` (or `-` for stdin; mutually exclusive with `--comment`). |
+| `--kind <KIND>` | Comment type for `comment`: `comment` (default), `proposed_fix`, or `reproducer` (reproducers require login to view). |
 | `--assignee <EMAIL>` | Assignee email address for `assign` (or `""` to unassign). |
 | `--duplicate-of <ID>` | Canonical `<project>-<uuid>` or numeric ID for `mark_duplicate`. |
 
