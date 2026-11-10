@@ -340,11 +340,44 @@ pub struct BugActionPayload {
     pub action: BugAction,
 }
 
+/// Allowed comment types attached to a bug via `BugAction::Comment`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BugCommentKind {
+    #[default]
+    Comment,
+    ProposedFix,
+    Reproducer,
+}
+
+impl BugCommentKind {
+    /// Returns the canonical `bug_enrichments.kind` string for this comment type.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Comment => "comment",
+            Self::ProposedFix => "proposed_fix",
+            Self::Reproducer => "reproducer",
+        }
+    }
+
+    /// Parses a comment kind string from CLI or HTTP inputs.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "comment" => Some(Self::Comment),
+            "proposed_fix" => Some(Self::ProposedFix),
+            "reproducer" => Some(Self::Reproducer),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum BugAction {
     Comment {
         content: String,
+        #[serde(default)]
+        kind: BugCommentKind,
     },
     Close {
         reason: Option<String>,

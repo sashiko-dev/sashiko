@@ -52,7 +52,7 @@ struct Cli {
     command: Commands,
 
     /// Override server URL (default: from settings or http://127.0.0.1:8080)
-    #[arg(long, global = true, env = "SASHIKO_SERVER")]
+    #[arg(long, alias = "url", global = true, env = "SASHIKO_SERVER")]
     server: Option<String>,
 
     /// Output format (text, json)
@@ -294,6 +294,14 @@ enum BugCommands {
         /// Comment text to attach
         #[arg(long)]
         comment: Option<String>,
+
+        /// Path to file containing comment/reproducer/patch body (use `-` for stdin)
+        #[arg(long, conflicts_with = "comment")]
+        comment_file: Option<String>,
+
+        /// Comment type for `comment` action (comment, proposed_fix, reproducer)
+        #[arg(long)]
+        kind: Option<String>,
 
         /// Assignee email (for assign action)
         #[arg(long)]
@@ -712,8 +720,15 @@ async fn handle_bugs(
                     let title = body["title"].as_str().unwrap_or("(untitled)");
                     let sev = body["severity"].as_str().unwrap_or("unknown");
                     let st = body["lifecycle_status"].as_str().unwrap_or("unknown");
+                    let assignee = body["assignee"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or("unassigned");
                     println!("{}: {}", label, title);
-                    println!("Severity: {} | Status: {}", sev, st);
+                    println!(
+                        "Severity: {} | Status: {} | Assignee: {}",
+                        sev, st, assignee
+                    );
                     if let Some(sec_line) = format_bug_security_detail(&body) {
                         println!("Security: {}", sec_line);
                     }
@@ -731,9 +746,33 @@ async fn handle_bugs(
             id,
             action,
             comment,
+            comment_file,
+            kind,
             assignee,
             duplicate_of,
         } => {
+            let resolved_comment = match (comment, comment_file) {
+                (Some(c), None) => Some(c),
+                (None, Some(path)) if path == "-" => {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = String::new();
+                    tokio::io::stdin()
+                        .read_to_string(&mut buf)
+                        .await
+                        .context("Failed to read comment body from stdin")?;
+                    Some(buf)
+                }
+                (None, Some(path)) => Some(
+                    tokio::fs::read_to_string(&path)
+                        .await
+                        .with_context(|| format!("Failed to read comment file {:?}", path))?,
+                ),
+                (None, None) => None,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("Cannot specify both --comment and --comment-file");
+                }
+            };
+
             let mut map = serde_json::Map::new();
             map.insert("action".to_string(), Value::String(action.clone()));
             match action.as_str() {
@@ -743,25 +782,45 @@ async fn handle_bugs(
                             "Action 'comment' does not accept --assignee or --duplicate-of"
                         );
                     }
-                    let text = comment.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
-                        anyhow::anyhow!("Action 'comment' requires non-empty --comment")
-                    })?;
+                    let text = resolved_comment
+                        .filter(|s| !s.trim().is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Action 'comment' requires non-empty --comment or --comment-file"
+                            )
+                        })?;
                     map.insert("content".to_string(), Value::String(text));
+                    if let Some(raw_kind) = kind {
+                        let parsed = sashiko::api::BugCommentKind::parse(&raw_kind).ok_or_else(
+                            || {
+                                anyhow::anyhow!(
+                                    "Unsupported comment kind '{}'. Valid kinds: comment, proposed_fix, reproducer",
+                                    raw_kind
+                                )
+                            },
+                        )?;
+                        map.insert(
+                            "kind".to_string(),
+                            Value::String(parsed.as_str().to_string()),
+                        );
+                    }
                 }
                 "close" | "dismiss" | "evaluate_security" => {
-                    if assignee.is_some() || duplicate_of.is_some() {
+                    if kind.is_some() || assignee.is_some() || duplicate_of.is_some() {
                         anyhow::bail!(
-                            "Action '{}' does not accept --assignee or --duplicate-of",
+                            "Action '{}' does not accept --kind, --assignee, or --duplicate-of",
                             action
                         );
                     }
-                    if let Some(c) = comment {
+                    if let Some(c) = resolved_comment {
                         map.insert("reason".to_string(), Value::String(c));
                     }
                 }
                 "mark_duplicate" => {
-                    if assignee.is_some() {
-                        anyhow::bail!("Action 'mark_duplicate' does not accept --assignee");
+                    if kind.is_some() || assignee.is_some() {
+                        anyhow::bail!(
+                            "Action 'mark_duplicate' does not accept --kind or --assignee"
+                        );
                     }
                     let dup = duplicate_of
                         .filter(|s| !s.trim().is_empty())
@@ -777,13 +836,13 @@ async fn handle_bugs(
                             Value::String(dup_trimmed.to_string()),
                         );
                     }
-                    if let Some(c) = comment {
+                    if let Some(c) = resolved_comment {
                         map.insert("reasoning".to_string(), Value::String(c));
                     }
                 }
                 "assign" => {
-                    if duplicate_of.is_some() {
-                        anyhow::bail!("Action 'assign' does not accept --duplicate-of");
+                    if kind.is_some() || duplicate_of.is_some() {
+                        anyhow::bail!("Action 'assign' does not accept --kind or --duplicate-of");
                     }
                     let raw = assignee.ok_or_else(|| {
                         anyhow::anyhow!(
@@ -796,7 +855,7 @@ async fn handle_bugs(
                         Value::String(raw)
                     };
                     map.insert("assignee".to_string(), assignee_val);
-                    if let Some(c) = comment {
+                    if let Some(c) = resolved_comment {
                         map.insert("reason".to_string(), Value::String(c));
                     }
                 }
@@ -2841,6 +2900,57 @@ mod tests {
             } if id == "linux-123e4567-e89b-12d3-a456-426614174000"
                 && dup == "linux-00000000-0000-0000-0000-000000000001"
         ));
+
+        let comment_kind_action = Cli::try_parse_from([
+            "sashiko-cli",
+            "--url",
+            "https://sashiko.dev",
+            "bugs",
+            "action",
+            "linux-123e4567-e89b-12d3-a456-426614174000",
+            "--action",
+            "comment",
+            "--kind",
+            "reproducer",
+            "--comment-file",
+            "repro.c",
+        ])
+        .unwrap();
+        assert_eq!(
+            comment_kind_action.server.as_deref(),
+            Some("https://sashiko.dev")
+        );
+        assert!(matches!(
+            comment_kind_action.command,
+            Commands::Bugs {
+                action: BugCommands::Action {
+                    ref id,
+                    ref action,
+                    kind: Some(ref kind),
+                    comment_file: Some(ref path),
+                    ..
+                }
+            } if id == "linux-123e4567-e89b-12d3-a456-426614174000"
+                && action == "comment"
+                && kind == "reproducer"
+                && path == "repro.c"
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "sashiko-cli",
+                "bugs",
+                "action",
+                "linux-123e4567-e89b-12d3-a456-426614174000",
+                "--action",
+                "comment",
+                "--comment",
+                "inline",
+                "--comment-file",
+                "repro.c",
+            ])
+            .is_err()
+        );
 
         let sec_list = Cli::try_parse_from([
             "sashiko-cli",
