@@ -54,6 +54,9 @@ auditable.
   - A use-after-free between a work handler and a driver teardown path.
   - A change that stops a supported board or common configuration from booting.
   - A driver that silently returns corrupted data on its normal read path.
+  - Missing or clearly broken `Signed-off-by` trailer in the commit message
+    (missing DCO sign-off, missing or placeholder email address, bot identity,
+    or handle/username instead of a real human name).
 
 ## Medium
 

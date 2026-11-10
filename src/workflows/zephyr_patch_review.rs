@@ -84,7 +84,7 @@ Baseline SHA: {{{{baseline_sha}}}}
 
 Target Commit:
 {diff_var}
-{{{{prefetched_block}}}}{{{{custom_prompt_block}}}}"#
+{{{{fixes_block}}}}{{{{prefetched_block}}}}{{{{custom_prompt_block}}}}"#
     ))
     .with_var("target_commit_sha", |s: &ZephyrPatchReviewState| {
         s.target_commit_sha.clone()
@@ -101,6 +101,9 @@ Target Commit:
     })
     .with_var("target_commit_diff_only", |s: &ZephyrPatchReviewState| {
         s.target_commit_diff_only.clone()
+    })
+    .with_var("fixes_block", move |s: &ZephyrPatchReviewState| {
+        crate::worker::fixes_check::render_fixes_block(use_log, &s.fixes_analysis)
     })
     .with_var("prefetched_block", |s: &ZephyrPatchReviewState| {
         if s.prefetch_failed {
@@ -152,7 +155,7 @@ You are a senior Zephyr maintainer evaluating the high-level intent, architectur
 - Public API Impact: If a public header changes, check the API's status in its `@version` tag. Flag a breaking change to a stable API that does not follow the API lifecycle.
 - Alternatives: Are there obviously simpler or more idiomatic approaches that achieve the same goal using existing Zephyr facilities?
 - Single Responsibility: Flag commits that bundle unrelated changes or mix concerns that should be split into separate commits.
-- Commit Message Audit (Mandatory): Verify the title follows `area: summary`, the body explains both WHAT changed and WHY it is needed rather than restating the diff, and a Signed-off-by trailer is present."#;
+- Commit Message Audit (Mandatory): Verify the title follows `area: summary`, the body explains both WHAT changed and WHY it is needed rather than restating the diff, and a `Signed-off-by: Real Name <email>` trailer is present (`<fixes_context>` when available) using a real human name (not a handle/username, placeholder, or bot identity) and a valid routable `<email>` address; if `Signed-off-by:` is missing or clearly broken, raise a `High` severity concern (`"preexisting": false`) on `"commit_message"`."#;
 
 const STAGE_IMPLEMENTATION_INSTRUCTION: &str = r#"# Verify implementation against intent
 
@@ -265,7 +268,7 @@ const STAGE_POST_VERIFICATION_INSTRUCTION: &str = r#"# Per-finding post-verifica
 
 You are the lead reviewer performing deep, tool-assisted codebase verification of a speculative or contested candidate issue (`inconclusive_concerns`) identified during initial verification.
 For each candidate in `inconclusive_concerns`, use the available Git and file tools (`git_read_files`, `git_grep`, `git_diff`, `git_show`, `git_blame`) to answer each candidate's `verification_question` and inspect the actual code in the worktree.
-1. Dismiss in `dismissed_concerns` any candidate that alleges a build, compilation, syntax, or linter error of the kind `scripts/ci/check_compliance.py` or a Twister build reports. A Kconfig or Devicetree logic error that builds cleanly but behaves wrongly is not such an error and must be verified like any other candidate (carry forward the candidate's target `file`, `function_or_symbol`, and `code_snippet` in `locations`).
+1. Dismiss in `dismissed_concerns` any candidate that alleges a build, compilation, syntax, or linter error of the kind `scripts/ci/check_compliance.py` or a Twister build reports. A Kconfig or Devicetree logic error that builds cleanly but behaves wrongly is not such an error and must be verified like any other candidate (carry forward the candidate's target `file`, `function_or_symbol`, and `code_snippet` in `locations`). For valid missing or clearly broken `Signed-off-by:` findings (missing trailer, non-real name/handle/placeholder/bot identity, or missing/invalid `<email>`), validate in `findings` at `High` severity with `"preexisting": false`.
 2. **SYMMETRICAL PROOF BAR & ALL-CALLERS VERIFICATION:** For all other candidates, both `concern_arguments` and `dismissal_arguments` are untrusted hypotheses. Only dismiss a code-behavior candidate in `dismissed_concerns` if concrete, verifiable code in the repository proves the exact failure mechanism, branch, caller, and external interaction cannot occur across ALL callers, entry points, and modes. Citing a single caller does NOT disprove a buffer overflow, race, missing validation, or lifecycle leak in a helper function unless `git_grep` across all callers and entry points (ISRs, work handlers, driver API entry points, shell commands, and system call verifiers) proves every caller upholds the invariant. Do NOT give code the benefit of the doubt.
 3. **LOCAL BOUNDARY & ASYMMETRY RULE:** Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems or parallel execution will safely mask or prevent the issue, or by rationalizing an unpaired init/deinit, get/put, or ref/unref call, an unchecked error return, or overwritten state as a "harmless no-op" or "intentional behavior", unless you can point to specific code in the repository that concretely proves the failure mode is structurally impossible.
 4. **PROMOTING SPECULATIVE DISMISSALS:** When `"signal_reason"` is `"speculative_dismissal"`, a previous analyst spotted the candidate bug described in `concern_arguments` and dismissed it using `dismissal_arguments`. Inspect the actual code with tools: if the dismissal's assumption is false or incomplete (for example: another caller does NOT uphold the invariant; the caller does NOT clean up the resource on an error path; the cited lock does NOT serialize the access against the competing thread, ISR, or CPU; or an unintended state mutation affects downstream consumers), you MUST report the bug as a verified finding in `findings`.
