@@ -457,17 +457,33 @@ fn push_header_and_task(
         ProjectId::Linux => "Linux Kernel",
         other => other.display_name(),
     };
+    let code_phrase = if project == ProjectId::Linux {
+        "the kernel code"
+    } else {
+        "the target source code"
+    };
+    let tree_check_phrase = if project == ProjectId::Linux {
+        "the corresponding subsystem maintainer's tree (e.g. `MAINTAINERS` `T:` tree or linux-next) and upstream"
+    } else {
+        "the corresponding maintainer tree and upstream"
+    };
     out.push_str(&format!("# Fix {project_label} Bug: {heading_title}\n\n"));
-    out.push_str(
+    out.push_str(&format!(
         "You are tasked with investigating and fixing the pre-existing bug described below.\n\
-         Before writing a patch, verify the defect directly in your local git checkout:\n\
-         confirm that the buggy code path still exists on the target branch, inspect all\n\
-         callers and locking/lifetime invariants, and implement a minimal root-cause fix\n\
-         that follows the surrounding subsystem's conventions without unrelated refactoring.\n\
-         Do not add inline comments where surrounding code has none, and never add comments\n\
-         that merely restate the code or narrate the bug history (only update stale adjacent\n\
-         comments or document genuinely non-obvious invariants).\n\n",
-    );
+         Follow this workflow before writing a patch:\n\
+         1. **Check if already fixed**: Check whether the bug is already fixed in\n   \
+         {tree_check_phrase} before working on a reproducer or a fix.\n\
+         2. **Verify and generate a reproducer first**: Confirm the buggy code path still\n   \
+         exists in your local git checkout and inspect all callers and locking/lifetime\n   \
+         invariants. Unless told otherwise by the user, generate a standalone reproducer\n   \
+         first and confirm it triggers the bug **without changing {code_phrase}**\n   \
+         before writing a fix. If the bug is truly trivial and obvious directly from the\n   \
+         code, you do not need a reproducer.\n\
+         3. **Implement a minimal root-cause fix**: Follow the surrounding subsystem's\n   \
+         conventions without unrelated refactoring. Do not add inline comments where surrounding code has none,\n   \
+         and never add comments that merely restate the code or narrate the bug history\n   \
+         (only update stale adjacent comments or document genuinely non-obvious invariants).\n\n",
+    ));
 
     if bug.is_fixed() || bug.lifecycle_status.is_resolved() {
         out.push_str("> **Note:** This bug report is currently marked **");
@@ -798,6 +814,9 @@ fn build_suggested_trailers(
     if project == ProjectId::Sashiko {
         trailer_block.push_str(&format!("Fixes: {bugid}\n"));
     }
+    if project == ProjectId::Linux {
+        trailer_block.push_str("Cc: stable@vger.kernel.org\n");
+    }
     trailer_block.push_str(&format!("Reported-by: {reported_by}\n"));
     trailer_block.push_str(&format!("Link: {bug_url}"));
     if project != ProjectId::Linux {
@@ -816,14 +835,15 @@ fn push_trailer_notes(
     push_fixes_bullet(out, fixes);
     if project == ProjectId::Linux {
         out.push_str(&format!(
-            "- **`Reported-by:` & `Link:` / `Closes:`**: Keep `Reported-by: {reported_by}`\n  \
-             immediately followed on the next line by `Link: {bug_url}` (or\n  \
-             `Closes: {bug_url}` when fully resolving the report per\n  \
-             `submitting-patches.rst` / `scripts/checkpatch.pl`) so reviewers can inspect\n  \
-             the full bug report. When the bug affects released stable kernels under\n  \
-             `Documentation/process/stable-kernel-rules.rst`, place\n  \
+            "- **`Reported-by:`, `Link:` / `Closes:`, & `Cc: stable@vger.kernel.org`**: You\n  \
+             **must** add `Reported-by: {reported_by}` immediately followed on the next line\n  \
+             by `Link: {bug_url}` (or `Closes: {bug_url}` when fully resolving the report per\n  \
+             `submitting-patches.rst` / `scripts/checkpatch.pl`) to the commit log trailers so\n  \
+             reviewers can inspect the full bug report. Also include\n  \
              `Cc: stable@vger.kernel.org` (`Cc: stable@kernel.org` for unpublished\n  \
-             vulnerabilities) before `Reported-by:`.\n\
+             vulnerabilities) above `Reported-by:` whenever the bug affects released stable\n  \
+             kernels under `Documentation/process/stable-kernel-rules.rst` (omit only if the\n  \
+             defect never affected a released stable kernel).\n\
              - **`Signed-off-by:`**: Per `Documentation/process/coding-assistants.rst`, AI\n  \
              coding assistants must **not** add `Signed-off-by:` tags themselves — leave\n  \
              DCO sign-off for the human submitter to add after reviewing the patch\n  \
@@ -833,8 +853,9 @@ fn push_trailer_notes(
         ));
     } else {
         out.push_str(&format!(
-            "- **`Reported-by:` & `Link:`**: Keep `Reported-by: {reported_by}` and\n  \
-             `Link: {bug_url}` so reviewers can inspect the full bug report.\n\
+            "- **`Reported-by:` & `Link:`**: You **must** add `Reported-by: {reported_by}`\n  \
+             and `Link: {bug_url}` to the commit log trailers so reviewers can inspect the\n  \
+             full bug report.\n\
              - **`Signed-off-by:`**: Sign off with the human patch author's real name and\n  \
              email (`git commit -s`). Do not emit AI/bot `Co-authored-by:` or\n  \
              `Assisted-by:` trailers unless explicitly requested by the user or required\n  \
@@ -1165,6 +1186,7 @@ mod tests {
         assert!(md.contains("## Comments & Discussion"));
         assert!(md.contains("Please also free fp->handle on the second error return."));
         assert!(md.contains("Fixes: 3330ee8db989 (\"smb: server: add durable handle\")\n"));
+        assert!(md.contains("Cc: stable@vger.kernel.org\n"));
         assert!(md.contains("Reported-by: Sashiko <sashiko@sashiko.dev>\n"));
         assert!(md.contains("Link: https://sashiko.dev/#/bug/linux-7f9a2c4b\n"));
         assert!(!md.contains("Bug #42"));
@@ -1188,6 +1210,13 @@ mod tests {
             activity: &[],
         });
 
+        assert!(md.contains("Check whether the bug is already fixed"));
+        assert!(md.contains("corresponding subsystem maintainer's tree"));
+        assert!(md.contains("generate a standalone reproducer\n   first"));
+        assert!(md.contains("without changing the kernel code"));
+        assert!(md.contains(
+            "trivial and obvious directly from the\n   code, you do not need a reproducer"
+        ));
         assert!(md.contains("Do not add inline comments where surrounding code has none"));
         assert!(md.contains("`Documentation/process/submitting-patches.rst`"));
         assert!(md.contains("`Documentation/process/coding-assistants.rst`"));
@@ -1202,9 +1231,11 @@ mod tests {
         assert!(md.contains("PoC-specific\n     interface/variable names"));
         assert!(!md.contains("Signed-off-by: Your Name"));
         assert!(md.contains("AI\n  coding assistants must **not** add `Signed-off-by:` tags"));
+        assert!(md.contains("**must** add `Reported-by: Sashiko <sashiko-bot@kernel.org>`"));
         assert!(md.contains(
             "`Closes: https://sashiko.dev/#/bug/linux-97b284e0-576e-4373-b62f-eb132f482b91`"
         ));
+        assert!(md.contains("Cc: stable@vger.kernel.org\n"));
         assert!(md.contains("`Cc: stable@vger.kernel.org`"));
         assert!(md.contains("./scripts/checkpatch.pl --no-signoff"));
         assert!(md.contains("`sashiko review --project linux --agent HEAD`"));
