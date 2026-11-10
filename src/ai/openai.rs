@@ -181,6 +181,8 @@ pub struct OpenAiCompatClient {
     service_tier: Option<ServiceTier>,
     send_reasoning_content: bool,
     extra_headers: reqwest::header::HeaderMap,
+    /// Carries each request's conversation ID when set.
+    session_affinity_header: Option<reqwest::header::HeaderName>,
     extra_body: serde_json::Map<String, Value>,
     send_empty_tool_call_content: bool,
     /// Learned by post_json; see there.
@@ -214,6 +216,7 @@ impl OpenAiCompatClient {
             send_reasoning_content: false,
             client,
             extra_headers: reqwest::header::HeaderMap::new(),
+            session_affinity_header: None,
             extra_body: serde_json::Map::new(),
             temperature_unsupported: AtomicBool::new(false),
             send_empty_tool_call_content: false,
@@ -241,12 +244,55 @@ impl OpenAiCompatClient {
             // Header names are case-insensitive, so two configured keys
             // differing only in case would collapse into one and drop a
             // credential without a word.
-            if self.extra_headers.contains_key(&header_name) {
-                anyhow::bail!("extra header {name:?} is configured more than once");
+            if let Some(owner) = self.header_owner(&header_name) {
+                anyhow::bail!("extra header {name:?} is already set by {owner}");
             }
             self.extra_headers.insert(header_name, header_value);
         }
         Ok(self)
+    }
+
+    /// Sends each request's conversation ID in the named header,
+    /// replacing any name set before.
+    pub fn with_session_affinity_header(mut self, name: Option<&str>) -> Result<Self> {
+        self.session_affinity_header = None;
+        let Some(name) = name else {
+            return Ok(self);
+        };
+        let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| anyhow::anyhow!("invalid session_affinity_header {name:?}: {e}"))?;
+        if let Some(owner) = self.header_owner(&header_name) {
+            anyhow::bail!("session_affinity_header {name:?} is already set by {owner}");
+        }
+        self.session_affinity_header = Some(header_name);
+        Ok(self)
+    }
+
+    /// Returns the setting that already uses this header name, if any.
+    /// Both setters use this check to reject conflicting header settings.
+    fn header_owner(&self, name: &reqwest::header::HeaderName) -> Option<&'static str> {
+        if self.extra_headers.contains_key(name) {
+            Some("extra_headers")
+        } else if self.session_affinity_header.as_ref() == Some(name) {
+            Some("session_affinity_header")
+        } else {
+            None
+        }
+    }
+
+    /// Returns the extra headers for this request.
+    /// Adds the affinity header if configured and a conversation ID exists.
+    fn request_headers(
+        &self,
+        conversation_id: Option<uuid::Uuid>,
+    ) -> Result<std::borrow::Cow<'_, reqwest::header::HeaderMap>> {
+        let (Some(name), Some(id)) = (&self.session_affinity_header, conversation_id) else {
+            return Ok(std::borrow::Cow::Borrowed(&self.extra_headers));
+        };
+        let value = reqwest::header::HeaderValue::from_str(&format!("sashiko-conversation-{id}"))?;
+        let mut headers = self.extra_headers.clone();
+        headers.insert(name.clone(), value);
+        Ok(std::borrow::Cow::Owned(headers))
     }
 
     pub fn with_extra_body(mut self, fields: serde_json::Map<String, Value>) -> Result<Self> {
@@ -317,11 +363,15 @@ impl OpenAiCompatClient {
         Ok(openai_req)
     }
 
-    async fn post_request(&self, body: &mut Value) -> Result<OpenAiResponse, OpenAiCompatError> {
+    async fn post_request(
+        &self,
+        headers: &reqwest::header::HeaderMap,
+        body: &mut Value,
+    ) -> Result<OpenAiResponse, OpenAiCompatError> {
         let response: OpenAiResponse = post_json(
             &self.client,
             &self.base_url,
-            &self.extra_headers,
+            headers,
             body,
             &self.temperature_unsupported,
         )
@@ -605,10 +655,11 @@ impl AiProvider for OpenAiCompatClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         tracing::debug!("Sending OpenAI request...");
 
+        let headers = self.request_headers(request.conversation_id)?;
         let openai_req = self.build_request(request)?;
 
         let mut resp_body = self.request_body(&openai_req)?;
-        let resp = self.post_request(&mut resp_body).await?;
+        let resp = self.post_request(&headers, &mut resp_body).await?;
         translate_ai_response(resp)
     }
 
@@ -1764,6 +1815,206 @@ mod tests {
         assert_eq!(body["extraData"]["clientName"], "sashiko");
         assert_eq!(body["extraData"]["sessionId"], "review-1");
         server.abort();
+        Ok(())
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn session_affinity_header_carries_the_conversation_id() -> Result<()> {
+        let (base_url, captured, server) = capturing_server().await?;
+        let client = |header: Option<&str>| -> Result<OpenAiCompatClient> {
+            OpenAiCompatClient::new(
+                base_url.clone(),
+                OpenAiProviderType::OpenAiCompatible,
+                "test-model".to_string(),
+                8192,
+                128,
+                5,
+                None,
+                None,
+            )?
+            .with_session_affinity_header(header)
+        };
+        let request = |id: Option<uuid::Uuid>| AiRequest {
+            conversation_id: id,
+            ..empty_request()
+        };
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+
+        // One client handles multiple conversations.
+        // Each request must use its own conversation's ID.
+        // Requests without an ID must send no affinity header.
+        let shared = client(Some("X-Session-Affinity"))?;
+        for id in [Some(a), Some(b), Some(a), None] {
+            shared.generate_content(request(id)).await?;
+        }
+        client(None)?.generate_content(request(Some(a))).await?;
+
+        let requests = captured.lock().await;
+        let sent: Vec<Option<&str>> = requests
+            .iter()
+            .map(|(headers, _)| {
+                headers
+                    .get("x-session-affinity")
+                    .map(|v| v.to_str().unwrap())
+            })
+            .collect();
+        let (header_a, header_b) = (
+            format!("sashiko-conversation-{a}"),
+            format!("sashiko-conversation-{b}"),
+        );
+        assert_eq!(
+            sent,
+            vec![
+                Some(header_a.as_str()),
+                Some(header_b.as_str()),
+                Some(header_a.as_str()),
+                None,
+                None,
+            ]
+        );
+        // The ID routes the request; it never reaches the prompt.
+        for (_, body) in requests.iter() {
+            let body = body.to_string();
+            assert!(!body.contains(&a.to_string()) && !body.contains(&b.to_string()));
+        }
+        server.abort();
+        Ok(())
+    }
+
+    /// Accepts the second answer, so a run makes a request and a retry.
+    #[cfg(feature = "server")]
+    struct RetryOnceSession {
+        answers: usize,
+    }
+
+    #[cfg(feature = "server")]
+    #[async_trait::async_trait]
+    impl crate::ai::session::LlmSession for RetryOnceSession {
+        type Output = ();
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "review".to_string()
+        }
+
+        fn validate(
+            &mut self,
+            _response: &AiResponse,
+        ) -> Result<(), crate::ai::session::ValidationError> {
+            self.answers += 1;
+            if self.answers < 2 {
+                return Err(crate::ai::session::ValidationError::FormatViolation(
+                    "retry".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn configured_session_affinity_header_reaches_the_wire() -> Result<()> {
+        let (base_url, captured, server) = capturing_server().await?;
+        let mut settings = crate::settings::Settings::new()?;
+        settings.ai.provider = "openai-compatible".to_string();
+        settings.ai.model = "test-model".to_string();
+        settings.ai.openai_compat = Some(crate::settings::OpenAiCompatSettings {
+            base_url: Some(base_url),
+            context_window_size: None,
+            max_tokens: None,
+            effort: None,
+            send_reasoning_content: false,
+            extra_headers: Default::default(),
+            session_affinity_header: Some("x-session-affinity".to_string()),
+            extra_body: Default::default(),
+            send_empty_tool_call_content: false,
+            api: None,
+            service_tier: None,
+        });
+        let provider = crate::ai::create_provider(&settings)?;
+
+        crate::ai::session::SessionRunner::new(provider.as_ref())
+            .run(&mut RetryOnceSession { answers: 0 })
+            .await?;
+        crate::ai::session::SessionRunner::new(provider.as_ref())
+            .run(&mut RetryOnceSession { answers: 0 })
+            .await?;
+
+        let requests = captured.lock().await;
+        let sent: Vec<String> = requests
+            .iter()
+            .map(|(headers, _)| {
+                headers
+                    .get("x-session-affinity")
+                    .expect("every request carries the header")
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(sent.len(), 4, "two runs of a request and a retry each");
+        assert!(sent[0].starts_with("sashiko-conversation-"), "{}", sent[0]);
+        assert_eq!(sent[0], sent[1], "a retry stays in its conversation");
+        assert_eq!(sent[2], sent[3]);
+        assert_ne!(sent[0], sent[2], "each run is a new conversation");
+        server.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn session_affinity_header_rejects_invalid_and_duplicate_names() -> Result<()> {
+        let client = || test_client("https://api.openai.com/v1", 4096, None);
+        assert!(client().with_session_affinity_header(None).is_ok());
+        assert!(
+            client()
+                .with_session_affinity_header(Some("bad header"))
+                .is_err()
+        );
+        assert!(client().with_session_affinity_header(Some("")).is_err());
+
+        let extra = std::collections::BTreeMap::from([(
+            "X-Session-Affinity".to_string(),
+            "value".to_string(),
+        )]);
+        let error = match client()
+            .with_extra_headers(&extra)?
+            .with_session_affinity_header(Some("x-session-affinity"))
+        {
+            Ok(_) => panic!("a header already in extra_headers must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(error.contains("extra_headers"), "{error}");
+
+        // The conflict is caught whichever setter runs first.
+        let error = match client()
+            .with_session_affinity_header(Some("x-session-affinity"))?
+            .with_extra_headers(&extra)
+        {
+            Ok(_) => panic!("an extra header that is the affinity header must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(error.contains("session_affinity_header"), "{error}");
+
+        // Setting the name again replaces it rather than conflicting.
+        assert!(
+            client()
+                .with_session_affinity_header(Some("x-session-affinity"))?
+                .with_session_affinity_header(Some("x-session-affinity"))
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cache_identity_ignores_session_affinity_header() -> Result<()> {
+        let plain = test_client("https://api.openai.com/v1", 4096, None);
+        let affine = test_client("https://api.openai.com/v1", 4096, None)
+            .with_session_affinity_header(Some("x-session-affinity"))?;
+        assert_eq!(plain.cache_identity(), affine.cache_identity());
         Ok(())
     }
 
