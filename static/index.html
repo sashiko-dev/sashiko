@@ -182,6 +182,36 @@
             }
             #btn-copy-bug-link[data-hint]::before, #btn-bug-markdown[data-hint]::before { display: none; }
         }
+        .cvss-vector-wrap { position: relative; display: inline-block; cursor: help; }
+        .cvss-vector-wrap code { border-bottom: 1px dashed var(--text-muted); }
+        .cvss-vector-wrap[data-cvss-tip]::after {
+            content: attr(data-cvss-tip); position: absolute; top: calc(100% + 8px); left: 0;
+            width: max-content; max-width: min(440px, 90vw); padding: 8px 10px;
+            background: var(--card-bg); color: var(--text); border: 1px solid var(--border);
+            border-radius: 4px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.22);
+            font-size: 12px; font-weight: normal; line-height: 1.45; white-space: pre-line; text-align: left;
+            z-index: 1000; opacity: 0; visibility: hidden; transform: translateY(-3px);
+            transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s ease; pointer-events: none;
+        }
+        .cvss-vector-wrap[data-cvss-tip]::before {
+            content: ""; position: absolute; top: calc(100% + 3px); left: 16px; width: 8px; height: 8px;
+            background: var(--card-bg); border-top: 1px solid var(--border); border-left: 1px solid var(--border);
+            transform: rotate(45deg); z-index: 1001; opacity: 0; visibility: hidden;
+            transition: opacity 0.15s ease, visibility 0.15s ease; pointer-events: none;
+        }
+        .cvss-vector-wrap[data-cvss-tip]:hover::after, .cvss-vector-wrap[data-cvss-tip]:focus-visible::after {
+            opacity: 1; visibility: visible; transform: translateY(0);
+        }
+        .cvss-vector-wrap[data-cvss-tip]:hover::before, .cvss-vector-wrap[data-cvss-tip]:focus-visible::before {
+            opacity: 1; visibility: visible;
+        }
+        @media (max-width: 768px) {
+            .cvss-vector-wrap[data-cvss-tip]::after {
+                position: fixed; top: auto; bottom: 12px; left: 12px; right: 12px;
+                width: auto; max-width: none; transform: none;
+            }
+            .cvss-vector-wrap[data-cvss-tip]::before { display: none; }
+        }
 
         /* Subsystem Multi-select Dropdown */
         .subsystem-dropdown { position: relative; display: inline-block; }
@@ -1192,6 +1222,69 @@
             return SEVERITY_COLORS[String(sev || '').toLowerCase()] || 'var(--sev-unknown)';
         }
 
+        const CVSS_METRIC_LABELS = {
+            AV: ['Attack Vector', { N: 'Network', A: 'Adjacent', L: 'Local', P: 'Physical' }],
+            AC: ['Attack Complexity', { L: 'Low', H: 'High' }],
+            AT: ['Attack Requirements', { N: 'None', P: 'Present' }],
+            PR: ['Privileges Required', { N: 'None', L: 'Low', H: 'High' }],
+            UI: ['User Interaction', { N: 'None', P: 'Passive', A: 'Active', R: 'Required' }],
+            VC: ['Vulnerable System Confidentiality', { N: 'None', L: 'Low', H: 'High' }],
+            VI: ['Vulnerable System Integrity', { N: 'None', L: 'Low', H: 'High' }],
+            VA: ['Vulnerable System Availability', { N: 'None', L: 'Low', H: 'High' }],
+            SC: ['Subsequent System Confidentiality', { N: 'None', L: 'Low', H: 'High' }],
+            SI: ['Subsequent System Integrity', { N: 'None', L: 'Low', H: 'High' }],
+            SA: ['Subsequent System Availability', { N: 'None', L: 'Low', H: 'High' }],
+            AU: ['Automatable', { N: 'No', Y: 'Yes', X: 'Not Defined' }],
+            R: ['Recovery', { A: 'Automatic', U: 'User', I: 'Irrecoverable', X: 'Not Defined' }],
+            RE: ['Vulnerability Response Effort', { L: 'Low', M: 'Moderate', H: 'High', X: 'Not Defined' }],
+            E: ['Exploit Maturity', { A: 'Attacked', P: 'POC', U: 'Unreported', X: 'Not Defined' }],
+            V: ['Value Density', { D: 'Diffuse', C: 'Concentrated', X: 'Not Defined' }],
+            U: ['Provider Urgency', { Clear: 'Clear', Green: 'Green', Amber: 'Amber', Red: 'Red', X: 'Not Defined' }],
+            C: ['Confidentiality Impact', { N: 'None', L: 'Low', H: 'High' }],
+            I: ['Integrity Impact', { N: 'None', L: 'Low', H: 'High' }],
+            A: ['Availability Impact', { N: 'None', L: 'Low', H: 'High' }]
+        };
+
+        function explainCvssVector(vector) {
+            if (!vector || typeof vector !== 'string') return '';
+            const parts = vector.trim().split('/').filter(Boolean);
+            if (parts.length === 0) return '';
+            const isV3 = /^CVSS:3\./i.test(parts[0]);
+            const header = /^CVSS:/i.test(parts[0]) ? parts.shift() : 'CVSS';
+            const lines = [`${header} Breakdown:`];
+            for (const part of parts) {
+                const idx = part.indexOf(':');
+                if (idx <= 0) continue;
+                const key = part.slice(0, idx).toUpperCase();
+                const val = part.slice(idx + 1);
+                if (key === 'S') {
+                    const sDesc = isV3
+                        ? ({ U: 'Unchanged', C: 'Changed' }[val.toUpperCase()] || val)
+                        : ({ N: 'Negligible', P: 'Present', X: 'Not Defined' }[val.toUpperCase()] || val);
+                    lines.push(`${key}:${val} — ${isV3 ? 'Scope' : 'Safety'}: ${sDesc}`);
+                    continue;
+                }
+                const entry = CVSS_METRIC_LABELS[key];
+                if (entry) {
+                    const [name, values] = entry;
+                    const desc = values[val] || values[val.toUpperCase()] || val;
+                    lines.push(`${key}:${val} — ${name}: ${desc}`);
+                } else {
+                    lines.push(`${key}:${val}`);
+                }
+            }
+            return lines.length > 1 ? lines.join('\n') : vector;
+        }
+
+        function renderCvssVectorHtml(vector) {
+            if (!vector) return '';
+            const explanation = explainCvssVector(vector);
+            const tipAttr = explanation
+                ? ` data-cvss-tip="${escapeHtml(explanation)}" aria-label="${escapeHtml(explanation.replace(/\n/g, '; '))}" tabindex="0"`
+                : '';
+            return `<span class="cvss-vector-wrap"${tipAttr}><code>${escapeHtml(vector)}</code></span> <button class="copy-btn" data-copy="${escapeHtml(vector)}" title="Copy CVSS v4.0 vector">Copy</button>`;
+        }
+
         function renderSecurityCell(bug) {
             const cls = bug.security_class;
             if (!cls) {
@@ -1223,9 +1316,7 @@
                 const rating = data.security_rating || 'Low';
                 const scoreStr = typeof data.security_score === 'number' ? data.security_score.toFixed(1) : '0.0';
                 const color = getSeverityColor(rating);
-                const vecHtml = data.cvss_vector
-                    ? ` <code>${escapeHtml(data.cvss_vector)}</code> <button class="copy-btn" data-copy="${escapeHtml(data.cvss_vector)}" title="Copy CVSS v4.0 vector">Copy</button>`
-                    : '';
+                const vecHtml = data.cvss_vector ? ` ${renderCvssVectorHtml(data.cvss_vector)}` : '';
                 return `<span class="tag" style="border:1px solid ${color}; color:${color}; font-weight:bold; background:transparent;">${escapeHtml(rating)} (${escapeHtml(scoreStr)}/10.0)</span>${vecHtml}${queuedHtml}`;
             }
             const label = cls === 'hardening' ? 'Hardening (0.0/10.0)' : 'Not Security (0.0/10.0)';
@@ -1239,7 +1330,7 @@
                 const rating = item.security_rating || 'Low';
                 const scoreStr = typeof item.security_score === 'number' ? item.security_score.toFixed(1) : '0.0';
                 const color = getSeverityColor(rating);
-                parts.push(`<div class="review-meta-label">CVSS v4.0:</div><div><span style="color:${color}; font-weight:bold;">${escapeHtml(rating)} (${escapeHtml(scoreStr)}/10.0)</span>${item.cvss_vector ? ` <code>${escapeHtml(item.cvss_vector)}</code> <button class="copy-btn" data-copy="${escapeHtml(item.cvss_vector)}" title="Copy CVSS v4.0 vector">Copy</button>` : ''}</div>`);
+                parts.push(`<div class="review-meta-label">CVSS v4.0:</div><div><span style="color:${color}; font-weight:bold;">${escapeHtml(rating)} (${escapeHtml(scoreStr)}/10.0)</span>${item.cvss_vector ? ` ${renderCvssVectorHtml(item.cvss_vector)}` : ''}</div>`);
             } else if (item.security_class) {
                 const label = item.security_class === 'hardening' ? 'Hardening (0.0/10.0)' : 'Not Security (0.0/10.0)';
                 parts.push(`<div class="review-meta-label">Classification:</div><div>${escapeHtml(label)}</div>`);
