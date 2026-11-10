@@ -67,6 +67,7 @@ min_severity = "medium"
 ["linux-integrity@vger.kernel.org"]
 ["linux-kernel@vger.kernel.org"]
 ["linux-kselftest@vger.kernel.org"]
+["linux-mmc@vger.kernel.org"]
 ["linux-omap@vger.kernel.org"]
 ["linux-pm@vger.kernel.org"]
 ["linux-pwm@vger.kernel.org"]
