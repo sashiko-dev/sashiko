@@ -155,13 +155,15 @@ impl ProjectId {
         }
     }
 
-    /// The path to this project's upstream maintainer grants
-    /// ([`crate::upstream_grants`]), for the projects whose access follows
-    /// MAINTAINERS. A missing file means no grants.
-    pub fn upstream_maintainers_path(self) -> Option<&'static str> {
+    /// The path to this project's bug and embargo access grants
+    /// ([`crate::bugs_access`]). A missing file means no grants.
+    pub fn bugs_access_path(self) -> &'static str {
         match self {
-            ProjectId::Linux => Some("projects/linux/upstream_maintainers.toml"),
-            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu | ProjectId::Zephyr => None,
+            ProjectId::Linux => "projects/linux/bugs_access.toml",
+            ProjectId::Sashiko => "projects/sashiko/bugs_access.toml",
+            ProjectId::Gcc => "projects/gcc/bugs_access.toml",
+            ProjectId::Qemu => "projects/qemu/bugs_access.toml",
+            ProjectId::Zephyr => "projects/zephyr/bugs_access.toml",
         }
     }
 

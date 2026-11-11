@@ -1167,44 +1167,10 @@ async fn run_daemon(
         Err(e) => error!("Failed to clean up interrupted Fetching patchsets: {}", e),
     }
 
-    // Load and initialize authoritative immutable MAINTAINERS index when the
-    // reviewed project uses kernel MAINTAINERS.
-    let maintainers_index = if project.uses_maintainers() {
-        let linux_repo_path = std::path::PathBuf::from(&settings.git.repository_path);
-        match sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&linux_repo_path) {
-            Ok(mut idx) => {
-                info!(
-                    "Successfully parsed and indexed {} MAINTAINERS sections from top-of-trunk of Linus's tree",
-                    idx.len()
-                );
-                if let Some(path) = project.upstream_maintainers_path() {
-                    // A grant file that cannot be read or parsed grants
-                    // nothing, which is the direction to fail in.
-                    match sashiko::upstream_grants::load(std::path::Path::new(path)) {
-                        Ok(grants) => {
-                            let listed = grants.len();
-                            let kept = idx.set_upstream_grants(grants);
-                            info!(
-                                "Loaded {kept} of {listed} upstream maintainer grants from {path}"
-                            );
-                        }
-                        Err(e) => error!("Ignoring upstream maintainer grants: {e:#}"),
-                    }
-                }
-                Arc::new(idx)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to load MAINTAINERS from top-of-trunk: {}. Using empty index.",
-                    e
-                );
-                Arc::new(sashiko::maintainers::MaintainersIndex::new())
-            }
-        }
-    } else {
-        info!("Project {project} does not use kernel MAINTAINERS; skipping index.");
-        Arc::new(sashiko::maintainers::MaintainersIndex::new())
-    };
+    // Load and initialize authoritative immutable MAINTAINERS + bugs_access index.
+    let index_repo_path = std::path::PathBuf::from(&settings.git.repository_path);
+    let maintainers_index =
+        sashiko::maintainers::MaintainersIndex::load_for_project(project, &index_repo_path);
     sashiko::maintainers::init_global_maintainers(maintainers_index);
 
     // Attributes series ingested before attribution existed. Best effort: a
