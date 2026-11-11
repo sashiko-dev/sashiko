@@ -829,14 +829,105 @@ fn mainline_branch(project: Option<ProjectId>) -> &'static str {
     project.map_or("master", ProjectId::mainline_branch)
 }
 
+fn sanitize_diff_path(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim().trim_start_matches("./");
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('-')
+        || trimmed.chars().any(char::is_control)
+        || trimmed
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn parse_unified_header_path<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(prefix)?;
+    let path = rest.split('\t').next()?.trim();
+    let path = path
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(path);
+    Some(path)
+}
+
+fn strip_p1_single_side(raw: &str) -> &str {
+    if let Some(rel) = raw.strip_prefix("b/").or_else(|| raw.strip_prefix("a/")) {
+        return rel;
+    }
+    if let Some((root, rel)) = raw.split_once('/')
+        && (root == "linux" || root.starts_with("linux-") || root.ends_with(".orig"))
+    {
+        return rel;
+    }
+    raw
+}
+
+fn extract_unified_pair_path<'a>(old_raw: &'a str, new_raw: &'a str) -> Option<&'a str> {
+    if old_raw == "/dev/null" && new_raw == "/dev/null" {
+        return None;
+    }
+    if old_raw == "/dev/null" {
+        return sanitize_diff_path(strip_p1_single_side(new_raw));
+    }
+    if new_raw == "/dev/null" {
+        return sanitize_diff_path(strip_p1_single_side(old_raw));
+    }
+    if let Some(rel) = new_raw
+        .strip_prefix("b/")
+        .or_else(|| old_raw.strip_prefix("a/"))
+    {
+        return sanitize_diff_path(rel);
+    }
+    if old_raw != new_raw
+        && let (Some((_, old_rel)), Some((_, new_rel))) =
+            (old_raw.split_once('/'), new_raw.split_once('/'))
+        && old_rel == new_rel
+    {
+        return sanitize_diff_path(new_rel);
+    }
+    sanitize_diff_path(new_raw)
+}
+
 pub fn extract_files_from_diff(diff: &str) -> Vec<String> {
+    let lines: Vec<&str> = diff.lines().collect();
     let mut files = Vec::new();
-    for line in diff.lines() {
+    let mut in_git_header = false;
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
         if let Some(path) = line.strip_prefix("diff --git a/")
             && let Some((a, _)) = path.split_once(' ')
         {
-            files.push(a.to_string());
+            if let Some(clean) = sanitize_diff_path(a) {
+                files.push(clean.to_string());
+            }
+            in_git_header = true;
+            i += 1;
+            continue;
         }
+        if line.starts_with("@@ ") {
+            in_git_header = false;
+            i += 1;
+            continue;
+        }
+        if !in_git_header
+            && i + 2 < lines.len()
+            && lines[i + 2].starts_with("@@ -")
+            && let Some(old_raw) = parse_unified_header_path(line, "--- ")
+            && let Some(new_raw) = parse_unified_header_path(lines[i + 1], "+++ ")
+        {
+            if let Some(clean) = extract_unified_pair_path(old_raw, new_raw) {
+                files.push(clean.to_string());
+            }
+            i += 3;
+            continue;
+        }
+        i += 1;
     }
     files
 }
@@ -2291,5 +2382,73 @@ F: patterns/
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_extract_files_from_diff_supports_quilt_and_git_formats() {
+        let quilt_diff = "\
+Commit description.
+
+---
+ kernel/sched/fair.c  | 4 ++--
+ kernel/sched/new.c   | 3 +++
+ kernel/sched/old.c   | 3 ---
+ kernel/time/timer.c  | 2 +-
+ 4 files changed, 6 insertions(+), 6 deletions(-)
+
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -10,4 +10,4 @@
+--- inside_hunk_old
++++ inside_hunk_new
+ context
+--- /dev/null
++++ b/kernel/sched/new.c
+@@ -0,0 +1,3 @@
++int x;
+--- a/kernel/sched/old.c
++++ /dev/null
+@@ -1,3 +0,0 @@
+-int y;
+Index: linux/kernel/time/timer.c
+===================================================================
+--- linux.orig/kernel/time/timer.c\t2026-11-05 12:00:00.000000000 +0100
++++ linux/kernel/time/timer.c\t2026-11-05 12:01:00.000000000 +0100
+@@ -5,2 +5,2 @@
+-old
++new
+";
+        assert_eq!(
+            extract_files_from_diff(quilt_diff),
+            vec![
+                "kernel/sched/fair.c",
+                "kernel/sched/new.c",
+                "kernel/sched/old.c",
+                "kernel/time/timer.c",
+            ]
+        );
+
+        // Standard git format-patch headers must not double-count their --- / +++ pair,
+        // and path traversal or option-like paths are rejected.
+        let mixed = "\
+diff --git a/kernel/irq/manage.c b/kernel/irq/manage.c
+index 1111111..2222222 100644
+--- a/kernel/irq/manage.c
++++ b/kernel/irq/manage.c
+@@ -1,2 +1,2 @@
+-a
++b
+--- a/../etc/passwd
++++ b/../etc/passwd
+@@ -1 +1 @@
+-x
++y
+--- a/--option
++++ b/--option
+@@ -1 +1 @@
+-x
++y
+";
+        assert_eq!(extract_files_from_diff(mixed), vec!["kernel/irq/manage.c"]);
     }
 }
