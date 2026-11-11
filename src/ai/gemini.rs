@@ -156,13 +156,16 @@ pub struct Candidate {
     pub continuation_token: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageMetadata {
+    #[serde(default)]
     pub prompt_token_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidates_token_count: Option<u32>,
+    #[serde(default)]
     pub total_token_count: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_content_token_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thoughts_token_count: Option<u32>,
@@ -3241,6 +3244,23 @@ mod tests {
         assert_eq!(
             api_err.to_string(),
             "Gemini API error (400 Bad Request) (reason: API_KEY_INVALID): API key not valid. Please pass a valid API key."
+        );
+    }
+
+    #[test]
+    fn test_blocked_prompt_feedback_with_empty_usage_metadata_reports_block_reason() {
+        let raw = r#"{"promptFeedback":{"blockReason":"BLOCKLIST"},"usageMetadata":{}}"#;
+        let parsed: GenerateContentResponse =
+            serde_json::from_str(raw).expect("empty usageMetadata should deserialize");
+        let usage = parsed.usage_metadata.as_ref().expect("usageMetadata");
+        assert_eq!(usage.prompt_token_count, 0);
+        assert_eq!(usage.total_token_count, 0);
+        assert_eq!(usage.output_token_count(), 0);
+
+        let err = translate_ai_response(parsed).expect_err("blocked response must return Err");
+        assert_eq!(
+            err.to_string(),
+            "Gemini request blocked by prompt feedback (reason: BLOCKLIST)"
         );
     }
 }
