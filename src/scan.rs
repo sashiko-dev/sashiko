@@ -1791,6 +1791,16 @@ pub struct VerifiedScanBug {
     pub duplicate_of_bugid: Option<String>,
 }
 
+fn displayed_subsystem_names(subsystems: &[crate::db::AttributedSubsystem]) -> Vec<String> {
+    let mut names = Vec::new();
+    for sub in subsystems {
+        if sub.source != crate::db::SubsystemSource::UpstreamGrant && !names.contains(&sub.name) {
+            names.push(sub.name.clone());
+        }
+    }
+    names
+}
+
 impl VerifiedScanBug {
     pub fn from_standalone(bug: crate::workflows::linux_bug::StandaloneVerifiedBug) -> Self {
         Self {
@@ -1798,7 +1808,7 @@ impl VerifiedScanBug {
             canonical_description: bug.canonical_description,
             severity: bug.severity.as_str().to_string(),
             severity_explanation: bug.severity_explanation,
-            subsystems: bug.subsystems.into_iter().map(|s| s.name).collect(),
+            subsystems: displayed_subsystem_names(&bug.subsystems),
             source_files: bug.source_files,
             locations: bug.locations.unwrap_or_else(|| serde_json::json!([])),
             introduced_in_commit: bug.introduced_in_commit,
@@ -1817,13 +1827,15 @@ impl VerifiedScanBug {
         duplicate_of_bugid: Option<String>,
     ) -> Self {
         let subsystems = if bug.subsystems.is_empty() {
-            fallback_input
-                .subsystems
-                .iter()
-                .map(|s| s.name.clone())
-                .collect()
+            displayed_subsystem_names(&fallback_input.subsystems)
         } else {
-            bug.subsystems.clone()
+            let mut names = Vec::with_capacity(bug.subsystems.len());
+            for name in &bug.subsystems {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+            names
         };
         Self {
             canonical_title: bug.title.clone(),
@@ -2256,6 +2268,7 @@ async fn preload_scan_notes(
 }
 
 async fn load_or_init_maintainers(
+    project: crate::project::ProjectId,
     repo_path: &Path,
 ) -> Option<std::sync::Arc<crate::maintainers::MaintainersIndex>> {
     if let Some(idx) = crate::maintainers::get_global_maintainers() {
@@ -2263,9 +2276,9 @@ async fn load_or_init_maintainers(
     }
     let repo_for_maintainers = repo_path.to_path_buf();
     let loaded = tokio::task::spawn_blocking(move || {
-        crate::maintainers::MaintainersIndex::from_top_of_trunk(&repo_for_maintainers)
-            .ok()
-            .map(std::sync::Arc::new)
+        let idx =
+            crate::maintainers::MaintainersIndex::load_for_project(project, &repo_for_maintainers);
+        idx.is_ready_for_reconcile().then_some(idx)
     })
     .await
     .ok()
@@ -2998,7 +3011,7 @@ pub async fn run_scan(
         },
     );
 
-    let maintainers = load_or_init_maintainers(&options.repo_path).await;
+    let maintainers = load_or_init_maintainers(options.project, &options.repo_path).await;
     let notes_ctx = std::sync::Arc::new(
         preload_scan_notes(
             &options.repo_path,
@@ -3602,6 +3615,66 @@ pub fn second_fn() -> u32 {
 
         let bug1 = VerifiedScanBug::from_standalone(standalone);
         assert_eq!(bug1.severity, "High");
+
+        let with_grants = crate::workflows::linux_bug::StandaloneVerifiedBug {
+            canonical_title: "btrfs: uaf".to_string(),
+            canonical_description: "desc".to_string(),
+            severity: crate::db::Severity::High,
+            severity_explanation: "high".to_string(),
+            subsystems: vec![
+                crate::db::AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM"),
+                crate::db::AttributedSubsystem::from_upstream_grant("BTRFS FILE SYSTEM"),
+                crate::db::AttributedSubsystem::from_upstream_grant(
+                    "bugs_access::custom:btrfs zoned",
+                ),
+            ],
+            source_files: vec!["fs/btrfs/zoned.c".to_string()],
+            locations: None,
+            introduced_in_commit: None,
+            verified_on_sha: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            tokens_in: 0,
+            tokens_out: 0,
+            tokens_cached: 0,
+        };
+        assert_eq!(
+            VerifiedScanBug::from_standalone(with_grants).subsystems,
+            vec!["BTRFS FILE SYSTEM".to_string()]
+        );
+        #[cfg(feature = "server")]
+        {
+            let empty_db_bug: crate::db::Bug = serde_json::from_value(serde_json::json!({
+                "internal_id": 1,
+                "bugid": "linux-1",
+                "title": "btrfs: uaf",
+                "reporter": "sashiko",
+                "reported_at": 1,
+                "created_at": 1,
+                "updated_at": 1
+            }))
+            .unwrap();
+            let fb = crate::api::BugInput {
+                problem: "btrfs: uaf".to_string(),
+                reasoning: "desc".to_string(),
+                locations: None,
+                subsystems: vec![
+                    crate::db::AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM"),
+                    crate::db::AttributedSubsystem::from_upstream_grant(
+                        "bugs_access::override:BTRFS FILE SYSTEM",
+                    ),
+                ],
+                source_files: vec!["fs/btrfs/zoned.c".to_string()],
+                commit_sha: None,
+                patchset_id: None,
+                patch_id: None,
+                baseline_sha: None,
+                review_id: None,
+                min_severity: None,
+            };
+            assert_eq!(
+                VerifiedScanBug::from_db_bug(&empty_db_bug, &fb, "abc", None, None).subsystems,
+                vec!["BTRFS FILE SYSTEM".to_string()]
+            );
+        }
 
         let bug_same_fn = VerifiedScanBug {
             canonical_title: "smb: server: fp memory leak in parse_durable_handle_context()"

@@ -1962,19 +1962,20 @@ async fn analyze_bug(
         .or_else(|| Some(provider.get_capabilities().model_name));
     let mut payload = payload.input;
     if payload.subsystems.is_empty() && !payload.source_files.is_empty() {
+        let mindex = crate::maintainers::get_global_maintainers().unwrap_or_else(|| {
+            crate::maintainers::MaintainersIndex::load_for_project(
+                project,
+                std::path::Path::new(&state.settings.git.repository_path),
+            )
+        });
         if project.uses_maintainers() {
-            let matched = if let Some(mindex) = crate::maintainers::get_global_maintainers() {
-                mindex.attribute_files(&payload.source_files)
-            } else if let Ok(mindex) = crate::maintainers::MaintainersIndex::from_top_of_trunk(
-                &state.settings.git.repository_path,
-            ) {
+            payload.subsystems = if mindex.is_ready_for_reconcile() {
                 mindex.attribute_files(&payload.source_files)
             } else {
                 Vec::new()
             };
-            payload.subsystems = matched;
         } else {
-            payload.subsystems =
+            let mut subs: Vec<_> =
                 crate::workflows::linux_bug::extract_directory_subsystems_for_project(
                     &payload.source_files,
                     project,
@@ -1982,6 +1983,13 @@ async fn analyze_bug(
                 .into_iter()
                 .map(crate::db::AttributedSubsystem::from_path_prefix)
                 .collect();
+            subs.extend(
+                mindex
+                    .bugs_access_sections(&payload.source_files)
+                    .into_iter()
+                    .map(crate::db::AttributedSubsystem::from_upstream_grant),
+            );
+            payload.subsystems = subs;
         }
     }
 
@@ -2740,7 +2748,7 @@ async fn list_bugs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugListQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let scope = principal.maintained_section_names();
+    let scope = principal.readable_section_names();
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(50).clamp(1, 100);
 
@@ -2922,7 +2930,7 @@ async fn list_bug_subsystems(
         Some(Err(_)) => return Err(StatusCode::BAD_REQUEST),
         None => crate::db::BugLifecycleStatus::Open,
     };
-    let scope = principal.maintained_section_names();
+    let scope = principal.readable_section_names();
     let visibility = principal.visibility(&scope);
     // Key the cache on the parsed status so the alias and the canonical
     // spelling do not each get their own entry, and on the principal's scope so
@@ -6315,6 +6323,39 @@ F:	net/
             &acl,
             Some(&index)
         ));
+
+        // bugs_access.toml `read` and `read_write` grantees become sign-in
+        // eligible, while a maintainer removed by `replace_emails` loses
+        // eligibility.
+        let mut with_grants = index;
+        with_grants.set_bugs_access(vec![
+            crate::bugs_access::RawAccessGrant {
+                section: Some("BTRFS FILE SYSTEM".into()),
+                read: vec!["btrfs-reader@example.org".into()],
+                ..Default::default()
+            },
+            crate::bugs_access::RawAccessGrant {
+                section: Some("NETWORKING [GENERAL]".into()),
+                replace_emails: true,
+                read_write: vec!["net-delegate@example.org".into()],
+                ..Default::default()
+            },
+        ]);
+        assert!(is_sign_in_eligible(
+            "btrfs-reader@example.org",
+            &acl,
+            Some(&with_grants)
+        ));
+        assert!(is_sign_in_eligible(
+            "net-delegate@example.org",
+            &acl,
+            Some(&with_grants)
+        ));
+        assert!(!is_sign_in_eligible(
+            "davem@davemloft.net",
+            &acl,
+            Some(&with_grants)
+        ));
     }
 
     #[tokio::test]
@@ -7319,6 +7360,224 @@ F:	*
                 .any(|m| m.contains("Security re-evaluation requested: Updated threat model"))
         );
     }
+
+    #[tokio::test]
+    async fn test_bugs_access_read_vs_read_write_and_path_overrides_endpoints() {
+        let _guard = crate::maintainers::GLOBAL_INDEX_TEST_LOCK.lock().await;
+        crate::maintainers::clear_global_maintainers();
+
+        let maintainers_text = r#"
+Maintainers List
+===================
+
+BTRFS FILE SYSTEM
+M:	Chris Mason <clm@fb.com>
+S:	Maintained
+F:	fs/btrfs/
+
+NETWORKING [GENERAL]
+M:	David S. Miller <davem@davemloft.net>
+S:	Maintained
+F:	net/
+"#;
+        let mut index =
+            crate::maintainers::MaintainersIndex::from_reader(maintainers_text.as_bytes()).unwrap();
+        index.set_bugs_access(vec![
+            crate::bugs_access::RawAccessGrant {
+                section: Some("BTRFS FILE SYSTEM".into()),
+                exclude_paths: vec!["fs/btrfs/tests/".into()],
+                ..Default::default()
+            },
+            crate::bugs_access::RawAccessGrant {
+                section: Some("BTRFS FILE SYSTEM".into()),
+                read: vec!["btrfs-reader@example.org".into()],
+                read_write: vec!["btrfs-rw@example.org".into()],
+                ..Default::default()
+            },
+        ]);
+        let index = Arc::new(index);
+        crate::maintainers::init_global_maintainers(index.clone());
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.database.url = ":memory:".to_string();
+        settings.server.testing_mode = false;
+        settings.server.read_only = false;
+        settings.server.jwt_secret = Some("test-bugs-access-secret".to_string());
+        settings.linux_bug.enabled = true;
+        let db = Arc::new(Database::new(&settings.database).await.unwrap());
+        db.migrate().await.unwrap();
+        let settings = Arc::new(settings);
+
+        // Bug 1: fs/btrfs/inode.c (covered by BTRFS after exclude_paths).
+        let mut visible_bug: crate::db::NewBug = serde_json::from_value(serde_json::json!({
+            "bugid": "linux-btrfs-visible",
+            "title": "btrfs: uaf in inode"
+        }))
+        .unwrap();
+        visible_bug.subsystems = index.attribute_files(["fs/btrfs/inode.c"]);
+        let visible_id = db
+            .create_bug_with_enrichment(
+                &visible_bug,
+                Some(&crate::db::NewBugEnrichment {
+                    kind: "reproducer".to_string(),
+                    tool: "test".to_string(),
+                    created_at: 10,
+                    content: Some("BTRFS_REPRO_MARKER".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Bug 2: fs/btrfs/tests/extent-io-tests.c (excluded by exclude_paths,
+        // even though raw MAINTAINERS still matches BTRFS FILE SYSTEM).
+        let mut excluded_bug: crate::db::NewBug = serde_json::from_value(serde_json::json!({
+            "bugid": "linux-btrfs-excluded",
+            "title": "btrfs: test helper warning"
+        }))
+        .unwrap();
+        excluded_bug.subsystems = index.attribute_files(["fs/btrfs/tests/extent-io-tests.c"]);
+        let excluded_id = db.create_bug(&excluded_bug).await.unwrap();
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(settings, db, event_tx, fetch_tx, ServerOptions::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let secret = "test-bugs-access-secret";
+        let reader_tok = crate::auth::create_token(
+            "btrfs-reader@example.org",
+            secret,
+            Some("session".into()),
+            3600,
+        )
+        .unwrap();
+        let rw_tok =
+            crate::auth::create_token("btrfs-rw@example.org", secret, Some("session".into()), 3600)
+                .unwrap();
+        let client = reqwest::Client::new();
+
+        // 1. Read grantee lists BTRFS bugs (seeing only the non-excluded bug),
+        //    sees subsystem counts, and reads full bug details + reproducers,
+        //    with can_comment = false and can_manage = false.
+        let list_body: serde_json::Value = client
+            .get(format!("http://{}/api/bugs", addr))
+            .header("Authorization", format!("Bearer {}", reader_tok))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list_body["total"], 1);
+        assert_eq!(list_body["items"][0]["bugid"], "linux-btrfs-visible");
+        assert_eq!(
+            list_body["items"][0]["subsystems"],
+            serde_json::json!(["BTRFS FILE SYSTEM"])
+        );
+
+        let subs_body: serde_json::Value = client
+            .get(format!(
+                "http://{}/api/bugs/subsystems?lifecycle_status=new",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", reader_tok))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(subs_body.as_array().unwrap().len(), 1);
+        assert_eq!(subs_body[0]["name"], "BTRFS FILE SYSTEM");
+        assert_eq!(subs_body[0]["count"], 1);
+
+        let detail_reader: serde_json::Value = client
+            .get(format!("http://{}/api/bug?id={}", addr, visible_id))
+            .header("Authorization", format!("Bearer {}", reader_tok))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail_reader["can_comment"], false);
+        assert_eq!(detail_reader["can_manage"], false);
+        assert!(
+            detail_reader["evidence"]["activity"]
+                .to_string()
+                .contains("BTRFS_REPRO_MARKER")
+        );
+
+        // Excluded path bug returns 404 even by numeric id to BTRFS grantees.
+        for tok in [&reader_tok, &rw_tok] {
+            let excluded_resp = client
+                .get(format!("http://{}/api/bug?id={}", addr, excluded_id))
+                .header("Authorization", format!("Bearer {}", tok))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(excluded_resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        // Read grantee is rejected with 403 on Comment and Close mutations.
+        for payload in [
+            serde_json::json!({ "action": "comment", "content": "nope" }),
+            serde_json::json!({ "action": "close", "reason": "nope" }),
+        ] {
+            let resp = client
+                .post(format!("http://{}/api/bug/action?id={}", addr, visible_id))
+                .header("Authorization", format!("Bearer {}", reader_tok))
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        // 2. Read-write grantee gets can_comment = true, can_manage = true,
+        //    and succeeds on Comment and Close mutations.
+        let detail_rw: serde_json::Value = client
+            .get(format!("http://{}/api/bug?id={}", addr, visible_id))
+            .header("Authorization", format!("Bearer {}", rw_tok))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail_rw["can_comment"], true);
+        assert_eq!(detail_rw["can_manage"], true);
+
+        let comment_ok = client
+            .post(format!("http://{}/api/bug/action?id={}", addr, visible_id))
+            .header("Authorization", format!("Bearer {}", rw_tok))
+            .json(&serde_json::json!({ "action": "comment", "content": "triaged" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(comment_ok.status(), StatusCode::OK);
+
+        let close_ok = client
+            .post(format!("http://{}/api/bug/action?id={}", addr, visible_id))
+            .header("Authorization", format!("Bearer {}", rw_tok))
+            .json(&serde_json::json!({ "action": "close", "reason": "fixed" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(close_ok.status(), StatusCode::OK);
+
+        crate::maintainers::clear_global_maintainers();
+    }
 }
 
 /// Whether the caller may exercise a capability.
@@ -7452,7 +7711,7 @@ fn is_sign_in_eligible(
     !email.is_empty()
         && !acl.is_blocklisted(email)
         && (acl.is_known_identity(email)
-            || maintainers.is_some_and(|m| m.subsystems_for_address(email).is_some()))
+            || maintainers.is_some_and(|m| m.has_access_for_address(email)))
 }
 
 use crate::db::SIGN_IN_LINK_LIFETIME_SECONDS;

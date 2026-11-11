@@ -1090,21 +1090,34 @@ impl Bug {
         None
     }
 
-    /// The files a bug is attributed by: the latest verification's
-    /// `source_files`, else the ones filed with the candidate. Unlike
-    /// [`Bug::source_files`], this also covers bugs not yet verified.
+    /// The files a bug is attributed by: the latest verification's or
+    /// deduplication's `source_files`, else the ones filed with the candidate.
+    /// Unlike [`Bug::source_files`], this also covers bugs folded during
+    /// deduplication or not yet verified.
     pub fn attributable_files(&self) -> Option<Vec<String>> {
-        self.source_files().or_else(|| {
-            self.enrichments.iter().find_map(|e| {
-                if e.kind != "candidate" && e.kind != "raw_candidate" {
-                    return None;
-                }
-                e.data_json
-                    .as_ref()?
-                    .get("source_files")
-                    .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+        self.source_files()
+            .or_else(|| {
+                self.enrichments.iter().rev().find_map(|e| {
+                    if e.kind != "deduplication" {
+                        return None;
+                    }
+                    e.data_json
+                        .as_ref()?
+                        .get("source_files")
+                        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                })
             })
-        })
+            .or_else(|| {
+                self.enrichments.iter().find_map(|e| {
+                    if e.kind != "candidate" && e.kind != "raw_candidate" {
+                        return None;
+                    }
+                    e.data_json
+                        .as_ref()?
+                        .get("source_files")
+                        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                })
+            })
     }
 
     pub fn introduced_in_commit(&self) -> Option<String> {
@@ -7440,6 +7453,19 @@ impl Database {
     /// This single Transaction boundary guarantees tearing cannot occur during deduplication.
     /// Returns false when automatic deduplication preserves existing triage.
     pub async fn mark_bug_as_duplicate(&self, params: MarkDuplicateBugParams<'_>) -> Result<bool> {
+        self.mark_bug_as_duplicate_with_attribution(params, None, None)
+            .await
+    }
+
+    /// Transitions a bug into `Duplicate` while atomically updating its
+    /// verified subsystem attribution and `source_files` inside the same
+    /// transaction.
+    pub async fn mark_bug_as_duplicate_with_attribution(
+        &self,
+        params: MarkDuplicateBugParams<'_>,
+        subsystems: Option<&[AttributedSubsystem]>,
+        source_files: Option<&[String]>,
+    ) -> Result<bool> {
         let now = chrono::Utc::now().timestamp();
         let tx = self.begin_bug_write(params.ephemeral_id).await?;
 
@@ -7478,6 +7504,12 @@ impl Database {
             return Ok(false);
         }
 
+        if let Some(subs) = subsystems {
+            self.with_connection((*tx).clone())
+                .replace_bug_subsystems(params.ephemeral_id, subs)
+                .await?;
+        }
+
         // Folding a bug into a canonical one ends its pipeline, so the
         // analysis state is retired in the same statement as the triage state.
         // Leaving it behind strands the row: the dedup stage returns before the
@@ -7508,6 +7540,7 @@ impl Database {
         )
         .await?;
 
+        let data_json = source_files.map(|files| serde_json::json!({ "source_files": files }));
         self.with_connection((*tx).clone())
             .insert_bug_enrichment(
                 params.ephemeral_id,
@@ -7518,11 +7551,11 @@ impl Database {
                     model: self.bug_model.clone(),
                     created_at: now,
                     content: Some(params.reasoning.to_string()),
+                    data_json,
                     tokens_in: params.tokens_in,
                     tokens_out: params.tokens_out,
                     tokens_cached: params.tokens_cached,
                     logs: params.logs.map(str::to_string),
-                    ..Default::default()
                 },
             )
             .await?;
@@ -17264,6 +17297,47 @@ mod tests {
             })
             .await?;
         assert_eq!(total, 0);
+
+        // Folding a candidate as a duplicate atomically persists its verified
+        // grant rows and attributable files, restoring canonical visibility.
+        let dup_bug: NewBug = serde_json::from_value(json!({"bugid": "b-dup", "title": "dup"}))?;
+        let dup_id = db.create_bug(&dup_bug).await?;
+        assert!(db.authorizing_sections_for_bug(dup_id).await?.is_empty());
+        let folded = db
+            .mark_bug_as_duplicate_with_attribution(
+                MarkDuplicateBugParams {
+                    preserve_triage: true,
+                    ephemeral_id: dup_id,
+                    canonical_id: id,
+                    reasoning: "same uaf",
+                    logs: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    tokens_cached: None,
+                },
+                Some(&[
+                    AttributedSubsystem::from_maintainers("ARM/QUALCOMM SUPPORT"),
+                    AttributedSubsystem::from_upstream_grant(soc),
+                ]),
+                Some(&["drivers/soc/qcom/smem.c".to_string()]),
+            )
+            .await?;
+        assert!(folded);
+        assert_eq!(
+            db.authorizing_sections_for_bug(dup_id).await?,
+            vec![soc.to_string(), "ARM/QUALCOMM SUPPORT".to_string()]
+        );
+        assert_eq!(
+            db.get_bug(dup_id).await?.unwrap().attributable_files(),
+            Some(vec!["drivers/soc/qcom/smem.c".to_string()])
+        );
+        let (_, total_after_fold) = db
+            .list_bugs(ListBugsParams {
+                visibility: BugVisibility::Sections(&scope),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(total_after_fold, 1);
         Ok(())
     }
 

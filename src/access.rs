@@ -11,12 +11,13 @@
 //! evidence it rests on, who the configuration names and what MAINTAINERS says
 //! they own, is the same evidence whatever is being protected.
 
+use crate::bugs_access::{AccessLevel, normalize_section_title};
 use crate::maintainers::MaintainersIndex;
 use crate::settings::AclSettings;
 use axum::extract::FromRequestParts;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A MAINTAINERS section title, carried both as written and normalized for
@@ -43,16 +44,9 @@ impl SectionTitle {
     /// lowercasing, so that a title stored on a bug matches the same title
     /// read out of MAINTAINERS regardless of incidental formatting.
     pub fn new(title: &str) -> Self {
-        let mut normalized = String::with_capacity(title.len());
-        for word in title.split_whitespace() {
-            if !normalized.is_empty() {
-                normalized.push(' ');
-            }
-            normalized.extend(word.chars().flat_map(char::to_lowercase));
-        }
         Self {
             original: title.trim().to_string(),
-            normalized,
+            normalized: normalize_section_title(title),
         }
     }
 
@@ -157,8 +151,17 @@ impl BugAccess {
     }
 }
 
+impl From<AccessLevel> for BugAccess {
+    fn from(level: AccessLevel) -> Self {
+        match level {
+            AccessLevel::Read => BugAccess::Read,
+            AccessLevel::ReadWrite => BugAccess::Manage,
+        }
+    }
+}
+
 /// The standing of one caller, resolved once per request from the
-/// configuration and the MAINTAINERS index.
+/// configuration, MAINTAINERS, and `bugs_access.toml`.
 ///
 /// This records what the caller is, not what they may do. Turning that into a
 /// decision is each domain's own business, because the same maintainer may be
@@ -175,8 +178,8 @@ pub struct Principal {
     /// Maintainer of a section that claims the whole tree, which today means
     /// THE REST. Manage on every bug.
     global_maintainer: bool,
-    /// The sections this address maintains. Manage within these.
-    maintained_sections: HashSet<SectionTitle>,
+    /// Per-section access levels resolved from MAINTAINERS and `bugs_access.toml`.
+    section_access: HashMap<SectionTitle, BugAccess>,
     /// May file a new bug over HTTP.
     may_create: bool,
     /// Optional privilege ceiling imposed by a scoped API token.
@@ -199,17 +202,24 @@ impl Principal {
             return Self::anonymous();
         }
         let operator = acl.is_admin(email);
-        let maintained_sections = maintainers
-            .and_then(|index| index.subsystems_for_address(email))
-            .map(|titles| titles.iter().map(|t| SectionTitle::new(t)).collect())
-            .unwrap_or_default();
+        let mut section_access = HashMap::new();
+        if let Some(entries) = maintainers.and_then(|index| index.section_access_for_address(email))
+        {
+            for (title, &level) in entries {
+                let grant = BugAccess::from(level);
+                section_access
+                    .entry(SectionTitle::new(title))
+                    .and_modify(|cur: &mut BugAccess| *cur = (*cur).max(grant))
+                    .or_insert(grant);
+            }
+        }
         Self {
             email: email.trim().to_string(),
             authenticated: true,
             operator,
             security: acl.is_security(email),
             global_maintainer: maintainers.is_some_and(|index| index.is_global_maintainer(email)),
-            maintained_sections,
+            section_access,
             // Operators can always file bugs; the list exists to admit tools
             // in addition to them.
             may_create: operator || acl.is_bug_reporter(email),
@@ -248,10 +258,11 @@ impl Principal {
     /// Resolves the access level for a bug from the subsystems attributed to
     /// it.
     ///
-    /// Only titles matched out of MAINTAINERS may be passed here. A directory
-    /// prefix or a name the reporter invented names nobody, so a bug carrying
-    /// only those matches no maintainer and stays invisible to them, which is
-    /// the intended outcome for a bug nobody could classify.
+    /// Only titles matched out of MAINTAINERS or `bugs_access.toml` may be
+    /// passed here. A directory prefix or a name the reporter invented names
+    /// nobody, so a bug carrying only those matches no maintainer and stays
+    /// invisible to them, which is the intended outcome for a bug nobody could
+    /// classify.
     pub fn access_to(&self, attributed: &[SectionTitle]) -> BugAccess {
         self.access_to_with_bugid(attributed, false)
     }
@@ -262,12 +273,7 @@ impl Principal {
     /// Knowing the `bugid` grants `BugAccess::Read` on that single bug, subject
     /// to any explicit `max_access` ceiling imposed on a scoped API token.
     pub fn access_to_with_bugid(&self, attributed: &[SectionTitle], has_bugid: bool) -> BugAccess {
-        let base = if self.operator
-            || self.global_maintainer
-            || attributed
-                .iter()
-                .any(|title| self.maintained_sections.contains(title))
-        {
+        let mut base = if self.operator || self.global_maintainer {
             BugAccess::Manage
         } else if self.security {
             BugAccess::Comment
@@ -276,6 +282,11 @@ impl Principal {
         } else {
             BugAccess::None
         };
+        for title in attributed {
+            if let Some(&grant) = self.section_access.get(title) {
+                base = base.max(grant);
+            }
+        }
         match self.max_access {
             Some(limit) => base.min(limit),
             None => base,
@@ -301,7 +312,7 @@ impl Principal {
     }
 
     /// Whether this principal may view embargoed review results on a patchset
-    /// from the MAINTAINERS sections attributed to it.
+    /// from the sections attributed to it.
     pub fn may_view_embargoed(&self, attributed: &[SectionTitle]) -> bool {
         if self.max_access.is_some_and(|m| !m.can_read()) {
             return false;
@@ -310,7 +321,7 @@ impl Principal {
             || self.global_maintainer
             || attributed
                 .iter()
-                .any(|title| self.maintained_sections.contains(title))
+                .any(|title| self.section_access.get(title).is_some_and(|a| a.can_read()))
     }
 
     /// Whether this principal may view embargoed review results on every
@@ -319,27 +330,42 @@ impl Principal {
         self.max_access.is_none_or(|m| m.can_read()) && (self.operator || self.global_maintainer)
     }
 
-    /// Whether this principal holds any maintainer or operator standing that
-    /// could grant embargo visibility on at least one patchset.
+    /// Whether this principal holds any maintainer, grant, or operator standing
+    /// that could grant embargo visibility on at least one patchset.
     pub fn has_any_embargo_visibility(&self) -> bool {
         self.max_access.is_none_or(|m| m.can_read())
-            && (self.operator || self.global_maintainer || !self.maintained_sections.is_empty())
+            && (self.operator
+                || self.global_maintainer
+                || self.section_access.values().any(|a| a.can_read()))
     }
 
     /// Whether this principal may release a review embargo on a patchset from
-    /// the MAINTAINERS sections attributed to it.
+    /// the sections attributed to it.
     pub fn may_release_embargo(&self, attributed: &[SectionTitle]) -> bool {
         self.access_to(attributed).can_manage()
     }
 
-    /// The sections this principal maintains, spelled as MAINTAINERS spells
-    /// them, for use as query parameters. Sorted so that the value is stable
-    /// enough to key a cache on.
+    /// All authorization sections this principal may read (`Read` or higher),
+    /// sorted for deterministic query and cache keys.
+    pub fn readable_section_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .section_access
+            .iter()
+            .filter(|(_, access)| access.can_read())
+            .map(|(title, _)| title.original().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The sections this principal maintains (`Manage`), spelled as stored for
+    /// query parameters.
     pub fn maintained_section_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
-            .maintained_sections
+            .section_access
             .iter()
-            .map(|title| title.original().to_string())
+            .filter(|(_, access)| access.can_manage())
+            .map(|(title, _)| title.original().to_string())
             .collect();
         names.sort();
         names
@@ -516,10 +542,12 @@ impl TranscriptPrincipal {
         if self.principal.has_global_bug_visibility() {
             return TranscriptAccess::Granted;
         }
-        if attributed
-            .iter()
-            .any(|title| self.principal.maintained_sections.contains(title))
-        {
+        if attributed.iter().any(|title| {
+            self.principal
+                .section_access
+                .get(title)
+                .is_some_and(|a| a.can_read())
+        }) {
             return TranscriptAccess::Granted;
         }
         if !self.principal.email.is_empty()
@@ -998,5 +1026,61 @@ F:	*/
         assert!(davem.has_any_embargo_visibility());
         assert!(!davem.has_global_embargo_visibility());
         assert!(!clm_blocked.may_view_embargoed(&btrfs()));
+    }
+
+    #[test]
+    fn test_bugs_access_read_and_read_write_levels_compose_across_domains() {
+        use crate::bugs_access::RawAccessGrant;
+
+        let mut idx = index();
+        idx.set_bugs_access(vec![
+            RawAccessGrant {
+                section: Some("BTRFS FILE SYSTEM".into()),
+                read: vec!["btrfs-reader@example.org".into()],
+                read_write: vec!["btrfs-rw@example.org".into()],
+                ..Default::default()
+            },
+            RawAccessGrant {
+                section: Some("NETWORKING [GENERAL]".into()),
+                exclude_emails: vec!["davem@davemloft.net".into()],
+                read: vec!["davem@davemloft.net".into()],
+                ..Default::default()
+            },
+        ]);
+        let acl_cfg = AclSettings::default();
+        let net = [SectionTitle::new("NETWORKING [GENERAL]")];
+
+        // Read grantee sees BTRFS in readable_section_names, can view embargoes
+        // and transcripts, and cannot comment, manage, or release embargoes.
+        let reader = Principal::resolve("btrfs-reader@example.org", &acl_cfg, Some(&idx));
+        assert_eq!(reader.access_to(&btrfs()), BugAccess::Read);
+        assert_eq!(reader.access_to(&net), BugAccess::None);
+        assert_eq!(
+            reader.readable_section_names(),
+            vec!["BTRFS FILE SYSTEM".to_string()]
+        );
+        assert!(reader.maintained_section_names().is_empty());
+        assert!(reader.may_view_embargoed(&btrfs()));
+        assert!(!reader.may_release_embargo(&btrfs()));
+        assert_eq!(
+            TranscriptPrincipal::new(reader, false).access_to_patchset(&btrfs(), None),
+            TranscriptAccess::Granted
+        );
+
+        // Read-write grantee receives full Manage authority on BTRFS only.
+        let rw = Principal::resolve("btrfs-rw@example.org", &acl_cfg, Some(&idx));
+        assert_eq!(rw.access_to(&btrfs()), BugAccess::Manage);
+        assert_eq!(rw.access_to(&net), BugAccess::None);
+        assert_eq!(
+            rw.maintained_section_names(),
+            vec!["BTRFS FILE SYSTEM".to_string()]
+        );
+        assert!(rw.may_release_embargo(&btrfs()));
+
+        // Maintainer downgraded via exclude_emails + read gets Read instead of Manage.
+        let davem = Principal::resolve("davem@davemloft.net", &acl_cfg, Some(&idx));
+        assert_eq!(davem.access_to(&net), BugAccess::Read);
+        assert!(!davem.may_release_embargo(&net));
+        assert!(davem.may_view_embargoed(&net));
     }
 }
