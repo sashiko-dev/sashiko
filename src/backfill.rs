@@ -125,28 +125,31 @@ async fn sections_for_patchset(db: &Database, id: i64) -> Result<Vec<AttributedS
 /// Records which upstream grants the stored grant rows were derived from.
 const UPSTREAM_GRANTS_FINGERPRINT_KEY: &str = "upstream_grants_fingerprint";
 
-/// Re-derives every stored upstream grant row when the grants change.
+/// Re-derives every stored `bugs_access.toml` path-rule row when the active
+/// path rules change.
 ///
 /// Grant rows are written as bugs and patchsets are attributed, so on their
-/// own they only reflect the grants in force at that moment. This brings the
-/// archive in line with the grants loaded now: a new grant reaches existing
+/// own they only reflect the rules in force at that moment. This brings the
+/// archive in line with the rules loaded now: a new path rule reaches existing
 /// bugs and patchsets, and a removed one stops conferring access. It runs
-/// only when the fingerprint of the loaded grants differs from the one
+/// only when the fingerprint of the loaded path rules differs from the one
 /// recorded after the last complete walk, and records the new one only once
 /// the walk has finished, so an interrupted walk is redone on the next boot.
 ///
-/// It does nothing without a loaded MAINTAINERS index: every grant is dropped
-/// when its section cannot be found, so walking then would revoke every grant
-/// until a boot that has the kernel tree.
+/// It does nothing when `is_ready_for_reconcile()` is false (for instance when
+/// the Linux repository could not be read at startup), preserving stored grant
+/// rows until a boot with the repository available.
 pub async fn reconcile_upstream_grant_sections(db: &Database) -> Result<()> {
-    let Some(index) = crate::maintainers::get_global_maintainers().filter(|i| !i.is_empty()) else {
+    let Some(index) =
+        crate::maintainers::get_global_maintainers().filter(|i| i.is_ready_for_reconcile())
+    else {
         warn!(
-            "Skipping upstream grant reconciliation: no MAINTAINERS sections are loaded. \
+            "Skipping bugs_access grant reconciliation: base index is not loaded. \
              Stored grant rows are left as they are."
         );
         return Ok(());
     };
-    let fingerprint = index.upstream_grants_fingerprint();
+    let fingerprint = index.bugs_access_fingerprint();
     if db
         .get_meta(UPSTREAM_GRANTS_FINGERPRINT_KEY)
         .await?
@@ -156,16 +159,16 @@ pub async fn reconcile_upstream_grant_sections(db: &Database) -> Result<()> {
         return Ok(());
     }
 
-    if index.has_upstream_grants() {
+    if index.has_bugs_access_path_rules() {
         let (bugs, bugs_skipped) = reconcile_bugs(db, &index).await?;
         let patchsets = reconcile_patchsets(db, &index).await?;
         info!(
-            "Re-derived upstream grant sections for {bugs} bugs ({bugs_skipped} without \
+            "Re-derived bugs_access sections for {bugs} bugs ({bugs_skipped} without \
              recorded files get none) and {patchsets} patchsets."
         );
     } else {
         db.clear_upstream_sections().await?;
-        info!("No upstream grants are configured; cleared all upstream grant sections.");
+        info!("No bugs_access path rules are configured; cleared all grant sections.");
     }
     db.set_meta(UPSTREAM_GRANTS_FINGERPRINT_KEY, &fingerprint)
         .await?;
@@ -194,7 +197,7 @@ async fn reconcile_bugs(
             if files.is_empty() {
                 skipped += 1;
             }
-            rows.push((id, index.upstream_grant_sections(&files)));
+            rows.push((id, index.bugs_access_sections(&files)));
         }
         db.replace_bug_upstream_sections_batch(&rows).await?;
     }
@@ -219,7 +222,7 @@ async fn reconcile_patchsets(
             for diff in db.patch_diffs_only(id).await? {
                 files.extend(crate::baseline::extract_files_from_diff(&diff));
             }
-            rows.push((id, index.upstream_grant_sections(&files)));
+            rows.push((id, index.bugs_access_sections(&files)));
         }
         db.replace_patchset_upstream_sections_batch(&rows).await?;
     }
@@ -434,16 +437,17 @@ F:	net/
         bare.subsystems = vec![];
         let bare_id = db.create_bug(&bare).await.unwrap();
 
-        let with_grant = |grants: Vec<crate::upstream_grants::RawUpstreamGrant>| {
+        let with_grant = |grants: Vec<crate::bugs_access::RawAccessGrant>| {
             let mut index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
-            index.set_upstream_grants(grants);
+            index.set_bugs_access(grants);
             clear_global_maintainers();
             init_global_maintainers(Arc::new(index));
         };
 
-        with_grant(vec![crate::upstream_grants::RawUpstreamGrant {
-            section: net.clone(),
+        with_grant(vec![crate::bugs_access::RawAccessGrant {
+            section: Some(net.clone()),
             paths: vec!["fs/btrfs/".into()],
+            ..Default::default()
         }]);
         reconcile_upstream_grant_sections(&db).await.unwrap();
         assert_eq!(

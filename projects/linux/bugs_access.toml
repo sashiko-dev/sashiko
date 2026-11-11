@@ -1,0 +1,37 @@
+# Subsystem bug and embargo access grants and overrides.
+#
+# Extends or overrides MAINTAINERS strictly for Sashiko access control (bugs,
+# embargoed review results, review transcripts, and sign-in eligibility).
+# Nothing else changes: mail routing, T: baseline trees, contributor authority,
+# and the subsystem names displayed on bugs and patchsets keep following
+# MAINTAINERS.
+#
+# Each [[grant]] entry accepts:
+#   section        - Existing MAINTAINERS section title (case-insensitive) or a
+#                    custom section title. Optional when `paths` and at least
+#                    one of `read` / `read_write` are non-empty.
+#   paths          - MAINTAINERS F:-style patterns to include.
+#   exclude_paths  - MAINTAINERS X:-style patterns to exclude.
+#   replace_paths  - Discard inherited MAINTAINERS F:/X:/N: patterns for
+#                    `section` (default: false).
+#   read           - Bare addresses ("user@domain") or "Name <user@domain>"
+#                    entries granted read-only access.
+#   read_write     - Addresses granted full maintainer read-write access (also
+#                    accepted as `"read-write"`).
+#   exclude_emails - Addresses removed from `section` before `read` and
+#                    `read_write` apply.
+#   replace_emails - Discard inherited MAINTAINERS M:/R: addresses for
+#                    `section` (default: false).
+#   access         - Optional `"read"` or `"read_write"` (`"read-write"`) for
+#                    path-only grants on an existing section (default:
+#                    `"read_write"`).
+#
+# Grants widen or reshape access to pre-disclosure material. Add or change one
+# only at the request of, or with the agreement of, the affected maintainers.
+
+# The SoC group receives pull requests from the platform maintainers for
+# device trees, SoC drivers and firmware drivers.
+# https://github.com/sashiko-dev/sashiko/issues/787
+[[grant]]
+section = "ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)"
+paths = ["arch/*/boot/dts/", "drivers/soc/", "drivers/firmware/"]

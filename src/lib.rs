@@ -26,6 +26,7 @@ pub mod baseline;
 pub mod benchmark;
 #[cfg(feature = "server")]
 pub mod bug_markdown;
+pub mod bugs_access;
 #[cfg(feature = "server")]
 pub mod compression;
 pub mod db;
@@ -74,7 +75,6 @@ pub mod settings;
 pub(crate) mod test_support;
 pub mod threat_model;
 pub mod toolbox;
-pub mod upstream_grants;
 pub mod utils;
 pub mod worker;
 pub mod workflow;

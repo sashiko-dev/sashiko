@@ -20,15 +20,19 @@
 
 use anyhow::{Context, Result};
 use regex::Regex;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tracing::{error, info};
 
+use crate::bugs_access::{
+    self, AccessLevel, RESERVED_SECTION_PREFIX, RawAccessGrant, anonymous_rule_key,
+    normalize_section_title,
+};
 use crate::db::AttributedSubsystem;
-use crate::upstream_grants::{self, RawUpstreamGrant, UpstreamGrant};
+use crate::project::ProjectId;
 
 /// Represents a compiled file or directory pattern from an `F:` or `X:` line.
 #[derive(Debug, Clone)]
@@ -125,6 +129,16 @@ impl CompiledPattern {
             CompiledPattern::DirSingleLevel { depth, .. } => *depth,
             CompiledPattern::ExactFile { depth, .. } => *depth + 1,
             CompiledPattern::Glob { depth, .. } => *depth,
+        }
+    }
+
+    /// Stable string representation for reconciliation fingerprinting.
+    fn fingerprint_key(&self) -> String {
+        match self {
+            CompiledPattern::PrefixDir { prefix, .. } => format!("P:{prefix}"),
+            CompiledPattern::DirSingleLevel { dir_prefix, .. } => format!("D:{dir_prefix}"),
+            CompiledPattern::ExactFile { path, .. } => format!("E:{path}"),
+            CompiledPattern::Glob { regex, .. } => format!("G:{}", regex.as_str()),
         }
     }
 }
@@ -408,29 +422,302 @@ impl<'a> FileMatcher<'a> {
     }
 }
 
-/// In-memory index of all parsed MAINTAINERS sections for high-performance matching.
+#[derive(Debug, Clone)]
+enum AccessPathRule {
+    /// Standalone, extended, or replaced pattern list: matches when no
+    /// `excludes` match and at least one `paths` pattern matches.
+    Patterns {
+        auth_key: String,
+        raw_paths: Vec<String>,
+        raw_excludes: Vec<String>,
+        paths: Vec<CompiledPattern>,
+        excludes: Vec<CompiledPattern>,
+    },
+    /// Path-narrowed existing `MAINTAINERS` section (`replace_paths == false`
+    /// with non-empty `exclude_paths`).
+    InheritedWithOverrides {
+        auth_key: String,
+        section_indices: Vec<usize>,
+        raw_extra_paths: Vec<String>,
+        raw_excludes: Vec<String>,
+        extra_paths: Vec<CompiledPattern>,
+        excludes: Vec<CompiledPattern>,
+    },
+}
+
+impl AccessPathRule {
+    fn patterns(auth_key: String, raw_paths: Vec<String>, raw_excludes: Vec<String>) -> Self {
+        let paths = raw_paths
+            .iter()
+            .map(|p| CompiledPattern::compile(p))
+            .collect();
+        let excludes = raw_excludes
+            .iter()
+            .map(|x| CompiledPattern::compile(x))
+            .collect();
+        Self::Patterns {
+            auth_key,
+            raw_paths,
+            raw_excludes,
+            paths,
+            excludes,
+        }
+    }
+
+    fn inherited_with_overrides(
+        auth_key: String,
+        section_indices: Vec<usize>,
+        raw_extra_paths: Vec<String>,
+        raw_excludes: Vec<String>,
+    ) -> Self {
+        let extra_paths = raw_extra_paths
+            .iter()
+            .map(|p| CompiledPattern::compile(p))
+            .collect();
+        let excludes = raw_excludes
+            .iter()
+            .map(|x| CompiledPattern::compile(x))
+            .collect();
+        Self::InheritedWithOverrides {
+            auth_key,
+            section_indices,
+            raw_extra_paths,
+            raw_excludes,
+            extra_paths,
+            excludes,
+        }
+    }
+
+    fn auth_key(&self) -> &str {
+        match self {
+            Self::Patterns { auth_key, .. } | Self::InheritedWithOverrides { auth_key, .. } => {
+                auth_key
+            }
+        }
+    }
+
+    fn covers(&self, sections: &[MaintainerSection], file_path: &str) -> bool {
+        match self {
+            Self::Patterns {
+                paths, excludes, ..
+            } => {
+                !excludes.iter().any(|x| x.is_match(file_path))
+                    && paths.iter().any(|p| p.is_match(file_path))
+            }
+            Self::InheritedWithOverrides {
+                section_indices,
+                extra_paths,
+                excludes,
+                ..
+            } => {
+                if excludes.iter().any(|x| x.is_match(file_path)) {
+                    return false;
+                }
+                section_indices
+                    .iter()
+                    .any(|&idx| sections[idx].match_file(file_path).is_some())
+                    || extra_paths.iter().any(|p| p.is_match(file_path))
+            }
+        }
+    }
+
+    fn fingerprint_entry(&self, sections: &[MaintainerSection]) -> (String, Vec<String>) {
+        match self {
+            Self::Patterns {
+                auth_key,
+                raw_paths,
+                raw_excludes,
+                ..
+            } => {
+                let mut items: Vec<String> =
+                    raw_paths.iter().map(|p| p.trim().to_string()).collect();
+                items.extend(
+                    raw_excludes
+                        .iter()
+                        .map(|x| format!("\0exclude:{}", x.trim())),
+                );
+                items.sort();
+                items.dedup();
+                (auth_key.clone(), items)
+            }
+            Self::InheritedWithOverrides {
+                auth_key,
+                section_indices,
+                raw_extra_paths,
+                raw_excludes,
+                ..
+            } => {
+                let mut items: Vec<String> = raw_extra_paths
+                    .iter()
+                    .map(|p| p.trim().to_string())
+                    .collect();
+                items.extend(
+                    raw_excludes
+                        .iter()
+                        .map(|x| format!("\0exclude:{}", x.trim())),
+                );
+                for &idx in section_indices {
+                    let sec = &sections[idx];
+                    items.extend(
+                        sec.files
+                            .iter()
+                            .map(|f| format!("\0inherit_f:{}", f.fingerprint_key())),
+                    );
+                    items.extend(
+                        sec.excludes
+                            .iter()
+                            .map(|x| format!("\0inherit_x:{}", x.fingerprint_key())),
+                    );
+                    items.extend(
+                        sec.regexes
+                            .iter()
+                            .map(|n| format!("\0inherit_n:{}", n.as_str())),
+                    );
+                }
+                items.sort();
+                items.dedup();
+                (auth_key.clone(), items)
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct FoldedSectionGrant {
+    emails: BTreeMap<String, AccessLevel>,
+    replaced_paths: bool,
+    read_write_paths: Vec<String>,
+    read_only_paths: Vec<String>,
+    exclude_paths: Vec<String>,
+}
+
+impl FoldedSectionGrant {
+    fn apply(&mut self, grant: &RawAccessGrant) {
+        if grant.replace_emails {
+            self.emails.clear();
+        }
+        for raw in &grant.exclude_emails {
+            if let Some(addr) = maintainer_address(raw) {
+                self.emails.remove(&addr);
+            }
+        }
+        for raw in &grant.read {
+            if let Some(addr) = maintainer_address(raw) {
+                self.emails
+                    .entry(addr)
+                    .and_modify(|cur| *cur = (*cur).max(AccessLevel::Read))
+                    .or_insert(AccessLevel::Read);
+            }
+        }
+        for raw in &grant.read_write {
+            if let Some(addr) = maintainer_address(raw) {
+                self.emails.insert(addr, AccessLevel::ReadWrite);
+            }
+        }
+        let path_level = grant.access.unwrap_or(AccessLevel::ReadWrite);
+        if grant.replace_paths {
+            self.replaced_paths = true;
+            self.read_write_paths.clear();
+            self.read_only_paths.clear();
+            self.exclude_paths.clone_from(&grant.exclude_paths);
+        } else {
+            self.exclude_paths
+                .extend(grant.exclude_paths.iter().cloned());
+        }
+        match path_level {
+            AccessLevel::ReadWrite => self.read_write_paths.extend(grant.paths.iter().cloned()),
+            AccessLevel::Read => self.read_only_paths.extend(grant.paths.iter().cloned()),
+        }
+    }
+}
+
+/// In-memory index of all parsed MAINTAINERS sections and `bugs_access.toml`
+/// access-control rules.
 #[derive(Debug, Clone, Default)]
 pub struct MaintainersIndex {
     sections: Vec<MaintainerSection>,
-    /// Every section title an address is listed against (`M:` or `R:`), keyed
-    /// by lowercased address. Built once so that resolving a caller's authority
-    /// costs one hash lookup rather than a scan of several thousand sections.
+    /// True when the base index loaded cleanly (either parsed from MAINTAINERS
+    /// with at least one section, or constructed via [`Self::without_maintainers`]
+    /// for a project without a MAINTAINERS file). False on [`Self::new`] so an
+    /// unreadable repository never triggers a destructive reconciliation walk.
+    ready_for_reconcile: bool,
+    /// Raw MAINTAINERS section titles an address is listed against (`M:` or
+    /// `R:`), keyed by lowercased address.
     subsystems_by_address: HashMap<String, BTreeSet<String>>,
+    /// Effective access-control standing per lowercased address, mapping each
+    /// authorization section key to the strongest [`AccessLevel`] granted.
+    access_by_address: HashMap<String, BTreeMap<String, AccessLevel>>,
     /// Addresses listed on a section that claims the whole tree.
     global_addresses: HashSet<String>,
-    /// Validated upstream grants (`upstream_maintainers.toml`). They widen
-    /// access only; [`MaintainersIndex::match_files`] never consults them.
-    upstream_grants: Vec<UpstreamGrant>,
+    /// Active path rules (`bugs_access.toml`) that emit rows into
+    /// `bug_upstream_sections` and `patchset_upstream_sections`.
+    /// [`MaintainersIndex::match_files`] never consults them.
+    access_path_rules: Vec<AccessPathRule>,
 }
 
 impl MaintainersIndex {
-    /// Creates a new empty index.
+    /// Creates an unloaded empty index (`!is_ready_for_reconcile()`).
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Creates an index for a project that has no kernel `MAINTAINERS` file
+    /// (`is_ready_for_reconcile() == true`), ready to attach `bugs_access.toml`
+    /// grants.
+    pub fn without_maintainers() -> Self {
+        Self {
+            ready_for_reconcile: true,
+            ..Self::default()
+        }
+    }
+
+    /// Loads `MAINTAINERS` (when `project.uses_maintainers()`) and attaches
+    /// `projects/<project>/bugs_access.toml`.
+    pub fn load_for_project(project: ProjectId, repo_path: &Path) -> Arc<Self> {
+        let mut idx = if project.uses_maintainers() {
+            match Self::from_top_of_trunk(repo_path) {
+                Ok(idx) => {
+                    info!(
+                        "Successfully parsed and indexed {} MAINTAINERS sections from top-of-trunk of Linus's tree",
+                        idx.len()
+                    );
+                    idx
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load MAINTAINERS from top-of-trunk: {}. Using empty index.",
+                        e
+                    );
+                    return Arc::new(Self::new());
+                }
+            }
+        } else {
+            info!("Project {project} does not use kernel MAINTAINERS; skipping index.");
+            Self::without_maintainers()
+        };
+
+        match bugs_access::load_for_project(project) {
+            Ok((path, grants)) => {
+                let listed = grants.len();
+                let kept = idx.set_bugs_access(grants);
+                if listed > 0 {
+                    info!("Loaded {kept} of {listed} bugs_access grants from {path}");
+                }
+            }
+            Err(e) => error!("Ignoring bugs_access grants: {e:#}"),
+        }
+        Arc::new(idx)
+    }
+
+    /// Whether this index has its authoritative base loaded and can safely
+    /// reconcile stored grant rows.
+    pub fn is_ready_for_reconcile(&self) -> bool {
+        self.ready_for_reconcile
+    }
+
     /// Builds the index, including the address lookups derived from it.
     fn from_sections(sections: Vec<MaintainerSection>) -> Self {
+        let ready_for_reconcile = !sections.is_empty();
         let mut subsystems_by_address: HashMap<String, BTreeSet<String>> = HashMap::new();
         let mut global_addresses = HashSet::new();
         for section in &sections {
@@ -444,76 +731,313 @@ impl MaintainersIndex {
                     .insert(section.name.clone());
             }
         }
-        Self {
+        let mut idx = Self {
             sections,
+            ready_for_reconcile,
             subsystems_by_address,
+            access_by_address: HashMap::new(),
             global_addresses,
-            upstream_grants: Vec::new(),
+            access_path_rules: Vec::new(),
+        };
+        idx.reset_access_to_maintainers();
+        idx
+    }
+
+    fn reset_access_to_maintainers(&mut self) {
+        self.access_by_address.clear();
+        self.access_path_rules.clear();
+        for section in &self.sections {
+            if section.catch_all {
+                continue;
+            }
+            for address in section.maintainer_addresses() {
+                self.access_by_address
+                    .entry(address)
+                    .or_default()
+                    .insert(section.name.clone(), AccessLevel::ReadWrite);
+            }
         }
     }
 
-    /// Attaches upstream grants, replacing any attached before, and returns
-    /// how many were kept.
+    fn remove_section_from_access(&mut self, section_key: &str) {
+        self.access_by_address.retain(|_, map| {
+            map.remove(section_key);
+            !map.is_empty()
+        });
+    }
+
+    fn insert_section_access(&mut self, section_key: &str, emails: &BTreeMap<String, AccessLevel>) {
+        for (addr, &level) in emails {
+            self.access_by_address
+                .entry(addr.clone())
+                .or_default()
+                .entry(section_key.to_string())
+                .and_modify(|cur| *cur = (*cur).max(level))
+                .or_insert(level);
+        }
+    }
+
+    /// Attaches `bugs_access.toml` rules, replacing any attached before, and
+    /// returns how many `[[grant]]` entries were kept.
     ///
-    /// A grant is dropped, with an error logged, when its section is not in
-    /// the index, is a catch-all section, or its paths fail validation.
-    /// Dropping keeps the daemon up when upstream renames a section, and the
-    /// error makes the stale grant visible. A dropped grant grants nothing.
-    pub fn set_upstream_grants(&mut self, grants: Vec<RawUpstreamGrant>) -> usize {
-        self.upstream_grants.clear();
+    /// Invalid or ambiguous entries are dropped with an error logged so a
+    /// section rename upstream or a malformed rule fails closed without
+    /// preventing daemon startup.
+    pub fn set_bugs_access(&mut self, grants: Vec<RawAccessGrant>) -> usize {
+        self.reset_access_to_maintainers();
+        let mut maint_by_norm: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, sec) in self.sections.iter().enumerate() {
+            maint_by_norm
+                .entry(normalize_section_title(&sec.name))
+                .or_default()
+                .push(idx);
+        }
+
+        let mut existing_groups: Vec<(String, Vec<RawAccessGrant>)> = Vec::new();
+        let mut custom_groups: Vec<(String, String, Vec<RawAccessGrant>)> = Vec::new();
+        let mut anon_grants: Vec<RawAccessGrant> = Vec::new();
+
         for grant in grants {
-            let wanted = grant.section.trim();
-            let Some(section) = self
-                .sections
-                .iter()
-                .find(|s| s.name.trim().eq_ignore_ascii_case(wanted))
-            else {
-                error!(
-                    "Dropping upstream grant: no MAINTAINERS section is titled {:?}",
-                    grant.section
-                );
+            if let Err(why) = bugs_access::validate_grant(&grant) {
+                error!("Dropping bugs_access grant {:?}: {why}", grant.section);
+                continue;
+            }
+            let Some(raw_title) = grant.section.clone() else {
+                anon_grants.push(grant);
                 continue;
             };
-            if section.catch_all {
+            let norm = normalize_section_title(&raw_title);
+            if let Some(indices) = maint_by_norm.get(&norm) {
+                let canonical = &self.sections[indices[0]].name;
+                if indices.iter().any(|&i| self.sections[i].catch_all) {
+                    error!(
+                        "Dropping bugs_access grant for {:?}: it is a catch-all section",
+                        canonical
+                    );
+                    continue;
+                }
+                if !grant.paths.is_empty()
+                    && !grant.replace_paths
+                    && grant.has_emails()
+                    && !grant.replace_emails
+                {
+                    error!(
+                        "Dropping bugs_access grant for existing MAINTAINERS section {:?}: \
+                         setting both `paths` and `read`/`read_write` without `replace_paths` \
+                         or `replace_emails` is ambiguous; split into separate `[[grant]]` \
+                         entries or use a custom section",
+                        canonical
+                    );
+                    continue;
+                }
+                if let Some((_, list)) = existing_groups.iter_mut().find(|(k, _)| k == &norm) {
+                    list.push(grant);
+                } else {
+                    existing_groups.push((norm, vec![grant]));
+                }
+            } else if grant.access.is_some() {
                 error!(
-                    "Dropping upstream grant for {:?}: it is a catch-all section",
-                    section.name
+                    "Dropping bugs_access grant for {:?}: `access` applies only to existing \
+                     MAINTAINERS sections; list addresses under `read` or `read_write` on custom \
+                     sections",
+                    raw_title
                 );
                 continue;
+            } else if let Some((_, _, list)) = custom_groups.iter_mut().find(|(k, _, _)| k == &norm)
+            {
+                list.push(grant);
+            } else {
+                custom_groups.push((norm, raw_title, vec![grant]));
             }
-            if let Err(why) = upstream_grants::validate_paths(&grant.paths) {
-                error!("Dropping upstream grant for {:?}: {why}", section.name);
-                continue;
-            }
-            self.upstream_grants
-                .push(UpstreamGrant::new(section.name.clone(), grant.paths));
         }
-        self.upstream_grants.len()
+
+        let mut kept = 0usize;
+        for (norm, group) in existing_groups {
+            let indices = maint_by_norm[&norm].clone();
+            kept += self.apply_existing_section_grants(&indices, &group);
+        }
+        for (norm, raw_title, group) in custom_groups {
+            kept += self.apply_custom_section_grants(&norm, &raw_title, &group);
+        }
+        for grant in anon_grants {
+            self.apply_anonymous_grant(grant);
+            kept += 1;
+        }
+        kept
     }
 
-    /// Sections whose maintainers hold an upstream grant over any of `files`,
-    /// in grant order and without duplicates.
-    pub fn upstream_grant_sections<I, S>(&self, files: I) -> Vec<String>
+    fn apply_existing_section_grants(
+        &mut self,
+        indices: &[usize],
+        group: &[RawAccessGrant],
+    ) -> usize {
+        let canonical = self.sections[indices[0]].name.clone();
+        let mut folded = FoldedSectionGrant::default();
+        for &idx in indices {
+            for addr in self.sections[idx].maintainer_addresses() {
+                folded.emails.insert(addr, AccessLevel::ReadWrite);
+            }
+        }
+        for grant in group {
+            folded.apply(grant);
+        }
+
+        self.remove_section_from_access(&canonical);
+        let path_narrowed = folded.replaced_paths || !folded.exclude_paths.is_empty();
+        if !path_narrowed {
+            self.insert_section_access(&canonical, &folded.emails);
+            if !folded.read_write_paths.is_empty() && !folded.emails.is_empty() {
+                self.access_path_rules.push(AccessPathRule::patterns(
+                    canonical.clone(),
+                    folded.read_write_paths,
+                    Vec::new(),
+                ));
+            }
+            self.attach_read_only_extra_paths(
+                &canonical,
+                &folded.emails,
+                folded.read_only_paths,
+                Vec::new(),
+            );
+        } else {
+            let override_key = format!("{RESERVED_SECTION_PREFIX}override:{canonical}");
+            if folded.replaced_paths {
+                if !folded.read_write_paths.is_empty() && !folded.emails.is_empty() {
+                    self.insert_section_access(&override_key, &folded.emails);
+                    self.access_path_rules.push(AccessPathRule::patterns(
+                        override_key,
+                        folded.read_write_paths,
+                        folded.exclude_paths.clone(),
+                    ));
+                }
+            } else {
+                self.insert_section_access(&override_key, &folded.emails);
+                if !folded.emails.is_empty() {
+                    self.access_path_rules
+                        .push(AccessPathRule::inherited_with_overrides(
+                            override_key,
+                            indices.to_vec(),
+                            folded.read_write_paths,
+                            folded.exclude_paths.clone(),
+                        ));
+                }
+            }
+            self.attach_read_only_extra_paths(
+                &canonical,
+                &folded.emails,
+                folded.read_only_paths,
+                folded.exclude_paths,
+            );
+        }
+        group.len()
+    }
+
+    fn attach_read_only_extra_paths(
+        &mut self,
+        canonical: &str,
+        emails: &BTreeMap<String, AccessLevel>,
+        read_only_paths: Vec<String>,
+        exclude_paths: Vec<String>,
+    ) {
+        if read_only_paths.is_empty() || emails.is_empty() {
+            return;
+        }
+        let read_key = format!("{RESERVED_SECTION_PREFIX}path_read:{canonical}");
+        let read_emails: BTreeMap<String, AccessLevel> = emails
+            .keys()
+            .map(|addr| (addr.clone(), AccessLevel::Read))
+            .collect();
+        self.insert_section_access(&read_key, &read_emails);
+        self.access_path_rules.push(AccessPathRule::patterns(
+            read_key,
+            read_only_paths,
+            exclude_paths,
+        ));
+    }
+
+    fn apply_custom_section_grants(
+        &mut self,
+        norm: &str,
+        raw_title: &str,
+        group: &[RawAccessGrant],
+    ) -> usize {
+        let mut folded = FoldedSectionGrant::default();
+        for grant in group {
+            folded.apply(grant);
+        }
+        debug_assert!(folded.read_only_paths.is_empty());
+        if folded.read_write_paths.is_empty() || folded.emails.is_empty() {
+            error!(
+                "Dropping bugs_access grant(s) for {:?}: no MAINTAINERS section has this title, \
+                 and a custom section requires `paths` plus `read` or `read_write`",
+                raw_title
+            );
+            return 0;
+        }
+        let custom_key = format!("{RESERVED_SECTION_PREFIX}custom:{norm}");
+        self.insert_section_access(&custom_key, &folded.emails);
+        self.access_path_rules.push(AccessPathRule::patterns(
+            custom_key,
+            folded.read_write_paths,
+            folded.exclude_paths,
+        ));
+        group.len()
+    }
+
+    fn apply_anonymous_grant(&mut self, grant: RawAccessGrant) {
+        let rule_key = anonymous_rule_key("rule", &grant.paths, &grant.exclude_paths);
+        let mut emails = BTreeMap::new();
+        for raw in &grant.read {
+            if let Some(addr) = maintainer_address(raw) {
+                emails.insert(addr, AccessLevel::Read);
+            }
+        }
+        for raw in &grant.read_write {
+            if let Some(addr) = maintainer_address(raw) {
+                emails.insert(addr, AccessLevel::ReadWrite);
+            }
+        }
+        self.insert_section_access(&rule_key, &emails);
+        if !self
+            .access_path_rules
+            .iter()
+            .any(|r| r.auth_key() == rule_key)
+        {
+            self.access_path_rules.push(AccessPathRule::patterns(
+                rule_key,
+                grant.paths,
+                grant.exclude_paths,
+            ));
+        }
+    }
+
+    /// Authorization section keys from `bugs_access.toml` path rules covering
+    /// any of `files`, in rule order and without duplicates.
+    pub fn bugs_access_sections<I, S>(&self, files: I) -> Vec<String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
         let files: Vec<S> = files.into_iter().collect();
         let mut out: Vec<String> = Vec::new();
-        for grant in &self.upstream_grants {
-            if out.contains(&grant.section) {
+        for rule in &self.access_path_rules {
+            let key = rule.auth_key();
+            if out.iter().any(|existing| existing == key) {
                 continue;
             }
-            if files.iter().any(|f| grant.covers(f.as_ref())) {
-                out.push(grant.section.clone());
+            if files
+                .iter()
+                .any(|f| rule.covers(&self.sections, f.as_ref()))
+            {
+                out.push(key.to_string());
             }
         }
         out
     }
 
     /// The sections that confer access over changes to `files`: every
-    /// MAINTAINERS match, then every upstream grant covering the files. The
-    /// same title may appear with both sources; they are stored apart.
+    /// MAINTAINERS match, then every `bugs_access.toml` path rule covering the
+    /// files.
     pub fn attribute_files<I, S>(&self, files: I) -> Vec<AttributedSubsystem>
     where
         I: IntoIterator<Item = S>,
@@ -526,43 +1050,54 @@ impl MaintainersIndex {
             .map(AttributedSubsystem::from_maintainers)
             .collect();
         out.extend(
-            self.upstream_grant_sections(files.iter().map(AsRef::as_ref))
+            self.bugs_access_sections(files.iter().map(AsRef::as_ref))
                 .into_iter()
                 .map(AttributedSubsystem::from_upstream_grant),
         );
         out
     }
 
-    /// A stable description of the attached grants. Stored rows derived from
-    /// grants are stale whenever this changes.
-    pub fn upstream_grants_fingerprint(&self) -> String {
-        let mut grants: Vec<(String, Vec<String>)> = self
-            .upstream_grants
+    /// A stable description of the active `bugs_access.toml` path rules. Stored
+    /// database rows derived from path rules are stale whenever this changes;
+    /// email-only or access-level edits leave it unchanged.
+    pub fn bugs_access_fingerprint(&self) -> String {
+        let mut entries: Vec<(String, Vec<String>)> = self
+            .access_path_rules
             .iter()
-            .map(|g| {
-                let mut paths: Vec<String> =
-                    g.raw_paths().iter().map(|p| p.trim().to_string()).collect();
-                paths.sort();
-                paths.dedup();
-                (g.section.clone(), paths)
-            })
+            .map(|r| r.fingerprint_entry(&self.sections))
             .collect();
-        grants.sort();
-        serde_json::to_string(&grants).unwrap_or_default()
+        entries.sort();
+        serde_json::to_string(&entries).unwrap_or_default()
     }
 
-    /// Whether any upstream grant is attached.
-    pub fn has_upstream_grants(&self) -> bool {
-        !self.upstream_grants.is_empty()
+    /// Whether any `bugs_access.toml` path rule is active.
+    pub fn has_bugs_access_path_rules(&self) -> bool {
+        !self.access_path_rules.is_empty()
     }
 
-    /// The section titles the given address is listed against.
+    /// Raw MAINTAINERS section titles the given address is listed against.
     ///
     /// The address is matched case insensitively, since it arrives from a
     /// sign-in form rather than from the file.
     pub fn subsystems_for_address(&self, address: &str) -> Option<&BTreeSet<String>> {
         self.subsystems_by_address
             .get(&address.trim().to_ascii_lowercase())
+    }
+
+    /// Effective authorization sections and [`AccessLevel`]s for `address`,
+    /// combining `MAINTAINERS` with `bugs_access.toml` extensions and overrides.
+    pub fn section_access_for_address(
+        &self,
+        address: &str,
+    ) -> Option<&BTreeMap<String, AccessLevel>> {
+        self.access_by_address
+            .get(&address.trim().to_ascii_lowercase())
+    }
+
+    /// Whether `address` holds any access standing (catch-all maintainer or at
+    /// least one section in `section_access_for_address`).
+    pub fn has_access_for_address(&self, address: &str) -> bool {
+        self.is_global_maintainer(address) || self.section_access_for_address(address).is_some()
     }
 
     /// Whether the address is listed on a section that claims the whole tree,
@@ -1167,7 +1702,7 @@ F:	*/
     }
 
     #[test]
-    fn test_upstream_grants_widen_access_attribution_only() {
+    fn test_bugs_access_path_grants_widen_access_attribution_only() {
         let maintainers = "\
 Maintainers List
 ----------------
@@ -1189,29 +1724,44 @@ F:\t*/
 ";
         let mut index = MaintainersIndex::from_reader(maintainers.as_bytes()).unwrap();
         let soc = "ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)";
-        let kept = index.set_upstream_grants(vec![
+        let kept = index.set_bugs_access(vec![
             // Matched case insensitively, stored as MAINTAINERS spells it.
-            RawUpstreamGrant {
-                section: soc.to_ascii_lowercase(),
+            RawAccessGrant {
+                section: Some(soc.to_ascii_lowercase()),
                 paths: vec!["arch/*/boot/dts/".into(), "drivers/soc/".into()],
+                ..Default::default()
             },
-            RawUpstreamGrant {
-                section: "NO SUCH SECTION".into(),
+            // Typo / missing section with no emails is dropped.
+            RawAccessGrant {
+                section: Some("NO SUCH SECTION".into()),
                 paths: vec!["drivers/".into()],
+                ..Default::default()
             },
-            RawUpstreamGrant {
-                section: "THE REST".into(),
+            // Catch-all section is dropped.
+            RawAccessGrant {
+                section: Some("THE REST".into()),
                 paths: vec!["drivers/".into()],
+                ..Default::default()
             },
-            RawUpstreamGrant {
-                section: soc.into(),
+            // Catch-all path pattern is dropped.
+            RawAccessGrant {
+                section: Some(soc.into()),
                 paths: vec!["*/".into()],
+                ..Default::default()
+            },
+            // Ambiguous paths + emails on an existing MAINTAINERS section without
+            // replace_paths or replace_emails is dropped.
+            RawAccessGrant {
+                section: Some(soc.into()),
+                paths: vec!["drivers/soc/".into()],
+                read: vec!["extra@example.com".into()],
+                ..Default::default()
             },
         ]);
         assert_eq!(kept, 1);
 
         let smem = ["drivers/soc/qcom/smem.c"];
-        assert_eq!(index.upstream_grant_sections(smem), vec![soc]);
+        assert_eq!(index.bugs_access_sections(smem), vec![soc]);
         assert_eq!(
             index.attribute_files(smem),
             vec![
@@ -1222,7 +1772,7 @@ F:\t*/
         // Path precise: the platform section's other files are not granted.
         assert!(
             index
-                .upstream_grant_sections(["drivers/watchdog/gunyah_wdt.c"])
+                .bugs_access_sections(["drivers/watchdog/gunyah_wdt.c"])
                 .is_empty()
         );
         // Ownership, and everything derived from it, is unchanged.
@@ -1232,16 +1782,208 @@ F:\t*/
             vec!["linux-arm-msm@example.com"]
         );
 
-        let before = index.upstream_grants_fingerprint();
-        index.set_upstream_grants(vec![RawUpstreamGrant {
-            section: soc.into(),
+        let before = index.bugs_access_fingerprint();
+        index.set_bugs_access(vec![RawAccessGrant {
+            section: Some(soc.into()),
             paths: vec!["drivers/soc/".into(), "arch/*/boot/dts/".into()],
+            ..Default::default()
         }]);
-        assert_eq!(index.upstream_grants_fingerprint(), before);
-        index.set_upstream_grants(Vec::new());
-        assert!(!index.has_upstream_grants());
-        assert_ne!(index.upstream_grants_fingerprint(), before);
-        assert!(index.upstream_grant_sections(smem).is_empty());
+        assert_eq!(index.bugs_access_fingerprint(), before);
+        index.set_bugs_access(Vec::new());
+        assert!(!index.has_bugs_access_path_rules());
+        assert_ne!(index.bugs_access_fingerprint(), before);
+        assert!(index.bugs_access_sections(smem).is_empty());
+    }
+
+    #[test]
+    fn test_bugs_access_email_grants_and_overrides_keep_fingerprint_clean() {
+        let mut index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
+        let baseline_fp = index.bugs_access_fingerprint();
+
+        let kept = index.set_bugs_access(vec![
+            RawAccessGrant {
+                section: Some("BTRFS FILE SYSTEM".into()),
+                read: vec![
+                    "Reader Dev <reader@example.org>".into(),
+                    "promoted@example.org".into(),
+                ],
+                read_write: vec!["promoted@example.org".into(), "rw@example.org".into()],
+                ..Default::default()
+            },
+            // Replace MEMORY MANAGEMENT emails: clm@fb.com loses MEMORY MANAGEMENT
+            // while keeping BTRFS FILE SYSTEM.
+            RawAccessGrant {
+                section: Some("MEMORY MANAGEMENT".into()),
+                replace_emails: true,
+                read: vec!["mm-triage@example.org".into()],
+                ..Default::default()
+            },
+            // Replace NETWORKING [GENERAL] emails completely: davem loses all standing.
+            RawAccessGrant {
+                section: Some("NETWORKING [GENERAL]".into()),
+                replace_emails: true,
+                read_write: vec!["net-delegate@example.org".into()],
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(kept, 3);
+        // Email-only changes produce zero path rules and keep the fingerprint identical.
+        assert!(!index.has_bugs_access_path_rules());
+        assert_eq!(index.bugs_access_fingerprint(), baseline_fp);
+
+        // Existing Btrfs maintainer retains ReadWrite on BTRFS, loses MEMORY MANAGEMENT.
+        let clm = index.section_access_for_address("clm@fb.com").unwrap();
+        assert_eq!(clm.get("BTRFS FILE SYSTEM"), Some(&AccessLevel::ReadWrite));
+        assert!(!clm.contains_key("MEMORY MANAGEMENT"));
+
+        // Added developers receive Read vs ReadWrite (with ReadWrite winning on overlap).
+        assert_eq!(
+            index
+                .section_access_for_address("reader@example.org")
+                .unwrap()
+                .get("BTRFS FILE SYSTEM"),
+            Some(&AccessLevel::Read)
+        );
+        assert_eq!(
+            index
+                .section_access_for_address("promoted@example.org")
+                .unwrap()
+                .get("BTRFS FILE SYSTEM"),
+            Some(&AccessLevel::ReadWrite)
+        );
+        assert_eq!(
+            index
+                .section_access_for_address("rw@example.org")
+                .unwrap()
+                .get("BTRFS FILE SYSTEM"),
+            Some(&AccessLevel::ReadWrite)
+        );
+        assert!(index.has_access_for_address("reader@example.org"));
+
+        assert!(
+            index
+                .section_access_for_address("davem@davemloft.net")
+                .is_none()
+        );
+        assert!(!index.has_access_for_address("davem@davemloft.net"));
+        assert_eq!(
+            index
+                .section_access_for_address("net-delegate@example.org")
+                .unwrap()
+                .get("NETWORKING [GENERAL]"),
+            Some(&AccessLevel::ReadWrite)
+        );
+        assert_eq!(
+            index
+                .section_access_for_address("mm-triage@example.org")
+                .unwrap()
+                .get("MEMORY MANAGEMENT"),
+            Some(&AccessLevel::Read)
+        );
+    }
+
+    #[test]
+    fn test_bugs_access_path_overrides_custom_and_anonymous_sections() {
+        let mut index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
+        let kept = index.set_bugs_access(vec![
+            // Narrow BTRFS FILE SYSTEM by excluding fs/btrfs/tests/, and grant
+            // read-only extra paths over fs/iomap/.
+            RawAccessGrant {
+                section: Some("BTRFS FILE SYSTEM".into()),
+                exclude_paths: vec!["fs/btrfs/tests/".into()],
+                ..Default::default()
+            },
+            RawAccessGrant {
+                section: Some("BTRFS FILE SYSTEM".into()),
+                paths: vec!["fs/iomap/".into()],
+                access: Some(AccessLevel::Read),
+                ..Default::default()
+            },
+            // Custom named section with both read and read_write lists.
+            RawAccessGrant {
+                section: Some("BTRFS ZONED".into()),
+                paths: vec!["fs/btrfs/zoned.*".into()],
+                read: vec!["zoned-reader@example.org".into()],
+                read_write: vec!["zoned-lead@example.org".into()],
+                ..Default::default()
+            },
+            // `access` on a custom section is dropped rather than merged into read_write.
+            RawAccessGrant {
+                section: Some("BTRFS ZONED".into()),
+                paths: vec!["fs/iomap/".into()],
+                access: Some(AccessLevel::Read),
+                ..Default::default()
+            },
+            // Anonymous standalone grant.
+            RawAccessGrant {
+                paths: vec!["unclaimed/".into()],
+                read: vec!["unclaimed@example.org".into()],
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(kept, 4);
+
+        let override_key = "bugs_access::override:BTRFS FILE SYSTEM";
+        let path_read_key = "bugs_access::path_read:BTRFS FILE SYSTEM";
+        let custom_key = "bugs_access::custom:btrfs zoned";
+        // clm@fb.com now holds the override key (ReadWrite) and path_read key (Read)
+        // on BTRFS rather than the raw title, so raw MAINTAINERS rows on excluded
+        // files cannot leak access.
+        let clm = index.section_access_for_address("clm@fb.com").unwrap();
+        assert!(!clm.contains_key("BTRFS FILE SYSTEM"));
+        assert_eq!(clm.get(override_key), Some(&AccessLevel::ReadWrite));
+        assert_eq!(clm.get(path_read_key), Some(&AccessLevel::Read));
+
+        assert_eq!(
+            index.bugs_access_sections(["fs/btrfs/inode.c"]),
+            vec![override_key]
+        );
+        assert_eq!(
+            index.bugs_access_sections(["fs/iomap/buffered-io.c"]),
+            vec![path_read_key]
+        );
+        assert!(
+            index
+                .bugs_access_sections(["fs/btrfs/tests/extent-io-tests.c"])
+                .is_empty()
+        );
+        assert_eq!(
+            index.bugs_access_sections(["fs/btrfs/zoned.c"]),
+            vec![override_key, custom_key]
+        );
+        assert_eq!(
+            index
+                .section_access_for_address("zoned-reader@example.org")
+                .unwrap()
+                .get(custom_key),
+            Some(&AccessLevel::Read)
+        );
+        assert_eq!(
+            index
+                .section_access_for_address("zoned-lead@example.org")
+                .unwrap()
+                .get(custom_key),
+            Some(&AccessLevel::ReadWrite)
+        );
+        // Displayed MAINTAINERS matching stays untouched.
+        assert_eq!(
+            index.match_files(["fs/btrfs/tests/extent-io-tests.c"]),
+            vec!["BTRFS FILE SYSTEM"]
+        );
+
+        // Non-MAINTAINERS project index reconciles standalone grants cleanly.
+        let mut non_linux = MaintainersIndex::without_maintainers();
+        assert!(non_linux.is_ready_for_reconcile());
+        assert_eq!(
+            non_linux.set_bugs_access(vec![RawAccessGrant {
+                paths: vec!["src/server.rs".into()],
+                read: vec!["reviewer@sashiko.dev".into()],
+                ..Default::default()
+            }]),
+            1
+        );
+        assert!(non_linux.has_access_for_address("reviewer@sashiko.dev"));
+        assert_eq!(non_linux.bugs_access_sections(["src/server.rs"]).len(), 1);
     }
 
     #[test]
@@ -1348,9 +2090,10 @@ F:\t*/
         clear_global_maintainers();
 
         let mut index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
-        index.set_upstream_grants(vec![RawUpstreamGrant {
-            section: "BTRFS FILE SYSTEM".into(),
+        index.set_bugs_access(vec![RawAccessGrant {
+            section: Some("BTRFS FILE SYSTEM".into()),
             paths: vec!["net/core/".into()],
+            ..Default::default()
         }]);
         let arc = Arc::new(index);
         init_global_maintainers(arc.clone());
