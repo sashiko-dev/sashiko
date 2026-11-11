@@ -1315,7 +1315,7 @@ fn deduplicate_classic_benchmark_commits(entries: &[BenchmarkEntry]) -> Vec<Stri
 async fn commit_has_completed_review(db: &Database, commit: &str) -> Result<bool> {
     let (trimmed, bracketed) = normalize_commit_or_msgid(commit);
     let mut rows = db
-        .conn
+        .read_conn()
         .query(
             "SELECT 1
              FROM patches p
@@ -1334,7 +1334,7 @@ async fn commit_has_completed_review(db: &Database, commit: &str) -> Result<bool
     if trimmed.len() < 40 && !trimmed.contains('@') {
         let root_msg_id = format!("{trimmed}@sashiko.local");
         let mut fallback_rows = db
-            .conn
+            .read_conn()
             .query(
                 "SELECT 1
                  FROM patchsets ps
@@ -1542,7 +1542,7 @@ async fn persist_benchmark_patch(
     // Reset non-Reviewed prior attempts when re-running against an existing DB
     // so Reviewer picks up and re-reviews previously Failed/Cancelled commits.
     let mut rev_rows = db
-        .conn
+        .read_conn()
         .query(
             "SELECT 1 FROM reviews WHERE patch_id = ? AND status = 'Reviewed' LIMIT 1",
             libsql::params![patch_id],
@@ -1603,7 +1603,7 @@ impl Drop for AbortTaskOnDrop {
 
 async fn load_benchmark_skipped_patch_ids(db: &Database) -> Result<std::collections::HashSet<i64>> {
     let mut rows = db
-        .conn
+        .read_conn()
         .query(
             "SELECT p.id
              FROM patches p
@@ -2163,7 +2163,7 @@ async fn finalize_ancestor_patchset_state(
             .await?;
 
             let mut rows = db
-                .conn
+                .read_conn()
                 .query(
                     "SELECT id, COALESCE(part_index, 1), message_id
                      FROM patches
@@ -2185,7 +2185,7 @@ async fn finalize_ancestor_patchset_state(
 
             for (patch_id, part_index, patch_msg_id) in patches {
                 let mut existing_rev = db
-                    .conn
+                    .read_conn()
                     .query(
                         "SELECT id, provider FROM reviews WHERE patch_id = ? AND status = 'Reviewed' LIMIT 1",
                         libsql::params![patch_id],
@@ -2290,7 +2290,7 @@ async fn prepare_target_patchset_review_state(
     target_msg_ids: &BTreeSet<String>,
 ) -> Result<()> {
     let mut rows = db
-        .conn
+        .read_conn()
         .query(
             "SELECT id, message_id FROM patches WHERE patchset_id = ? ORDER BY part_index ASC LIMIT 256",
             libsql::params![patchset_id],
@@ -2315,7 +2315,7 @@ async fn prepare_target_patchset_review_state(
         }
 
         let mut rev_rows = db
-            .conn
+            .read_conn()
             .query(
                 "SELECT 1 FROM reviews WHERE patch_id = ? AND status = 'Reviewed' LIMIT 1",
                 libsql::params![patch_id],
@@ -2378,7 +2378,7 @@ async fn lookup_benchmark_patch_row(
 ) -> Result<Option<(i64, i64, Option<String>, Option<String>, Option<String>)>> {
     let (trimmed, bracketed) = normalize_commit_or_msgid(commit);
     let mut rows = db
-        .conn
+        .read_conn()
         .query(
             "SELECT p.id, p.patchset_id, p.status, ps.status, m.subject
              FROM patches p
@@ -2403,7 +2403,7 @@ async fn lookup_benchmark_patch_row(
     if trimmed.len() < 40 && !trimmed.contains('@') {
         let root_msg_id = format!("{trimmed}@sashiko.local");
         let mut fallback_rows = db
-            .conn
+            .read_conn()
             .query(
                 "SELECT p.id, p.patchset_id, p.status, ps.status, m.subject
                  FROM patchsets ps
@@ -2458,7 +2458,7 @@ async fn count_commit_review_progress(
         }
 
         let mut rev_rows = db
-            .conn
+            .read_conn()
             .query(
                 "SELECT status FROM reviews WHERE patch_id = ?
                  ORDER BY CASE WHEN status = 'Reviewed' THEN 0 ELSE 1 END ASC, id DESC LIMIT 1",
@@ -2522,7 +2522,7 @@ pub(crate) async fn load_commit_review_data(
     };
 
     let mut rev_rows = db
-        .conn
+        .read_conn()
         .query(
             "SELECT id, status, summary, result_description, interaction_id, created_at, inline_review
              FROM reviews
@@ -2563,7 +2563,7 @@ pub(crate) async fn load_commit_review_data(
     let mut parsed_output: Option<Value> = None;
     if let Some(iid) = interaction_id {
         let mut int_rows = db
-            .conn
+            .read_conn()
             .query(
                 "SELECT tokens_in, tokens_out, tokens_cached, created_at, output_raw
                  FROM ai_interactions
@@ -2590,7 +2590,7 @@ pub(crate) async fn load_commit_review_data(
     }
 
     let mut tool_rows = db
-        .conn
+        .read_conn()
         .query(
             "SELECT COUNT(*) FROM tool_usages WHERE review_id = ?",
             libsql::params![review_id],
@@ -2867,7 +2867,7 @@ async fn load_findings_table_fallback(
     findings: &mut Vec<BenchmarkFindingRecord>,
 ) -> Result<()> {
     let mut rows = db
-        .conn
+        .read_conn()
         .query(
             "SELECT problem, severity, severity_explanation, preexisting
              FROM findings
@@ -4862,7 +4862,7 @@ mod tests {
         .unwrap();
 
         let mut remaining = db
-            .conn
+            .read_conn()
             .query(
                 "SELECT id, status FROM reviews WHERE patch_id = ?",
                 libsql::params![patch_id],
@@ -6187,7 +6187,7 @@ mod tests {
 
         // Verify v1 <- v2 <- v3 patchset lineage and patch lineage links.
         let mut ps_lineage = db
-            .conn
+            .read_conn()
             .query(
                 "SELECT id, previous_patchset_id FROM patchsets WHERE id IN (?, ?, ?) ORDER BY id ASC",
                 libsql::params![v1_ps_id, v2_ps_id, v3_ps_id],
@@ -6202,7 +6202,7 @@ mod tests {
         drop(ps_lineage);
 
         let mut p_lineage = db
-            .conn
+            .read_conn()
             .query(
                 "SELECT previous_patch_id FROM patches WHERE id = ?",
                 libsql::params![v3_p2_id],
@@ -6214,7 +6214,7 @@ mod tests {
 
         // Verify seeded Sashiko finding on v1 patch 2.
         let mut seeded_rows = db
-            .conn
+            .read_conn()
             .query(
                 "SELECT f.problem FROM findings f JOIN reviews r ON f.review_id = r.id WHERE r.patch_id = ?",
                 libsql::params![v1_p2_id],
@@ -6236,7 +6236,7 @@ mod tests {
         // Re-ingesting against an existing DB (or shared ancestor) must not duplicate seeded findings.
         ingest_versioned_benchmark_entries(&db, &bench_file, std::slice::from_ref(&entry)).await?;
         let mut count_rows = db
-            .conn
+            .read_conn()
             .query(
                 "SELECT COUNT(*) FROM findings f JOIN reviews r ON f.review_id = r.id WHERE r.patch_id = ?",
                 libsql::params![v1_p2_id],
@@ -6450,7 +6450,7 @@ mod tests {
             };
             if ctx.is_empty_for_audit() {
                 let mut mcount_rows = db
-                    .conn
+                    .read_conn()
                     .query(
                         "SELECT COUNT(*), (SELECT subject FROM patchsets WHERE id = ?) FROM messages WHERE thread_id IN (SELECT thread_id FROM patchsets WHERE id = ?)",
                         libsql::params![prev_ps_id, prev_ps_id],
