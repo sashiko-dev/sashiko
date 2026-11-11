@@ -16,24 +16,33 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Node, Parser};
 
 /// Files up to this line count are audited as a single chunk without splitting.
-pub const SINGLE_CHUNK_MAX_LINES: usize = 800;
+pub const SINGLE_CHUNK_MAX_LINES: usize = 500;
 
 /// Soft target line count when grouping consecutive functions into a chunk.
-pub const TARGET_CHUNK_LINES: usize = 600;
+pub const TARGET_CHUNK_LINES: usize = 400;
 
 /// Hard upper bound when extending a chunk to keep mutually-calling functions together.
-pub const MAX_CHUNK_LINES: usize = 900;
+pub const MAX_CHUNK_LINES: usize = 650;
+
+/// Maximum number of functions rendered in the per-file outline before summarizing.
+const MAX_INDEXED_FUNCTIONS: usize = 140;
 
 /// Line overlap when splitting a single giant function that exceeds `MAX_CHUNK_LINES`.
 pub const GIANT_FUNCTION_OVERLAP_LINES: usize = 50;
 
 /// Maximum character budget for pre-fetched external header definitions per chunk.
-pub const MAX_HEADER_PREFETCH_CHARS: usize = 30_000;
+pub const MAX_HEADER_PREFETCH_CHARS: usize = 22_000;
+
+/// Maximum character budget for deterministic out-of-chunk intra-file context per chunk.
+pub const MAX_INTRA_FILE_CONTEXT_CHARS: usize = 18_000;
+
+/// Maximum file byte size eligible for a single-turn whole-file invariant synthesis pass.
+const MAX_WHOLE_FILE_SYNTHESIS_BYTES: usize = 260_000;
 
 /// Maximum lines of file-scope preamble (structs, macros, statics) prepended to later chunks.
 const MAX_PREAMBLE_LINES: usize = 80;
@@ -48,7 +57,7 @@ const DEFAULT_IGNORED_PREFIXES: &[&str] = &[
 ];
 
 /// Metadata for a single function extracted from a source file.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FunctionSpan {
     pub name: String,
     pub signature: String,
@@ -58,6 +67,12 @@ pub struct FunctionSpan {
     pub end_line: usize,
     /// Intra-file or external functions directly called by this function.
     pub called_functions: Vec<String>,
+    /// Functions defined in the same file called or referenced by this function.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intra_file_callees: Vec<String>,
+    /// Functions or vtable initializers in the same file that call or reference this function.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intra_file_callers: Vec<String>,
     /// High-signal kernel operations detected inside this function body.
     pub risk_signals: Vec<String>,
 }
@@ -77,6 +92,15 @@ pub struct ScanChunk {
     pub numbered_source: String,
     /// Compact summary of all functions in the file so the model knows what else exists.
     pub file_function_index: String,
+    /// Deterministic intra-file context (out-of-chunk file-local types/macros, 1-hop static
+    /// callees, and intra-file caller call-sites).
+    pub intra_file_context: String,
+    /// Optional synthesized whole-file locking, nullable-field, and lifecycle invariants.
+    pub file_invariants: String,
+    /// Normative architecture & contract specification from `ContractCartographer` (`Agent 1`).
+    pub contract_notes: String,
+    /// Pre-fetched 1-hop external call-sites and ops-table registrations for exported functions.
+    pub external_callers: String,
     /// Functions overlapping this chunk.
     pub functions: Vec<FunctionSpan>,
     /// Pre-fetched struct/enum/macro definitions from headers in the same subsystem.
@@ -403,6 +427,13 @@ pub async fn build_scan_chunks_for_file(
     build_scan_chunks_for_file_with_limit(repo_path, target_sha, file_path, None).await
 }
 
+struct LoadedFileChunks {
+    file_path: String,
+    raw_source: String,
+    whole_file_external_callers: String,
+    chunks: Vec<ScanChunk>,
+}
+
 /// Reads a file blob at `target_sha`, partitions it into `ScanChunk`s (truncating to
 /// `max_chunks` if specified), and prefetches external header definitions in a single
 /// batched pass over the retained chunks.
@@ -412,8 +443,26 @@ pub async fn build_scan_chunks_for_file_with_limit(
     file_path: &str,
     max_chunks: Option<usize>,
 ) -> Result<Vec<ScanChunk>> {
+    Ok(
+        load_file_chunks_with_limit(repo_path, target_sha, file_path, max_chunks)
+            .await?
+            .chunks,
+    )
+}
+
+async fn load_file_chunks_with_limit(
+    repo_path: &Path,
+    target_sha: &str,
+    file_path: &str,
+    max_chunks: Option<usize>,
+) -> Result<LoadedFileChunks> {
     if max_chunks == Some(0) {
-        return Ok(Vec::new());
+        return Ok(LoadedFileChunks {
+            file_path: file_path.to_string(),
+            raw_source: String::new(),
+            whole_file_external_callers: String::new(),
+            chunks: Vec::new(),
+        });
     }
     let spec = format!("{target_sha}:{file_path}");
     let output = crate::git_cmd::in_dir_async(repo_path)
@@ -459,7 +508,62 @@ pub async fn build_scan_chunks_for_file_with_limit(
         }
     }
 
-    Ok(chunks)
+    let mut whole_file_external_callers = String::new();
+    if !file_path.ends_with(".h") && !chunks.is_empty() {
+        let per_chunk_exported_fns: Vec<Vec<String>> = chunks
+            .iter()
+            .map(|c| {
+                c.functions
+                    .iter()
+                    .filter(|f| !is_file_static_signature(file_path, &f.signature))
+                    .map(|f| f.name.clone())
+                    .collect()
+            })
+            .collect();
+        if let Ok((whole_callers, chunk_callers)) =
+            crate::worker::prefetch::prefetch_external_callers_for_chunks(
+                repo_path,
+                target_sha,
+                file_path,
+                &per_chunk_exported_fns,
+                14_000,
+                7_000,
+            )
+            .await
+        {
+            whole_file_external_callers = whole_callers;
+            for (chunk, callers) in chunks.iter_mut().zip(chunk_callers.into_iter()) {
+                chunk.external_callers = callers;
+            }
+        }
+    }
+
+    Ok(LoadedFileChunks {
+        file_path: file_path.to_string(),
+        raw_source: source,
+        whole_file_external_callers,
+        chunks,
+    })
+}
+
+fn is_file_static_signature(file_path: &str, signature: &str) -> bool {
+    let trimmed = signature.trim_start();
+    if file_path.ends_with(".rs") {
+        !trimmed.starts_with("pub ") && !trimmed.contains(" pub fn ")
+    } else {
+        trimmed.starts_with("static ")
+            || trimmed.starts_with("static\t")
+            || trimmed.starts_with("static\n")
+            || trimmed.contains(" static ")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FileLocalDef {
+    names: Vec<String>,
+    referenced_idents: BTreeSet<String>,
+    start_line: usize,
+    end_line: usize,
 }
 
 /// Deterministically partitions `source` into locality-aware `ScanChunk`s.
@@ -469,7 +573,13 @@ pub fn chunk_source_file(file_path: &str, source: &str) -> Vec<ScanChunk> {
         return Vec::new();
     }
     let total_lines = lines.len();
-    let functions = extract_functions(file_path, source);
+    let local_defs = if file_path.ends_with(".rs") {
+        Vec::new()
+    } else {
+        extract_c_file_local_defs(source)
+    };
+    let mut functions = extract_functions(file_path, source);
+    populate_intra_file_graph(&mut functions, &local_defs, &lines);
     let file_function_index = format_function_index(file_path, total_lines, &functions);
 
     if total_lines <= SINGLE_CHUNK_MAX_LINES {
@@ -481,6 +591,10 @@ pub fn chunk_source_file(file_path: &str, source: &str) -> Vec<ScanChunk> {
             end_line: total_lines,
             numbered_source: format_numbered_lines(&lines, 1, total_lines, None),
             file_function_index,
+            intra_file_context: String::new(),
+            file_invariants: String::new(),
+            contract_notes: String::new(),
+            external_callers: String::new(),
             functions,
             prefetched_headers: String::new(),
         }];
@@ -512,6 +626,20 @@ pub fn chunk_source_file(file_path: &str, source: &str) -> Vec<ScanChunk> {
             } else {
                 None
             };
+            let intra_file_context = if total_chunks >= 2 {
+                build_chunk_intra_file_context(
+                    &lines,
+                    start_line,
+                    end_line,
+                    preamble.map(|(_, pe)| pe).unwrap_or(0),
+                    &chunk_fns,
+                    &functions,
+                    &local_defs,
+                    MAX_INTRA_FILE_CONTEXT_CHARS,
+                )
+            } else {
+                String::new()
+            };
             ScanChunk {
                 file_path: file_path.to_string(),
                 chunk_index: idx + 1,
@@ -520,6 +648,10 @@ pub fn chunk_source_file(file_path: &str, source: &str) -> Vec<ScanChunk> {
                 end_line,
                 numbered_source: format_numbered_lines(&lines, start_line, end_line, preamble),
                 file_function_index: file_function_index.clone(),
+                intra_file_context,
+                file_invariants: String::new(),
+                contract_notes: String::new(),
+                external_callers: String::new(),
                 functions: chunk_fns,
                 prefetched_headers: String::new(),
             }
@@ -680,7 +812,28 @@ fn format_function_index(
         "{file_path} ({total_lines} lines, {} functions):\n",
         functions.len()
     );
-    for f in functions {
+    let shown: Vec<&FunctionSpan> = if functions.len() <= MAX_INDEXED_FUNCTIONS {
+        functions.iter().collect()
+    } else {
+        let mut selected: Vec<&FunctionSpan> = functions
+            .iter()
+            .filter(|f| !f.risk_signals.is_empty())
+            .take(MAX_INDEXED_FUNCTIONS)
+            .collect();
+        if selected.len() < MAX_INDEXED_FUNCTIONS {
+            for f in functions {
+                if selected.len() >= MAX_INDEXED_FUNCTIONS {
+                    break;
+                }
+                if f.risk_signals.is_empty() {
+                    selected.push(f);
+                }
+            }
+            selected.sort_by_key(|f| f.start_line);
+        }
+        selected
+    };
+    for f in &shown {
         let signals = if f.risk_signals.is_empty() {
             String::new()
         } else {
@@ -689,6 +842,12 @@ fn format_function_index(
         out.push_str(&format!(
             "- {}() [lines {}-{}]{}\n",
             f.name, f.start_line, f.end_line, signals
+        ));
+    }
+    if functions.len() > shown.len() {
+        out.push_str(&format!(
+            "... and {} more functions in {file_path} (use git_grep / git_read_files to inspect)\n",
+            functions.len() - shown.len()
         ));
     }
     out
@@ -789,8 +948,421 @@ fn build_c_function_span(node: Node<'_>, source: &[u8], lines: &[&str]) -> Optio
         start_line,
         end_line,
         called_functions: calls.into_iter().collect(),
+        intra_file_callees: Vec::new(),
+        intra_file_callers: Vec::new(),
         risk_signals,
     })
+}
+
+fn extract_c_file_local_defs(source: &str) -> Vec<FileLocalDef> {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let bytes = source.as_bytes();
+    let total_lines = source.lines().count().max(1);
+    let mut out = Vec::new();
+    collect_c_file_local_defs(tree.root_node(), bytes, total_lines, &mut out);
+    out.sort_by_key(|d| d.start_line);
+    out
+}
+
+fn collect_c_file_local_defs(
+    node: Node<'_>,
+    source: &[u8],
+    total_lines: usize,
+    out: &mut Vec<FileLocalDef>,
+) {
+    match node.kind() {
+        "function_definition" => {}
+        "preproc_if"
+        | "preproc_ifdef"
+        | "preproc_elif"
+        | "preproc_else"
+        | "translation_unit"
+        | "declaration_list"
+        | "linkage_specification" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_c_file_local_defs(child, source, total_lines, out);
+            }
+        }
+        "struct_specifier" | "union_specifier" | "enum_specifier" => {
+            if node.child_by_field_name("body").is_some()
+                && let Some(def) = build_file_local_def(node, source, total_lines)
+            {
+                out.push(def);
+            }
+        }
+        "type_definition" | "preproc_def" | "preproc_function_def" | "declaration" => {
+            if let Some(def) = build_file_local_def(node, source, total_lines) {
+                out.push(def);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn build_file_local_def(node: Node<'_>, source: &[u8], total_lines: usize) -> Option<FileLocalDef> {
+    let start_line = node.start_position().row + 1;
+    let end_line = (node.end_position().row + 1).min(total_lines);
+    let mut names = BTreeSet::new();
+    collect_defined_names_in_node(node, source, &mut names);
+    if names.is_empty() {
+        return None;
+    }
+    let mut referenced_idents = BTreeSet::new();
+    collect_all_identifiers(node, source, &mut referenced_idents);
+    for n in &names {
+        referenced_idents.remove(n);
+    }
+    Some(FileLocalDef {
+        names: names.into_iter().collect(),
+        referenced_idents,
+        start_line,
+        end_line,
+    })
+}
+
+fn collect_defined_names_in_node(node: Node<'_>, source: &[u8], out: &mut BTreeSet<String>) {
+    match node.kind() {
+        "preproc_def" | "preproc_function_def" => {
+            if let Some(n) = node.child_by_field_name("name")
+                && let Ok(txt) = n.utf8_text(source)
+            {
+                let trimmed = txt.trim();
+                if trimmed.len() >= 2 {
+                    out.insert(trimmed.to_string());
+                }
+            }
+        }
+        "struct_specifier" | "union_specifier" | "enum_specifier" => {
+            if node.child_by_field_name("body").is_some()
+                && let Some(n) = node.child_by_field_name("name")
+                && let Ok(txt) = n.utf8_text(source)
+            {
+                let trimmed = txt.trim();
+                if trimmed.len() >= 2 {
+                    out.insert(trimmed.to_string());
+                }
+            }
+        }
+        "type_definition" => {
+            if let Some(decl) = node.child_by_field_name("declarator")
+                && let Some(name) = extract_c_type_or_var_name(decl, source)
+            {
+                out.insert(name);
+            }
+            if let Some(ty) = node.child_by_field_name("type") {
+                collect_defined_names_in_node(ty, source, out);
+            }
+        }
+        "declaration" => {
+            if let Some(ty) = node.child_by_field_name("type") {
+                collect_defined_names_in_node(ty, source, out);
+            }
+            let mut cursor = node.walk();
+            for child in node.children_by_field_name("declarator", &mut cursor) {
+                // Skip pure forward function prototypes (`static int foo(int x);`).
+                if is_function_prototype_declarator(child) {
+                    continue;
+                }
+                if let Some(name) = extract_c_type_or_var_name(child, source) {
+                    out.insert(name);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_function_prototype_declarator(mut cur: Node<'_>) -> bool {
+    loop {
+        match cur.kind() {
+            "function_declarator" => return true,
+            "init_declarator" => return false,
+            "pointer_declarator" | "parenthesized_declarator" | "attributed_declarator" => {
+                let Some(next) = cur.child_by_field_name("declarator") else {
+                    return false;
+                };
+                cur = next;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn extract_c_type_or_var_name(mut cur: Node<'_>, source: &[u8]) -> Option<String> {
+    loop {
+        match cur.kind() {
+            "identifier" | "type_identifier" => {
+                return cur
+                    .utf8_text(source)
+                    .ok()
+                    .map(str::trim)
+                    .filter(|s| s.len() >= 2)
+                    .map(str::to_string);
+            }
+            "init_declarator"
+            | "array_declarator"
+            | "pointer_declarator"
+            | "function_declarator"
+            | "parenthesized_declarator"
+            | "attributed_declarator" => {
+                cur = cur.child_by_field_name("declarator")?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn collect_all_identifiers(node: Node<'_>, source: &[u8], out: &mut BTreeSet<String>) {
+    if matches!(node.kind(), "identifier" | "type_identifier")
+        && let Ok(txt) = node.utf8_text(source)
+    {
+        let trimmed = txt.trim();
+        if trimmed.len() >= 2 {
+            out.insert(trimmed.to_string());
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_all_identifiers(child, source, out);
+    }
+}
+
+fn extract_identifiers_from_lines(
+    lines: &[&str],
+    start_line_1: usize,
+    end_line_1: usize,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if lines.is_empty() || start_line_1 == 0 || start_line_1 > end_line_1 {
+        return out;
+    }
+    let hi = end_line_1.min(lines.len());
+    for line in &lines[(start_line_1 - 1)..hi] {
+        for tok in line.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            if tok.len() >= 2 && !tok.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+                out.insert(tok.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn populate_intra_file_graph(
+    functions: &mut [FunctionSpan],
+    local_defs: &[FileLocalDef],
+    lines: &[&str],
+) {
+    let fn_names: BTreeSet<String> = functions.iter().map(|f| f.name.clone()).collect();
+    if fn_names.is_empty() {
+        return;
+    }
+
+    let mut callers_map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for f in functions.iter_mut() {
+        let body_idents = extract_identifiers_from_lines(lines, f.start_line, f.end_line);
+        let mut callees = BTreeSet::new();
+        for cand in body_idents.intersection(&fn_names) {
+            if cand != &f.name {
+                callees.insert(cand.clone());
+                callers_map
+                    .entry(cand.clone())
+                    .or_default()
+                    .insert(f.name.clone());
+            }
+        }
+        f.intra_file_callees = callees.into_iter().collect();
+    }
+
+    for def in local_defs {
+        let def_label = def
+            .names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("decl@L{}", def.start_line));
+        for target_fn in def.referenced_idents.intersection(&fn_names) {
+            callers_map
+                .entry(target_fn.clone())
+                .or_default()
+                .insert(def_label.clone());
+        }
+    }
+
+    for f in functions.iter_mut() {
+        if let Some(callers) = callers_map.remove(&f.name) {
+            f.intra_file_callers = callers.into_iter().collect();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_chunk_intra_file_context(
+    lines: &[&str],
+    chunk_start: usize,
+    chunk_end: usize,
+    preamble_end: usize,
+    chunk_fns: &[FunctionSpan],
+    all_fns: &[FunctionSpan],
+    local_defs: &[FileLocalDef],
+    max_chars: usize,
+) -> String {
+    let chunk_idents = extract_identifiers_from_lines(lines, chunk_start, chunk_end);
+    let chunk_fn_names: BTreeSet<&str> = chunk_fns.iter().map(|f| f.name.as_str()).collect();
+    let in_chunk_or_preamble = |s: usize, e: usize| -> bool {
+        (preamble_end > 0 && e <= preamble_end) || (s >= chunk_start && e <= chunk_end)
+    };
+
+    let mut out = String::new();
+    let append_snippet = |out: &mut String, header: &str, s_line: usize, e_line: usize| -> bool {
+        let clamped_s = s_line.max(1);
+        let clamped_e = e_line.min(lines.len());
+        if clamped_s > clamped_e {
+            return true;
+        }
+        let mut block = String::from(header);
+        for ln in clamped_s..=clamped_e {
+            block.push_str(&format!("{:>6}: {}\n", ln, lines[ln - 1]));
+        }
+        block.push('\n');
+        if out.len() + block.len() > max_chars {
+            return false;
+        }
+        out.push_str(&block);
+        true
+    };
+
+    // 1. Out-of-chunk file-local types, macros, locks, and ops tables referenced by this chunk
+    //    (or referencing functions defined in this chunk).
+    for def in local_defs {
+        if in_chunk_or_preamble(def.start_line, def.end_line) {
+            continue;
+        }
+        let referenced_by_chunk = def.names.iter().any(|n| chunk_idents.contains(n));
+        let references_chunk_fn = def
+            .referenced_idents
+            .iter()
+            .any(|id| chunk_fn_names.contains(id.as_str()));
+        if !referenced_by_chunk && !references_chunk_fn {
+            continue;
+        }
+        let label = def.names.join(", ");
+        let end_capped = def.end_line.min(def.start_line + 60);
+        let header = format!(
+            "// --- File-local definition `{label}` [lines {}-{}] ---\n",
+            def.start_line, def.end_line
+        );
+        if !append_snippet(&mut out, &header, def.start_line, end_capped) {
+            return out;
+        }
+    }
+
+    // 2. Out-of-chunk 1-hop intra-file callees called/referenced by functions in this chunk.
+    let mut wanted_callees = BTreeSet::new();
+    for cf in chunk_fns {
+        for callee in &cf.intra_file_callees {
+            if !chunk_fn_names.contains(callee.as_str()) {
+                wanted_callees.insert(callee.as_str());
+            }
+        }
+    }
+    for f in all_fns {
+        if !wanted_callees.contains(f.name.as_str())
+            || in_chunk_or_preamble(f.start_line, f.end_line)
+        {
+            continue;
+        }
+        let span_len = f.end_line.saturating_sub(f.start_line) + 1;
+        if span_len <= 70 {
+            let header = format!(
+                "// --- Intra-file callee `{}()` [lines {}-{}] ---\n",
+                f.name, f.start_line, f.end_line
+            );
+            if !append_snippet(&mut out, &header, f.start_line, f.end_line) {
+                return out;
+            }
+        } else {
+            let head_end = f.start_line + 24;
+            let tail_start = f.end_line.saturating_sub(19).max(head_end + 1);
+            let mut block = format!(
+                "// --- Intra-file callee `{}()` [lines {}-{}, middle elided] ---\n",
+                f.name, f.start_line, f.end_line
+            );
+            for ln in f.start_line..=head_end.min(lines.len()) {
+                block.push_str(&format!("{:>6}: {}\n", ln, lines[ln - 1]));
+            }
+            block.push_str(&format!(
+                "// ... lines {}..{} elided ...\n",
+                head_end + 1,
+                tail_start - 1
+            ));
+            for ln in tail_start..=f.end_line.min(lines.len()) {
+                block.push_str(&format!("{:>6}: {}\n", ln, lines[ln - 1]));
+            }
+            block.push('\n');
+            if out.len() + block.len() > max_chars {
+                return out;
+            }
+            out.push_str(&block);
+        }
+    }
+
+    // 3. Out-of-chunk intra-file caller call-site windows for functions defined in this chunk.
+    let mut wanted_caller_fns = BTreeSet::new();
+    for cf in chunk_fns {
+        for caller in &cf.intra_file_callers {
+            if !chunk_fn_names.contains(caller.as_str()) {
+                wanted_caller_fns.insert(caller.as_str());
+            }
+        }
+    }
+    let mut call_windows_emitted = 0usize;
+    for caller_fn in all_fns {
+        if call_windows_emitted >= 12 {
+            break;
+        }
+        if !wanted_caller_fns.contains(caller_fn.name.as_str())
+            || in_chunk_or_preamble(caller_fn.start_line, caller_fn.end_line)
+        {
+            continue;
+        }
+        let mut last_emitted_end = 0usize;
+        for ln in caller_fn.start_line..=caller_fn.end_line.min(lines.len()) {
+            if ln <= last_emitted_end {
+                continue;
+            }
+            let has_hit = lines[ln - 1]
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|tok| chunk_fn_names.contains(tok));
+            if !has_hit {
+                continue;
+            }
+            let win_s = ln.saturating_sub(8).max(caller_fn.start_line);
+            let win_e = (ln + 8).min(caller_fn.end_line).min(lines.len());
+            let header = format!(
+                "// --- Intra-file caller `{}()` call-site [lines {}-{}] ---\n",
+                caller_fn.name, win_s, win_e
+            );
+            if !append_snippet(&mut out, &header, win_s, win_e) {
+                return out;
+            }
+            last_emitted_end = win_e;
+            call_windows_emitted += 1;
+            if call_windows_emitted >= 12 {
+                break;
+            }
+        }
+    }
+
+    out
 }
 
 fn extract_c_declarator_name(mut cur: Node<'_>, source: &[u8]) -> Option<String> {
@@ -922,9 +1494,35 @@ fn detect_risk_signals(body_text: &str) -> Vec<String> {
                 "queue_delayed_work",
                 "cancel_work_sync",
                 "cancel_delayed_work_sync",
+                "irq_work_queue",
+                "irq_work_sync",
                 "mod_timer",
                 "del_timer_sync",
                 "timer_delete_sync",
+                "timer_shutdown_sync",
+            ],
+        ),
+        (
+            "xarray_idr",
+            &[
+                "xa_store",
+                "xas_store",
+                "xas_nomem",
+                "xa_destroy",
+                "idr_alloc",
+                "ida_alloc",
+            ],
+        ),
+        (
+            "cgroup_kernfs",
+            &[
+                "css_free",
+                "css_released",
+                "css_offline",
+                "percpu_ref_",
+                "kernfs_break_active_protection",
+                "__GFP_ACCOUNT",
+                "XA_FLAGS_ACCOUNT",
             ],
         ),
         (
@@ -1142,6 +1740,8 @@ fn extract_rust_functions(source: &str) -> Vec<FunctionSpan> {
                 start_line,
                 end_line: end_idx + 1,
                 called_functions: Vec::new(),
+                intra_file_callees: Vec::new(),
+                intra_file_callers: Vec::new(),
                 risk_signals,
             });
             idx = end_idx + 1;
@@ -1683,7 +2283,11 @@ async fn build_scan_provider(
     let raw_provider = crate::ai::create_provider_cached(&settings.ai, None)
         .await
         .context("Failed to create AI provider for scan")?;
-    let llm_concurrency = crate::ai::concurrency_limited_provider::llm_permits(concurrency);
+    // Active-scan prompts include full source chunks, intra-file context, and
+    // prefetched headers (~35K-55K tokens each). Cap simultaneous in-flight LLM
+    // requests tighter than diff-review llm_permits() so parallel specialist stages
+    // do not trigger prefill-queue preemption storms on shared model backends.
+    let llm_concurrency = concurrency.saturating_mul(2).clamp(3, 6);
     let llm_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(llm_concurrency));
     let quota = std::sync::Arc::new(crate::ai::quota::QuotaManager::with_limits(
         settings.ai.max_rps,
@@ -1711,7 +2315,7 @@ struct ChunkScanResult {
 async fn scan_single_chunk(
     chunk: ScanChunk,
     target_sha: &str,
-    repo_path: &Path,
+    shared_tools: std::sync::Arc<crate::toolbox::ToolBox>,
     prompts_dir: &Path,
     provider: std::sync::Arc<dyn crate::ai::AiProvider>,
     maintainers: Option<std::sync::Arc<crate::maintainers::MaintainersIndex>>,
@@ -1777,11 +2381,6 @@ async fn scan_single_chunk(
             .unwrap_or_default()
         };
 
-    let mut tb = crate::toolbox::ToolBox::new(repo_path.to_path_buf());
-    tb.set_virtual_head(target_sha.to_string());
-    tb.set_active_patch_files(vec![chunk.file_path.clone()]);
-    let tools = std::sync::Arc::new(tb);
-
     let maintainers_hint = maintainers.as_ref().and_then(|mindex| {
         let matched = mindex.match_files(std::slice::from_ref(&chunk.file_path));
         if matched.is_empty() {
@@ -1801,6 +2400,10 @@ async fn scan_single_chunk(
         chunk_functions_json: serde_json::to_string_pretty(&chunk.functions)
             .unwrap_or_else(|_| "[]".to_string()),
         file_function_index: chunk.file_function_index.clone(),
+        intra_file_context: chunk.intra_file_context.clone(),
+        file_invariants: chunk.file_invariants.clone(),
+        contract_notes: chunk.contract_notes.clone(),
+        external_callers: chunk.external_callers.clone(),
         prefetched_context: chunk.prefetched_headers.clone(),
         maintainers_hint,
         maintainer_notes,
@@ -1820,7 +2423,7 @@ async fn scan_single_chunk(
     );
     let env = crate::workflow::WorkflowEnv {
         provider,
-        tools,
+        tools: shared_tools,
         base_dir: prompts_dir,
         context_tag: Some(format!("[scan:{chunk_id}] ")),
     };
@@ -1846,8 +2449,9 @@ async fn scan_single_chunk(
     let tokens_out = outcome.tokens_out as usize;
     let tokens_cached = outcome.tokens_cached as usize;
 
-    let early_exited =
-        state.planned_stages.is_empty() && state.manual_stages.as_ref().is_none_or(Vec::is_empty);
+    let early_exited = state.planned_stages.is_empty()
+        && state.manual_stages.as_ref().is_none_or(Vec::is_empty)
+        && state.all_concerns.is_empty();
     let candidate_bugs = state.to_candidate_bug_inputs(maintainers.as_deref());
 
     let dismissed = if !state.deduplicated_dismissed_concerns.is_empty() {
@@ -2166,10 +2770,39 @@ async fn submit_scan_candidates(
         .load(std::sync::atomic::Ordering::Relaxed);
 }
 
+fn merge_file_prefetched_headers(chunks: &[ScanChunk], max_chars: usize) -> String {
+    let mut seen_headers = BTreeSet::new();
+    let mut out = String::new();
+    for chunk in chunks {
+        for section in chunk.prefetched_headers.split("\n--- ") {
+            let trimmed = section.trim();
+            if trimmed.is_empty() || trimmed.starts_with("Source revision:") {
+                continue;
+            }
+            let normalized = if trimmed.starts_with("--- ") {
+                trimmed.to_string()
+            } else {
+                format!("--- {trimmed}")
+            };
+            let key = normalized.lines().next().unwrap_or("").to_string();
+            if !key.is_empty() && seen_headers.insert(key) {
+                if out.len() + normalized.len() + 2 > max_chars {
+                    return out;
+                }
+                out.push_str(&normalized);
+                out.push_str("\n\n");
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn verify_scan_candidates_standalone(
     provider: &dyn crate::ai::AiProvider,
+    shared_tools: std::sync::Arc<crate::toolbox::ToolBox>,
     options: &ScanOptions,
-    target_sha: &str,
+    file_invariants_by_file: &BTreeMap<String, String>,
     candidate_bugs: Vec<crate::api::BugInput>,
     summary: &mut ScanSummary,
     progress: Option<&ScanProgressCallback<'_>>,
@@ -2177,16 +2810,26 @@ async fn verify_scan_candidates_standalone(
     if candidate_bugs.is_empty() {
         return;
     }
-    let mut bug_tb = crate::toolbox::ToolBox::new(options.repo_path.clone());
-    bug_tb.set_virtual_head(target_sha.to_string());
-    let bug_tools = std::sync::Arc::new(bug_tb);
     let verify_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(options.concurrency.max(1)));
     let total = candidate_bugs.len();
 
     let min_severity = options.min_severity;
     let verify_futures = candidate_bugs.into_iter().enumerate().map(|(idx, input)| {
         let sem = verify_sem.clone();
-        let tools = bug_tools.clone();
+        let tools = shared_tools.clone();
+        let extra_ctx = input
+            .source_files
+            .iter()
+            .filter_map(|f| file_invariants_by_file.get(f))
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!("Synthesized File Invariants:\n{}", s.trim()))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let extra_context = if extra_ctx.is_empty() {
+            None
+        } else {
+            Some(extra_ctx)
+        };
         async move {
             let _permit = sem.acquire_owned().await;
             let problem = input.problem.clone();
@@ -2198,13 +2841,19 @@ async fn verify_scan_candidates_standalone(
                     problem: problem.clone(),
                 },
             );
-            let res = crate::workflows::linux_bug::run_standalone_bug_pipeline_with_min_severity(
+            let res = crate::workflows::linux_bug::run_standalone_bug_pipeline_with_options(
                 provider,
                 Some(tools),
                 input,
                 Some("[scan:linux_bug] "),
                 crate::project::ProjectId::Linux,
-                min_severity,
+                crate::workflows::linux_bug::StandaloneBugPipelineOptions {
+                    min_severity,
+                    fast_origin_tracing: true,
+                    reuse_canonical_input: true,
+                    extra_context,
+                    max_session_turns: 6,
+                },
             )
             .await;
             (problem, res)
@@ -2324,17 +2973,18 @@ pub async fn run_scan(
     .await?;
 
     let max_chunks = options.max_chunks.filter(|&n| n > 0);
-    let mut all_chunks = Vec::new();
+    let mut loaded_files = Vec::new();
+    let mut chunks_accum = 0usize;
     for file in &files {
-        let remaining = max_chunks.map(|limit| limit.saturating_sub(all_chunks.len()));
+        let remaining = max_chunks.map(|limit| limit.saturating_sub(chunks_accum));
         if remaining == Some(0) {
             break;
         }
-        let mut file_chunks =
-            build_scan_chunks_for_file_with_limit(&options.repo_path, &target_sha, file, remaining)
-                .await?;
-        all_chunks.append(&mut file_chunks);
-        if max_chunks.is_some_and(|limit| all_chunks.len() >= limit) {
+        let loaded =
+            load_file_chunks_with_limit(&options.repo_path, &target_sha, file, remaining).await?;
+        chunks_accum += loaded.chunks.len();
+        loaded_files.push(loaded);
+        if max_chunks.is_some_and(|limit| chunks_accum >= limit) {
             break;
         }
     }
@@ -2344,7 +2994,7 @@ pub async fn run_scan(
         ScanProgressEvent::ResolvedTargets {
             target_sha: target_sha.clone(),
             files_count: files.len(),
-            chunks_count: all_chunks.len(),
+            chunks_count: chunks_accum,
         },
     );
 
@@ -2361,17 +3011,138 @@ pub async fn run_scan(
     );
     let provider = build_scan_provider(settings, options.concurrency).await?;
 
+    let mut shared_tb = crate::toolbox::ToolBox::new(options.repo_path.clone());
+    shared_tb.set_virtual_head(target_sha.clone());
+    shared_tb.set_active_patch_files(files.clone());
+    let shared_tools = std::sync::Arc::new(shared_tb);
+
     let chunk_semaphore =
         std::sync::Arc::new(tokio::sync::Semaphore::new(options.concurrency.max(1)));
     let max_interactions = settings.ai.max_interactions;
     let temperature = settings.ai.temperature;
     let effort = options.effort.or_else(|| settings.effective_effort());
 
+    let mut synthesis_tokens_in = 0usize;
+    let mut synthesis_tokens_out = 0usize;
+    let mut synthesis_tokens_cached = 0usize;
+    let mut file_invariants_by_file: BTreeMap<String, String> = BTreeMap::new();
+
+    let run_cartographer = options.stages.as_ref().is_none_or(|manual| {
+        manual
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("contract-audit"))
+    });
+    if run_cartographer {
+        let cartographer_futures = loaded_files.iter().enumerate().filter_map(|(f_idx, lf)| {
+            if lf.file_path.ends_with(".h")
+                || lf.raw_source.is_empty()
+                || lf.raw_source.len() > MAX_WHOLE_FILE_SYNTHESIS_BYTES
+            {
+                return None;
+            }
+            let sem = chunk_semaphore.clone();
+            let prov = provider.clone();
+            let tools_for_cart = shared_tools.clone();
+            let mindex = maintainers.clone();
+            let notes = notes_ctx.clone();
+            let file_path = lf.file_path.clone();
+            let raw_source = lf.raw_source.clone();
+            let merged_headers = merge_file_prefetched_headers(&lf.chunks, 20_000);
+            let ext_callers = lf.whole_file_external_callers.clone();
+            let target_sha_owned = target_sha.clone();
+            Some(async move {
+                let _permit = sem.acquire_owned().await.ok()?;
+                let maintainers_hint = mindex.as_ref().and_then(|idx| {
+                    let matched = idx.match_files(std::slice::from_ref(&file_path));
+                    if matched.is_empty() {
+                        None
+                    } else {
+                        Some(matched.join(", "))
+                    }
+                });
+                let maint_notes = if notes.maintainer_notes.is_empty() {
+                    String::new()
+                } else {
+                    let fp = file_path.clone();
+                    let rs = raw_source.clone();
+                    let ctx = notes.clone();
+                    tokio::task::spawn_blocking(move || {
+                        render_chunk_notes_blocking(&ctx, &fp, &rs).0
+                    })
+                    .await
+                    .unwrap_or_default()
+                };
+                let lines: Vec<&str> = raw_source.lines().collect();
+                let numbered_full = format_numbered_lines(&lines, 1, lines.len(), None);
+                let res = crate::workflows::linux_scan::run_contract_cartographer_pass(
+                    prov.as_ref(),
+                    Some(tools_for_cart),
+                    &file_path,
+                    &target_sha_owned,
+                    maintainers_hint.as_deref(),
+                    &maint_notes,
+                    &numbered_full,
+                    &merged_headers,
+                    &ext_callers,
+                    temperature,
+                    effort,
+                )
+                .await;
+                Some((f_idx, file_path, res))
+            })
+        });
+
+        for outcome in futures_util::future::join_all(cartographer_futures)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            let (f_idx, file_path, res) = outcome;
+            match res {
+                Ok(sr) => {
+                    synthesis_tokens_in += sr.usage.prompt_tokens;
+                    synthesis_tokens_out += sr.usage.completion_tokens;
+                    synthesis_tokens_cached += sr.usage.cached_tokens.unwrap_or(0);
+                    let contract_notes = sr.output.architecture_contract_notes.trim().to_string();
+                    if !contract_notes.is_empty() {
+                        for chunk in &mut loaded_files[f_idx].chunks {
+                            chunk.contract_notes = contract_notes.clone();
+                        }
+                    }
+                    let inv = sr.output.file_invariants.trim().to_string();
+                    if !inv.is_empty() {
+                        for chunk in &mut loaded_files[f_idx].chunks {
+                            chunk.file_invariants = inv.clone();
+                        }
+                        file_invariants_by_file.insert(file_path, inv);
+                    }
+                }
+                Err(e) => {
+                    if let Some(sf) = e.downcast_ref::<crate::ai::session::SessionFailure>() {
+                        synthesis_tokens_in += sf.usage.prompt_tokens;
+                        synthesis_tokens_out += sf.usage.completion_tokens;
+                        synthesis_tokens_cached += sf.usage.cached_tokens.unwrap_or(0);
+                    }
+                    tracing::warn!(
+                        "Contract cartographer pass skipped for '{}': {}",
+                        file_path,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    let mut all_chunks = Vec::with_capacity(chunks_accum);
+    for mut lf in loaded_files {
+        all_chunks.append(&mut lf.chunks);
+    }
+
     let chunks_total = all_chunks.len();
     let chunk_futures = all_chunks.into_iter().map(|chunk| {
         let sem = chunk_semaphore.clone();
         let target_sha_ref = &target_sha;
-        let repo_ref = options.repo_path.as_path();
+        let tools_for_chunk = shared_tools.clone();
         let prompts_ref = options.prompts.as_path();
         let prov = provider.clone();
         let mindex = maintainers.clone();
@@ -2387,7 +3158,7 @@ pub async fn run_scan(
             match scan_single_chunk(
                 chunk,
                 target_sha_ref,
-                repo_ref,
+                tools_for_chunk,
                 prompts_ref,
                 prov,
                 mindex,
@@ -2424,6 +3195,9 @@ pub async fn run_scan(
         min_severity: Some(options.min_severity),
         files_scanned: files.len(),
         chunks_total,
+        tokens_in: synthesis_tokens_in,
+        tokens_out: synthesis_tokens_out,
+        tokens_cached: synthesis_tokens_cached,
         ..Default::default()
     };
 
@@ -2477,8 +3251,9 @@ pub async fn run_scan(
 
     verify_scan_candidates_standalone(
         provider.as_ref(),
+        shared_tools,
         &options,
-        &target_sha,
+        &file_invariants_by_file,
         candidate_bugs,
         &mut summary,
         progress,
@@ -2647,24 +3422,21 @@ err_unlock:
                 signature: "static inline void stub_a(void)".to_string(),
                 start_line: 10,
                 end_line: 10,
-                called_functions: vec![],
-                risk_signals: vec![],
+                ..Default::default()
             },
             FunctionSpan {
                 name: "stub_b".to_string(),
                 signature: "static inline void stub_b(void)".to_string(),
                 start_line: 10,
                 end_line: 10,
-                called_functions: vec![],
-                risk_signals: vec![],
+                ..Default::default()
             },
             FunctionSpan {
                 name: "large_fn".to_string(),
                 signature: "static int large_fn(void)".to_string(),
                 start_line: 12,
                 end_line: 650,
-                called_functions: vec![],
-                risk_signals: vec![],
+                ..Default::default()
             },
         ];
         // Total lines = 1800 (large trailing non-function section after line 650).
@@ -2956,6 +3728,38 @@ pub fn second_fn() -> u32 {
             !is_in_run_duplicate_input(std::slice::from_ref(&vncr_fp_cand), &vncr_real_cand),
             "distinct target functions sharing a background allocator location must never collide"
         );
+    }
+
+    #[test]
+    fn test_intra_file_context_extraction() {
+        let mut src = String::from("static int early_helper(int v)\n{\n\treturn v + 1;\n}\n\n");
+        src.push_str("static int early_caller(void)\n{\n");
+        for i in 0..270 {
+            src.push_str(&format!("\tint pad_{i} = {i};\n"));
+        }
+        src.push_str("\treturn late_target(42);\n}\n\n");
+        src.push_str("#define MID_MAGIC_MASK 0x7f\n");
+        src.push_str("struct mid_item {\n\tint flags;\n};\n\n");
+        src.push_str("static const struct item_ops mid_ops = {\n\t.release = late_target,\n};\n\n");
+        for i in 0..260 {
+            src.push_str(&format!("static int filler_{i}(void) {{ return {i}; }}\n"));
+        }
+        src.push_str(
+            "static int late_target(int x)\n{\n\tstruct mid_item item = { .flags = x & MID_MAGIC_MASK };\n\treturn early_helper(item.flags);\n}\n",
+        );
+
+        let chunks = chunk_source_file("drivers/misc/intra.c", &src);
+        assert!(chunks.len() >= 2);
+        let last_chunk = chunks.last().unwrap();
+        assert!(
+            last_chunk.functions.iter().any(|f| f.name == "late_target"),
+            "last chunk should contain late_target"
+        );
+        assert!(last_chunk.intra_file_context.contains("MID_MAGIC_MASK"));
+        assert!(last_chunk.intra_file_context.contains("struct mid_item"));
+        assert!(last_chunk.intra_file_context.contains("early_helper"));
+        assert!(last_chunk.intra_file_context.contains("early_caller"));
+        assert!(last_chunk.intra_file_context.contains("mid_ops"));
     }
 
     #[tokio::test]

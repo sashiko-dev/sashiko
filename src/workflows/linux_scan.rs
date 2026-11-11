@@ -20,11 +20,13 @@
 //! and selects which specialist stages should run (early-exiting benign/boilerplate
 //! chunks).
 //!
-//! Phase 2 runs parallel specialist stages (`execution-flow`, `resources`,
-//! `locking`, `security`, `hardware`) with full Git tool access, followed by
-//! `verification` and parallel `post-verification` so confirmed `High` and
-//! `Critical` chunk findings can be converted into candidate [`crate::api::BugInput`]
-//! payloads and fed into the [`crate::workflows::linux_bug`] pipeline.
+//! Phase 2 runs parallel specialist stages (`implementation`, `execution-flow`,
+//! `resources`, `locking`, `security`, `hardware`) with full Git tool access,
+//! followed by `verification` and parallel `post-verification` so confirmed
+//! actionable chunk findings (`Medium`, `High`, and `Critical`) can be converted
+//! into candidate [`crate::api::BugInput`] payloads and fed into the
+//! [`crate::workflows::linux_bug`] pipeline for ground-truth verification and
+//! severity calibration.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -39,7 +41,7 @@ use crate::workflows::linux_patch_review::{
     AnalysisStage, ConsolidationStage, MAX_POST_VERIFICATION_STAGES, POST_VERIFICATION_STAGE_NAMES,
     PostVerificationOutput, StageConcernsOutput, VerificationOutput,
     append_stage_dismissed_concerns_with_prompts, append_stage_items_with_prompts,
-    batch_inconclusive_concerns_by_severity, build_stage_efforts_schema, collect_stage_prompts,
+    batch_inconclusive_concerns_by_severity, collect_stage_prompts,
     enrich_post_verification_output, extra_prompt_paths_for_items, extract_item_stages_and_prompts,
     format_post_verification_feedback, format_verification_stage_feedback, push_unique_prompt,
     push_unique_string,
@@ -78,6 +80,13 @@ pub struct LinuxScanState {
     pub numbered_source: String,
     pub chunk_functions_json: String,
     pub file_function_index: String,
+    pub intra_file_context: String,
+    pub file_invariants: String,
+    /// Normative architecture & contract specification produced by the isolated
+    /// `ContractCartographer` agent (`Agent 1`), exposed ONLY to `contract-audit` (`Agent 2`).
+    pub contract_notes: String,
+    /// Pre-fetched 1-hop external call-sites and ops-table registrations for exported functions.
+    pub external_callers: String,
     pub prefetched_context: String,
     pub maintainers_hint: Option<String>,
     /// Rendered `<maintainer_notes>` block for the system prompt, or empty.
@@ -128,77 +137,122 @@ pub struct LinuxScanState {
 // Stage Definitions & Tables
 // ---------------------------------------------------------------------------
 
+const STAGE_SCAN_IMPLEMENTATION_INSTRUCTION: &str = r#"# Active Codebase Scan: Implementation, Semantics & Accounting Audit
+
+You are auditing existing Linux kernel C or Rust source code in `<target_chunk_source>` for semantic correctness, API contract violations, accounting bugs, and broken subsystem invariants (`Medium`, `High`, or `Critical`).
+1. Audit EVERY function listed in `<chunk_functions>` systematically from top to bottom (use `<triage_focus_targets>` and `<file_invariants>` as extra cross-function leads, never as a reason to skip other functions in the chunk). Do not stop after finding one or two issues—multiple independent bugs often exist in the same file or even in the same function.
+2. Compare functions, callbacks, and allocation/cleanup paths against sibling helpers in `<intra_file_context>`, `<pre_fetched_context>`, and the subsystem:
+   - Pointer-vs-pointee & size-argument bugs: check every `memset`, `memcpy`, `memcmp`, `kzalloc`, `kcalloc`, and `copy_to_user`/`copy_from_user` for `sizeof(ptr)` instead of `sizeof(*ptr)` or mismatched struct/header sizes that leave trailing bytes uninitialized or copy the wrong length.
+   - Wrong subject/entity variable bugs: in functions operating on a target task, vCPU, device, port, queue, or map alongside `current` or a parent container, verify every helper call passes the intended target entity (e.g., `target` vs `current` in ptrace/regset/cred/signal paths, or the right vCPU/map/vport struct) rather than querying the caller's own state.
+   - Mathematical, bitwise, & parameter-type narrowing bugs: 32-bit shift overflows (`1 << n` or `BIT(n)` into 64-bit masks/addresses instead of `BIT_ULL(n)`), passing signed struct fields or return values (`s8`/`s16`/`int`/`ssize_t` that can hold negative sentinel values like `-1` or `-127` or `-ERRNO`) into narrow unsigned `u8`/`u16`/`unsigned` helper parameters or variables (silently wrapping negative sentinels into large positive levels/counts), inverted bitmask clearing (`& mask` vs `& ~mask`), and `ALIGN`/`round_up` extending past validated capacity.
+   - Resource/cgroup accounting & container contracts: allocations or XArrays/IDRs omitting `__GFP_ACCOUNT` or `XA_FLAGS_ACCOUNT` where sibling paths account memory; manual XArray clearing loops omitting `xa_destroy()`; helpers mutating struct fields, indices, or IDs before an error check without restoring sentinel state on failure."#;
+
 const STAGE_SCAN_EXECUTION_FLOW_INSTRUCTION: &str = r#"# Active Codebase Scan: Execution Flow & Error Path Audit
 
-You are a static analysis engine auditing existing Linux kernel C or Rust source code in the target chunk for serious (`High` or `Critical`) execution flow defects.
-1. Prioritize the `focus_targets` identified during triage, then systematically audit the remaining functions in the chunk.
-2. Trace control flow across every branch, switch statement, loop boundary, and `goto` error-handling label:
-   - Look for missing state restoration or partial-init unwind omissions on error paths (e.g., leaving global/shared pointers, IDs, or list links dangling when returning an error).
-   - Look for NULL pointer dereferences reachable via concrete caller paths (remember: reading a pointer field is not a dereference; accessing its target memory is).
-   - Check for off-by-one array bounds, signed/unsigned comparison bugs, integer truncation, or bitwise mask/shift errors that corrupt kernel state.
-   - Use `git_read_files` and `git_grep` at the target revision to verify caller preconditions and callee return-value contracts across the repository.
-3. Focus strictly on reachable `High` and `Critical` bugs (crash, panic, memory corruption, UAF, privilege escalation, or persistent resource/state corruption). Ignore style, minor cleanups, or purely theoretical issues guarded by callers."#;
+You are a static analysis engine auditing EVERY function listed in `<chunk_functions>` from top to bottom for control-flow, loop, bounds, and error-unwind defects (`Medium`, `High`, or `Critical`). Treat `<triage_focus_targets>` as supplemental hints only—never skip the remaining functions in the chunk, and check every error path in each function even if you already found another bug in that function.
+1. Trace control flow across every branch, switch statement, loop condition, and `goto` error-handling label in each function:
+   - Chronological `goto` & early-return unwind bugs: verify that every `goto err_*` and early `return` unwinds ALL and ONLY the allocations, mappings, locks, counters, and registrations acquired above that exact line (not jumping to a label that skips freeing an intermediate allocation, and not jumping above an initialization to free/unmap uninitialized state).
+   - Unchecked lookup/erase/insert return values: check callers of `xa_erase()`, `xa_store()`, `idr_remove()`, hash/tree lookups, and `copy_from_user()` where a `NULL` / `xa_err` / existing-entry collision return means the entry was absent or insertion failed, yet execution continues to decrement counters, unpreserve pages, or leak the newly allocated or displaced object.
+   - Partial-init, retry & termination bugs: resources or global IDs allocated during `*_alloc`/`*_init` leaked when a later step fails because `*_free` guards cleanup on a flag set later; nested retry loops (`xas_nomem`) missing error checks and spinning forever.
+   - Off-by-one (`<` vs `<=`), missing wrap-around resets, and reachable NULL / ERR_PTR dereferences—including struct pointers (`pgt`, `collection`, `private_data`) that can be `NULL` before initialization, after detach/teardown, or after a preceding loop/helper (`may_block` / `cond_resched*`) temporarily dropped the lock, especially where neighboring lines use a safe accessor helper instead of raw `ptr->field` dereferencing."#;
 
-const STAGE_SCAN_RESOURCES_INSTRUCTION: &str = r#"# Active Codebase Scan: Resource Lifecycle & Memory Safety Audit
+const STAGE_SCAN_RESOURCES_INSTRUCTION: &str = r#"# Active Codebase Scan: Resource Lifecycle & Asynchronous Teardown Audit
 
-You are an expert in Linux kernel resource management auditing the target source chunk for serious (`High` or `Critical`) memory and lifecycle bugs.
-1. Prioritize the `focus_targets` identified during triage, then systematically audit every allocation, reference count operation, registration, and teardown path in the chunk.
-2. Check for:
-   - Use-After-Free (UAF) and double-free vulnerabilities across error paths, concurrent callbacks, and teardown routines.
-   - Reference counting imbalances (`kref_get`/`kref_put`, `get_device`/`put_device`, `fget`/`fput`, `of_node_get`/`of_node_put`, RCU grace-period violations).
-   - Memory, page, DMA, or descriptor leaks on reachable error returns or abnormal exit paths.
-   - Asynchronous teardown ordering bugs: freeing an object before canceling timers (`timer_delete_sync`), workqueues (`cancel_work_sync` / `disable_work_sync`), IRQs (`free_irq`), or unregistering subsystem interfaces that can still invoke callbacks on that object.
-3. Use `git_read_files` and `git_grep` at the target revision to inspect callers and paired init/cleanup functions before concluding."#;
+You are an expert in Linux kernel resource management auditing EVERY function listed in `<chunk_functions>` from top to bottom for Use-After-Free (UAF), double-free, reference-count, stale-recycled-object, leak, and teardown-ordering defects (`Medium`, `High`, or `Critical`). Treat `<triage_focus_targets>` as supplemental leads only—audit every allocation, reallocation, recycle pool, refcount, callback, and cleanup path in the chunk.
+1. Perform a chronological resource-lifecycle sweep on each function:
+   - Allocation, overwrite & error-path leaks: check every `kmalloc`/`kzalloc`/`kvzalloc`/`kvmalloc`/`alloc_pages` and container insertion; verify that overwriting/replacing an entry or failing mid-loop frees both displaced and newly allocated objects, and check `krealloc`/`kvrealloc` callers for concurrent reader UAF on the old buffer or leak on failure.
+   - Stale state on object reuse / custom freelists / per-CPU pools: when elements, descriptors, or chunks are recycled from a freelist, per-CPU cache, or pre-allocated pool rather than freshly `kzalloc`'d, verify that all flags, refcounts, embedded timers/work/locks, and pointers are reinitialized and torn down in valid order before reuse or free.
+   - Asymmetric preserve/unpreserve, register/unregister, map/unmap, save/restore, and open/stop pairs across the file (cross-checking `<intra_file_context>` and `<file_invariants>`).
+2. Scrutinize multi-phase framework callbacks and asynchronous work teardown:
+   - Multi-phase teardown ordering (e.g., `css_offline` -> `css_released` -> `css_free_rwork_fn` -> `css_free`, or `unregister`/`del` vs `release`): verify whether core framework callers tear down `rstat`/`percpu_ref`/queues *before* the final release callback cancels async work.
+   - Chained async work (`irq_work`, timer, or RCU callback queueing a `work_struct`): cancelling stage B (`cancel_work_sync`) requires synchronizing stage A (`irq_work_sync` / `timer_shutdown_sync`) *first*."#;
 
 const STAGE_SCAN_LOCKING_INSTRUCTION: &str = r#"# Active Codebase Scan: Locking, Concurrency & Synchronization Audit
 
-You are a Linux kernel concurrency and locking specialist auditing the target source chunk for serious (`High` or `Critical`) synchronization defects.
-1. Prioritize the `focus_targets` identified during triage, then audit shared-state accesses and lock scopes across the chunk.
-2. Check for:
-   - Sleeping in atomic context: calling `mutex_lock`, `kzalloc(..., GFP_KERNEL)`, `msleep`, `synchronize_rcu`, `cancel_work_sync`, or `copy_from_user`/`copy_to_user` while holding a spinlock, rwlock, RCU read lock (`rcu_read_lock`), or with IRQs/preemption disabled.
-   - AB-BA deadlocks, lock order inversions across functions/callers, recursive locking, or missing `spin_lock_irqsave` when a lock is also acquired in interrupt/timer context.
-   - Missing unlock on error return paths.
-   - Data races / TOCTOU races where shared lists, pointers, or state flags are modified or freed without holding the required lock or RCU synchronization, leading to UAF or kernel memory corruption.
-3. Use `git_read_files` and `git_grep` at the target revision to verify lock hierarchies and caller lock contexts across the tree."#;
+You are a Linux kernel concurrency and locking specialist auditing EVERY function listed in `<chunk_functions>` from top to bottom for synchronization, cross-lock race, atomic-context, and deadlock defects (`Medium`, `High`, or `Critical`). Treat `<triage_focus_targets>` as supplemental leads only—inspect all shared-state accesses, callbacks, and lock scopes in the chunk.
+1. Check every function against `<file_invariants>` and `<intra_file_context>` for:
+   - Cross-lock, lockless-reader, & check-then-use double-read TOCTOU races: writer mutating, unlinking, resetting (`field = -1` / `NULL`), or `kvrealloc`-resizing a shared struct field/array/list under Lock A (or locklessly on another CPU) while another function reads, indexes, or performs a non-`READ_ONCE` check-then-use (`if (p->cpu != -1) use(p->cpu)` or `if (p->ptr) use(p->ptr)`) without common serialization, allowing the second load to observe `-1`/`NULL`!
+   - Execution-context, NMI/IRQ, & migration rules: sleeping calls (`mutex_lock`, `GFP_KERNEL`, `synchronize_rcu`, `cancel_work_sync`, `kvfree`/`vfree` where unsafe, user-copy) inside spinlock, rwlock, `rcu_read_lock()`, IRQ-disabled, or NMI context; non-NMI-safe locking or re-entrant deadlock in NMI/BPF/IRQ callbacks; per-CPU or BPF map operations missing required `migrate_disable()` or `rcu_read_lock()` protection.
+   - Lock-drop & teardown pointer invalidation: holding locks or `kernfs` active protection across unbounded user-controlled work, lock-ordering inversions (AB-BA deadlocks), missing unlocks on error paths, and dereferencing a secondary pointer (`pgt`, `collection`, `cl`, etc.) after a loop/callee taking `may_block`/`gfp_t` (`cond_resched_lock` / `cond_resched_rwlock_write`) or during teardown where that pointer may already be `NULL` while sibling lines avoid dereferencing it.
+2. Verify lock hierarchies and caller lock contexts in `<intra_file_context>` first, and use `git_grep` / bounded `git_read_files` when callers live in other files."#;
 
-const STAGE_SCAN_SECURITY_INSTRUCTION: &str = r#"# Active Codebase Scan: Security & Boundary Audit
+const STAGE_SCAN_SECURITY_INSTRUCTION: &str = r#"# Active Codebase Scan: Security & Trust Boundary Audit
 
-You are a Linux kernel security researcher auditing the target source chunk for serious (`High` or `Critical`) vulnerabilities.
-1. Prioritize the `focus_targets` identified during triage, focusing on user-space entry points (`ioctl`, `netlink`, `sysfs`, `debugfs`, `procfs`, file operations, socket/network packet parsers, and vhost/virtio handlers).
-2. Check for:
-   - Out-of-bounds reads/writes, heap/stack buffer overflows, and integer overflows/underflows in allocation size or offset calculations controlled by untrusted input.
-   - Missing capability/permission checks (`capable()`, `ns_capable()`) on privileged operations.
-   - Uninitialized kernel stack or heap memory copied to user space (`copy_to_user`, `put_user`, `nla_put`) causing kernel information leaks.
-   - Double-fetch / TOCTOU vulnerabilities across user-space memory reads.
-3. Trace untrusted inputs from caller entry points using `git_grep` and `git_read_files` at the target revision to confirm reachability."#;
+You are a Linux kernel security researcher auditing EVERY function listed in `<chunk_functions>` for memory-safety, boundary, infoleak, integer-overflow, resource-exhaustion, and isolation defects (`Medium`, `High`, or `Critical`).
+1. Scrutinize every trust boundary defined by the Linux kernel threat model (`Documentation/process/threat-model.rst`, provided below under `<kernel_threat_model>` when available):
+   - Unprivileged local users, unprivileged user namespaces, ptrace/regset callers, BPF programs, and delegated cgroup hierarchies: check for uninitialized kernel stack/heap memory copied to userspace (`copy_to_user` / regset / netlink after partial `memset` or struct padding), wrong task/cred target checks, bounded global ID/resource exhaustion, missing `capable()`/`ns_capable()` checks, and privilege escalation.
+   - Remote network peers & packet/sched classifiers: packet/header length vs buffer/fragment bounds, integer overflows in allocation sizes, class/qdisc state corruption, and bitmask validation bypasses.
+   - Virtualization guest-to-host / nested hypervisor & MM permission boundaries (`kvm`, `vgic`, `vhost`, `virtio`, `mm`): guest-triggerable host NULL/UAF/OOB dereferences, unchecked guest register/ITS/MMU indices or addresses, missing architectural feature checks allowing guests to trap or corrupt host EL2/hypervisor state, IOMMU/DMA boundaries, and multi-layer fault/GUP permission mismatches (where a read fault calls `*faultin_pfn`/`get_user_pages` without `FOLL_WRITE` on a read-only memslot/VMA—yielding `writable == false`—yet downstream code marks the page dirty or installs a writable mapping using only the guest/upper-layer PTE write flag without intersecting `&& writable`).
+2. For every concern you raise, state in `reasoning`: (1) the concrete actor and entry point, (2) required capabilities/configuration, and (3) whether it crosses a guaranteed kernel security boundary.
+3. CRITICAL NON-DISMISSAL RULE: Never dismiss or omit a genuine memory-safety, bounds, race, leak, or accounting bug merely because the threat model classifies it as a regular bug rather than a security vulnerability (e.g., on a `CAP_SYS_ADMIN`, `debugfs`, or mounted-image path). Report every real bug in `concerns` with accurate privilege details so downstream severity calibration scores it properly."#;
 
-const STAGE_SCAN_HARDWARE_INSTRUCTION: &str = r#"# Active Codebase Scan: Hardware & Driver State Machine Audit
+const STAGE_SCAN_HARDWARE_INSTRUCTION: &str = r#"# Active Codebase Scan: Hardware, Architecture & Driver State Machine Audit
 
-You are a hardware and device-driver engineer auditing the target source chunk for serious (`High` or `Critical`) driver and hardware interaction bugs.
-1. If the target chunk is purely generic software logic with no hardware/driver interaction, return `{"concerns": [], "dismissed_concerns": []}`.
-2. Otherwise, prioritize `focus_targets` and check for:
-   - Accessing MMIO registers or hardware queues before clocks/power domains/runtime PM are enabled or after they are disabled (`pm_runtime_get_sync` / `clk_prepare_enable` ordering).
-   - DMA mapping/unmapping bugs: DMA-mapping stack memory, wrong `dma_data_direction`, missing `dma_mapping_error()` checks, or freeing/unmapping DMA buffers while hardware DMA or IRQ handlers are still active.
-   - Suspend/resume, device reset, or probe/remove asymmetry that leaves IRQs enabled, hardware rings uninitialized, or resources leaked/corrupted."#;
+You are a CPU architecture, virtualization, and device-driver engineer auditing `<target_chunk_source>` for serious (`Medium`, `High`, or `Critical`) hardware, system-register, hypervisor, and driver state-machine bugs.
+1. If the target chunk is purely generic high-level software logic with no CPU architecture, virtualization/hypervisor, interrupt-controller, DMA, or device-driver interaction, return `{"concerns": [], "dismissed_concerns": []}`.
+2. Otherwise, audit EVERY function in `<chunk_functions>` for:
+   - CPU architecture & hypervisor state (`arch/*`, `kvm`, `vgic`, `ptrace`, `iommu`): missing CPU feature / ID-register capability checks before accessing optional system registers or vector state (SVE/SME/NV/GIC), wrong trap routing or RES0/RES1/writable bitmask calculations, missing Stage-2/TLB/ICache invalidation, or corrupting host/guest saved register state across context switches.
+   - MMIO, power & IRQ ordering: accessing MMIO registers or hardware queues before clocks/power domains/runtime PM are enabled or after disable; freeing/stopping queues or vports while NAPI, IRQ handlers, or adminq work remain active.
+   - Register bitmask/shift & DMA bugs: wrong shift offsets, 32-bit `1 << n` overflow on 64-bit registers, overlapping bitmasks, DMA-mapping stack memory, wrong `dma_data_direction`, or missing `dma_mapping_error()` checks.
+   - Open/stop, init/deinit, reset, or suspend/resume asymmetry that leaves IRQs enabled, state flags desynchronized, or hardware rings/resources leaked or double-freed."#;
+
+const STAGE_SCAN_CONTRACT_AUDIT_INSTRUCTION: &str = r#"# Active Codebase Scan: Differential Contract-Breakage Audit (Agent 2)
+
+You are an independent Contract-Breakage Auditor. An isolated Architecture Cartographer (Agent 1, who was forbidden from bug hunting and whose reasoning you cannot see) studied the full subsystem source, header definitions, and external kernel callers, and wrote `<architecture_contract_notes>` documenting how every data structure, lifecycle, lock, pointer/sentinel, and caller/callee interface in this file is SUPPOSED to work.
+
+Your sole task is systematic differential verification: check EVERY function in `<chunk_functions>` from first to last—paying equal attention to short teardown, flush, unmap, and notifier helpers at the bottom of the chunk—against `<architecture_contract_notes>` and `<external_callers>` to find every place where the actual C/Rust implementation BREAKS a documented contract (`Medium`, `High`, or `Critical`):
+1. **Object Creation, Teardown & Optional-vs-Base State Breakages:**
+   - Teardown, flush, stop, or release hooks (`*flush*`, `*free*`, `*uninit*`, `*unpreserve*`, `*release*`, `*stop*`) invoked unconditionally by external callers (`<external_callers>`) that return early on an optional/lazy sub-feature condition (`if (!optional_count) return;`) and skip tearing down unconditionally-initialized base state at the bottom of the function!
+   - Error-unwind `goto` labels, early returns, or retry paths that leak allocations, pages, refcounts, workqueues, fds, or global IDs, or call teardown helpers on zeroed/partially-initialized array slots; recycled/reused objects zeroing persistent embedded timers/locks or leaving per-CPU/status flags desynchronized.
+2. **Synchronization, Lock-Drop & Check-Then-Use TOCTOU Breakages:**
+   - Functions mutating, reallocating (`kvrealloc`/`krealloc`), unlinking, or resetting (`field = -1` / `NULL`) shared fields/arrays outside the lock documented for readers (`config_lock` vs `mmu_lock`, or lockless updates racing with non-`READ_ONCE` `if (p->field != -1) use(p->field)` double reads).
+   - Sleeping/blocking inside atomic/RCU/NMI/IRQ contexts, or missing `migrate_disable()`/`rcu_read_lock()` required by per-CPU/BPF data structures.
+3. **Nullability Window, Lock-Drop Invalidation & Sentinel/Type Domain Breakages:**
+   - Dereferencing a struct pointer (`pgt`, `vncr_tlb`, `collection`, `cl`, etc.) in a path where `<architecture_contract_notes>`, `<external_callers>`, or sibling helpers show that pointer can be `NULL` (before lazy first-run init, after detach/free, during teardown, or after a preceding `may_block`/`cond_resched*` loop dropped and reacquired the lock—especially when adjacent lines use a safe non-dereferencing helper!).
+   - Passing signed fields/returns (`s8`/`int` capable of negative sentinels like `-1` or `S1_MMU_DISABLED`) into narrow unsigned (`u8`/`u16`/`u32`) parameters, or unchecked `0`/overflow return values used in `~(size - 1)` range masks or bit shifts.
+4. **Caller/Callee Interface, Permission Dataflow & Sibling Symmetry Breakages:**
+   - Ignoring out-parameters (`writable` from `*faultin_pfn`/`get_user_pages` on read faults over read-only mappings when setting dirty/writable page protections; `xa_erase`/`cmpxchg` return values showing concurrent removal), operating on `current` instead of `target`, `sizeof(ptr)` instead of `sizeof(*ptr)`, or omitting a filter/check enforced by sibling handlers (`vcpu1`, `btf_type_is_void`, `cl_is_active`).
+
+Verify any external uncertainty using bounded `git_read_files` / `git_grep` at `Target Revision SHA` before dismissing a suspected contract breakage."#;
+
+pub static SCAN_CONTRACT_AUDIT_STAGE: AnalysisStage = AnalysisStage {
+    name: "contract-audit",
+    short: "Contract Audit",
+    instruction: STAGE_SCAN_CONTRACT_AUDIT_INSTRUCTION,
+    guides: &[],
+    uses_commit_log: false,
+    optional: false,
+    wants_series_context: false,
+};
 
 const SCAN_STAGE_JSON_SCHEMA_INSTRUCTIONS: &str = r#"
 TodoWrite compatibility: vendored prompts may ask you to add tasks or suspected bugs to TodoWrite. Do not call or mention TodoWrite. Treat those instructions as an internal checklist only. If that checklist identifies a concrete suspected bug, carry it forward as a JSON concern with file, function_or_symbol, line when known, triggering condition, and evidence. Do not output generic checklist progress as a concern.
 
-Once you have gathered sufficient information with tools, return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
+Once you have gathered sufficient information, return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
 If you find no Medium, High, or Critical bugs and no dismissed concerns, return `{"concerns": [], "dismissed_concerns": []}`.
 - Set `"preexisting": true` on all concerns discovered during codebase scanning.
+- Report distinct defects as separate entries in `'concerns'` (even if two bugs occur in the same function).
 - Each object in `'concerns'` MUST use: `"type"`, `"description"`, `"reasoning"`, `"preexisting"` (`true`), and `"locations"` (non-empty array of `{"file", "function_or_symbol", "line", "code_snippet", "why_this_location_matters"}`).
 - Each object in `'dismissed_concerns'` MUST use: `"type"`, `"description"`, `"reasoning"`, and `"locations"` (quoting the verbatim disproving guard, lock, cleanup path, or caller check in the repository).
-- NO DISMISSAL WITHOUT VERIFIED PROOF: Never dismiss a candidate bug by assuming callers or surrounding code handle it without verifying ALL callers via `git_grep` and `git_read_files` and quoting the disproving code in `locations`. If you cannot find concrete disproving code, report it in `'concerns'`."#;
+- NO DISMISSAL WITHOUT VERIFIED PROOF: Never dismiss a candidate bug by assuming callers, framework teardown callbacks (such as `->css_free` or `->release`), or surrounding code handle it without inspecting ALL relevant callers and framework entry points and quoting the disproving code in `locations`. If you cannot prove safety from concrete code, report it in `'concerns'`."#;
 
 pub static SCAN_ANALYSIS_STAGES: &[AnalysisStage] = &[
+    AnalysisStage {
+        name: "implementation",
+        short: "Implementation",
+        instruction: STAGE_SCAN_IMPLEMENTATION_INSTRUCTION,
+        guides: &[],
+        uses_commit_log: false,
+        optional: false,
+        wants_series_context: false,
+    },
     AnalysisStage {
         name: "execution-flow",
         short: "Execution Flow",
         instruction: STAGE_SCAN_EXECUTION_FLOW_INSTRUCTION,
         guides: &["callstack.md"],
         uses_commit_log: false,
-        optional: true,
+        optional: false,
         wants_series_context: false,
     },
     AnalysisStage {
@@ -207,7 +261,7 @@ pub static SCAN_ANALYSIS_STAGES: &[AnalysisStage] = &[
         instruction: STAGE_SCAN_RESOURCES_INSTRUCTION,
         guides: &[],
         uses_commit_log: false,
-        optional: true,
+        optional: false,
         wants_series_context: false,
     },
     AnalysisStage {
@@ -216,7 +270,7 @@ pub static SCAN_ANALYSIS_STAGES: &[AnalysisStage] = &[
         instruction: STAGE_SCAN_LOCKING_INSTRUCTION,
         guides: &["locking.md"],
         uses_commit_log: false,
-        optional: true,
+        optional: false,
         wants_series_context: false,
     },
     AnalysisStage {
@@ -256,6 +310,9 @@ pub static SCAN_CONSOLIDATION_STAGES: &[&ConsolidationStage] =
 
 pub fn scan_analysis_stage_by_name(name: &str) -> Option<&'static AnalysisStage> {
     let normalized = normalize_stage_name(name);
+    if normalized == SCAN_CONTRACT_AUDIT_STAGE.name {
+        return Some(&SCAN_CONTRACT_AUDIT_STAGE);
+    }
     SCAN_ANALYSIS_STAGES.iter().find(|s| s.name == normalized)
 }
 
@@ -279,6 +336,9 @@ pub fn scan_stage_short_label(name: &str) -> Option<&'static str> {
     }
     match normalize_stage_name(name).as_str() {
         "triage" => Some("Chunk Triage"),
+        "file-synthesis" => Some("File Synthesis"),
+        "file-cartographer" => Some("Contract Cartographer"),
+        "file-dedup" => Some("Candidate Dedup"),
         _ => None,
     }
 }
@@ -299,10 +359,10 @@ pub fn linux_scan_system_prompt() -> PromptTemplate<LinuxScanState> {
 
 You are an expert Linux kernel maintainer and static security auditor performing an active deep scan of the Linux kernel source tree to uncover real (`Medium`, `High`, and `Critical`) defects.
 
-TOOL USAGE: When you need to gather information using tools (`git_read_files`, `git_grep`, `git_blame`, `git_log`, `git_show`), actively batch parallel or independent tool calls into a single response to minimize conversation turns. Always pass the exact `Target Revision SHA` (`{{{{target_sha}}}}`) when calling Git tools.
+TOOL USAGE & EFFICIENCY: First check `<target_chunk_source>`, `<intra_file_context>`, `<file_invariants>`, and `<pre_fetched_context>` already provided below—do NOT re-read code lines already shown in your prompt. When you need external callers or definitions using tools (`git_read_files`, `git_grep`, `git_blame`, `git_log`, `git_show`), batch independent tool calls into a single turn, pass explicit `start_line` and `end_line` bounds (`<= 200` lines) to `git_read_files` instead of reading entire multi-thousand-line files, and always pass `Target Revision SHA` (`{{{{target_sha}}}}`).
 
 <global_review_guidelines>
-Any accompanying <maintainer_notes> blocks contain subsystem-specific priorities, architectural rules, and maintainer expectations that you MUST adhere to during your audit. Any accompanying <code_notes> blocks provide reference background notes generated from a fixed kernel snapshot to help you understand surrounding subsystem contracts, callers, and known pitfalls. However, <code_notes> are NOT a source of truth for the code under audit—that snapshot may be stale or may already describe the target revision's own buggy behavior as fact. The repository source code at Target Revision SHA is always authoritative: actively check functions, structs, locks, lifecycle transitions, and API calls against the invariants described in <maintainer_notes> and <code_notes>, but NEVER use a <code_notes> entry to justify, excuse, or dismiss a suspected defect in the code under audit.
+Any accompanying <maintainer_notes> blocks contain subsystem-specific priorities, architectural rules, and maintainer expectations that you MUST adhere to during your audit. Any accompanying <code_notes> blocks provide reference background notes generated from a fixed kernel snapshot to help you understand surrounding subsystem contracts, callers, and known pitfalls. However, <code_notes> and <file_invariants> are NOT substitutes for the live code under audit: always verify against verbatim code at Target Revision SHA before dismissing a suspected defect.
 </global_review_guidelines>{{{{maintainer_notes}}}}{{{{code_notes}}}}
 
 === Active Scan Target Metadata ===
@@ -314,7 +374,7 @@ Target File: {{{{file_path}}}} (lines {{{{start_line}}}}..={{{{end_line}}}}){{{{
 <file_function_index>
 Outline of all functions in {{{{file_path}}}}:
 {{{{file_function_index}}}}
-</file_function_index>
+</file_function_index>{{{{file_invariants_block}}}}
 
 <chunk_functions>
 Functions defined in this chunk (lines {{{{start_line}}}}..={{{{end_line}}}}):
@@ -323,7 +383,7 @@ Functions defined in this chunk (lines {{{{start_line}}}}..={{{{end_line}}}}):
 
 <target_chunk_source>
 {{{{numbered_source}}}}
-</target_chunk_source>{{{{prefetched_block}}}}{{{{focus_targets_block}}}}{{{{custom_prompt_block}}}}"#
+</target_chunk_source>{{{{intra_file_context_block}}}}{{{{prefetched_block}}}}{{{{focus_targets_block}}}}{{{{custom_prompt_block}}}}"#
     ))
     .with_var("target_sha", |s: &LinuxScanState| s.target_sha.clone())
     .with_var("chunk_id", |s: &LinuxScanState| s.chunk_id.clone())
@@ -337,11 +397,32 @@ Functions defined in this chunk (lines {{{{start_line}}}}..={{{{end_line}}}}):
     .with_var("file_function_index", |s: &LinuxScanState| {
         s.file_function_index.clone()
     })
+    .with_var("file_invariants_block", |s: &LinuxScanState| {
+        if s.file_invariants.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n<file_invariants>\nFile-wide locking, nullable-state, execution-context, and lifecycle contracts synthesized across `{}`:\n{}\n</file_invariants>",
+                s.file_path,
+                s.file_invariants.trim()
+            )
+        }
+    })
     .with_var("chunk_functions_json", |s: &LinuxScanState| {
         s.chunk_functions_json.clone()
     })
     .with_var("numbered_source", |s: &LinuxScanState| {
         s.numbered_source.clone()
+    })
+    .with_var("intra_file_context_block", |s: &LinuxScanState| {
+        if s.intra_file_context.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n<intra_file_context>\nFile-local types, macros, ops tables, 1-hop static callees, and intra-file caller call-sites from other sections of `{}` at revision `{}`:\n\n{}\n</intra_file_context>",
+                s.file_path, s.target_sha, s.intra_file_context
+            )
+        }
     })
     .with_var("maintainers_block", |s: &LinuxScanState| {
         s.maintainers_hint
@@ -372,7 +453,120 @@ Functions defined in this chunk (lines {{{{start_line}}}}..={{{{end_line}}}}):
         } else {
             let json_str = serde_json::to_string_pretty(&s.focus_targets).unwrap_or_default();
             format!(
-                "\n\n<triage_focus_targets>\nPhase 1 triage identified the following high-risk functions and hypotheses in this chunk:\n{json_str}\n</triage_focus_targets>"
+                "\n\n<triage_focus_targets>\nPhase 1 triage highlighted the following cross-function hypotheses as supplemental leads (do NOT restrict your audit to these functions—you MUST still audit EVERY function in <target_chunk_source> from top to bottom):\n{json_str}\n</triage_focus_targets>"
+            )
+        }
+    })
+    .with_var("custom_prompt_block", |s: &LinuxScanState| {
+        s.custom_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map_or_else(String::new, |p| {
+                format!("\n\n<custom_instructions>\n{p}\n</custom_instructions>")
+            })
+    })
+}
+
+/// Context-isolated system prompt for `contract-audit` (`Agent 2`), receiving ONLY
+/// `Agent 1`'s `<architecture_contract_notes>`, `<external_callers>`, and raw chunk context
+/// without `<triage_focus_targets>` anchoring or `Agent 1`'s chain-of-thought.
+pub fn linux_contract_audit_system_prompt() -> PromptTemplate<LinuxScanState> {
+    let current_date = chrono::Utc::now().format("%A, %B %d, %Y").to_string();
+
+    PromptTemplate::<LinuxScanState>::new(format!(
+        r#"Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.
+
+You are an independent Linux kernel Contract-Breakage Auditor (Agent 2) verifying implementation code against `<architecture_contract_notes>` synthesized by an isolated Architecture Cartographer (Agent 1).
+
+TOOL USAGE & EFFICIENCY: First check `<architecture_contract_notes>`, `<external_callers>`, `<target_chunk_source>`, `<intra_file_context>`, and `<pre_fetched_context>` already provided below—do NOT re-read code lines already shown in your prompt. When you need additional external callers or definitions using tools (`git_read_files`, `git_grep`, `git_blame`, `git_log`, `git_show`), batch independent tool calls into a single turn, pass explicit `start_line` and `end_line` bounds (`<= 200` lines) to `git_read_files`, and always pass `Target Revision SHA` (`{{{{target_sha}}}}`).{{{{maintainer_notes}}}}
+
+=== Active Scan Target Metadata ===
+Target Revision SHA: {{{{target_sha}}}}
+Chunk ID: {{{{chunk_id}}}}
+Target File: {{{{file_path}}}} (lines {{{{start_line}}}}..={{{{end_line}}}}){{{{maintainers_block}}}}
+===================================
+
+<architecture_contract_notes>
+Normative subsystem data-structure lifecycles, synchronization protocols, pointer/sentinel domains, and caller/callee contracts documented by Agent 1 (verify every function in <target_chunk_source> against these rules, treating live code at Target Revision SHA as ground truth):
+{{{{contract_notes}}}}
+</architecture_contract_notes>{{{{external_callers_block}}}}
+
+<file_function_index>
+Outline of all functions in {{{{file_path}}}}:
+{{{{file_function_index}}}}
+</file_function_index>
+
+<chunk_functions>
+Functions defined in this chunk (lines {{{{start_line}}}}..={{{{end_line}}}}):
+{{{{chunk_functions_json}}}}
+</chunk_functions>
+
+<target_chunk_source>
+{{{{numbered_source}}}}
+</target_chunk_source>{{{{intra_file_context_block}}}}{{{{prefetched_block}}}}{{{{custom_prompt_block}}}}"#
+    ))
+    .with_var("target_sha", |s: &LinuxScanState| s.target_sha.clone())
+    .with_var("chunk_id", |s: &LinuxScanState| s.chunk_id.clone())
+    .with_var("file_path", |s: &LinuxScanState| s.file_path.clone())
+    .with_var("start_line", |s: &LinuxScanState| s.start_line.to_string())
+    .with_var("end_line", |s: &LinuxScanState| s.end_line.to_string())
+    .with_var("maintainer_notes", |s: &LinuxScanState| {
+        s.maintainer_notes.clone()
+    })
+    .with_var("contract_notes", |s: &LinuxScanState| {
+        s.contract_notes.trim().to_string()
+    })
+    .with_var("external_callers_block", |s: &LinuxScanState| {
+        if s.external_callers.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n<external_callers>\n1-hop external kernel call-sites and ops-table registrations invoking exported functions in this chunk at revision `{}`:\n\n{}\n</external_callers>",
+                s.target_sha,
+                s.external_callers.trim()
+            )
+        }
+    })
+    .with_var("file_function_index", |s: &LinuxScanState| {
+        s.file_function_index.clone()
+    })
+    .with_var("chunk_functions_json", |s: &LinuxScanState| {
+        s.chunk_functions_json.clone()
+    })
+    .with_var("numbered_source", |s: &LinuxScanState| {
+        s.numbered_source.clone()
+    })
+    .with_var("intra_file_context_block", |s: &LinuxScanState| {
+        if s.intra_file_context.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n<intra_file_context>\nFile-local types, macros, ops tables, 1-hop static callees, and intra-file caller call-sites from other sections of `{}` at revision `{}`:\n\n{}\n</intra_file_context>",
+                s.file_path, s.target_sha, s.intra_file_context
+            )
+        }
+    })
+    .with_var("maintainers_block", |s: &LinuxScanState| {
+        s.maintainers_hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map_or_else(String::new, |h| {
+                if h.starts_with("MAINTAINERS") || h.starts_with("<official_maintainers") {
+                    format!("\n{h}")
+                } else {
+                    format!("\nMAINTAINERS Subsystem(s): {h}")
+                }
+            })
+    })
+    .with_var("prefetched_block", |s: &LinuxScanState| {
+        if s.prefetched_context.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n<pre_fetched_context>\nThe following external definitions (structs, enums, macros, and callees) referenced by this chunk were pre-fetched at revision `{}`:\n\n{}\n</pre_fetched_context>",
+                s.target_sha, s.prefetched_context
             )
         }
     })
@@ -662,59 +856,15 @@ pub fn validate_scan_verification_output(
     output: &VerificationOutput,
     state: &LinuxScanState,
 ) -> Result<(), String> {
+    if !output.inconclusive_concerns.is_empty() {
+        return Err(format!(
+            "inconclusive_concerns contains {} entries, but active scan chunk consolidation must return an empty 'inconclusive_concerns': [] array. Emit every plausible Medium, High, or Critical candidate defect directly in 'findings' (cross-file tool verification runs after cross-chunk deduplication in the linux_bug pipeline), and place only concretely disproved or Low-trivia items in 'dismissed_concerns'.",
+            output.inconclusive_concerns.len()
+        ));
+    }
+
     for (idx, finding) in output.findings.iter().enumerate() {
         validate_scan_finding_object(finding, idx)?;
-    }
-
-    for (idx, inconclusive) in output.inconclusive_concerns.iter().enumerate() {
-        let has_type = inconclusive
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_desc = inconclusive
-            .get("description")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_severity = inconclusive
-            .get("estimated_severity")
-            .and_then(Value::as_str)
-            .is_some_and(|s| matches!(s, "Low" | "Medium" | "High" | "Critical" | "Unknown"));
-        let has_signal_reason = inconclusive
-            .get("signal_reason")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_args = inconclusive
-            .get("concern_arguments")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_dismissal_args = inconclusive
-            .get("dismissal_arguments")
-            .is_some_and(|v| v.is_string() || v.is_null());
-        let has_question = inconclusive
-            .get("verification_question")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_locations = inconclusive.get("locations").is_some_and(Value::is_array);
-        if !has_type
-            || !has_desc
-            || !has_severity
-            || !has_signal_reason
-            || !has_args
-            || !has_dismissal_args
-            || !has_question
-            || !has_locations
-        {
-            return Err(format!(
-                "inconclusive_concerns[{idx}] must have non-empty 'type', 'description', 'signal_reason', 'concern_arguments', and 'verification_question' strings, valid 'estimated_severity' (Low, Medium, High, Critical, or Unknown), string 'dismissal_arguments', and a 'locations' array."
-            ));
-        }
-    }
-
-    if state.all_dismissed_concerns.is_empty() && !output.dismissed_concerns.is_empty() {
-        return Err(format!(
-            "dismissed_concerns contains {} entries, but input dismissed_concerns is empty. Raised concerns from all_concerns must never be placed into dismissed_concerns in verification; route any disputed, speculative, or questionable concern to inconclusive_concerns.",
-            output.dismissed_concerns.len(),
-        ));
     }
 
     for (idx, dismissed) in output.dismissed_concerns.iter().enumerate() {
@@ -741,20 +891,20 @@ pub fn validate_scan_verification_output(
 
     if !state.all_concerns.is_empty()
         && output.findings.is_empty()
-        && output.inconclusive_concerns.is_empty()
+        && output.dismissed_concerns.is_empty()
     {
         return Err(
-            "At least one concern was raised by the analysis stages, so 'findings' and 'inconclusive_concerns' cannot both be empty. Every consolidated concern must be classified either into 'findings' (if well-justified with no competing dismissal) or into 'inconclusive_concerns' (if contested, speculative, or requiring tool verification)."
+            "At least one concern was raised by the analysis stages, so 'findings' and 'dismissed_concerns' cannot both be empty. Every consolidated concern must be classified either into 'findings' (if plausible) or into 'dismissed_concerns' (if concretely disproved by verbatim code)."
                 .to_string(),
         );
     }
 
     if !state.all_dismissed_concerns.is_empty()
         && output.dismissed_concerns.is_empty()
-        && output.inconclusive_concerns.is_empty()
+        && output.findings.is_empty()
     {
         return Err(
-            "At least one dismissed_concern was provided in input, so 'dismissed_concerns' and 'inconclusive_concerns' cannot both be empty. Every input dismissed_concern must be classified into either 'dismissed_concerns' (if backed by concrete disproving code) or 'inconclusive_concerns' (if contested or relying on unproven assumptions)."
+            "At least one dismissed_concern was provided in input, so 'dismissed_concerns' and 'findings' cannot both be empty. Every input dismissed_concern must be classified into either 'dismissed_concerns' (if backed by concrete disproving code) or promoted to 'findings' (if relying on unproven cross-file assumptions)."
                 .to_string(),
         );
     }
@@ -781,20 +931,9 @@ pub fn validate_scan_verification_output(
         let valid_label = all_valid.join(", ");
         let mut accounted = std::collections::BTreeSet::new();
 
-        for (collection_name, items, allow_concerns, allow_dismissed) in [
-            ("findings", &output.findings, true, false),
-            (
-                "inconclusive_concerns",
-                &output.inconclusive_concerns,
-                true,
-                true,
-            ),
-            (
-                "dismissed_concerns",
-                &output.dismissed_concerns,
-                false,
-                true,
-            ),
+        for (collection_name, items) in [
+            ("findings", &output.findings),
+            ("dismissed_concerns", &output.dismissed_concerns),
         ] {
             for (idx, item) in items.iter().enumerate() {
                 let sids = extract_non_empty_source_ids(collection_name, idx, item, &valid_label)?;
@@ -802,16 +941,6 @@ pub fn validate_scan_verification_output(
                     if !all_valid.contains(&sid) {
                         return Err(format!(
                             "{collection_name}[{idx}].source_ids contains unknown ID '{sid}'. Valid input IDs are: {valid_label}."
-                        ));
-                    }
-                    if !allow_concerns && concern_ids.contains(&sid) {
-                        return Err(format!(
-                            "dismissed_concerns[{idx}].source_ids references raised concern ID '{sid}'. Raised concerns (C*) must never be placed in 'dismissed_concerns' in verification; classify any contested or questionable concern into 'inconclusive_concerns'."
-                        ));
-                    }
-                    if !allow_dismissed && dismissed_ids.contains(&sid) {
-                        return Err(format!(
-                            "findings[{idx}].source_ids references dismissed_concern ID '{sid}'. Category 1a 'findings' are only for uncontested raised concerns (C*); any contested issue (C* + D*) or promoted dismissal (D*) must be placed in 'inconclusive_concerns'."
                         ));
                     }
                     accounted.insert(sid);
@@ -825,7 +954,7 @@ pub fn validate_scan_verification_output(
             .collect();
         if !missing.is_empty() {
             return Err(format!(
-                "Verification output failed to account for input ID(s): {}. Every input concern (C*) and dismissed_concern (D*) ID must appear in 'source_ids' of at least one item in 'findings', 'inconclusive_concerns', or 'dismissed_concerns'.",
+                "Verification output failed to account for input ID(s): {}. Every input concern (C*) and dismissed_concern (D*) ID must appear in 'source_ids' of at least one item in 'findings' or 'dismissed_concerns'.",
                 missing.join(", ")
             ));
         }
@@ -1188,7 +1317,7 @@ pub fn validate_scan_triage_output(
     for raw_stage in &out.relevant_stages {
         if scan_analysis_stage_by_name(raw_stage).is_none() {
             return Err(format!(
-                "relevant_stages contains unknown stage {raw_stage:?}; expected one of execution-flow, resources, locking, security, hardware."
+                "relevant_stages contains unknown stage {raw_stage:?}; expected one of implementation, execution-flow, resources, locking, security, hardware."
             ));
         }
     }
@@ -1236,6 +1365,75 @@ pub fn format_scan_triage_feedback(violation: &str) -> String {
     )
 }
 
+pub fn build_scan_stage_efforts_schema(stages: &[AnalysisStage]) -> Value {
+    let mut props = serde_json::Map::new();
+    for def in stages {
+        props.insert(
+            def.name.to_string(),
+            json!({
+                "type": "string",
+                "enum": ["medium", "high"]
+            }),
+        );
+    }
+    // Leave required omitted so dynamic-effort early exits on benign
+    // boilerplate chunks can emit an empty stage_efforts object under
+    // constrained JSON schema decoding. Non-empty selections are checked by
+    // validate_scan_triage_output_with_effort and defaulted by
+    // apply_scan_triage_output.
+    json!({
+        "type": "object",
+        "properties": props,
+    })
+}
+
+pub fn apply_scan_triage_output(
+    dynamic_effort: bool,
+    out: ScanTriageOutput,
+    state: &mut LinuxScanState,
+) {
+    let mut triage_selected = std::collections::BTreeSet::new();
+    for raw_name in out.relevant_stages {
+        if let Some(def) = scan_analysis_stage_by_name(&raw_name) {
+            triage_selected.insert(def.name);
+        }
+    }
+    // Honor explicit early-exit (`relevant_stages: []`); otherwise ensure all
+    // non-optional core scan stages run in canonical order alongside any
+    // optional stages (`security`, `hardware`) selected by triage.
+    let stages: Vec<String> = if triage_selected.is_empty() {
+        Vec::new()
+    } else {
+        SCAN_ANALYSIS_STAGES
+            .iter()
+            .filter(|def| !def.optional || triage_selected.contains(def.name))
+            .map(|def| def.name.to_string())
+            .collect()
+    };
+    let mut efforts = std::collections::BTreeMap::new();
+    if dynamic_effort {
+        for (raw_stage, raw_effort) in out.stage_efforts {
+            if let Some(def) = scan_analysis_stage_by_name(&raw_stage)
+                && let Some(parsed) = crate::ai::ReasoningEffort::from_str_loose(&raw_effort)
+            {
+                let clamped = match parsed {
+                    crate::ai::ReasoningEffort::Low => crate::ai::ReasoningEffort::Medium,
+                    other => other,
+                };
+                efforts.insert(def.name.to_string(), clamped);
+            }
+        }
+        for stage_name in &stages {
+            efforts
+                .entry(stage_name.clone())
+                .or_insert(crate::ai::ReasoningEffort::Medium);
+        }
+    }
+    state.planned_stages = stages;
+    state.planned_efforts = efforts;
+    state.focus_targets = out.focus_targets;
+}
+
 pub fn scan_triage_stage_with_effort(
     temperature: f32,
     effort: Option<crate::ai::EffortMode>,
@@ -1262,23 +1460,21 @@ pub fn scan_triage_stage_with_effort(
     });
 
     let (user_prompt, output_format) = if dynamic_effort {
-        let stage_efforts_schema = build_stage_efforts_schema(SCAN_ANALYSIS_STAGES);
+        let stage_efforts_schema = build_scan_stage_efforts_schema(SCAN_ANALYSIS_STAGES);
         (
             r#"Perform a Phase 1 exploration and triage pass over the target kernel source chunk:
 1. Select which specialist audit stages should run on this chunk (`relevant_stages`):
-   - `execution-flow`: Complex branching, multi-label `goto` error unwinds, state mutations, pointer/bounds arithmetic.
-   - `resources`: Allocations (`kmalloc`/`kzalloc`/pages/DMA), refcounts (`kref`/`get_device`/`fget`), subsystem registrations, teardown callbacks, timers/workqueues.
-   - `locking`: Spinlocks, mutexes, RCU, atomics, lockless shared state, interrupt/timer synchronization.
-   - `security`: User-space inputs (`copy_from_user`, `ioctl`, `netlink`, `sysfs`), packet/header parsing, length/offset calculations, capability checks, `copy_to_user`.
-   - `hardware`: Device driver MMIO registers, DMA mappings, IRQ handlers, runtime PM / clocks, suspend/resume/reset state machines.
-   CRITICAL EARLY-EXIT RULE: If this chunk consists purely of benign boilerplate (e.g., static tables, constant definitions, tracepoints, simple getters/setters, or trivial wrappers with no plausible High/Critical bug surface), return `"relevant_stages": []`, `"focus_targets": []`, and `"stage_efforts": {}`.
-2. Identify the highest-risk functions and entry points in `focus_targets` (each object requiring `"function"`, `"risk_category"`, and `"hypothesis"`, plus optional `"lines"` and `"callers_or_callees_to_check"`), stating the specific `hypothesis` to test and which external `callers_or_callees_to_check` specialist stages should inspect with Git tools.
+   - Core stages (`implementation`, `execution-flow`, `resources`, `locking`) should ALWAYS be included whenever the chunk contains non-trivial executable logic.
+   - `security`: MUST be included whenever the chunk touches syscalls, ioctls, netlink, bpf, ptrace/regsets, `procfs`/`sysfs`/`cgroupfs`/`kernfs` handlers, mmap/fault paths, packet/sched classifiers, namespaces/capabilities, `copy_from_user`/`copy_to_user`, `kvm`/`vgic`/`vhost`/`virtio`, or resource/cgroup memory accounting and bounded ID tables.
+   - `hardware`: Include when the chunk touches CPU architecture / system registers (`arch/*`, `kvm`, `vgic`, `ptrace`, `iommu`), device driver MMIO registers, bitmasks, DMA mappings, IRQ/NAPI handlers, runtime PM / clocks, or open/stop/suspend/resume/reset state machines.
+   CRITICAL EARLY-EXIT RULE: ONLY if this chunk consists purely of benign boilerplate (e.g., static tables, constant definitions, tracepoints, simple getters/setters, or trivial wrappers with no plausible Medium/High/Critical bug surface), return `"relevant_stages": []`, `"focus_targets": []`, and `"stage_efforts": {}`.
+2. Identify cross-function risk leads in `focus_targets` (each object requiring `"function"`, `"risk_category"`, and `"hypothesis"`, plus optional `"lines"` and `"callers_or_callees_to_check"`), stating specific cross-file callers, framework callbacks (such as `css_free_rwork_fn`), or paired init/teardown helpers that specialist stages should inspect with Git tools (specialist stages will still audit every function in the chunk).
 3. For each selected stage in `relevant_stages`, assign `"medium"` or `"high"` reasoning effort in `stage_efforts`.
 
 Respond with ONLY a JSON object. Example:
 ```json
 {
-  "relevant_stages": ["resources", "locking", "security"],
+  "relevant_stages": ["implementation", "execution-flow", "resources", "locking", "security"],
   "focus_targets": [
     {
       "function": "smb2_ioctl",
@@ -1289,6 +1485,8 @@ Respond with ONLY a JSON object. Example:
     }
   ],
   "stage_efforts": {
+    "implementation": "medium",
+    "execution-flow": "high",
     "resources": "high",
     "locking": "medium",
     "security": "high"
@@ -1314,18 +1512,16 @@ Respond with ONLY a JSON object. Example:
         (
             r#"Perform a Phase 1 exploration and triage pass over the target kernel source chunk:
 1. Select which specialist audit stages should run on this chunk (`relevant_stages`):
-   - `execution-flow`: Complex branching, multi-label `goto` error unwinds, state mutations, pointer/bounds arithmetic.
-   - `resources`: Allocations (`kmalloc`/`kzalloc`/pages/DMA), refcounts (`kref`/`get_device`/`fget`), subsystem registrations, teardown callbacks, timers/workqueues.
-   - `locking`: Spinlocks, mutexes, RCU, atomics, lockless shared state, interrupt/timer synchronization.
-   - `security`: User-space inputs (`copy_from_user`, `ioctl`, `netlink`, `sysfs`), packet/header parsing, length/offset calculations, capability checks, `copy_to_user`.
-   - `hardware`: Device driver MMIO registers, DMA mappings, IRQ handlers, runtime PM / clocks, suspend/resume/reset state machines.
-   CRITICAL EARLY-EXIT RULE: If this chunk consists purely of benign boilerplate (e.g., static tables, constant definitions, tracepoints, simple getters/setters, or trivial wrappers with no plausible High/Critical bug surface), return `"relevant_stages": []` and `"focus_targets": []`.
-2. Identify the highest-risk functions and entry points in `focus_targets` (each object requiring `"function"`, `"risk_category"`, and `"hypothesis"`, plus optional `"lines"` and `"callers_or_callees_to_check"`), stating the specific `hypothesis` to test and which external `callers_or_callees_to_check` specialist stages should inspect with Git tools.
+   - Core stages (`implementation`, `execution-flow`, `resources`, `locking`) should ALWAYS be included whenever the chunk contains non-trivial executable logic.
+   - `security`: MUST be included whenever the chunk touches syscalls, ioctls, netlink, bpf, ptrace/regsets, `procfs`/`sysfs`/`cgroupfs`/`kernfs` handlers, mmap/fault paths, packet/sched classifiers, namespaces/capabilities, `copy_from_user`/`copy_to_user`, `kvm`/`vgic`/`vhost`/`virtio`, or resource/cgroup memory accounting and bounded ID tables.
+   - `hardware`: Include when the chunk touches CPU architecture / system registers (`arch/*`, `kvm`, `vgic`, `ptrace`, `iommu`), device driver MMIO registers, bitmasks, DMA mappings, IRQ/NAPI handlers, runtime PM / clocks, or open/stop/suspend/resume/reset state machines.
+   CRITICAL EARLY-EXIT RULE: ONLY if this chunk consists purely of benign boilerplate (e.g., static tables, constant definitions, tracepoints, simple getters/setters, or trivial wrappers with no plausible Medium/High/Critical bug surface), return `"relevant_stages": []` and `"focus_targets": []`.
+2. Identify cross-function risk leads in `focus_targets` (each object requiring `"function"`, `"risk_category"`, and `"hypothesis"`, plus optional `"lines"` and `"callers_or_callees_to_check"`), stating specific cross-file callers, framework callbacks (such as `css_free_rwork_fn`), or paired init/teardown helpers that specialist stages should inspect with Git tools (specialist stages will still audit every function in the chunk).
 
 Respond with ONLY a JSON object. Example:
 ```json
 {
-  "relevant_stages": ["resources", "locking", "security"],
+  "relevant_stages": ["implementation", "execution-flow", "resources", "locking", "security"],
   "focus_targets": [
     {
       "function": "smb2_ioctl",
@@ -1366,32 +1562,7 @@ Respond with ONLY a JSON object. Example:
         })
         .skip_if(|s| s.manual_stages.is_some())
         .reduce(move |state, out: ScanTriageOutput| {
-            let mut stages = Vec::new();
-            for raw_name in out.relevant_stages {
-                if let Some(def) = scan_analysis_stage_by_name(&raw_name)
-                    && !stages.iter().any(|s| s == def.name)
-                {
-                    stages.push(def.name.to_string());
-                }
-            }
-            let mut efforts = std::collections::BTreeMap::new();
-            if dynamic_effort {
-                for (raw_stage, raw_effort) in out.stage_efforts {
-                    if let Some(def) = scan_analysis_stage_by_name(&raw_stage)
-                        && let Some(parsed) =
-                            crate::ai::ReasoningEffort::from_str_loose(&raw_effort)
-                    {
-                        let clamped = match parsed {
-                            crate::ai::ReasoningEffort::Low => crate::ai::ReasoningEffort::Medium,
-                            other => other,
-                        };
-                        efforts.insert(def.name.to_string(), clamped);
-                    }
-                }
-            }
-            state.planned_stages = stages;
-            state.planned_efforts = efforts;
-            state.focus_targets = out.focus_targets;
+            apply_scan_triage_output(dynamic_effort, out, state);
         })
         .build()
 }
@@ -1433,11 +1604,16 @@ fn scan_analysis_stage(
     temperature: f32,
     reasoning_effort: Option<crate::ai::ReasoningEffort>,
 ) -> Box<dyn ExecutableStage<LinuxScanState>> {
+    let sys_prompt = if def.name == SCAN_CONTRACT_AUDIT_STAGE.name {
+        linux_contract_audit_system_prompt()
+    } else {
+        linux_scan_system_prompt()
+    };
     let user_template = scan_analysis_stage_user_prompt(def);
 
     Box::new(
         Stage::builder(def.name)
-            .system_prompt(linux_scan_system_prompt())
+            .system_prompt(sys_prompt)
             .user_prompt(user_template)
             .output_format(
                 OutputFormat::json()
@@ -1487,13 +1663,23 @@ pub fn resolve_scan_analysis_stages_with_options(
     max_turns: usize,
     temperature: f32,
 ) -> Vec<Box<dyn ExecutableStage<LinuxScanState>>> {
-    let selected_stages: Vec<String> = if let Some(ref manual) = state.manual_stages {
+    let mut selected_stages: Vec<String> = if let Some(ref manual) = state.manual_stages {
         manual.clone()
     } else {
         // When `triage` ran and selected an empty `planned_stages`, honor the
         // early-exit decision by returning no specialist stages.
-        state.planned_stages.clone()
+        let mut planned = state.planned_stages.clone();
+        if !planned.is_empty()
+            && !state.contract_notes.trim().is_empty()
+            && !planned.iter().any(|s| s == SCAN_CONTRACT_AUDIT_STAGE.name)
+        {
+            planned.insert(0, SCAN_CONTRACT_AUDIT_STAGE.name.to_string());
+        }
+        planned
     };
+    if state.contract_notes.trim().is_empty() && state.manual_stages.is_none() {
+        selected_stages.retain(|s| s != SCAN_CONTRACT_AUDIT_STAGE.name);
+    }
 
     let mut stages = Vec::new();
     for name in selected_stages {
@@ -1508,21 +1694,24 @@ pub fn resolve_scan_analysis_stages_with_options(
     stages
 }
 
-const STAGE_SCAN_VERIFICATION_INSTRUCTION: &str = r#"# Scan Verification, Severity Calibration & Canonical Bug Formatting
+const STAGE_SCAN_VERIFICATION_INSTRUCTION: &str = r#"# Scan Candidate Consolidation, Deduplication & Canonical Bug Formatting
 
 You are the lead Linux kernel maintainer consolidating `concerns` and `dismissed_concerns` produced by parallel specialist scan stages on an existing kernel source chunk.
-Your task is to (1) deduplicate overlapping items that share the same root cause and function, and (2) classify every unique candidate into:
-- **Category 1a (`findings`):** Well-justified, uncontested bugs backed by concrete code proof.
-- **Category 1b (`dismissed_concerns`):** Well-justified dismissals backed by a concrete disproving `code_snippet` in `locations` (with no competing `concern`).
-- **Category 2: Inconclusive (`inconclusive_concerns`):** Contested (`C*` + `D*`), speculative, or assumption-based dismissals (`"signal_reason": "speculative_dismissal"`) requiring tool-based `post-verification` across callers/callees.
+Every candidate you emit in `findings` will be deduplicated across chunks of the file and then verified against the full repository by the Phase 2 `linux_bug` adversarial verifier (which has full Git tools to inspect cross-file callers, callees, locking, and lifecycle invariants). Therefore, do NOT defer plausible defects to `"inconclusive_concerns"`—`"inconclusive_concerns"` MUST always be `[]`.
+
+Your task is to:
+1. **Deduplicate only identical root-cause + function defects:** Merge duplicate items ONLY when they share the exact same root cause AND the same function/lifecycle phase. NEVER merge distinct bugs in the same function (e.g., an error-unwind leak vs. a signedness/shift bug in the same function) or setup vs. teardown bugs across separate functions.
+2. **Classify every consolidated candidate into `findings` or `dismissed_concerns`:**
+   - **`findings`:** Emit every plausible `Medium`, `High`, or `Critical` kernel defect (`C*`) that is NOT concretely disproved by verbatim code in the chunk, `<intra_file_context>`, `<prefetched_context>`, or a competing `D*`. If a `dismissed_concern` (`D*`) dismissed a real defect by assuming an unverified cross-file caller/framework invariant without verbatim disproving code from all callers, promote that `D*` into `findings` so Phase 2 verifies the callers with Git tools!
+   - **`dismissed_concerns`:** Place items here ONLY when backed by a concrete verbatim disproving `code_snippet` in `locations` proving the failure mode is impossible (or when an item is pure `Low` style/hygiene trivia per `false-positive-guide.md`). Both `D*` and concretely refuted `C*` IDs may be placed in `dismissed_concerns`.
 
 ### CRITICAL SEVERITY & CANONICAL BUGREPO FORMAT REQUIREMENTS
-Active codebase scanning forwards verified `Medium`, `High`, and `Critical` kernel defects to the `linux_bug` verification and severity calibration pipeline (filtering out `Low` hygiene/trivia).
-- **LINEAGE REQUIREMENT (`source_ids`):** Every input item in Aggregated Concerns has an `"id"` (`"C1"`, `"C2"`, ...) and every input item in Aggregated Dismissed Concerns has an `"id"` (`"D1"`, `"D2"`, ...). Every output object across `findings`, `inconclusive_concerns`, and `dismissed_concerns` MUST include a non-empty `"source_ids"` array listing the exact input `"id"` string(s) merged into that item. Every input `"C*"` and `"D*"` ID MUST appear in at least one output item's `"source_ids"`.
-- **Category 1a (`findings`) required keys:**
-  1. `"source_ids"`: non-empty array of input `C*` IDs only (never `D*` IDs).
+Active codebase scanning forwards `Medium`, `High`, and `Critical` kernel defects to the `linux_bug` verification and severity calibration pipeline (filtering out `Low` hygiene/trivia).
+- **LINEAGE REQUIREMENT (`source_ids`):** Every input item in Aggregated Concerns has an `"id"` (`"C1"`, `"C2"`, ...) and every input item in Aggregated Dismissed Concerns has an `"id"` (`"D1"`, `"D2"`, ...). Every output object across `findings` and `dismissed_concerns` MUST include a non-empty `"source_ids"` array listing the exact input `"id"` string(s) merged into that item. Every input `"C*"` and `"D*"` ID MUST appear in at least one output item's `"source_ids"`.
+- **`findings` required keys:**
+  1. `"source_ids"`: non-empty array of input `C*` and/or promoted `D*` IDs.
   2. `"problem"` (Canonical Title):
-     - Format: `"<subsystem_prefix>: <defect or broken invariant in function_name()>"` (e.g. `"smb: server: memory leak in parse_durable_handle_context()"` or `"btrfs: use-after-free in btrfs_cleanup_ordered_extents()"`).
+     - Format: `"<subsystem_prefix>: <defect or broken invariant in function_name()>"` (e.g. `"smb: server: memory leak in parse_durable_handle_context()"` or `"mm: memcontrol: private_id leak in __mem_cgroup_free()"`).
      - Strictly under 80 characters, NO backticks (`), NO markdown.
      - Do NOT start the description after `:` with patch/fix verbs (`fix`, `fixes`, `prevent`, `avoid`, `resolve`). State the defect directly.
   3. `"canonical_description"`:
@@ -1531,29 +1720,20 @@ Active codebase scanning forwards verified `Medium`, `High`, and `Critical` kern
        `Call Chain: ...`
        `Failure Mechanism: ...`
        `Impact: ...`
-  4. `"severity"`: `"Low"`, `"Medium"`, `"High"`, `"Critical"`, or `"Unknown"` calibrated per `severity.md`. (Only `"High"` and `"Critical"` findings will be promoted to the bug repository.)
-  5. `"severity_explanation"`: Detailed step-by-step proof of reachability, triggering conditions, and blast radius.
+  4. `"severity"`: `"Low"`, `"Medium"`, `"High"`, `"Critical"`, or `"Unknown"` calibrated per `severity.md` and `<kernel_threat_model>` (when provided below). Note: leaks of bounded global IDs/resources, guest-triggerable `WARN_ON*`, error-path page/memory leaks, and broken hardware/register masks or type truncations are `Medium` or `High`, never `Low`.
+  5. `"severity_explanation"`: Detailed step-by-step proof of consequence, actor/privilege & trust boundary, and triggering preconditions.
   6. `"affected_source_files"`: Non-empty array of repository-relative file paths (e.g. `["fs/smb/server/smb2pdu.c"]`).
   7. `"locations"`: Non-empty array of verified location objects (`file`, `function_or_symbol`, `line`, `code_snippet`, `why_this_location_matters`).
-- **Category 2: Inconclusive (`inconclusive_concerns`) required keys:**
-  1. `"source_ids"`: non-empty array of input `C*` and/or `D*` IDs.
-  2. `"type"`: short defect category string.
-  3. `"description"`: clear description of the candidate issue.
-  4. `"estimated_severity"`: `"Low"`, `"Medium"`, `"High"`, `"Critical"`, or `"Unknown"`.
-  5. `"signal_reason"`: `"mixed_signals"`, `"speculative_concern"`, `"speculative_dismissal"`, `"series_interaction"`, or `"other"`.
-  6. `"concern_arguments"`: consolidated arguments for why the bug can occur.
-  7. `"dismissal_arguments"`: consolidated arguments/snippets from any competing or standalone dismissal (or `""` if none).
-  8. `"verification_question"`: specific code question that `post-verification` must answer using Git tools.
-  9. `"locations"`: non-empty array of location objects (`file`, `function_or_symbol`, `line`, `code_snippet`, `why_this_location_matters`).
-- **Category 1b (`dismissed_concerns`) required keys:**
-  1. `"source_ids"`: non-empty array of input `D*` IDs only (never place a raised `C*` concern into `dismissed_concerns` in this stage).
+- **`inconclusive_concerns`:** MUST always be an empty array `[]`.
+- **`dismissed_concerns` required keys:**
+  1. `"source_ids"`: non-empty array of input `D*` and/or concretely disproved `C*` IDs.
   2. `"type"`: short category string.
   3. `"description"`: the concern that was investigated and dismissed.
-  4. `"reasoning"`: concrete code explanation proving safety.
+  4. `"reasoning"`: concrete code explanation proving safety (or explaining why it is pure `Low` style trivia).
   5. `"locations"`: non-empty array of location objects (`file`, `function_or_symbol`, `line`, `code_snippet`, `why_this_location_matters`) with a non-empty verbatim disproving `code_snippet`."#;
 
 pub fn scan_verification_stage_with_effort(
-    max_turns: usize,
+    _max_turns: usize,
     temperature: f32,
     effort: Option<crate::ai::EffortMode>,
 ) -> Stage<LinuxScanState, VerificationOutput> {
@@ -1574,9 +1754,9 @@ Aggregated Concerns:
 Aggregated Dismissed Concerns:
 {{{{aggregated_dismissed_concerns}}}}
 
-Return ONLY a JSON object with 'findings', 'inconclusive_concerns', and 'dismissed_concerns' arrays.
-- Every input "C*" and "D*" ID MUST appear in at least one output item's "source_ids".
-- Never place a raised concern ("C*") into 'dismissed_concerns' in this stage; route any questionable or contested concern into 'inconclusive_concerns'."#
+Return ONLY a JSON object with 'findings', 'inconclusive_concerns' (MUST be []), and 'dismissed_concerns' arrays.
+- Every input "C*" and "D*" ID MUST appear in at least one output item's "source_ids" across 'findings' or 'dismissed_concerns'.
+- Emit every plausible Medium, High, or Critical defect directly in 'findings' so Phase 2 cross-file verification checks it once after cross-chunk deduplication."#
     ))
     .include_file("false-positive-guide.md")
     .include_file("severity.md")
@@ -1607,8 +1787,8 @@ Return ONLY a JSON object with 'findings', 'inconclusive_concerns', and 'dismiss
                 .with_feedback_formatter(format_verification_stage_feedback),
         )
         .policy(StagePolicy {
-            tools: ToolScope::All,
-            max_turns,
+            tools: ToolScope::None,
+            max_turns: 1,
             temperature,
             reasoning_effort: effort.map(crate::ai::EffortMode::verification_stage_effort),
             ..Default::default()
@@ -1813,6 +1993,250 @@ impl LinuxScanState {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContractCartographerOutput {
+    #[serde(default)]
+    pub file_invariants: String,
+    #[serde(default)]
+    pub architecture_contract_notes: String,
+}
+
+struct ContractCartographerSession<'a> {
+    file_path: &'a str,
+    target_sha: &'a str,
+    maintainers_hint: Option<&'a str>,
+    maintainer_notes: &'a str,
+    numbered_full_source: &'a str,
+    external_headers: &'a str,
+    external_callers: &'a str,
+    tools: Option<std::sync::Arc<crate::toolbox::ToolBox>>,
+    last_tool_call: Option<(String, Value)>,
+    temperature: f32,
+    effort: Option<crate::ai::ReasoningEffort>,
+    context_tag: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl crate::ai::session::LlmSession for ContractCartographerSession<'_> {
+    type Output = ContractCartographerOutput;
+
+    fn system_prompt(&self) -> String {
+        let maint = self
+            .maintainers_hint
+            .filter(|h| !h.trim().is_empty())
+            .map(|h| format!("\nMAINTAINERS Subsystem(s): {h}"))
+            .unwrap_or_default();
+        let notes = if self.maintainer_notes.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{}", self.maintainer_notes.trim())
+        };
+        format!(
+            "You are a Linux kernel Architecture & Design-Contract Cartographer (Agent 1) documenting `{}` at commit `{}`.{}{}\n\n\
+            STRICT ROLE & CONTEXT ISOLATION:\n\
+            - Do NOT hunt for bugs, do NOT speculate about defects, and do NOT rationalize questionable implementation lines.\n\
+            - Your sole responsibility is to reconstruct and write down the NORMATIVE design contracts—how data structures, lifecycles, locks, pointers/sentinels, and caller/callee interfaces are SUPPOSED to work—derived from struct/type definitions, initialization/allocation sites, external callers (`<external_callers>`), vtable/ops registrations, docstrings, and majority patterns across sibling functions.\n\
+            - CRITICAL ANTI-RATIONALIZATION RULE: Never treat an individual function's early return, missing NULL/bounds check, or lock omission as part of the intended specification unless an explicit comment or hardware/ABI rule justifies it. Explicitly distinguish base VM/device/map state (allocated unconditionally for every instance) from optional/lazy feature state (allocated only when an optional feature is enabled) when documenting teardown/flush/release hooks!\n\
+            - `<full_file_source>`, `<external_header_definitions>`, and `<external_callers>` are already provided below; only invoke Git tools (`git_read_files` with `<= 150`-line ranges, or `git_grep`) if a critical external struct or caller contract is missing.",
+            self.file_path, self.target_sha, maint, notes
+        )
+    }
+
+    fn initial_user_prompt(&self) -> String {
+        let ext_hdr = if self.external_headers.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n<external_header_definitions>\n{}\n</external_header_definitions>",
+                self.external_headers.trim()
+            )
+        };
+        let ext_callers = if self.external_callers.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n<external_callers>\n1-hop external call-sites and ops-table registrations invoking `{}`:\n{}\n</external_callers>",
+                self.file_path,
+                self.external_callers.trim()
+            )
+        };
+        format!(
+            r####"Study the complete numbered source of `{file_path}` at commit `{target_sha}` together with its external headers and external callers:
+
+<full_file_source>
+{full_source}
+</full_file_source>{ext_hdr}{ext_callers}
+
+Produce a JSON object with two fields:
+1. `"file_invariants"` (concise bullet list, <= 2500 chars): high-signal lock->field rules, atomic/RCU/NMI/IRQ contexts, nullable pointer lifecycles, and base-vs-optional teardown obligations for downstream bug verifiers.
+2. `"architecture_contract_notes"` (structured markdown specification, <= 8500 chars) organized into 4 sections for an isolated downstream Contract-Breakage Auditor (Agent 2):
+   - `### 1. Data Structures & Lifecycles (Create -> Transitions / Recycling -> Teardown)`: For every key struct, array, XArray/hash/list, and per-CPU/fixmap state, list EVERY dynamically allocated sub-buffer, IRQ, timer, or delayed_work field alongside the exact teardown/error-unwind function that must free or cancel it; state whether each sub-structure exists unconditionally for every instance or lazily for optional features; document what fields recycled objects must preserve vs reset; and state the canonical predicate/flag that defines whether an object is active/linked in a scheduler/hash/list (versus secondary counters or lengths that can diverge).
+   - `### 2. Synchronization, Lock-to-Field Protocol & Lock-Drop Windows`: Exact lock(s) required to read vs mutate/resize/reset each shared field or array, per-CPU/IRQ/NMI/RCU/migrate_disable requirements, and which loops/callees (`may_block`, `cond_resched*`, `gfp_t`) can drop and reacquire locks mid-function.
+   - `### 3. Pointer Nullability Windows, Sentinels & Type/Value Domains`: Every pointer or index field that can be `NULL`, `-1`, `ERR_PTR`, or a negative sentinel (e.g., `S1_MMU_DISABLED`), the exact lifecycle windows in which it can be `NULL`/`-1` (before first-run init, after detach/unmap, during VM/device teardown), and parameter signedness/width/range contracts of internal helpers.
+   - `### 4. External Caller Preconditions, Permission Dataflow & Sibling Symmetry`: Which external callers invoke each exported function (and under what locks/configurations), how multi-stage translations/faults must intersect permissions (e.g., upper-layer PTE write flags vs host/backing `writable` out-parameters and `xa_erase` return values), and invariants shared across sibling functions.
+
+Return ONLY a valid JSON object matching:
+```json
+{{
+  "file_invariants": "- ...",
+  "architecture_contract_notes": "### 1. Data Structures & Lifecycles...\n..."
+}}
+```"####,
+            file_path = self.file_path,
+            target_sha = self.target_sha,
+            full_source = self.numbered_full_source,
+            ext_hdr = ext_hdr,
+            ext_callers = ext_callers,
+        )
+    }
+
+    fn tools(&self) -> Option<Vec<crate::ai::AiTool>> {
+        self.tools.as_ref().map(|tb| tb.get_declarations_generic())
+    }
+
+    async fn call_tool(&mut self, name: &str, args: Value) -> anyhow::Result<Value> {
+        let Some(ref tb) = self.tools else {
+            anyhow::bail!("No toolbox configured for ContractCartographerSession");
+        };
+        let repeated = self
+            .last_tool_call
+            .as_ref()
+            .is_some_and(|last| last.0 == name && last.1 == args);
+        if repeated {
+            tracing::warn!("Blocked duplicate tool call: {} with args {:?}", name, args);
+            return Ok(json!({
+                "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
+            }));
+        }
+        self.last_tool_call = Some((name.to_string(), args.clone()));
+        match tb.call(name, args).await {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(json!({ "error": e.to_string() })),
+        }
+    }
+
+    async fn call_tools(
+        &mut self,
+        calls: Vec<crate::ai::ToolCall>,
+    ) -> anyhow::Result<Vec<(String, Value)>> {
+        let Some(ref tb) = self.tools else {
+            anyhow::bail!("No toolbox configured for ContractCartographerSession");
+        };
+        let mut results: Vec<Option<(String, Value)>> = vec![None; calls.len()];
+        let mut to_run = Vec::new();
+
+        for (idx, call) in calls.into_iter().enumerate() {
+            let repeated = self
+                .last_tool_call
+                .as_ref()
+                .is_some_and(|last| last.0 == call.function_name && last.1 == call.arguments);
+            if repeated {
+                tracing::warn!(
+                    "Blocked duplicate tool call: {} with args {:?}",
+                    call.function_name,
+                    call.arguments
+                );
+                results[idx] = Some((
+                    call.id,
+                    json!({
+                        "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
+                    }),
+                ));
+            } else {
+                self.last_tool_call = Some((call.function_name.clone(), call.arguments.clone()));
+                to_run.push((idx, call));
+            }
+        }
+
+        let futures = to_run.into_iter().map(|(idx, call)| {
+            let tools = tb.clone();
+            async move {
+                let res = match tools.call(&call.function_name, call.arguments).await {
+                    Ok(v) => v,
+                    Err(e) => json!({ "error": e.to_string() }),
+                };
+                (idx, (call.id, res))
+            }
+        });
+        for (idx, res) in futures_util::future::join_all(futures).await {
+            results[idx] = Some(res);
+        }
+
+        Ok(results.into_iter().flatten().collect())
+    }
+
+    fn temperature(&self) -> Option<f32> {
+        Some(self.temperature)
+    }
+
+    fn reasoning_effort(&self) -> Option<crate::ai::ReasoningEffort> {
+        self.effort
+    }
+
+    fn response_format(&self) -> Option<crate::ai::AiResponseFormat> {
+        Some(crate::ai::AiResponseFormat::Json { schema: None })
+    }
+
+    fn context_tag(&self) -> Option<String> {
+        self.context_tag.clone()
+    }
+
+    fn validate(
+        &mut self,
+        response: &crate::ai::AiResponse,
+    ) -> std::result::Result<Self::Output, crate::ai::session::ValidationError> {
+        let text = response.content.as_deref().unwrap_or("");
+        let parsed: ContractCartographerOutput =
+            crate::workflow::output::parse_json_from_text(text)
+                .map_err(crate::ai::session::ValidationError::FormatViolation)?;
+        if parsed.file_invariants.trim().is_empty()
+            || parsed.architecture_contract_notes.trim().is_empty()
+        {
+            return Err(crate::ai::session::ValidationError::FormatViolation(
+                "Both 'file_invariants' and 'architecture_contract_notes' must be non-empty strings."
+                    .to_string(),
+            ));
+        }
+        Ok(parsed)
+    }
+}
+
+/// Runs Agent 1 (`ContractCartographer`): a context-isolated specification pass that
+/// documents normative data-structure lifecycles, locking protocols, nullability/sentinel
+/// domains, and external caller contracts without hunting for bugs.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_contract_cartographer_pass(
+    provider: &dyn crate::ai::AiProvider,
+    tools: Option<std::sync::Arc<crate::toolbox::ToolBox>>,
+    file_path: &str,
+    target_sha: &str,
+    maintainers_hint: Option<&str>,
+    maintainer_notes: &str,
+    numbered_full_source: &str,
+    external_headers: &str,
+    external_callers: &str,
+    temperature: f32,
+    effort: Option<crate::ai::EffortMode>,
+) -> anyhow::Result<crate::ai::session::SessionResult<ContractCartographerOutput>> {
+    let max_turns = if tools.is_some() { 3 } else { 1 };
+    let runner = crate::ai::session::SessionRunner::new(provider).with_max_turns(max_turns);
+    let mut session = ContractCartographerSession {
+        file_path,
+        target_sha,
+        maintainers_hint,
+        maintainer_notes,
+        numbered_full_source,
+        external_headers,
+        external_callers,
+        tools,
+        last_tool_call: None,
+        temperature,
+        effort: effort.map(crate::ai::EffortMode::verification_stage_effort),
+        context_tag: Some(format!("[scan:file-cartographer:{file_path}] ")),
+    };
+    runner.run(&mut session).await
+}
+
 pub fn build_linux_scan_workflow() -> Workflow<LinuxScanState> {
     build_linux_scan_workflow_with_options(20, 0.0)
 }
@@ -1829,23 +2253,20 @@ pub fn build_linux_scan_workflow_with_effort(
     temperature: f32,
     effort: Option<crate::ai::EffortMode>,
 ) -> Workflow<LinuxScanState> {
+    let analysis_max_turns = max_turns.min(4);
     Workflow::builder("linux_scan")
         .dynamic_parallel(
             scan_triage_stage_with_effort(temperature, effort),
-            move |state| resolve_scan_analysis_stages_with_options(state, max_turns, temperature),
+            move |state| {
+                resolve_scan_analysis_stages_with_options(state, analysis_max_turns, temperature)
+            },
             ParallelPolicy::BestEffort,
         )
         .early_exit_if(
             |s| s.all_concerns.is_empty() && s.all_dismissed_concerns.is_empty(),
             "No concerns or dismissed concerns raised in scan specialist stages",
         )
-        .dynamic_parallel(
-            scan_verification_stage_with_effort(max_turns, temperature, effort),
-            move |state| {
-                resolve_scan_post_verification_stages_with_options(state, max_turns, temperature)
-            },
-            ParallelPolicy::BestEffort,
-        )
+        .stage(scan_verification_stage_with_effort(1, temperature, effort))
         .build()
 }
 
@@ -2117,7 +2538,13 @@ mod tests {
         assert!(!sec_without.contains("<kernel_threat_model source="));
         assert!(!sec_without.contains("{{kernel_threat_model_section}}"));
 
-        for non_sec in ["execution-flow", "resources", "locking", "hardware"] {
+        for non_sec in [
+            "implementation",
+            "execution-flow",
+            "resources",
+            "locking",
+            "hardware",
+        ] {
             let def = scan_analysis_stage_by_name(non_sec).unwrap();
             let rendered = scan_analysis_stage_user_prompt(def).render_for_log(&state_with);
             assert!(
@@ -2254,5 +2681,158 @@ mod tests {
         };
         record_verified_scan_findings(&mut low_floor_state, vec![low_finding]);
         assert_eq!(low_floor_state.findings.len(), 1);
+    }
+
+    #[test]
+    fn test_dynamic_effort_scan_triage_schema_and_reducer_support_early_exit_and_core_stages() {
+        let schema = build_scan_stage_efforts_schema(SCAN_ANALYSIS_STAGES);
+        assert_eq!(schema["type"], "object");
+        assert!(
+            schema.get("required").is_none(),
+            "scan stage_efforts schema must not require keys so early-exit can emit {{}}"
+        );
+        let props = schema["properties"].as_object().unwrap();
+        for def in SCAN_ANALYSIS_STAGES {
+            assert!(props.contains_key(def.name));
+        }
+
+        let mut early_exit_state = LinuxScanState::default();
+        let early_exit_out = ScanTriageOutput {
+            relevant_stages: vec![],
+            focus_targets: vec![],
+            stage_efforts: std::collections::BTreeMap::new(),
+        };
+        assert!(
+            validate_scan_triage_output_with_effort(&early_exit_out, &early_exit_state).is_ok()
+        );
+        apply_scan_triage_output(true, early_exit_out, &mut early_exit_state);
+        assert!(early_exit_state.planned_stages.is_empty());
+        assert!(early_exit_state.planned_efforts.is_empty());
+
+        let mut active_state = LinuxScanState::default();
+        let active_out = ScanTriageOutput {
+            relevant_stages: vec!["security".to_string()],
+            focus_targets: vec![],
+            stage_efforts: std::collections::BTreeMap::from([(
+                "security".to_string(),
+                "high".to_string(),
+            )]),
+        };
+        assert!(validate_scan_triage_output_with_effort(&active_out, &active_state).is_ok());
+        apply_scan_triage_output(true, active_out, &mut active_state);
+        assert_eq!(
+            active_state.planned_stages,
+            vec![
+                "implementation",
+                "execution-flow",
+                "resources",
+                "locking",
+                "security",
+            ]
+        );
+        assert_eq!(
+            active_state.planned_efforts.get("security"),
+            Some(&crate::ai::ReasoningEffort::High)
+        );
+        assert_eq!(
+            active_state.planned_efforts.get("implementation"),
+            Some(&crate::ai::ReasoningEffort::Medium)
+        );
+    }
+
+    #[test]
+    fn test_contract_audit_context_isolation_and_stage_resolution() {
+        let state = LinuxScanState {
+            chunk_id: "arch/arm64/kvm/nested.c:817-1170".to_string(),
+            file_path: "arch/arm64/kvm/nested.c".to_string(),
+            target_sha: "08f97454b7fa39bfcf82524955c0000000000000".to_string(),
+            start_line: 817,
+            end_line: 1170,
+            contract_notes: "### 1. Canonical Stage-2 MMU must be torn down unconditionally"
+                .to_string(),
+            external_callers: "virt/kvm/kvm_main.c:1200: kvm_arch_flush_shadow_all(kvm);"
+                .to_string(),
+            focus_targets: vec![ScanFocusTarget {
+                function: "invalidate_vncr_va".to_string(),
+                lines: "920-940".to_string(),
+                risk_category: "locking".to_string(),
+                hypothesis: "check vncr_tlb".to_string(),
+                callers_or_callees_to_check: vec![],
+            }],
+            planned_stages: vec!["implementation".to_string(), "resources".to_string()],
+            ..Default::default()
+        };
+
+        let track_a = linux_scan_system_prompt().render_for_log(&state);
+        assert!(
+            !track_a.contains("<architecture_contract_notes>"),
+            "Track A domain specialists must remain isolated from Agent 1 contract notes"
+        );
+        assert!(track_a.contains("<triage_focus_targets>"));
+
+        let track_b = linux_contract_audit_system_prompt().render_for_log(&state);
+        assert!(track_b.contains("<architecture_contract_notes>"));
+        assert!(track_b.contains("Canonical Stage-2 MMU must be torn down unconditionally"));
+        assert!(track_b.contains("<external_callers>"));
+        assert!(
+            !track_b.contains("<triage_focus_targets>"),
+            "Agent 2 contract-audit must not be anchored by Track A triage focus_targets"
+        );
+
+        let stages = resolve_scan_analysis_stages_with_options(&state, 4, 0.0);
+        assert_eq!(stages.len(), 3);
+        assert_eq!(stages[0].name(), "contract-audit");
+
+        let mut early_exit_state = state.clone();
+        early_exit_state.planned_stages.clear();
+        assert!(resolve_scan_analysis_stages_with_options(&early_exit_state, 4, 0.0).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_contract_cartographer_session_duplicate_guard_and_error_json() {
+        use crate::ai::session::LlmSession;
+        let tmp = tempfile::tempdir().unwrap();
+        let tb = std::sync::Arc::new(crate::toolbox::ToolBox::new(tmp.path().to_path_buf()));
+        let mut session = ContractCartographerSession {
+            file_path: "arch/arm64/kvm/nested.c",
+            target_sha: "08f97454b7fa39bfcf82524955c771d2d693d6fe",
+            maintainers_hint: None,
+            maintainer_notes: "",
+            numbered_full_source: "1: int f(void) { return 0; }",
+            external_headers: "",
+            external_callers: "",
+            tools: Some(tb),
+            last_tool_call: None,
+            temperature: 0.0,
+            effort: None,
+            context_tag: None,
+        };
+
+        let call = crate::ai::ToolCall {
+            id: "c1".to_string(),
+            function_name: "nonexistent_tool".to_string(),
+            arguments: json!({"path": "foo.c"}),
+            thought_signature: None,
+        };
+        let dup_call = crate::ai::ToolCall {
+            id: "c2".to_string(),
+            function_name: "nonexistent_tool".to_string(),
+            arguments: json!({"path": "foo.c"}),
+            thought_signature: None,
+        };
+        let results = session.call_tools(vec![call, dup_call]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[0].1.get("error").is_some(),
+            "unknown tool must return JSON error object rather than aborting session"
+        );
+        assert!(
+            results[1]
+                .1
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains("Duplicate tool call blocked")),
+            "consecutive identical tool call must be blocked"
+        );
     }
 }
