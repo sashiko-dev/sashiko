@@ -206,6 +206,42 @@ fn is_ping_subject(subject: &str) -> bool {
     subject_prefix_tokens(subject).any(|tok| tok.to_ascii_lowercase().starts_with("ping"))
 }
 
+/// Whether the leading bracketed subject prefixes declare a `git request-pull`
+/// email (`[GIT pull]`, `[GIT PULL]`, `[git-pull]`) rather than a patch or RFC.
+/// Bare `[PULL M/N]` tags without `GIT` are intentionally not matched so
+/// submaintainer pull series in projects such as QEMU continue to ingest.
+fn is_git_pull_subject(subject: &str) -> bool {
+    if is_rfc_subject(subject) {
+        return false;
+    }
+    let mut has_git = false;
+    let mut has_pull = false;
+    let mut has_git_pull = false;
+    let mut rest = subject.trim_start();
+    while let Some(after_open) = rest.strip_prefix('[') {
+        let Some((group, after_close)) = after_open.split_once(']') else {
+            break;
+        };
+        for tok in group
+            .split(|c: char| !c.is_alphanumeric() && c != '-')
+            .filter(|t| !t.is_empty())
+        {
+            if tok.eq_ignore_ascii_case("patch") || tok.eq_ignore_ascii_case("rfc") {
+                return false;
+            }
+            if tok.eq_ignore_ascii_case("git-pull") {
+                has_git_pull = true;
+            } else if tok.eq_ignore_ascii_case("git") {
+                has_git = true;
+            } else if tok.eq_ignore_ascii_case("pull") {
+                has_pull = true;
+            }
+        }
+        rest = after_close.trim_start();
+    }
+    has_git_pull || (has_git && has_pull)
+}
+
 pub fn is_promotable_reply_patch_subject(subject: &str) -> bool {
     let lower = subject.trim().to_lowercase();
     let starts_with_reply = lower.starts_with("re:")
@@ -515,9 +551,11 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
     let is_series_metadata = total > 1 || index == 0;
 
     // It is a patch or cover letter if:
-    // 1. It is NOT a reply (Re: ...)
+    // 1. It is NOT a reply (Re: ...) or a [GIT pull] request-pull email
     // 2. AND (It has [PATCH]/[RFC] tag OR it has a diff OR it looks like a series cover letter/part)
-    let is_patch_or_cover = !is_reply && (has_patch_tag || has_diff || is_series_metadata);
+    let is_patch_or_cover = !is_reply
+        && !is_git_pull_subject(&subject)
+        && (has_patch_tag || has_diff || is_series_metadata);
 
     let metadata = PatchsetMetadata {
         message_id: message_id.clone(),
@@ -2277,5 +2315,60 @@ diff --git a/f.c b/f.c\r\n";
             meta_explicit.in_reply_to.as_deref(),
             Some("direct-parent@example.com")
         );
+    }
+
+    #[test]
+    fn test_git_pull_request_is_not_ingested_as_patchset() {
+        for subject in [
+            "[GIT pull] timers/vdso for v7.4-rc1",
+            "[GIT PULL] x86/urgent: dispatch fixes for v7.3-rc5",
+            "[git-pull] irq/core for v7.4-rc1",
+            "[GIT][PULL] locking/core for v7.4-rc1",
+        ] {
+            let raw = format!(
+                "Message-ID: <pull@linutronix.de>\r\n\
+                 From: Thomas Gleixner <tglx@linutronix.de>\r\n\
+                 Subject: {subject}\r\n\
+                 \r\n\
+                 The following changes since commit 1234567890ab:\r\n\
+                 \r\n\
+                 diff --git a/kernel/time/timer.c b/kernel/time/timer.c\r\n\
+                 --- a/kernel/time/timer.c\r\n\
+                 +++ b/kernel/time/timer.c\r\n\
+                 @@ -1 +1 @@\r\n\
+                 -old\r\n\
+                 +new\r\n"
+            );
+            let (meta, _) = parse_email(raw.as_bytes()).unwrap();
+            assert!(
+                !meta.is_patch_or_cover,
+                "{subject:?} must not be classified as a patch or cover letter"
+            );
+        }
+
+        for subject in [
+            "[PATCH] git: fix pull request handling",
+            "[PATCH] doc: document [GIT pull] workflow",
+            "[RFC GIT pull] experimental change",
+            "[PULL 01/15] target/arm: implement feature",
+        ] {
+            let raw = format!(
+                "Message-ID: <patch@example.com>\r\n\
+                 From: Author <a@example.com>\r\n\
+                 Subject: {subject}\r\n\
+                 \r\n\
+                 diff --git a/f.c b/f.c\r\n\
+                 --- a/f.c\r\n\
+                 +++ b/f.c\r\n\
+                 @@ -1 +1 @@\r\n\
+                 -old\r\n\
+                 +new\r\n"
+            );
+            let (meta, _) = parse_email(raw.as_bytes()).unwrap();
+            assert!(
+                meta.is_patch_or_cover,
+                "{subject:?} must still be classified as a patch"
+            );
+        }
     }
 }
