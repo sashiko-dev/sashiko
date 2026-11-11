@@ -503,7 +503,7 @@ async fn load_file_chunks_with_limit(
         )
         .await
     {
-        for (chunk, prefetched) in chunks.iter_mut().zip(prefetched_blocks.into_iter()) {
+        for (chunk, prefetched) in chunks.iter_mut().zip(prefetched_blocks) {
             chunk.prefetched_headers = prefetched;
         }
     }
@@ -532,7 +532,7 @@ async fn load_file_chunks_with_limit(
             .await
         {
             whole_file_external_callers = whole_callers;
-            for (chunk, callers) in chunks.iter_mut().zip(chunk_callers.into_iter()) {
+            for (chunk, callers) in chunks.iter_mut().zip(chunk_callers) {
                 chunk.external_callers = callers;
             }
         }
@@ -1965,10 +1965,7 @@ fn extract_location_symbols(locations: &serde_json::Value) -> BTreeSet<(String, 
 
 fn strip_title_subsystem_prefix(title: &str) -> &str {
     let mut rest = title.trim();
-    loop {
-        let Some((head, tail)) = rest.split_once(':') else {
-            break;
-        };
+    while let Some((head, tail)) = rest.split_once(':') {
         // Keep C++/Rust `Type::method` intact.
         if tail.starts_with(':') {
             break;

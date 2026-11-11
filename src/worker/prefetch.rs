@@ -384,10 +384,7 @@ pub async fn prefetch_external_definitions_for_chunks(
     }
 
     let mut outputs = Vec::with_capacity(chunk_ranges_1based.len());
-    for (chunk_syms, file_ranges) in per_chunk_symbols
-        .into_iter()
-        .zip(per_chunk_ranges.into_iter())
-    {
+    for (chunk_syms, file_ranges) in per_chunk_symbols.into_iter().zip(per_chunk_ranges) {
         let mut range_map: LineRangeMap = BTreeMap::new();
         for sym in &chunk_syms {
             if let Some((def_path, start, end)) = resolved.get(sym) {
