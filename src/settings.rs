@@ -967,6 +967,8 @@ pub struct ServerSettings {
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
+    pub prometheus_metrics_enabled: bool,
+    #[serde(default)]
     pub testing_mode: bool,
     pub jwt_secret: Option<String>,
     /// Prints sign-in links in full to the log.
@@ -1000,6 +1002,7 @@ impl Default for ServerSettings {
             port: default_server_port(),
             public_base_url: None,
             read_only: false,
+            prometheus_metrics_enabled: false,
             testing_mode: false,
             jwt_secret: None,
             log_sign_in_links: false,
@@ -2385,6 +2388,7 @@ mod tests {
             port: 8080,
             public_base_url: Some("https://sashiko.example.org/".to_string()),
             read_only: false,
+            prometheus_metrics_enabled: false,
             testing_mode: false,
             jwt_secret: None,
             log_sign_in_links: false,
@@ -2405,6 +2409,7 @@ mod tests {
             port: 8080,
             public_base_url: Some("https://sashiko.example.org/".to_string()),
             read_only: false,
+            prometheus_metrics_enabled: false,
             testing_mode: false,
             jwt_secret: None,
             log_sign_in_links: false,
