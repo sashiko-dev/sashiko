@@ -76,8 +76,6 @@ spec:
               value: "gcc"
             - name: SASHIKO__PROJECT__NAME
               value: "Sashiko"
-            - name: SASHIKO__PROJECT__DESCRIPTION
-              value: "Sashiko reviewing GCC"
             - name: SASHIKO__PROJECT__DOMAIN
               value: "gcc.sashiko.dev"
             - name: SASHIKO__DATABASE__URL

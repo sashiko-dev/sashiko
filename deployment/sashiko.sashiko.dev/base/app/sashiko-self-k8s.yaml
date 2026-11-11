@@ -113,8 +113,6 @@ spec:
               value: "sashiko"
             - name: SASHIKO__PROJECT__NAME
               value: "Sashiko"
-            - name: SASHIKO__PROJECT__DESCRIPTION
-              value: "Sashiko reviewing Sashiko"
             - name: SASHIKO__PROJECT__DOMAIN
               value: "sashiko.sashiko.dev"
             - name: SASHIKO__DATABASE__URL

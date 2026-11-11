@@ -549,27 +549,23 @@
             <span class="modal-close" onclick="closeAbout()">&times;</span>
             <div class="about-logo">
                 <img src="static/logo.png" style="height: 1.5em; margin-right: 12px;" alt="Sashiko Logo">
-                About <span id="about-modal-project-name">Sashiko</span>
+                <span>About <span id="about-modal-project-name">Sashiko</span></span>
             </div>
             <div class="about-text" id="about-text-content">
                 <blockquote>
-                    <strong>Sashiko</strong> (刺し子, literally "little stabs") is a form of decorative reinforcement stitching from Japan. Originally used to reinforce points of wear or to repair worn places or tears with patches, here it represents our mission to reinforce the Linux kernel through automated, intelligent patch review.
+                    <strong>Sashiko</strong> (刺し子, literally "little stabs") is a form of decorative reinforcement stitching from Japan. Originally used to reinforce points of wear or to repair worn places or tears with patches, here it represents our mission to reinforce the Linux kernel and other critical open-source systems software through automated, intelligent patch review.
                 </blockquote>
 
                 <p>
-                    Sashiko is an agentic Linux kernel code review system. It monitors public mailing lists to thoroughly evaluate proposed Linux kernel changes. The system acts like a team of specialized reviewers covering domains from high-level architecture verification and security audits to low-level resource management and concurrency analysis.
+                    Sashiko is a self-contained, agentic code review system built primarily for the Linux kernel, with dedicated profiles for GCC, QEMU, Zephyr RTOS, and Sashiko itself. Acting like a team of specialized reviewers across architecture, execution flow, resource lifetimes, concurrency, and security, it combines a multi-stage verification protocol with a three-layer prompt architecture (source-verified code notes, maintainer notes, and review procedures) to maximize accuracy and minimize false positives.
                 </p>
 
                 <p>
-                    It combines a multi-stage verification protocol with Sashiko's own three-layer prompt architecture—automatic code notes verified directly against the kernel source tree, subsystem maintainer notes, and universal review procedures—to maximize accuracy and minimize false positives.
+                    Sashiko is an open-source project of the <strong>Linux Foundation</strong>, licensed under the <strong>Apache License, Version 2.0</strong>.
                 </p>
 
-                <p>
-                    This is an open-source project that belongs to the <strong>Linux Foundation</strong>, licensed under the <strong>Apache License, Version 2.0</strong>.
-                </p>
-
-                <p>
-                    This particular instance of Sashiko is provided as a service and is actively <strong>reviewing all LKML (Linux Kernel Mailing List) submissions</strong>. All compute resources and LLM tokens utilized for these automated reviews are proudly provided and funded by <strong>Google</strong>.
+                <p id="about-instance-note">
+                    This public instance (<strong>sashiko.dev</strong>) actively reviews <strong>Linux kernel</strong> mailing list submissions (<code>lore.kernel.org</code>) and tracks verified pre-existing bugs. All compute resources and LLM tokens utilized for these automated reviews are proudly provided and funded by <strong>Google</strong>.
                 </p>
             </div>
             <div style="margin-top: 32px; text-align: center;">
@@ -1021,18 +1017,40 @@
             return (!proj || base.includes(':')) ? base : `${base}: ${proj}`;
         }
 
+        function updateAboutModal() {
+            const aboutNameEl = document.getElementById('about-modal-project-name');
+            if (aboutNameEl) aboutNameEl.textContent = (config.project_name || 'Sashiko').trim() || 'Sashiko';
+
+            const noteEl = document.getElementById('about-instance-note');
+            if (!noteEl) return;
+
+            const desc = (config.project_description || '').trim();
+            if (desc && !/^sashiko reviewing\b/i.test(desc)) {
+                noteEl.textContent = desc;
+                return;
+            }
+
+            const domain = ((config.project_domain || '').trim() || window.location.hostname || '').toLowerCase();
+            const googleNote = ' All compute resources and LLM tokens utilized for these automated reviews are proudly provided and funded by <strong>Google</strong>.';
+            if (domain === 'sashiko.dev' || domain === 'www.sashiko.dev') {
+                noteEl.innerHTML = 'This public instance (<strong>sashiko.dev</strong>) actively reviews <strong>Linux kernel</strong> mailing list submissions (<code>lore.kernel.org</code>) and tracks verified pre-existing bugs.' + googleNote;
+            } else if (domain === 'gcc.sashiko.dev') {
+                noteEl.innerHTML = 'This official pilot instance (<strong>gcc.sashiko.dev</strong>) reviews <strong>GCC</strong> (GNU Compiler Collection) patches from <code>gcc-patches@gcc.gnu.org</code> and tracks verified pre-existing bugs.' + googleNote;
+            } else if (domain === 'sashiko.sashiko.dev') {
+                noteEl.innerHTML = 'This production instance (<strong>sashiko.sashiko.dev</strong>) reviews pull requests to <strong>Sashiko\'s own repository</strong> (<code>sashiko-dev/sashiko</code>) and tracks verified pre-existing bugs.' + googleNote;
+            } else {
+                const proj = escapeHtml((config.project || 'Linux').trim() || 'Linux');
+                noteEl.innerHTML = `This instance is configured to review <strong>${proj}</strong> changes.`;
+            }
+        }
+
         async function fetchConfig() {
             try {
                 const res = await fetch('/api/config');
                 if (res.ok) {
                     config = await res.json();
                     document.title = getHeaderTitle();
-                    const aboutContentEl = document.getElementById('about-text-content');
-                    if (aboutContentEl && config.project_description && config.project_description.trim() !== "") {
-                        aboutContentEl.innerHTML = `<p>${escapeHtml(config.project_description)}</p>`;
-                    }
-                    const aboutNameEl = document.getElementById('about-modal-project-name');
-                    if (aboutNameEl) aboutNameEl.textContent = config.project_name || 'Sashiko';
+                    updateAboutModal();
                 }
             } catch (e) { console.error("Failed to load config", e); }
         }
@@ -1879,7 +1897,7 @@
                     if (tbody) {
                         tbody.innerHTML = `<tr><td colspan="100%" style="text-align: center; padding: 48px 16px;">
                             <div style="font-weight: 500; font-size: 1.1em; margin-bottom: 8px;">Authentication Required</div>
-                            <div class="text-muted-sm" style="margin-bottom: 16px;">Please sign in to view Linux kernel bugs.</div>
+                            <div class="text-muted-sm" style="margin-bottom: 16px;">Please sign in to view tracked bugs.</div>
                             <button class="primary" onclick="openAuthModal('Please sign in to access bugs.')">Sign In</button>
                         </td></tr>`;
                     }
@@ -2469,9 +2487,9 @@
             if (data.bugs && Array.isArray(data.bugs) && data.bugs.length > 0) {
                 preexistingBugsHtml = `
                     <div class="section" id="preexisting-bugs">
-                        <h2>Discovered Linux Kernel Bugs (${data.bugs.length})</h2>
+                        <h2>Discovered Pre-existing Bugs (${data.bugs.length})</h2>
                         <div style="margin-bottom: 12px; color: var(--text-muted); font-size: 0.9em;">
-                            The following Linux Kernel defects in the codebase were identified during review (separated from patch regressions):
+                            The following pre-existing defects in the codebase were identified during review (separated from patch regressions):
                         </div>
                         ${data.bugs.map(b => {
                             const sevStr = b.severity || 'Unknown';
@@ -2882,7 +2900,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         async function renderBugView(slugOrId, initialTab) {
             const queryParam = /^\d+$/.test(slugOrId) ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
             const res = await fetch(`/api/bug?${queryParam}`);
-            if (handleBugViewHttpError(res, slugOrId, 'Please sign in to access Linux kernel bugs.')) return;
+            if (handleBugViewHttpError(res, slugOrId, 'Please sign in to access tracked bugs.')) return;
             if (!res.ok) throw new Error(`Bug could not be loaded (${res.status} ${res.statusText})`);
 
             const data = await res.json();
@@ -3131,7 +3149,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         <input type="hidden" id="bugActionTargetId" value="">
                         <div id="bugActionDuplicateSection" style="display: none; margin-bottom: 12px;">
                             <div style="margin-bottom: 6px;"><strong>Canonical Bug ID:</strong></div>
-                            <input type="text" id="bugActionDuplicateId" placeholder="linux-…" oninput="saveBugActionDraft()" style="width: 100%; max-width: 400px;">
+                            <input type="text" id="bugActionDuplicateId" placeholder="${escapeHtml(((config.project || 'linux').trim() || 'linux').toLowerCase())}-…" oninput="saveBugActionDraft()" style="width: 100%; max-width: 400px;">
                             <div style="font-size: 0.85em; color: var(--text-muted); margin-top: 4px;">Paste the bug ID shown at the top of the existing bug.</div>
                         </div>
                         <div id="bugActionAssignSection" style="display: none; margin-bottom: 12px;">
