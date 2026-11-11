@@ -1,13 +1,10 @@
 # Configuration Reference
 
-Sashiko is configured through two files:
+Sashiko is configured through three files:
 
 - **Settings.toml** -- application settings (AI, server, git, review)
 - **projects/\<project\>/mailing_lists.toml** -- per-mailing-list tracking, embargo, email delivery, and Patchwork policy
-
-Linux deployments also read
-[projects/linux/upstream_maintainers.toml](#projectslinuxupstream_maintainerstoml),
-which widens bug and embargo access for upstream maintainers.
+- **[projects/\<project\>/bugs_access.toml](#projectsprojectbugs_accesstoml)** -- optional bug and embargo access grants and `MAINTAINERS` access overrides
 
 This page is the complete reference. The files in the repository are
 starting points, each with one job:
@@ -615,33 +612,66 @@ context: sashiko
 
 Downstream tools can parse this format with simple line splitting.
 
-## `projects/linux/upstream_maintainers.toml`
+## `projects/<project>/bugs_access.toml`
 
-Grants that give the maintainers (`M:` and `R:`) of an existing MAINTAINERS
-section the same access as if the section listed extra paths: they can see
-and manage bugs, and see embargoed review results and review transcripts, for
-changes to those paths. Use it for maintainers who receive pull requests for
-a subtree they do not own in MAINTAINERS, such as the SoC group. Mail routing
-and the subsystems displayed for a bug or patchset still follow MAINTAINERS
-only. Only the Linux project reads this file; a missing file means no grants.
+Extends or overrides `MAINTAINERS` strictly for Sashiko access control (bugs,
+embargoed review results, review transcripts, and sign-in eligibility) across
+all projects. Mail routing, `T:` baseline trees, contributor authority, and the
+subsystem names displayed for a bug or patchset still follow `MAINTAINERS` (or
+directory prefixes on projects without `MAINTAINERS`). A missing file means no
+grants; on Linux, a legacy `projects/linux/upstream_maintainers.toml` is still
+loaded with a deprecation warning when `projects/linux/bugs_access.toml` is
+absent.
 
 ```toml
+# 1. Upstream pull-request receivers: widen paths for an existing MAINTAINERS
+#    section's M:/R: maintainers.
 [[grant]]
 section = "ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)"
 paths = ["arch/*/boot/dts/", "drivers/soc/", "drivers/firmware/"]
+
+# 2. Subsystem developer group: grant separate read-only (`read`) and
+#    read-write (`read_write` / `"read-write"`) access on an existing section.
+[[grant]]
+section = "BTRFS FILE SYSTEM"
+read = ["dev1@example.org", "Developer Two <dev2@example.org>"]
+read_write = ["co-maintainer@example.org"]
+
+# 3. Custom or standalone path grant (works on Linux and non-Linux projects):
+[[grant]]
+section = "BTRFS ZONED" # optional when `paths` + (`read` or `read_write`) are set
+paths = ["fs/btrfs/zoned.*"]
+exclude_paths = ["fs/btrfs/tests/"]
+read = ["zoned-reader@example.org"]
+read_write = ["zoned-lead@example.org"]
+
+# 4. Override an existing MAINTAINERS section's emails or paths:
+[[grant]]
+section = "LEGACY SUBSYSTEM"
+replace_emails = true
+read_write = ["active-maintainer@example.org"]
+exclude_paths = ["drivers/legacy/unmaintained/"]
 ```
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `section` | string | Title of an existing MAINTAINERS section, matched case insensitively. |
-| `paths` | list | Paths in the MAINTAINERS `F:` syntax. A trailing slash covers the whole subtree. Paths that cover the whole tree (`*`, `*/`, `**`) are rejected. |
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `section` | string | optional | Existing `MAINTAINERS` section title (matched case- and whitespace-insensitively) or a custom section title. Optional when `paths` and at least one of `read` / `read_write` are non-empty. |
+| `paths` | list | `[]` | `MAINTAINERS` `F:`-style file patterns to include. A trailing slash covers the whole subtree. Whole-tree patterns (`*`, `*/`, `**`) are rejected. |
+| `exclude_paths` | list | `[]` | `MAINTAINERS` `X:`-style file patterns to exclude (takes precedence over `paths` and inherited `F:`/`N:` patterns). |
+| `replace_paths` | bool | `false` | Discard inherited `MAINTAINERS` `F:`/`X:`/`N:` patterns for `section` and match only `paths` minus `exclude_paths`. Requires non-empty `paths`. |
+| `read` | list | `[]` | Bare addresses (`user@domain`) or `Name <user@domain>` entries granted read-only access: may sign in, list and read bugs in the **Bugs** tab (including reproducers), and view embargoed reviews and transcripts, without commenting or changing state. |
+| `read_write` | list | `[]` | Addresses granted full maintainer read-write access (also accepted as `"read-write"`): may comment, attach fixes/reproducers, close, dismiss, assign, deduplicate, re-evaluate security, and release embargoes. |
+| `exclude_emails` | list | `[]` | Addresses removed from `section` before `read` and `read_write` apply. |
+| `replace_emails` | bool | `false` | Discard inherited `MAINTAINERS` `M:`/`R:` addresses for `section` before applying `read` and `read_write`. |
+| `access` | string | `"read_write"` | Optional `"read"` or `"read_write"` (`"read-write"`) for path-only grants on an existing `MAINTAINERS` section when `read` and `read_write` are omitted. |
 
-The file is read at daemon startup. A grant whose section is missing or is a
-catch-all section (THE REST), or whose paths are invalid, is dropped with an
-error; a file that cannot be parsed grants nothing. When the loaded grants
-differ from the ones the stored access rows were derived from, startup
-re-derives those rows for every bug and patchset, so adding or removing a
-grant takes effect on existing data after a restart.
+The file is read at startup. Malformed entries, catch-all sections (`THE REST`),
+missing `MAINTAINERS` sections without both `paths` and `read`/`read_write`, and
+entries combining `paths` and `read`/`read_write` on an existing `MAINTAINERS`
+section without `replace_paths` or `replace_emails` are dropped with an error.
+Email-only edits (`read`, `read_write`, `exclude_emails`, `replace_emails`)
+take effect immediately in memory with no database walk; when path rules change,
+startup reconciles stored access rows across existing bugs and patchsets.
 
 ## Environment variables
 
