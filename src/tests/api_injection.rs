@@ -728,3 +728,87 @@ async fn threaded_mailing_list_cover_and_patch_group() {
         assert_eq!(db.count_patchsets(None, None).await.unwrap(), 1);
     }
 }
+
+/// quilt mail omits In-Reply-To and links patches to the cover letter solely
+/// via References, with Message-IDs that share no git-send-email hyphen stem
+/// and arrive out of order over NNTP.
+#[tokio::test]
+async fn quilt_mail_references_only_series_collects_in_any_order() {
+    let cover_id = "20261105165525.011876858@infradead.org";
+    let p1_id = "20261105170157.453569788@infradead.org";
+    let p2_id = "20261105170157.616859418@infradead.org";
+    let p3_id = "20261105170157.765325702@infradead.org";
+
+    let cover = format!(
+        "Message-Id: <{cover_id}>\r\n\
+From: Peter Zijlstra <peterz@infradead.org>\r\n\
+Subject: [PATCH 0/3] sched/fair: Fix cgroup::idle preemption\r\n\
+User-Agent: quilt/0.68\r\n\
+\r\n\
+Hi!\r\n"
+    )
+    .into_bytes();
+
+    let quilt_part = |id: &str, subj: &str, file: &str| {
+        format!(
+            "Message-Id: <{id}>\r\n\
+From: Peter Zijlstra <peterz@infradead.org>\r\n\
+Subject: {subj}\r\n\
+References: <{cover_id}>\r\n\
+User-Agent: quilt/0.68\r\n\
+\r\n\
+Commit message.\r\n\
+---\r\n\
+--- a/{file}\r\n\
++++ b/{file}\r\n\
+@@ -1 +1 @@\r\n\
+-old\r\n\
++new\r\n"
+        )
+        .into_bytes()
+    };
+
+    let p1 = quilt_part(
+        p1_id,
+        "[PATCH 1/3] sched/fair: Use guard in sched_group_set_idle()",
+        "kernel/sched/fair.c",
+    );
+    let p2 = quilt_part(
+        p2_id,
+        "[PATCH 2/3] sched/fair: Make cfs_rq::idle the sum of ancestor tg::idle",
+        "kernel/sched/debug.c",
+    );
+    let p3 = quilt_part(
+        p3_id,
+        "[RFC][PATCH 3/3] sched/eevdf: Fix sched idle task group preemption",
+        "kernel/sched/eevdf.c",
+    );
+
+    for batch in [
+        vec![&cover[..], &p1[..], &p2[..], &p3[..]],
+        // Out-of-order NNTP delivery: patches arrive before 0/3 cover letter.
+        vec![&p2[..], &p1[..], &cover[..], &p3[..]],
+        vec![&p3[..], &p2[..], &p1[..], &cover[..]],
+    ] {
+        let db = test_db().await;
+        ingest_list_messages(&db, &batch).await;
+        assert_eq!(db.count_patchsets(None, None).await.unwrap(), 1);
+        let ps_id = db
+            .find_patchset_id_by_msgid(cover_id)
+            .await
+            .unwrap()
+            .expect("series should adopt cover letter identity");
+        let details = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            details["subject"],
+            "[PATCH 0/3] sched/fair: Fix cgroup::idle preemption"
+        );
+        assert_eq!(details["total_parts"], 3);
+        assert_eq!(details["received_parts"], 3);
+        assert_eq!(details["status"], "Pending");
+    }
+}
