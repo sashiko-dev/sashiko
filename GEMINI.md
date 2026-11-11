@@ -62,7 +62,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `toolbox/`: Agent tools for inspecting git repositories and worktrees.
 - `ai/`: LLM provider integrations, session runner, and response caching.
 - `auth.rs` & `access.rs`: Authentication (`LocalToken`, JWTs) and capability/subsystem bug access control (`Principal`, `BugAccess`).
-- `maintainers.rs`: `MAINTAINERS` file parser and subsystem/maintainer lookup index.
+- `maintainers.rs` & `bugs_access.rs`: `MAINTAINERS` file parser, subsystem/maintainer lookup index, and `projects/<project>/bugs_access.toml` grants and overrides.
 - `ingestor.rs`, `fetcher.rs`, `mbox.rs`, `nntp.rs`, `patchwork.rs`, `backfill.rs`: Mailing list, Lore mbox, NNTP, and Patchwork ingestion pipelines.
 - `reviewer.rs`: Patchset review worker orchestration.
 - `local_review.rs` & `scan.rs`: Local review execution (`sashiko review`) and active codebase scanning (`sashiko scan`).
@@ -85,7 +85,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `--no-default-features`: Minimal build for `sashiko` local review (`sashiko init`, `sashiko review`) and `sashiko-cli` without `libsql`, `axum`, `lettre`, or `jsonwebtoken` (`--features cache` adds the local AI response cache).
 
 ## Configuration, Prompts & Docs
-- `Settings.toml` & `projects/<project>/mailing_lists.toml`: Main application and per-mailing-list tracking/delivery policy configuration (`projects/linux/mailing_lists.toml` by default; see `projects/linux/MAINTAINERS_GUIDE.md` for Linux maintainer onboarding and policy guidance).
+- `Settings.toml`, `projects/<project>/mailing_lists.toml` & `projects/<project>/bugs_access.toml`: Main application, per-mailing-list tracking/delivery policy, and subsystem bug/embargo access configuration (`projects/linux/mailing_lists.toml` by default; see `projects/linux/MAINTAINERS_GUIDE.md` for Linux maintainer onboarding and policy guidance).
 - `projects/linux/prompts/`: Primary Linux kernel review prompts (bundled as `kernel/`): review procedures, maintainer notes (`maintainers/`), and code notes (`notes/`); its `README.md` describes the layout.
 - `projects/gcc/prompts/`: Official GCC pilot review prompts (`--project gcc`): review procedures (`*.md`), maintainer notes (`maintainers/`), and generated code notes (`notes/`).
 - `projects/sashiko/prompts/`: First-party review prompts for reviewing Sashiko itself (`--project sashiko`): review procedures (`*.md`), maintainer notes (`projects/sashiko/prompts/maintainers/`), and code notes (`notes/`).

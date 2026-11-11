@@ -17,20 +17,42 @@ To request tracking for a new lore or NNTP mailing list, you can either:
 1.  **Submit a Pull Request:** Add a `["<list-email>"]` section to [`projects/linux/mailing_lists.toml`](mailing_lists.toml). Sashiko automatically derives the Lore NNTP group name by reversing the domain components and appending the list's local part (e.g., `bpf@vger.kernel.org` becomes `org.kernel.vger.bpf`). If the NNTP group name on `nntp.lore.kernel.org` does not follow this convention, set `nntp_group = "..."` explicitly in the section.
 2.  **Send an Email:** Contact the Sashiko development mailing list (`sashiko@lists.linux.dev`) and `Cc: Roman Gushchin <roman.gushchin@linux.dev>` with your request.
 
-## Access for Upstream Maintainers
+## Bug and Embargo Access (`bugs_access.toml`)
 
-Sashiko shows bugs, embargoed review results and review transcripts to the
-maintainers of the MAINTAINERS sections that cover the changed files. If you
-receive pull requests for a subtree that MAINTAINERS does not list under your
-section (for example, the SoC group for platform device trees and SoC
-drivers), send a pull request adding a grant to
-[`projects/linux/upstream_maintainers.toml`](upstream_maintainers.toml) that
-names your section and the paths you receive pull requests for. Everyone
-listed on that section with `M:` or `R:` then gets the same access to those
-paths as the platform maintainers, without any change to MAINTAINERS or to
-who is copied on patches. See
-[docs/configuration.md](../../docs/configuration.md#projectslinuxupstream_maintainerstoml)
-for the file format.
+Sashiko shows bugs, embargoed review results, and review transcripts to the
+maintainers (`M:` and `R:`) of the `MAINTAINERS` sections that cover the changed
+files. When `MAINTAINERS` alone does not match how your subsystem works, send a
+pull request updating [`projects/linux/bugs_access.toml`](bugs_access.toml) to
+extend or override access without changing `MAINTAINERS` or `get_maintainer.pl`
+patch recipients:
+
+*   **Subsystem developer groups (`read` and `read_write`):** Grant developers
+    who are not listed in `MAINTAINERS` read-only (`read = [...]`) or full
+    maintainer (`read_write = [...]`) access to your section's **Bugs** tab and
+    embargoed reviews:
+    ```toml
+    [[grant]]
+    section = "BTRFS FILE SYSTEM"
+    read = ["dev1@example.org", "Developer Two <dev2@example.org>"]
+    read_write = ["co-maintainer@example.org"]
+    ```
+*   **Upstream pull-request receivers (`paths`):** If you receive pull requests
+    for a subtree that `MAINTAINERS` does not list under your section (such as
+    the SoC group for platform device trees and SoC drivers), grant your
+    section's `M:` and `R:` maintainers access to those paths (optionally with
+    `access = "read"` for read-only visibility):
+    ```toml
+    [[grant]]
+    section = "ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)"
+    paths = ["arch/*/boot/dts/", "drivers/soc/", "drivers/firmware/"]
+    ```
+*   **Custom sub-sections and overrides:** Define standalone path-scoped grants
+    (`paths` + `read` / `read_write`) or override inherited `MAINTAINERS` emails
+    and paths (`exclude_emails`, `replace_emails`, `exclude_paths`,
+    `replace_paths`).
+
+See [docs/configuration.md](../../docs/configuration.md#projectsprojectbugs_accesstoml)
+for the complete schema.
 
 ## Adding and Updating Maintainer Notes
 
