@@ -252,6 +252,88 @@ pub fn verify_token(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::e
 }
 
 #[cfg(feature = "server")]
+pub(crate) fn authenticate_bearer_header(
+    headers: &axum::http::HeaderMap,
+    state: &crate::server::AppState,
+) -> Result<AuthUser, (StatusCode, &'static str)> {
+    let mut values = headers.get_all(axum::http::header::AUTHORIZATION).iter();
+    let Some(raw) = values.next() else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Please log in to access bugs repository.",
+        ));
+    };
+    if values.next().is_some() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Multiple Authorization headers are not allowed.",
+        ));
+    }
+
+    let token = raw
+        .to_str()
+        .ok()
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or((StatusCode::UNAUTHORIZED, "Invalid Authorization header."))?;
+
+    let secret = state
+        .settings
+        .server
+        .jwt_secret
+        .clone()
+        .or_else(|| std::env::var("JWT_SECRET").ok())
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Your session has expired or is invalid. Please log in again.",
+        ))?;
+
+    let claims = verify_token(token, &secret).map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Your session has expired or is invalid. Please log in again.",
+        )
+    })?;
+
+    match claims.typ.as_deref() {
+        Some("session") | Some("api_token") => {}
+        _ => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Invalid token type. Only session or API tokens are accepted.",
+            ));
+        }
+    }
+
+    if let Some(level) = claims.max_bug_access.as_deref()
+        && crate::access::BugAccess::parse(level).is_none()
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid max_bug_access claim in token.",
+        ));
+    }
+
+    if state.settings.server.acl.is_blocklisted(&claims.sub)
+        || claims
+            .sid
+            .as_deref()
+            .is_some_and(|sid| state.settings.server.acl.is_blocklisted(sid))
+    {
+        return Err((StatusCode::FORBIDDEN, "User is blocklisted."));
+    }
+
+    Ok(AuthUser {
+        email: claims.sub,
+        iat: claims.iat,
+        sid: claims.sid,
+        typ: claims.typ,
+        max_bug_access: claims.max_bug_access,
+    })
+}
+
+#[cfg(feature = "server")]
 impl FromRequestParts<std::sync::Arc<crate::server::AppState>> for AuthUser {
     type Rejection = (StatusCode, &'static str);
 
@@ -259,81 +341,35 @@ impl FromRequestParts<std::sync::Arc<crate::server::AppState>> for AuthUser {
         parts: &mut Parts,
         state: &std::sync::Arc<crate::server::AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let auth_header = parts
-            .headers
-            .get("Authorization")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "));
-
-        let token = match auth_header {
-            Some(token) => token,
-            None => {
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    "Please log in to access bugs repository.",
-                ));
-            }
-        };
-
-        // Use the same configured secret as the login and authorization endpoints.
-        let secret = match state
-            .settings
-            .server
-            .jwt_secret
-            .clone()
-            .or_else(|| std::env::var("JWT_SECRET").ok())
-        {
-            Some(s) => s,
-            None => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "JWT_SECRET is not configured on the server.",
-                ));
-            }
-        };
-
-        match verify_token(token, &secret) {
-            Ok(claims) => {
-                match claims.typ.as_deref() {
-                    Some("session") | Some("api_token") => {}
-                    _ => {
-                        return Err((
-                            StatusCode::UNAUTHORIZED,
-                            "Invalid token type. Only session or API tokens are accepted.",
-                        ));
-                    }
-                }
-                Ok(AuthUser {
-                    email: claims.sub,
-                    iat: claims.iat,
-                    sid: claims.sid,
-                    typ: claims.typ,
-                    max_bug_access: claims.max_bug_access,
-                })
-            }
-            Err(_) => Err((
-                StatusCode::UNAUTHORIZED,
-                "Your session has expired or is invalid. Please log in again.",
-            )),
-        }
+        authenticate_bearer_header(&parts.headers, state)
     }
 }
 
 #[cfg(feature = "server")]
 pub struct OptionalAuthUser(pub Option<AuthUser>);
 
+/// Resolves an optional JWT identity without swallowing invalid credentials.
+///
+/// Omitting the `Authorization` header (or presenting the daemon's local
+/// operator token) yields `None`; presenting any other `Authorization` header
+/// must validate as an active, non-blocklisted session or API token, otherwise
+/// the request is rejected before reaching the handler.
 #[cfg(feature = "server")]
 impl FromRequestParts<std::sync::Arc<crate::server::AppState>> for OptionalAuthUser {
-    type Rejection = std::convert::Infallible;
+    type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &std::sync::Arc<crate::server::AppState>,
     ) -> Result<Self, Self::Rejection> {
-        match AuthUser::from_request_parts(parts, state).await {
-            Ok(user) => Ok(OptionalAuthUser(Some(user))),
-            Err(_) => Ok(OptionalAuthUser(None)),
+        if !parts
+            .headers
+            .contains_key(axum::http::header::AUTHORIZATION)
+            || crate::server::presents_local_token(&parts.headers, state)
+        {
+            return Ok(OptionalAuthUser(None));
         }
+        authenticate_bearer_header(&parts.headers, state).map(|user| OptionalAuthUser(Some(user)))
     }
 }
 #[cfg(test)]

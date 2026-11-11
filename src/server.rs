@@ -377,8 +377,26 @@ pub fn build_router(
             get_service(ServeFile::new("static/index.html")),
         )
         .nest_service("/static", ServeDir::new("static"))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            reject_invalid_authorization,
+        ))
         .layer(middleware::from_fn(redirect_www))
         .with_state(state)
+}
+
+async fn reject_invalid_authorization(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Result<axum::response::Response, (StatusCode, &'static str)> {
+    let headers = request.headers();
+    if headers.contains_key(axum::http::header::AUTHORIZATION)
+        && !presents_local_token(headers, &state)
+    {
+        crate::auth::authenticate_bearer_header(headers, &state)?;
+    }
+    Ok(next.run(request).await)
 }
 
 pub async fn run_server(
@@ -1399,17 +1417,19 @@ async fn bug_access_for_query(
 /// Resolves the caller's standing for a single-bug read route.
 ///
 /// Addressing a bug by its `bugid` / `slug` is a capability read, so an
-/// unauthenticated caller (or one holding an expired session) resolves to the
-/// anonymous principal rather than being rejected with 401. Addressing a bug
-/// by its sequential numeric `id` requires a valid session or API token.
+/// unauthenticated caller (no `Authorization` header, or the local operator
+/// token) resolves to the anonymous principal rather than being rejected with
+/// 401; invalid, expired, or revoked `Authorization` tokens are rejected before
+/// reaching here. Addressing a bug by its sequential numeric `id` requires an
+/// authenticated principal.
 fn resolve_bug_read_principal(
-    principal: Result<Principal, (StatusCode, &'static str)>,
+    principal: Principal,
     query: &BugQuery,
 ) -> Result<Principal, StatusCode> {
-    match principal {
-        Ok(p) => Ok(p),
-        Err(_) if query.by_bugid() => Ok(Principal::anonymous()),
-        Err((status, _)) => Err(status),
+    if principal.is_authenticated() || query.by_bugid() {
+        Ok(principal)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
     }
 }
 
@@ -1610,7 +1630,7 @@ fn attach_security_fields(
 }
 
 async fn get_bug(
-    principal: Result<Principal, (StatusCode, &'static str)>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -2024,7 +2044,7 @@ async fn analyze_bug(
 }
 
 async fn render_bug_markdown_response(
-    principal: Result<Principal, (StatusCode, &'static str)>,
+    principal: Principal,
     state: &AppState,
     headers: &axum::http::HeaderMap,
     query: &BugQuery,
@@ -2068,7 +2088,7 @@ async fn render_bug_markdown_response(
 }
 
 async fn get_bug_markdown(
-    principal: Result<Principal, (StatusCode, &'static str)>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Query(query): Query<BugQuery>,
@@ -2077,7 +2097,7 @@ async fn get_bug_markdown(
 }
 
 async fn bug_path_handler(
-    principal: Result<Principal, (StatusCode, &'static str)>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Path(bugid): Path<String>,
@@ -3574,6 +3594,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoked_cancel.status(), StatusCode::FORBIDDEN);
+        let revoked_public = client
+            .get(format!("http://{}/api/patchsets", addr))
+            .bearer_auth(&revoked_session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(revoked_public.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -3715,7 +3742,7 @@ mod tests {
             .await
             .unwrap()
             .status();
-        assert_eq!(unparsed_wrong_token, 403);
+        assert_eq!(unparsed_wrong_token, 401);
 
         let unparsed_authorized = client
             .post(&submit)
@@ -3740,7 +3767,7 @@ mod tests {
             .unwrap()
             .status();
         assert_eq!(
-            wrong, 403,
+            wrong, 401,
             "a token this server did not write must not ingest"
         );
 
@@ -5561,7 +5588,7 @@ mod tests {
         ] {
             let principal = Principal::resolve(email, &acl, Some(&index));
             let Json(body) = get_bug(
-                Ok(principal.clone()),
+                OptionalPrincipal(principal.clone()),
                 State(state.clone()),
                 Query(BugQuery {
                     id: Some(id),
@@ -5580,7 +5607,7 @@ mod tests {
                 );
             }
             let md_resp = get_bug_markdown(
-                Ok(principal.clone()),
+                OptionalPrincipal(principal.clone()),
                 State(state.clone()),
                 axum::http::HeaderMap::new(),
                 Query(BugQuery {
@@ -5672,7 +5699,7 @@ mod tests {
             ("hidden", vec!["canonical", "sibling"]),
         ] {
             let Json(body) = get_bug(
-                Err((StatusCode::UNAUTHORIZED, "no token")),
+                OptionalPrincipal(Principal::anonymous()),
                 State(state.clone()),
                 Query(BugQuery {
                     id: None,
@@ -5723,7 +5750,7 @@ mod tests {
             .unwrap();
         let b_principal = Principal::resolve("b@example.org", &acl, Some(&index));
         let Json(reparented_body) = get_bug(
-            Ok(b_principal.clone()),
+            OptionalPrincipal(b_principal.clone()),
             State(state.clone()),
             Query(BugQuery {
                 id: Some(ids[1]),
@@ -5886,7 +5913,7 @@ mod tests {
         // Knowing the bugid or slug grants read-only access on GET /api/bug
         // for both anonymous and unprivileged authenticated callers, while
         // GET /api/bug/enrichments remains gated by Principal authority.
-        for bearer in [None, Some("nonsense".into()), Some(stranger.clone())] {
+        for bearer in [None, Some(stranger.clone())] {
             for query in ["bugid=linux-authz01", "slug=linux-authz01"] {
                 let res = get(format!("/api/bug?{}", query), bearer.clone())
                     .await
@@ -5931,6 +5958,57 @@ mod tests {
                 assert_eq!(missing.status(), 404);
             }
         }
+
+        // Presenting an invalid or expired Authorization header is rejected
+        // with 401 across public and capability-addressed routes rather than
+        // silently downgrading to anonymous.
+        let expired = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &crate::auth::Claims {
+                sub: "stranger@example.org".to_string(),
+                exp: 1,
+                iat: Some(1),
+                sid: Some("expired-sid-00000000000000000000".to_string()),
+                typ: Some("session".to_string()),
+                max_bug_access: None,
+            },
+            &jsonwebtoken::EncodingKey::from_secret(SECRET.as_ref()),
+        )
+        .unwrap();
+        for bad_bearer in ["nonsense".to_string(), expired] {
+            for path in [
+                "/api/bug?bugid=linux-authz01",
+                "/api/bug?slug=linux-authz01",
+                "/bug/linux-authz01.md",
+                "/bug/linux-authz01",
+                "/api/bug/markdown?bugid=linux-authz01",
+                "/api/patchsets",
+                "/api/messages",
+                "/api/config",
+                "/api/stats",
+            ] {
+                let res = get(path.to_string(), Some(bad_bearer.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    res.status(),
+                    401,
+                    "{} accepted invalid Authorization header",
+                    path
+                );
+            }
+        }
+
+        // Duplicate Authorization headers are rejected even when one carries a
+        // valid token.
+        let dup_res = client
+            .get(format!("http://{}/api/patchsets", addr))
+            .header("Authorization", format!("Bearer {}", stranger))
+            .header("Authorization", "Bearer nonsense")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(dup_res.status(), 401);
 
         // Raw transcript routes remain restricted even when bugid is known.
         for path in ["/api/bug/logs", "/api/bug/raw", "/api/bug/input"] {
@@ -6216,13 +6294,14 @@ mod tests {
         assert_eq!(invalid_kind.status(), 422);
 
         // Anonymous direct-UUID capability reads see comment and proposed_fix,
-        // but must NEVER see reproducer/testcase/poc entries.
-        for bearer in [None, Some("nonsense".to_string())] {
-            let mut req = client.get(format!("http://{}/api/bug?bugid=linux-repro01", addr));
-            if let Some(ref b) = bearer {
-                req = req.header("Authorization", format!("Bearer {}", b));
-            }
-            let resp = req.send().await.unwrap();
+        // but must NEVER see reproducer/testcase/poc entries, while an invalid
+        // Authorization header is rejected with 401.
+        {
+            let resp = client
+                .get(format!("http://{}/api/bug?bugid=linux-repro01", addr))
+                .send()
+                .await
+                .unwrap();
             assert_eq!(resp.status(), 200);
             let body: serde_json::Value = resp.json().await.unwrap();
             let activity_str = body["evidence"]["activity"].to_string();
@@ -6232,16 +6311,32 @@ mod tests {
             assert!(!activity_str.contains("TESTCASE_FIXTURE_MARKER"));
             assert!(!activity_str.contains("MINIMAL_REPRO_MARKER"));
 
-            let mut md_req = client.get(format!("http://{}/bug/linux-repro01.md", addr));
-            if let Some(ref b) = bearer {
-                md_req = md_req.header("Authorization", format!("Bearer {}", b));
-            }
-            let md = md_req.send().await.unwrap().text().await.unwrap();
+            let md = client
+                .get(format!("http://{}/bug/linux-repro01.md", addr))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
             assert!(md.contains("PLAIN_COMMENT_TEXT"));
             assert!(md.contains("PROPOSED_FIX_PATCH_TEXT"));
             assert!(!md.contains("REPRODUCER_FIXTURE_MARKER"));
             assert!(!md.contains("TESTCASE_FIXTURE_MARKER"));
             assert!(!md.contains("MINIMAL_REPRO_MARKER"));
+
+            for bad_url in [
+                format!("http://{}/api/bug?bugid=linux-repro01", addr),
+                format!("http://{}/bug/linux-repro01.md", addr),
+            ] {
+                let bad_resp = client
+                    .get(bad_url)
+                    .header("Authorization", "Bearer nonsense")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(bad_resp.status(), 401);
+            }
         }
 
         // Logged-in users (both direct-UUID capability reader and operator) DO see reproducers.
@@ -7648,9 +7743,16 @@ pub(crate) fn presents_local_token(
         return false;
     };
 
-    headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
+    let mut values = headers.get_all(axum::http::header::AUTHORIZATION).iter();
+    let Some(raw) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+
+    raw.to_str()
+        .ok()
         .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|presented| token.matches(presented.trim()))
 }
