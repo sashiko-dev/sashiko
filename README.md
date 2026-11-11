@@ -24,6 +24,8 @@ The Linux kernel is Sashiko's primary focus and most mature target (`--project l
 | **QEMU** | `qemu` | **Pilot** | None | Local review, mailing lists (self-hosted) |
 | **Zephyr RTOS** | `zephyr` | **Pilot** | None | Local review |
 
+Compute infrastructure and LLM tokens for the public Sashiko instances are generously provided and funded by **Google**.
+
 > [!NOTE]
 > **Bringing Sashiko to Your Project:** Interested in piloting Sashiko for another open-source project? Please reach out to Roman Gushchin (`roman.gushchin@linux.dev`) or [`sashiko@lists.linux.dev`](https://lore.kernel.org/sashiko).
 
@@ -130,6 +132,8 @@ Sashiko evaluates patches through specialized parallel analysis stages followed 
 - **[Contributing Guide](CONTRIBUTING.md):** DCO sign-off, local verification (`make check-pr`), and the Sashiko-for-Sashiko review workflow.
 
 ## Acknowledgments
+
+We thank **Google** for sponsoring the compute infrastructure and LLM tokens that power Sashiko's public instances ([sashiko.dev](https://sashiko.dev), [gcc.sashiko.dev](https://gcc.sashiko.dev), and [sashiko.sashiko.dev](https://sashiko.sashiko.dev)) and benchmark evaluations.
 
 Special thanks to Chris Mason, whose [review-prompts](https://github.com/masoncl/review-prompts) project powered Sashiko's initial launch and shaped our early review workflow. While Sashiko has since replaced `review-prompts` with its own code notes and maintainer notes, the project owes a great deal to that foundation.
 
