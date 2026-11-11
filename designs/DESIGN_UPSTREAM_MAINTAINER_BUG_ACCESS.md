@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted. Addresses GitHub issue #787 ("Upstream maintainers patterns for bug
+Superseded by [`DESIGN_BUGS_ACCESS.md`](DESIGN_BUGS_ACCESS.md) (#867). Originally
+accepted for GitHub issue #787 ("Upstream maintainers patterns for bug
 access").
 
 ## 1. Problem
