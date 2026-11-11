@@ -371,6 +371,7 @@ pub fn build_router(
             post(forge_webhook).layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024)),
         )
         .route("/", get_service(ServeFile::new("static/index.html")))
+        .route("/robots.txt", get(robots_txt))
         .route(
             "/auth/verify",
             get_service(ServeFile::new("static/index.html")),
@@ -404,6 +405,18 @@ pub async fn run_server(
     .await?;
 
     Ok(())
+}
+
+const ROBOTS_TXT: &str = include_str!("../static/robots.txt");
+
+async fn robots_txt() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        ROBOTS_TXT,
+    )
 }
 
 fn normalize_thread_message_id(message_id: &str) -> String {
@@ -6316,6 +6329,23 @@ F:	net/
         );
         let resp = client.get(&health_url).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let robots_resp = client
+            .get(format!("http://{}/robots.txt", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(robots_resp.status(), StatusCode::OK);
+        assert_eq!(
+            robots_resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+        let robots_body = robots_resp.text().await.unwrap();
+        assert!(robots_body.contains("Disallow: /api/"));
+        assert!(robots_body.contains("Disallow: /bug/"));
     }
 
     #[tokio::test]
