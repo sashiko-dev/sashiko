@@ -1334,8 +1334,11 @@ fn review_result_label(review: &Value) -> &str {
 }
 
 async fn fetch_patchset(client: &Client, base_url: &str, id: &str) -> Result<Value> {
-    let url = format!("{}/api/patch?id={}", base_url, id);
-    let resp = client.get(&url).send().await?;
+    let resp = client
+        .get(format!("{}/api/patch", base_url))
+        .query(&[("id", id)])
+        .send()
+        .await?;
     if resp.status().is_success() {
         Ok(resp.json().await?)
     } else {
@@ -1409,7 +1412,11 @@ async fn handle_show(
         if resp.status().is_success() {
             let data: PatchsetsResponse = resp.json().await?;
             if let Some(latest) = data.items.first() {
-                id = latest.id.to_string();
+                id = latest
+                    .slug
+                    .clone()
+                    .or_else(|| latest.message_id.clone())
+                    .unwrap_or_else(|| latest.id.to_string());
             } else {
                 return Err(anyhow::anyhow!("No patchsets found"));
             }
@@ -1427,8 +1434,11 @@ async fn handle_show(
 
     let mut last_status = String::new();
     loop {
-        let url = format!("{}/api/patch?id={}", base_url, id);
-        let resp = client.get(&url).send().await?;
+        let resp = client
+            .get(format!("{}/api/patch", base_url))
+            .query(&[("id", id.as_str())])
+            .send()
+            .await?;
 
         if resp.status().is_success() {
             let mut details: Value = resp.json().await?;
@@ -1455,15 +1465,22 @@ async fn handle_show(
                 continue;
             }
 
-            let numeric_id = details["id"].to_string();
-
             let mut review_data = None;
             if status == "Reviewed"
                 || status == "Embargoed"
                 || status == "Failed"
                 || status == "Failed To Apply"
             {
-                let review_url = format!("{}/api/review_log?patchset_id={}", base_url, numeric_id);
+                let latest_review_id = details
+                    .get("reviews")
+                    .and_then(|r| r.as_array())
+                    .and_then(|arr| arr.last())
+                    .and_then(|r| r.get("id"))
+                    .and_then(|i| i.as_i64());
+                let review_url = match latest_review_id {
+                    Some(rev_id) => format!("{}/api/review_log?id={}", base_url, rev_id),
+                    None => format!("{}/api/review_log?patchset_id={}", base_url, details["id"]),
+                };
                 let review_resp = client.get(&review_url).send().await?;
 
                 if review_resp.status().is_success() {

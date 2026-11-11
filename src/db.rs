@@ -5452,6 +5452,43 @@ impl Database {
             }
         }
 
+        let mut ps_ids_to_query = std::collections::HashSet::new();
+        for raw in &raw_discoveries {
+            if let Some(ps_id) = raw.patchset_id {
+                ps_ids_to_query.insert(ps_id);
+            }
+            if let Some(pid) = raw.patch_id
+                && let Some(&(Some(p_ps_id), _)) = patch_info.get(&pid)
+            {
+                ps_ids_to_query.insert(p_ps_id);
+            }
+        }
+        let mut patchset_refs: std::collections::HashMap<i64, String> =
+            std::collections::HashMap::new();
+        if !ps_ids_to_query.is_empty() {
+            let ps_ids: Vec<i64> = ps_ids_to_query.into_iter().collect();
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT ps.id,
+                            COALESCE(
+                                ps.slug,
+                                ps.cover_letter_message_id,
+                                (SELECT pt.message_id FROM patches pt WHERE pt.patchset_id = ps.id ORDER BY pt.part_index ASC, pt.id ASC LIMIT 1)
+                            )
+                     FROM patchsets ps
+                     WHERE ps.id IN (SELECT value FROM json_each(?))",
+                    libsql::params![serde_json::to_string(&ps_ids)?],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let ps_id: i64 = row.get(0)?;
+                if let Some(ps_ref) = row.get::<Option<String>>(1).ok().flatten() {
+                    patchset_refs.insert(ps_id, ps_ref);
+                }
+            }
+        }
+
         let mut discoveries = Vec::new();
         for raw in raw_discoveries {
             let mut patchset_id = raw.patchset_id;
@@ -5464,6 +5501,7 @@ impl Database {
                 }
                 patch_part = part;
             }
+            let patchset_ref = patchset_id.and_then(|id| patchset_refs.get(&id).cloned());
 
             let author = raw
                 .record
@@ -5490,6 +5528,7 @@ impl Database {
                 "model": raw.model,
                 "created_at": raw.record.map(|e| e.created_at).unwrap_or(raw.reported_at),
                 "patchset_id": patchset_id,
+                "patchset_ref": patchset_ref,
                 "patch_id": raw.patch_id,
                 "patch_part": patch_part,
                 "commit": raw.commit,
@@ -10631,7 +10670,9 @@ impl Database {
         // build_search returns "WHERE author ...".
 
         let sql = format!(
-            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
+            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date,
+             COALESCE(p.cover_letter_message_id, (SELECT pt.message_id FROM patches pt WHERE pt.patchset_id = p.id ORDER BY pt.part_index ASC, pt.id ASC LIMIT 1)),
+             p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
              COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters,
              p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug, p.priority
              FROM (
@@ -11041,8 +11082,9 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT id, subject, status, date, cover_letter_message_id, slug,
-                            version, previous_patchset_id, mr_number, embargo_until
+                    "SELECT id, subject, status, date,
+                            COALESCE(cover_letter_message_id, (SELECT pt.message_id FROM patches pt WHERE pt.patchset_id = patchsets.id ORDER BY pt.part_index ASC, pt.id ASC LIMIT 1)),
+                            slug, version, previous_patchset_id, mr_number, embargo_until
                      FROM patchsets WHERE id = ?",
                     libsql::params![curr_id],
                 )
@@ -11173,7 +11215,9 @@ impl Database {
             .conn
             .query(
                 "SELECT p.id, p.subject, p.status, p.to_recipients, p.cc_recipients,
-                        p.author, p.date, p.cover_letter_message_id, p.thread_id,
+                        p.author, p.date,
+                        COALESCE(p.cover_letter_message_id, (SELECT pt.message_id FROM patches pt WHERE pt.patchset_id = p.id ORDER BY pt.part_index ASC, pt.id ASC LIMIT 1)),
+                        p.thread_id,
                         p.total_parts, p.received_parts, p.failed_reason,
                         p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
                         p.embargo_until, p.mr_url, p.slug,
@@ -11287,7 +11331,8 @@ impl Database {
                     "SELECT p.id, p.message_id, p.part_index, m.id, m.subject, p.status, p.apply_error, 
                             eo.status as email_status, eo.to_addresses, eo.cc_addresses,
                             p.previous_patch_id, p.previous_patch_status,
-                            prev_p.part_index, prev_ps.id, prev_ps.cover_letter_message_id,
+                            prev_p.part_index, prev_ps.id,
+                            COALESCE(prev_ps.cover_letter_message_id, prev_p.message_id),
                             prev_ps.slug, prev_ps.version, prev_ps.subject
                  FROM patches p
                  LEFT JOIN messages m ON p.message_id = m.message_id
@@ -11447,7 +11492,9 @@ impl Database {
             .conn
             .query(
                 "SELECT p.id, p.subject, p.status, p.to_recipients, p.cc_recipients,
-                        p.author, p.date, p.cover_letter_message_id, p.thread_id,
+                        p.author, p.date,
+                        COALESCE(p.cover_letter_message_id, (SELECT pt.message_id FROM patches pt WHERE pt.patchset_id = p.id ORDER BY pt.part_index ASC, pt.id ASC LIMIT 1)),
+                        p.thread_id,
                         p.total_parts, p.received_parts, p.failed_reason,
                         p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
                         p.embargo_until, p.mr_url, p.slug,
@@ -11558,7 +11605,8 @@ impl Database {
                     "SELECT p.id, p.message_id, p.part_index, m.id, m.subject, p.status, p.apply_error, 
                             eo.status as email_status, eo.to_addresses, eo.cc_addresses,
                             p.previous_patch_id, p.previous_patch_status,
-                            prev_p.part_index, prev_ps.id, prev_ps.cover_letter_message_id,
+                            prev_p.part_index, prev_ps.id,
+                            COALESCE(prev_ps.cover_letter_message_id, prev_p.message_id),
                             prev_ps.slug, prev_ps.version, prev_ps.subject
                  FROM patches p
                  LEFT JOIN messages m ON p.message_id = m.message_id
@@ -11770,7 +11818,12 @@ impl Database {
                             (SELECT m.subject FROM patches p JOIN messages m ON p.message_id = m.message_id WHERE p.id = r.patch_id LIMIT 1),
                             (SELECT ps.subject FROM patchsets ps WHERE ps.id = r.patchset_id)
                         ),
-                        (SELECT ps.embargo_until FROM patchsets ps WHERE ps.id = r.patchset_id)
+                        (SELECT ps.embargo_until FROM patchsets ps WHERE ps.id = r.patchset_id),
+                        COALESCE(
+                            (SELECT ps.slug FROM patchsets ps WHERE ps.id = r.patchset_id),
+                            (SELECT ps.cover_letter_message_id FROM patchsets ps WHERE ps.id = r.patchset_id),
+                            (SELECT pt.message_id FROM patches pt WHERE pt.patchset_id = r.patchset_id ORDER BY pt.part_index ASC, pt.id ASC LIMIT 1)
+                        )
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -11811,6 +11864,7 @@ impl Database {
                 "patchset_id": r.get::<Option<i64>>(19).ok(),
                 "subject": r.get::<Option<String>>(20).ok(),
                 "embargo_until": r.get::<Option<i64>>(21).ok(),
+                "patchset_ref": r.get::<Option<String>>(22).ok(),
                 "bugs": bugs_json,
             })))
         } else {

@@ -697,10 +697,15 @@
             return !(config && config.read_only) && !!getAuthToken();
         }
 
+        const MAX_UNAUTHENTICATED_LIST_PAGE = 20;
+
+        function isAuthenticatedUser() {
+            return Boolean((config && config.user && config.user.is_authenticated) || getAuthToken());
+        }
+
         function getDisabledReason(guestMsg, permMsg) {
             if (config && config.read_only) return "Server is running in read-only mode.";
-            const isAuthed = (config && config.user && config.user.is_authenticated) || !!getAuthToken();
-            return isAuthed ? permMsg : guestMsg;
+            return isAuthenticatedUser() ? permMsg : guestMsg;
         }
         function getCommentDisabledTitle() {
             return getDisabledReason("Please sign in to add comments.", "You don't have permissions to comment on this bug.");
@@ -1558,7 +1563,7 @@
         function renderVersionList(data) {
             const chain = data.versions;
             const label = v => versionLabel(v.version, v.subject);
-            const href = v => `#/patchset/${encodeURIComponent(v.slug || v.id || v.message_id)}`;
+            const href = v => `#/patchset/${encodeURIComponent(v.slug || v.message_id || v.id)}`;
             const title = v => `${v.subject || '(no subject)'} (${v.status || 'Unknown'}, ${formatDate(v.date)})`;
 
             const curIdx = chain.findIndex(v => Number(v.id) === Number(data.id));
@@ -1819,13 +1824,16 @@
             return `<div>${escapeHtml(nameToDisplay)}</div>${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}`;
         }
 
-        async function fetchListData() {
+        async function fetchListData(previousPage = state.currentPage) {
             if (listFetchAbortController) listFetchAbortController.abort();
             listFetchAbortController = new AbortController();
             const signal = listFetchAbortController.signal;
             const currentReqId = ++listFetchRequestId;
             const requestedMode = state.listMode;
             state.selectedIndex = -1;
+            if (state.listMode !== 'bugs' && !isAuthenticatedUser() && state.currentPage > MAX_UNAUTHENTICATED_LIST_PAGE) {
+                state.currentPage = MAX_UNAUTHENTICATED_LIST_PAGE;
+            }
 
             const endpoint = state.listMode === 'patchsets' ? '/api/patchsets' : (state.listMode === 'bugs' ? '/api/bugs' : '/api/messages');
             let url = `${endpoint}?page=${state.currentPage}&per_page=${state.perPage}`;
@@ -1885,7 +1893,11 @@
 
                 const items = data.items || [];
                 const total = data.total || 0;
-                state.totalPages = Math.ceil(total / state.perPage) || 1;
+                const rawTotalPages = Math.ceil(total / state.perPage) || 1;
+                state.totalPages = (state.listMode !== 'bugs' && !isAuthenticatedUser())
+                    ? Math.min(rawTotalPages, MAX_UNAUTHENTICATED_LIST_PAGE)
+                    : rawTotalPages;
+                state.lastTotal = total;
                 if (tbody) tbody.innerHTML = '';
 
                 if (items.length === 0) {
@@ -1957,8 +1969,12 @@
             } catch (err) {
                 if (err.name === 'AbortError') return;
                 console.error("fetchListData failed:", err);
-                if (currentReqId === listFetchRequestId && state.listMode === requestedMode && tbody) {
-                    tbody.innerHTML = `<tr><td colspan="100%" style="text-align: center; color: var(--error-text, #d73a49); padding: 32px 16px;">Failed to load data: ${escapeHtml(err.message)}</td></tr>`;
+                if (currentReqId === listFetchRequestId && state.listMode === requestedMode) {
+                    state.currentPage = Math.min(Math.max(1, previousPage || 1), state.totalPages || 1);
+                    updatePagination(state.lastTotal || 0);
+                    if (tbody) {
+                        tbody.innerHTML = `<tr><td colspan="100%" style="text-align: center; color: var(--error-text, #d73a49); padding: 32px 16px;">Failed to load data: ${escapeHtml(err.message)}</td></tr>`;
+                    }
                 }
             }
         }
@@ -2193,8 +2209,9 @@
 
         async function goToPage(page) {
             if (page < 1 || page > state.totalPages) return;
+            const prevPage = state.currentPage;
             state.currentPage = page;
-            await fetchListData();
+            await fetchListData(prevPage);
         }
 
         // =====================================================================
@@ -2322,7 +2339,7 @@
                 let lineageBadge = '';
                 if (patch && patch.previous_patch) {
                     const prev = patch.previous_patch;
-                    const prevTarget = prev.patchset_slug || prev.patchset_id || prev.patchset_message_id;
+                    const prevTarget = prev.patchset_slug || prev.patchset_message_id || prev.patchset_id;
                     const prevHref = prev.part_index
                         ? `#/patchset/${encodeURIComponent(prevTarget)}?part=${encodeURIComponent(prev.part_index)}`
                         : `#/patchset/${encodeURIComponent(prevTarget)}`;
@@ -2339,7 +2356,7 @@
                 let header = patch
                     ? `Patch ${patch.part_index}: <a href="#/message/${encodeURIComponent(patch.message_id)}">${escapeHtml(patch.subject || '(no subject)')}</a>${lineageBadge}`
                     : `Patch ID ${pid}`;
-                const encodedPatchsetId = encodeURIComponent(state.patchsetId).replace(/'/g, '%27');
+                const encodedPatchsetId = encodeURIComponent(data.slug || data.message_id || state.patchsetId).replace(/'/g, '%27');
                 const patchLink = window.location.origin + window.location.pathname + `#/patchset/${encodedPatchsetId}?${patch ? 'part=' + encodeURIComponent(patch.part_index) : 'patch=' + encodeURIComponent(pid)}`;
                 header += `<a href="${escapeHtml(patchLink)}" class="permalink-icon" onclick="copyToClipboard(this.href); return false;" title="Copy permalink to this patch"><svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a>`;
 
@@ -2379,7 +2396,7 @@
             let paginationHtml = '';
             if (data.total_patches_in_db > data.limit) {
                 const totalPages = Math.ceil(data.total_patches_in_db / data.limit);
-                const basePath = `#/patchset/${encodeURIComponent(data.slug || data.id || data.message_id).replace(/'/g, '%27')}`;
+                const basePath = `#/patchset/${encodeURIComponent(data.slug || data.message_id || data.id).replace(/'/g, '%27')}`;
                 paginationHtml = `
                     <div class="pagination">
                         <button onclick="navigate('${basePath}?page=1&limit=${data.limit}')" ${data.page <= 1 ? 'disabled' : ''}>First</button>
@@ -2421,7 +2438,7 @@
                         const rows = logs.map((item, idx) => {
                             const badgeCls = item.status === 'Applied' ? 'status-Applied' : item.status === 'Skipped' ? 'status-Skipped' : 'status-Failed';
                             const badgeLabel = item.status === 'Applied' || item.status === 'Skipped' ? item.status : 'Failed';
-                            return `<tr><td class="bl-table-cell">${escapeHtml(item.baseline)}</td><td class="bl-table-cell"><span class="status-badge ${badgeCls}">${badgeLabel}</span></td><td class="bl-table-cell" style="text-align:right;"><a href="#/log/baseline/${encodeURIComponent(data.id || data.message_id)}/${idx}" style="font-weight:600; color:var(--text-muted); text-decoration:none; font-size:0.85em;" onmouseover="this.style.color='var(--link)'" onmouseout="this.style.color='var(--text-muted)'">View Log</a></td></tr>`;
+                            return `<tr><td class="bl-table-cell">${escapeHtml(item.baseline)}</td><td class="bl-table-cell"><span class="status-badge ${badgeCls}">${badgeLabel}</span></td><td class="bl-table-cell" style="text-align:right;"><a href="#/log/baseline/${encodeURIComponent(data.slug || data.message_id || data.id)}/${idx}" style="font-weight:600; color:var(--text-muted); text-decoration:none; font-size:0.85em;" onmouseover="this.style.color='var(--link)'" onmouseout="this.style.color='var(--text-muted)'">View Log</a></td></tr>`;
                         }).join('');
                         contentHtml = `<table style="width:100%; border-collapse:collapse; margin-top:8px;"><thead><tr style="background:var(--code-bg);"><th class="bl-table-header">Baseline</th><th class="bl-table-header" style="width:100px;">Status</th><th class="bl-table-header" style="text-align:right; width:120px;">Log</th></tr></thead><tbody>${rows}</tbody></table>`;
                     }
@@ -2884,11 +2901,13 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const discoveryRows = (evidence.discoveries || []).map(d => {
                 let sourceHtml = 'Direct report';
                 if (d.patchset_id && (d.patch_part || d.patch_id)) {
+                    const psRef = d.patchset_ref || d.patchset_id;
                     const patchLabel = d.patch_part ? `Patch ${d.patch_part}` : `Patch ID ${d.patch_id}`;
                     const patchParam = d.patch_part ? `part=${encodeURIComponent(d.patch_part)}` : `patch=${encodeURIComponent(d.patch_id)}`;
-                    sourceHtml = `<a href="#/patchset/${encodeURIComponent(d.patchset_id)}">Patchset #${escapeHtml(d.patchset_id)}</a> (<a href="#/patchset/${encodeURIComponent(d.patchset_id)}?${patchParam}">${escapeHtml(patchLabel)}</a>)`;
+                    sourceHtml = `<a href="#/patchset/${encodeURIComponent(psRef)}">Patchset #${escapeHtml(d.patchset_id)}</a> (<a href="#/patchset/${encodeURIComponent(psRef)}?${patchParam}">${escapeHtml(patchLabel)}</a>)`;
                 } else if (d.patchset_id) {
-                    sourceHtml = `<a href="#/patchset/${encodeURIComponent(d.patchset_id)}">Patchset #${escapeHtml(d.patchset_id)}</a>`;
+                    const psRef = d.patchset_ref || d.patchset_id;
+                    sourceHtml = `<a href="#/patchset/${encodeURIComponent(psRef)}">Patchset #${escapeHtml(d.patchset_id)}</a>`;
                 } else if (d.commit) {
                     sourceHtml = `Commit <code>${escapeHtml(formatCommitRef(d.commit))}</code>`;
                 }
@@ -4015,7 +4034,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 <div class="nav" style="display:flex; justify-content:space-between; align-items:center;">
                     <div>
                         <a href="#/" onclick="event.preventDefault(); goBack();">← Back</a>
-                        ${data.patchset_id ? `<span style="color:var(--text-dim); margin:0 6px;">&middot;</span><a href="#/patchset/${encodeURIComponent(data.patchset_id)}">Patchset #${escapeHtml(String(data.patchset_id))}</a>` : ''}
+                        ${data.patchset_id ? `<span style="color:var(--text-dim); margin:0 6px;">&middot;</span><a href="#/patchset/${encodeURIComponent(data.patchset_ref || data.patchset_id)}">Patchset #${escapeHtml(String(data.patchset_id))}</a>` : ''}
                     </div>
                     <a href="#/log/${encodeURIComponent(id)}" style="font-weight:600; color:var(--text-dim); text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">View Raw Log</a>
                 </div>
