@@ -1,0 +1,496 @@
+[
+    {
+        "Commit": "real_kvm_nested_08f97454b7fa",
+        "case_id": "real-01-kvm-nested-flush-shadow-early-return",
+        "category": "resource_leak",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "ec197dca8735f7627e5cff7e3fa8839b53a28514",
+        "scan_paths": [
+            "arch/arm64/kvm/nested.c"
+        ],
+        "scan_ref": "08f97454b7fa39bfcf82524955c771d2d693d6fe",
+        "target_function": "kvm_arch_flush_shadow_all",
+        "problem_description": "kvm_arch_flush_shadow_all() returns early when kvm->arch.nested_mmus_size is 0, skipping the trailing kvm_uninit_stage2_mmu(kvm) call for every non-nested VM so the canonical stage-2 MMU is never torn down (and under pKVM guest pages remain shared with EL2)."
+    },
+    {
+        "Commit": "real_kvm_nested_08f97454b7fa",
+        "case_id": "real-02-kvm-nested-s2-unmap-null-pgt",
+        "category": "null_deref",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "4c74e233cdedd11592775fae2a6243e67ca3f891",
+        "scan_paths": [
+            "arch/arm64/kvm/nested.c"
+        ],
+        "scan_ref": "08f97454b7fa39bfcf82524955c771d2d693d6fe",
+        "target_function": "kvm_nested_s2_unmap",
+        "problem_description": "NULL pointer dereference in kvm_nested_s2_unmap() and kvm_nested_s2_wp(): both functions dereference kvm->arch.mmu.pgt->ia_bits after nested stage-2 page table walks that can drop kvm->mmu_lock, allowing concurrent kvm_arch_flush_shadow_all() teardown to free kvm->arch.mmu.pgt and set it to NULL."
+    },
+    {
+        "Commit": "real_kvm_nested_08f97454b7fa",
+        "case_id": "real-03-kvm-nested-invalidate-vncr-va-null",
+        "category": "null_deref",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "4be6cbeb93d26994bd1827ddbce391e3c4395c8f",
+        "scan_paths": [
+            "arch/arm64/kvm/nested.c"
+        ],
+        "scan_ref": "08f97454b7fa39bfcf82524955c771d2d693d6fe",
+        "target_function": "invalidate_vncr_va",
+        "problem_description": "NULL pointer dereference in invalidate_vncr_va(): walks all vCPUs via kvm_for_each_vcpu() and dereferences vcpu->arch.vncr_tlb->valid without checking whether vcpu->arch.vncr_tlb is NULL (when another vCPU has not yet run/onlined)."
+    },
+    {
+        "Commit": "real_kvm_nested_08f97454b7fa",
+        "case_id": "real-04-kvm-nested-mmus-realloc-race",
+        "category": "use_after_free",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "70543358fa08e0f7cebc3447c3b70fe97ad7aaa8",
+        "scan_paths": [
+            "arch/arm64/kvm/nested.c"
+        ],
+        "scan_ref": "08f97454b7fa39bfcf82524955c771d2d693d6fe",
+        "target_function": "kvm_vcpu_init_nested",
+        "problem_description": "Use-after-free / data race in kvm_vcpu_init_nested(): reallocates and swaps kvm->arch.nested_mmus with kvrealloc() while holding only config_lock, whereas concurrent readers (get_s2_mmu_nested() / lookup_s2_mmu()) access kvm->arch.nested_mmus under kvm->mmu_lock."
+    },
+    {
+        "Commit": "real_kvm_nested_08f97454b7fa",
+        "case_id": "real-05-kvm-nested-pgshift-negative-level",
+        "category": "integer_truncation",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "8053393680d4fa3eb962667d2be95dd39f0940e5",
+        "scan_paths": [
+            "arch/arm64/kvm/nested.c"
+        ],
+        "scan_ref": "08f97454b7fa39bfcf82524955c771d2d693d6fe",
+        "target_function": "pgshift_level_to_ttl",
+        "problem_description": "Signedness truncation bug in pgshift_level_to_ttl() / kvm_invalidate_vncr_ipa(): pgshift_level_to_ttl() takes an unsigned u8 level, so when the guest EL2 stage-1 MMU is disabled (vt->wr.level == S1_MMU_DISABLED, negative -127, pgshift unset) it truncates the negative level and triggers BUG() or mis-sizes the VNCR invalidation range."
+    },
+    {
+        "Commit": "real_kvm_nested_08f97454b7fa",
+        "case_id": "real-06-kvm-nested-vncr-cpu-fixmap-race",
+        "category": "race_locking",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "38640bc32be3fcf9526d477155bc19d3f146231f",
+        "scan_paths": [
+            "arch/arm64/kvm/nested.c"
+        ],
+        "scan_ref": "08f97454b7fa39bfcf82524955c771d2d693d6fe",
+        "target_function": "invalidate_vncr",
+        "problem_description": "TOCTOU race between invalidate_vncr() (under kvm->mmu_lock) and this_cpu_reset_vncr_fixmap() / kvm_vcpu_put_hw_mmu() (without mmu_lock): invalidate_vncr() tests vt->cpu != -1 and calls clear_fixmap(vncr_fixmap(vt->cpu)) while vcpu_put concurrently clears the fixmap and sets vt->cpu = -1, risking clear_fixmap(vncr_fixmap(-1)) or hitting BUG_ON(vt->cpu != smp_processor_id())."
+    },
+    {
+        "Commit": "real_kvm_nested_08f97454b7fa",
+        "case_id": "real-07-kvm-nested-ro-memslot-vncr-write",
+        "category": "logic_bug",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "2684e02bac41c5220f6c1ab2bdcc957b71812977",
+        "scan_paths": [
+            "arch/arm64/kvm/nested.c"
+        ],
+        "scan_ref": "08f97454b7fa39bfcf82524955c771d2d693d6fe",
+        "target_function": "kvm_translate_vncr",
+        "problem_description": "Read-only host memory write violation in kvm_translate_vncr() / kvm_map_l1_vncr(): when a VNCR page is faulted in on a read (!write_fault) from a read-only memslot, writable is false, yet vt->wr.pw (guest stage-1 write permission) alone is used to mark the page dirty and map the per-CPU fixmap writable with PAGE_KERNEL."
+    },
+    {
+        "Commit": "real_kvm_nested_08f97454b7fa",
+        "case_id": "real-fp-01-kvm-nested-s2-flush",
+        "category": "false_positive_trap",
+        "subsystem": "kvm/arm64",
+        "expected_behavior": "suppress_false_positive",
+        "scan_paths": [
+            "arch/arm64/kvm/nested.c"
+        ],
+        "scan_ref": "08f97454b7fa39bfcf82524955c771d2d693d6fe",
+        "target_function": "kvm_nested_s2_flush",
+        "problem_description": "Early return when !kvm->arch.nested_mmus_size in kvm_nested_s2_flush() skips flushing the canonical stage-2 page tables for non-nested VMs."
+    },
+    {
+        "Commit": "real_kvm_vgic_its_effc0a39b8e0",
+        "case_id": "real-08-vgic-its-invalidate-cache-double-put",
+        "category": "use_after_free",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "13031fb6b8357fbbcded2a7f4cba73e4781ee594",
+        "scan_paths": [
+            "arch/arm64/kvm/vgic/vgic-its.c"
+        ],
+        "scan_ref": "effc0a39b8e0f30670fe24f51e44329d4324e566",
+        "target_function": "vgic_its_invalidate_cache",
+        "problem_description": "Reference count underflow / use-after-free in vgic_its_invalidate_cache(): iterates its->translation_cache with xa_for_each(), calls xa_erase() ignoring its return value, and unconditionally calls vgic_put_irq(kvm, irq), so concurrent cache invalidations drop the cache reference twice for the same irq."
+    },
+    {
+        "Commit": "real_kvm_vgic_its_effc0a39b8e0",
+        "case_id": "real-09-vgic-its-save-ite-null-collection",
+        "category": "null_deref",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "c6c156d931c33b92362383cf76f6d6e1291dcbfe",
+        "scan_paths": [
+            "arch/arm64/kvm/vgic/vgic-its.c"
+        ],
+        "scan_ref": "effc0a39b8e0f30670fe24f51e44329d4324e566",
+        "target_function": "vgic_its_save_ite",
+        "problem_description": "NULL pointer dereference in vgic_its_save_ite(): unconditionally dereferences ite->collection->collection_id, even though unmapping a collection (MAPC with V=0 / vgic_its_free_collection) sets ite->collection = NULL while leaving the ITE in dev->itt_head."
+    },
+    {
+        "Commit": "real_kvm_vgic_its_effc0a39b8e0",
+        "case_id": "real-10-vgic-its-restore-dte-eventid-bits",
+        "category": "out_of_bounds",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "9ce754ed8e7ab4e3999767ce1505f85c449ccb07",
+        "scan_paths": [
+            "arch/arm64/kvm/vgic/vgic-its.c"
+        ],
+        "scan_ref": "effc0a39b8e0f30670fe24f51e44329d4324e566",
+        "target_function": "vgic_its_restore_dte",
+        "problem_description": "Missing bounds check in vgic_its_restore_dte(): extracts num_eventid_bits (up to 32) from the userspace-supplied DTE Size field without enforcing num_eventid_bits <= VITS_TYPER_IDBITS (unlike vgic_its_cmd_handle_mapd())."
+    },
+    {
+        "Commit": "real_kvm_vgic_its_effc0a39b8e0",
+        "case_id": "real-11-vgic-its-save-collection-oob",
+        "category": "out_of_bounds",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "9b10fb74e4b661543d188701bd4d024fc5c18f58",
+        "scan_paths": [
+            "arch/arm64/kvm/vgic/vgic-its.c"
+        ],
+        "scan_ref": "effc0a39b8e0f30670fe24f51e44329d4324e566",
+        "target_function": "vgic_its_save_collection_table",
+        "problem_description": "Out-of-bounds guest memory write in vgic_its_save_collection_table(): computes max_size from GITS_BASER but never bounds-checks gpa or collection->collection_id (via vgic_its_check_id) while writing every collection on its->collection_list into the guest collection table."
+    },
+    {
+        "Commit": "real_kvm_vgic_its_effc0a39b8e0",
+        "case_id": "real-12-vgic-its-movall-wrong-source-vcpu",
+        "category": "logic_bug",
+        "subsystem": "kvm/arm64",
+        "Fixed-by": "751f4641560be8568dcc5af400c0e55a283abf51",
+        "scan_paths": [
+            "arch/arm64/kvm/vgic/vgic-its.c"
+        ],
+        "scan_ref": "effc0a39b8e0f30670fe24f51e44329d4324e566",
+        "target_function": "vgic_its_cmd_handle_movall",
+        "problem_description": "Logic bug / race in vgic_its_cmd_handle_movall() and update_affinity(): walks every LPI in dist->lpi_xa and calls update_affinity(irq, vcpu2) without verifying under irq->irq_lock that irq->target_vcpu == vcpu1, retargeting all LPIs in the VM instead of only those on source redistributor vcpu1."
+    },
+    {
+        "Commit": "real_kvm_vgic_its_effc0a39b8e0",
+        "case_id": "real-fp-02-vgic-its-free-collection",
+        "category": "false_positive_trap",
+        "subsystem": "kvm/arm64",
+        "expected_behavior": "suppress_false_positive",
+        "scan_paths": [
+            "arch/arm64/kvm/vgic/vgic-its.c"
+        ],
+        "scan_ref": "effc0a39b8e0f30670fe24f51e44329d4324e566",
+        "target_function": "vgic_its_free_collection",
+        "problem_description": "Use-after-free in vgic_its_free_collection() because kfree(collection) frees the its_collection while mapped its_ite entries in device->itt_head still retain dangling ite->collection pointers to it."
+    },
+    {
+        "Commit": "real_bpf_hashtab_ac0aaef0aa99",
+        "case_id": "real-13-bpf-rhtab-batch-delete-migrate",
+        "category": "atomic_context",
+        "subsystem": "bpf",
+        "Fixed-by": "de020dc8049bfb2b22e3b6d99c031feb2e22d112",
+        "scan_paths": [
+            "kernel/bpf/hashtab.c"
+        ],
+        "scan_ref": "ac0aaef0aa997fcdcb2458bd584539ba8608d33e",
+        "target_function": "__rhtab_map_lookup_and_delete_batch",
+        "problem_description": "Missing migration protection in __rhtab_map_lookup_and_delete_batch(): calls rhtab_delete_elem() -> bpf_mem_cache_free_rcu() inside a preemptible loop (holding only rcu_read_lock(), which does not disable migration under CONFIG_PREEMPT_RCU) without migrate_disable(), triggering per-CPU allocator BUG/warnings upon CPU migration."
+    },
+    {
+        "Commit": "real_bpf_hashtab_ac0aaef0aa99",
+        "case_id": "real-14-bpf-rhtab-nmi-free-fields",
+        "category": "atomic_context",
+        "subsystem": "bpf",
+        "Fixed-by": "65cc95eba9e8b46312cac38c227473605a4b996a",
+        "scan_paths": [
+            "kernel/bpf/hashtab.c"
+        ],
+        "scan_ref": "ac0aaef0aa997fcdcb2458bd584539ba8608d33e",
+        "target_function": "rhtab_delete_elem",
+        "problem_description": "Unsafe NMI-context destructor call in rhtab_delete_elem() / rhtab_map_update_existing() via rhtab_check_and_free_fields(): invokes bpf_obj_free_fields() directly during resizable hashtab delete/update (which can run in NMI context and before RCU grace period) instead of cancelling timers/wq via bpf_obj_cancel_fields() and deferring field destruction to rhtab_mem_dtor."
+    },
+    {
+        "Commit": "real_bpf_hashtab_ac0aaef0aa99",
+        "case_id": "real-15-bpf-rhtab-recycled-elem-reinit",
+        "category": "use_after_free",
+        "subsystem": "bpf",
+        "Fixed-by": "5df46ddcb7b36878c1b691e9057a0509042a2567",
+        "scan_paths": [
+            "kernel/bpf/hashtab.c"
+        ],
+        "scan_ref": "ac0aaef0aa997fcdcb2458bd584539ba8608d33e",
+        "target_function": "rhtab_map_update_elem",
+        "problem_description": "Use-after-free / timer corruption in rhtab_map_update_elem(): calls check_and_init_map_value() on elements allocated from bpf_mem_cache_alloc(&rhtab->ma), which zeroes special fields (such as embedded bpf_timer / bpf_wq pointers) in recycled elements while previous RCU-pending timer/work state may still exist."
+    },
+    {
+        "Commit": "real_bpf_hashtab_ac0aaef0aa99",
+        "case_id": "real-16-bpf-htab-void-btf-key",
+        "category": "null_deref",
+        "subsystem": "bpf",
+        "Fixed-by": "0895a0c0734703be5532f3883c42db95615fd98b",
+        "scan_paths": [
+            "kernel/bpf/hashtab.c"
+        ],
+        "scan_ref": "ac0aaef0aa997fcdcb2458bd584539ba8608d33e",
+        "target_function": "rhtab_map_check_btf",
+        "problem_description": "Missing BTF key validation in htab_map_check_btf() and rhtab_map_check_btf(): neither function rejects key-less BTF (btf_type_is_void(key_type)), allowing hash maps with BTF_KIND_VOID keys to be created and causing a NULL pointer dereference when BTF map printing/seq_show reads the key type."
+    },
+    {
+        "Commit": "real_bpf_hashtab_ac0aaef0aa99",
+        "case_id": "real-fp-03-bpf-htab-map-free-rcu",
+        "category": "false_positive_trap",
+        "subsystem": "bpf",
+        "expected_behavior": "suppress_false_positive",
+        "scan_paths": [
+            "kernel/bpf/hashtab.c"
+        ],
+        "scan_ref": "ac0aaef0aa997fcdcb2458bd584539ba8608d33e",
+        "target_function": "htab_map_free",
+        "problem_description": "RCU use-after-free in htab_map_free() because delete_all_elements() and bpf_map_area_free(htab->buckets) free the hash buckets and htab without calling synchronize_rcu() while BPF programs or call_rcu() callbacks are still accessing elements."
+    },
+    {
+        "Commit": "real_arm64_ptrace_a4e5927115f3",
+        "case_id": "real-17-arm64-ptrace-sizeof-pointer",
+        "category": "logic_bug",
+        "subsystem": "arm64/ptrace",
+        "Fixed-by": "c3f83d021162571bcd87b062ec9e587828d2b7f3",
+        "scan_paths": [
+            "arch/arm64/kernel/ptrace.c"
+        ],
+        "scan_ref": "a4e5927115f30a301f9939ed43e6a21a343e06ad",
+        "target_function": "sve_init_header_from_task",
+        "problem_description": "sizeof-pointer bug in sve_init_header_from_task(): sets inactive-mode header->size = sizeof(header) (8-byte pointer size) instead of sizeof(*header) (16-byte struct user_sve_header), so the header.size == sizeof(header) check in sve_get_common() (where header is a struct value) never matches and exposes registers from the wrong mode."
+    },
+    {
+        "Commit": "real_arm64_ptrace_a4e5927115f3",
+        "case_id": "real-18-arm64-ptrace-memset-current-vs-target",
+        "category": "memory_corruption",
+        "subsystem": "arm64/ptrace",
+        "Fixed-by": "5cbb61bf4168859d97c068d88d364f4f1f440325",
+        "scan_paths": [
+            "arch/arm64/kernel/ptrace.c"
+        ],
+        "scan_ref": "a4e5927115f30a301f9939ed43e6a21a343e06ad",
+        "target_function": "sve_set_common",
+        "problem_description": "Wrong task state corruption in sve_set_common(): calls memset(&current->thread.uw.fpsimd_state, 0, ...) instead of zeroing target->thread.uw.fpsimd_state, clobbering the ptracer's own saved FPSIMD registers while leaving the tracee's FPSIMD state unzeroed."
+    },
+    {
+        "Commit": "real_arm64_ptrace_a4e5927115f3",
+        "case_id": "real-19-arm64-ptrace-sve-without-sme",
+        "category": "logic_bug",
+        "subsystem": "arm64/ptrace",
+        "Fixed-by": "128a7494a9f15aad60cc6b7e3546bf481ac54a13",
+        "scan_paths": [
+            "arch/arm64/kernel/ptrace.c"
+        ],
+        "scan_ref": "a4e5927115f30a301f9939ed43e6a21a343e06ad",
+        "target_function": "sve_set_common",
+        "problem_description": "Missing TIF_SVE flag update in sve_set_common() on systems without SME: the switch setting set_tsk_thread_flag(target, TIF_SVE) for ARM64_VEC_SVE is gated behind if (system_supports_sme()), so PTRACE_SETREGSET(NT_ARM_SVE) fails to set TIF_SVE on SVE-only (!SME) systems."
+    },
+    {
+        "Commit": "real_arm64_ptrace_a4e5927115f3",
+        "case_id": "real-fp-04-arm64-ptrace-za-set-sve-alloc",
+        "category": "false_positive_trap",
+        "subsystem": "arm64/ptrace",
+        "expected_behavior": "suppress_false_positive",
+        "scan_paths": [
+            "arch/arm64/kernel/ptrace.c"
+        ],
+        "scan_ref": "a4e5927115f30a301f9939ed43e6a21a343e06ad",
+        "target_function": "za_set",
+        "problem_description": "NULL pointer dereference in za_set() because enabling SME ZA state sets TIF_SME without ensuring target->thread.sve_state is allocated."
+    },
+    {
+        "Commit": "real_idpf_lib_238e03d04662",
+        "case_id": "real-20-idpf-vport-open-irq-leak",
+        "category": "resource_leak",
+        "subsystem": "net/idpf",
+        "Fixed-by": "87b8ee64685bc096a087af833d4594b2332bfdb1",
+        "scan_paths": [
+            "drivers/net/ethernet/intel/idpf/idpf_lib.c"
+        ],
+        "scan_ref": "238e03d0466239410b72294b79494e43d4fabe77",
+        "target_function": "idpf_vport_open",
+        "problem_description": "Interrupt resource leak in idpf_vport_open(): after idpf_vport_intr_init() succeeds, error paths on queue register init and idpf_rx_bufs_init_all() jump to 'goto queues_rel' instead of 'goto intr_deinit', skipping interrupt teardown."
+    },
+    {
+        "Commit": "real_idpf_lib_238e03d04662",
+        "case_id": "real-21-idpf-init-task-load-err-work",
+        "category": "use_after_free",
+        "subsystem": "net/idpf",
+        "Fixed-by": "4d792219fe6f891b5b557a607ac8a0a14eda6e38",
+        "scan_paths": [
+            "drivers/net/ethernet/intel/idpf/idpf_lib.c"
+        ],
+        "scan_ref": "238e03d0466239410b72294b79494e43d4fabe77",
+        "target_function": "idpf_init_task",
+        "problem_description": "Uncancelled delayed work and PTP leak on error unwind in idpf_init_task(): when vport initialization fails during driver load (IDPF_HR_DRV_LOAD), idpf_init_task() unwinds vports without cancelling adapter->serv_task / adapter->mbx_task or releasing PTP, leading to NULL pointer dereferences / UAF."
+    },
+    {
+        "Commit": "real_idpf_lib_238e03d04662",
+        "case_id": "real-22-idpf-vport-rel-ptype-leak",
+        "category": "memory_leak",
+        "subsystem": "net/idpf",
+        "Fixed-by": "f6242b354605faff263ca45882b148200915a3f6",
+        "scan_paths": [
+            "drivers/net/ethernet/intel/idpf/idpf_lib.c"
+        ],
+        "scan_ref": "238e03d0466239410b72294b79494e43d4fabe77",
+        "target_function": "idpf_vport_rel",
+        "problem_description": "Memory leak in idpf_vport_rel(): frees vport via kfree(vport) without freeing vport->rx_ptype_lkup allocated during vport setup."
+    },
+    {
+        "Commit": "real_idpf_lib_238e03d04662",
+        "case_id": "real-fp-05-idpf-vport-stop-cleanup",
+        "category": "false_positive_trap",
+        "subsystem": "net/idpf",
+        "expected_behavior": "suppress_false_positive",
+        "scan_paths": [
+            "drivers/net/ethernet/intel/idpf/idpf_lib.c"
+        ],
+        "scan_ref": "238e03d0466239410b72294b79494e43d4fabe77",
+        "target_function": "idpf_vport_stop",
+        "problem_description": "Interrupt and queue resource leak in idpf_vport_stop() because interrupts are released before disabling queues and deinitializing XDP rxq info."
+    },
+    {
+        "Commit": "real_sch_qfq_6abcf751bc08",
+        "case_id": "real-23-qfq-change-class-existing-uaf",
+        "category": "use_after_free",
+        "subsystem": "net/sched",
+        "Fixed-by": "3879cffd9d07aa0377c4b8835c4f64b4fb24ac78",
+        "scan_paths": [
+            "net/sched/sch_qfq.c"
+        ],
+        "scan_ref": "6abcf751bc084804a9e5b3051442e8a2ce67f48a",
+        "target_function": "qfq_change_class",
+        "problem_description": "Use-after-free in qfq_change_class(): when modifying an existing class (existing == true) fails and jumps to destroy_class, qdisc_put(cl->qdisc) and kfree(cl) free the live class while it remains linked in q->clhash and its aggregate."
+    },
+    {
+        "Commit": "real_sch_qfq_6abcf751bc08",
+        "case_id": "real-24-qfq-reset-inactive-null-deref",
+        "category": "null_deref",
+        "subsystem": "net/sched",
+        "Fixed-by": "c1d73b1480235731e35c81df70b08f4714a7d095",
+        "scan_paths": [
+            "net/sched/sch_qfq.c"
+        ],
+        "scan_ref": "6abcf751bc084804a9e5b3051442e8a2ce67f48a",
+        "target_function": "qfq_reset_qdisc",
+        "problem_description": "NULL pointer dereference in qfq_reset_qdisc(): checks 'if (cl->qdisc->q.qlen > 0)' instead of cl_is_active(cl) before calling qfq_deactivate_class(q, cl), which dereferences NULL scheduler state when an inactive class's child qdisc has non-zero qlen."
+    },
+    {
+        "Commit": "real_sch_qfq_6abcf751bc08",
+        "case_id": "real-25-qfq-deact-rm-from-agg-qlen",
+        "category": "use_after_free",
+        "subsystem": "net/sched",
+        "Fixed-by": "d837fbee92453fbb829f950c8e7cf76207d73f33",
+        "scan_paths": [
+            "net/sched/sch_qfq.c"
+        ],
+        "scan_ref": "6abcf751bc084804a9e5b3051442e8a2ce67f48a",
+        "target_function": "qfq_deact_rm_from_agg",
+        "problem_description": "State corruption / exploit in qfq_deact_rm_from_agg(): relies on 'cl->qdisc->q.qlen > 0' instead of cl_is_active(cl) to decide whether to call qfq_deactivate_class(q, cl), failing to deactivate an active class whose child qlen dropped to 0 (or deactivating an inactive class)."
+    },
+    {
+        "Commit": "real_sch_qfq_6abcf751bc08",
+        "case_id": "real-fp-06-qfq-delete-class-in-use",
+        "category": "false_positive_trap",
+        "subsystem": "net/sched",
+        "expected_behavior": "suppress_false_positive",
+        "scan_paths": [
+            "net/sched/sch_qfq.c"
+        ],
+        "scan_ref": "6abcf751bc084804a9e5b3051442e8a2ce67f48a",
+        "target_function": "qfq_delete_class",
+        "problem_description": "Use-after-free in qfq_delete_class() because qfq_destroy_class(sch, cl) frees cl without removing it from q->clhash under sch_tree_lock(sch) or checking qdisc_class_in_use()."
+    },
+    {
+        "Commit": "real_kho_bba717bbc466",
+        "case_id": "real-26-kho-unpreserve-infinite-loop",
+        "category": "logic_bug",
+        "subsystem": "kexec_handover",
+        "Fixed-by": "b05addf6f0596edb1f82ab4059438c7ef2d2686d",
+        "scan_paths": [
+            "kernel/kexec_handover.c"
+        ],
+        "scan_ref": "bba717bbc466ab24d25964034f5e16ead1720512",
+        "target_function": "__kho_unpreserve",
+        "problem_description": "Infinite loop / soft lockup in __kho_unpreserve(): inside 'while (pfn < end_pfn)', if xa_load(&track->orders, order) or xa_load(&physxa->phys_bits, ...) returns NULL, 'continue;' jumps back to the while condition without advancing pfn."
+    },
+    {
+        "Commit": "real_kho_bba717bbc466",
+        "case_id": "real-27-kho-vmalloc-higher-order-leak",
+        "category": "resource_leak",
+        "subsystem": "kexec_handover",
+        "Fixed-by": "7ecd2e439d1272ac02d798b0033a426e3b00dff5",
+        "scan_paths": [
+            "kernel/kexec_handover.c"
+        ],
+        "scan_ref": "bba717bbc466ab24d25964034f5e16ead1720512",
+        "target_function": "kho_vmalloc_unpreserve_chunk",
+        "problem_description": "Higher-order page leak in kho_vmalloc_unpreserve_chunk() / kho_vmalloc_free_chunks(): calls __kho_unpreserve(track, pfn, pfn + 1) assuming order-0 pages instead of unpreserving pfn + (1 << kho_vmalloc->order)."
+    },
+    {
+        "Commit": "real_kho_bba717bbc466",
+        "case_id": "real-28-kho-vmalloc-chunk-oob",
+        "category": "out_of_bounds",
+        "subsystem": "kexec_handover",
+        "Fixed-by": "0b07092d09e54e49b85379a9c60f82d54a881514",
+        "scan_paths": [
+            "kernel/kexec_handover.c"
+        ],
+        "scan_ref": "bba717bbc466ab24d25964034f5e16ead1720512",
+        "target_function": "kho_restore_vmalloc",
+        "problem_description": "Out-of-bounds array read in kho_vmalloc_unpreserve_chunk() and kho_restore_vmalloc(): the loops 'for (int i = 0; chunk->phys[i]; i++)' lack an 'i < ARRAY_SIZE(chunk->phys)' bounds check, reading past the end of chunk->phys when all slots in a chunk are populated."
+    },
+    {
+        "Commit": "real_kho_bba717bbc466",
+        "case_id": "real-fp-07-kho-preserve-folio-overlap",
+        "category": "false_positive_trap",
+        "subsystem": "kexec_handover",
+        "expected_behavior": "suppress_false_positive",
+        "scan_paths": [
+            "kernel/kexec_handover.c"
+        ],
+        "scan_ref": "bba717bbc466ab24d25964034f5e16ead1720512",
+        "target_function": "kho_preserve_folio",
+        "problem_description": "Higher-order folio size bug in kho_preserve_folio() because kho_scratch_overlap() and __kho_preserve_order() only check/preserve a single PAGE_SIZE instead of accounting for folio_order(folio)."
+    },
+    {
+        "Commit": "real_gpiolib_cdev_24d479d26b25",
+        "case_id": "real-29-gpiolib-cdev-register-leak",
+        "category": "resource_leak",
+        "subsystem": "gpio",
+        "Fixed-by": "8a8c942cad4cd12f739a8bb60cac77fd173c4e07",
+        "scan_paths": [
+            "drivers/gpio/gpiolib-cdev.c"
+        ],
+        "scan_ref": "24d479d26b25bce5faea3ddd9fa8f3a6c3129ea7",
+        "target_function": "gpiolib_cdev_register",
+        "problem_description": "Workqueue and character device leak in gpiolib_cdev_register(): if cdev_device_add() fails, gdev->line_state_wq is leaked without destroy_workqueue(); and if !gc after srcu_dereference, both cdev_device_del() and destroy_workqueue(gdev->line_state_wq) are missed."
+    },
+    {
+        "Commit": "real_gpiolib_cdev_24d479d26b25",
+        "case_id": "real-30-gpiolib-lineinfo-notify-fput-leak",
+        "category": "resource_leak",
+        "subsystem": "gpio",
+        "Fixed-by": "70b3c280533167749a8f740acaa8ef720f78f984",
+        "scan_paths": [
+            "drivers/gpio/gpiolib-cdev.c"
+        ],
+        "scan_ref": "24d479d26b25bce5faea3ddd9fa8f3a6c3129ea7",
+        "target_function": "lineinfo_changed_notify",
+        "problem_description": "File reference leak in lineinfo_changed_notify(): acquires a file reference fp via get_file_active() before kzalloc(sizeof(*ctx), GFP_ATOMIC), and when kzalloc fails returns NOTIFY_DONE without calling fput(fp)."
+    },
+    {
+        "Commit": "real_gpiolib_cdev_24d479d26b25",
+        "case_id": "real-fp-08-gpiolib-chrdev-release-notifiers",
+        "category": "false_positive_trap",
+        "subsystem": "gpio",
+        "expected_behavior": "suppress_false_positive",
+        "scan_paths": [
+            "drivers/gpio/gpiolib-cdev.c"
+        ],
+        "scan_ref": "24d479d26b25bce5faea3ddd9fa8f3a6c3129ea7",
+        "target_function": "gpio_chrdev_release",
+        "problem_description": "Use-after-free in gpio_chrdev_release() because kfree(cdev) frees cdev before unregistering cdev->device_unregistered_nb and cdev->lineinfo_changed_nb from gdev's notifier chains."
+    }
+]

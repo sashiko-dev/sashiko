@@ -96,7 +96,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 
 # Benchmarking
 
-**CRITICAL RULE:** Never run the full (`benchmark.json`), small (`benchmark_small.json`), or versioned (`benchmark_versioned.json`) benchmarks without an explicit human request.
+**CRITICAL RULE:** Never run the full (`benchmark.json`), small (`benchmark_small.json`), versioned (`benchmark_versioned.json`), or active scan (`benchmark_scan.json`, `benchmark_scan_real.json`) benchmarks without an explicit human request.
 
 See `docs/benchmarking.md` for full setup and CLI options (`sashiko benchmark <path>` or `cargo run --bin sashiko -- benchmark <path>`). Available suites in `projects/linux/benchmarks/`:
 - `benchmark.json` (999 entries, full suite)
@@ -107,6 +107,8 @@ See `docs/benchmarking.md` for full setup and CLI options (`sashiko benchmark <p
 - `benchmark_arm64.json` (62 checked arm64 core bugs fixed in 2026)
 - `benchmark_preexisting.json` (known Linux bugs for testing the pre-existing bug pipeline)
 - `benchmark_versioned.json` (53 multi-version LKML patchset stories testing prior-version feedback verification, attribution, and suppression)
+- `benchmark_scan.json` (single-file active scan suite on `scan_corpus.c` with 26 minted historical Linux bugs and 6 clean false-positive traps)
+- `benchmark_scan_real.json` (8 unmodified real-world Linux `.c` files at historical revisions with 30 historical bugs and 8 clean false-positive traps)
 
 # LLM Workflow Design
 
