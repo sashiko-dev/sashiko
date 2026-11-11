@@ -55,7 +55,7 @@ Optional. Describes the project this configuration is for.
 |-----|------|---------|-------------|
 | `kind` | string | -- | Project this file is for: `"linux"`, `"sashiko"`, `"gcc"`, `"qemu"`, or `"zephyr"`. When set, it is checked against the project selected by `--project` / `SASHIKO_PROJECT`, and a mismatch is an error. When absent, the file is accepted for any project. |
 | `name` | string | `""` | Display name shown in the web UI. |
-| `description` | string | `""` | Short description shown in the web UI. |
+| `description` | string | `""` | Optional instance note shown in the web UI About dialog (in addition to the standard Sashiko overview). |
 | `domain` | string | `""` | Public hostname used to build links to the web UI in forge comments (`https://<domain>/#/patchset/...`). Falls back to `sashiko.sashiko.dev` when empty. |
 | `attribution` | string | -- | Actor name recorded on bug discoveries. Defaults to `domain`, or `"sashiko"` when neither is set. |
 
