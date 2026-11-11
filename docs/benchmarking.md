@@ -36,6 +36,7 @@ cargo run --bin sashiko -- benchmark projects/linux/benchmarks/benchmark_tiny.js
 | `projects/linux/benchmarks/benchmark_preexisting.json` | Tests detection of pre-existing bugs. |
 | `projects/linux/benchmarks/benchmark_versioned.json` | Multi-version LKML patchset stories (`v1..vN`) testing prior-feedback verification, reviewer attribution, and false-positive suppression. |
 | `projects/linux/benchmarks/benchmark_scan.json` | Single-file active codebase scan benchmark (`scan_corpus.c`, 32 entries: 26 minted historical kernel bugs across 9 categories + 6 clean false-positive traps) evaluated in one `sashiko scan` pass. |
+| `projects/linux/benchmarks/benchmark_scan_real.json` | Multi-file real-world active codebase scan benchmark across 8 unmodified Linux `.c` files at historical revisions (38 entries: 30 historical upstream bugs + 8 clean false-positive traps across KVM/arm64, BPF, arm64/ptrace, idpf, net/sched, KHO, and gpiolib). |
 
 Each file contains entries with a `Commit` hash (or target patch `Message-ID` for
 versioned mbox entries, or logical scan target key for active scan entries), an

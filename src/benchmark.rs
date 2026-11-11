@@ -7725,4 +7725,71 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_benchmark_scan_real_suite_validates_schema_and_invariants() -> Result<()> {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let bench_path = manifest_dir.join("projects/linux/benchmarks/benchmark_scan_real.json");
+        let raw = std::fs::read_to_string(&bench_path)?;
+        let entries: Vec<BenchmarkEntry> = serde_json::from_str(&raw)?;
+
+        assert_eq!(entries.len(), 38);
+        validate_benchmark_entries(&entries)?;
+
+        let mut case_ids = std::collections::HashSet::new();
+        let mut unique_commits = std::collections::HashSet::new();
+        let mut detect_count = 0usize;
+        let mut suppress_count = 0usize;
+
+        for entry in &entries {
+            assert!(entry.is_scan());
+            assert!(entry.requires_external_repo());
+            assert!(entry.scan_fixture.is_none());
+            assert_eq!(entry.scan_paths.len(), 1);
+            unique_commits.insert(entry.commit.clone());
+
+            let scan_ref = entry
+                .scan_ref
+                .as_deref()
+                .expect("every real scan benchmark entry must specify scan_ref");
+            assert_eq!(scan_ref.len(), 40);
+            assert!(scan_ref.chars().all(|c| c.is_ascii_hexdigit()));
+
+            let case_id = entry
+                .case_id
+                .as_deref()
+                .expect("every real scan benchmark entry must have a case_id");
+            assert!(
+                case_ids.insert(case_id.to_string()),
+                "duplicate case_id {case_id}"
+            );
+
+            let target_fn = entry
+                .target_function
+                .as_deref()
+                .expect("every real scan benchmark entry must specify target_function");
+            assert!(!target_fn.trim().is_empty());
+
+            match entry.expected_behavior {
+                BenchmarkExpectedBehavior::DetectBug => {
+                    detect_count += 1;
+                    let fixed_by = entry
+                        .fixed_by
+                        .as_deref()
+                        .expect("historical bug entry must carry Fixed-by reference");
+                    assert_eq!(fixed_by.len(), 40);
+                    assert!(fixed_by.chars().all(|c| c.is_ascii_hexdigit()));
+                }
+                BenchmarkExpectedBehavior::SuppressFalsePositive => {
+                    suppress_count += 1;
+                }
+                other => panic!("unexpected behavior {other:?} in benchmark_scan_real.json"),
+            }
+        }
+
+        assert_eq!(unique_commits.len(), 8);
+        assert_eq!(detect_count, 30);
+        assert_eq!(suppress_count, 8);
+        Ok(())
+    }
 }
