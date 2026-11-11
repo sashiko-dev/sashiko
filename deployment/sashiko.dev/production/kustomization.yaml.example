@@ -89,3 +89,12 @@ patches:
       - op: replace
         path: /metadata/annotations/networking.gke.io~1managed-certificates
         value: "certificate"
+
+  # 6. BackendConfig (Optional): Override Cloud Armor policy name
+  # - target:
+  #     kind: BackendConfig
+  #     name: sashiko-backend-config
+  #   patch: |-
+  #     - op: replace
+  #       path: /spec/securityPolicy/name
+  #       value: "sashiko-armor-policy"
