@@ -179,8 +179,8 @@ impl LlmSession for VerifySession<'_> {
             ProjectId::Linux => format!(
                 "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
                 You are an expert Linux kernel maintainer. Your task is to rigorously verify a candidate Linux kernel defect or vulnerability against the top-of-trunk of Linus Torvalds' main Linux kernel tree.\n\
-                Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
-                CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
+                Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the codebase, verify call chains, and confirm whether this defect exists. When calling git_read_files, pass explicit start_line and end_line ranges instead of reading entire multi-thousand-line files.\n\n\
+                CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. When a candidate defect depends on caller arguments, NULL/sentinel inputs, or missing locks, check the callers to confirm that the triggering precondition is actually reachable. Conversely, to mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the codebase that the described conditions are impossible, unreachable, or already safely handled (such as safe no-op helpers like kfree(NULL), all callers guaranteeing non-NULL/locked state, or dead error paths). PARTIAL-CONSEQUENCE GUARD: Never mark a candidate as a false positive merely because one claimed symptom (such as hitting a BUG()/WARN_ON() branch) is unreachable if the underlying invalid input, signed-to-unsigned truncation/sentinel cast, wrong bitmask/encoding, or state desynchronization STILL executes and produces a bogus return value, wrong invalidation size/range, silent failure, leak, or corrupted state in callers—trace the actual computed value into callers and keep is_false_positive=false with the accurate verified impact in verification_reasoning."
             ),
             ProjectId::Sashiko => format!(
                 "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
@@ -2870,6 +2870,35 @@ pub async fn run_standalone_bug_pipeline_for_project(
     .await
 }
 
+/// Options controlling standalone bug verification and calibration.
+#[derive(Debug, Clone)]
+pub struct StandaloneBugPipelineOptions {
+    pub min_severity: crate::db::SeverityFloor,
+    /// Skip multi-turn LLM git-history archeology (`TracingSession`) and use
+    /// fast deterministic `git blame` (`deterministic_blame_fallback`).
+    pub fast_origin_tracing: bool,
+    /// Reuse already-canonical title & description from `linux_scan` when valid,
+    /// avoiding a redundant `NormalizeSession` round-trip.
+    pub reuse_canonical_input: bool,
+    /// Optional supplemental file-wide invariant or intra-file context appended
+    /// to pre-fetched source context for `VerifySession` and `SeveritySession`.
+    pub extra_context: Option<String>,
+    /// Maximum tool-calling turns per `VerifySession` / `SeveritySession`.
+    pub max_session_turns: usize,
+}
+
+impl Default for StandaloneBugPipelineOptions {
+    fn default() -> Self {
+        Self {
+            min_severity: crate::db::SeverityFloor::High,
+            fast_origin_tracing: false,
+            reuse_canonical_input: false,
+            extra_context: None,
+            max_session_turns: 20,
+        }
+    }
+}
+
 /// Runs the standalone bug verification, origin-tracing, and severity
 /// calibration pipeline and filters results against `min_severity`.
 pub async fn run_standalone_bug_pipeline_with_min_severity(
@@ -2880,6 +2909,30 @@ pub async fn run_standalone_bug_pipeline_with_min_severity(
     project: ProjectId,
     min_severity: crate::db::SeverityFloor,
 ) -> Result<StandaloneBugOutcome> {
+    run_standalone_bug_pipeline_with_options(
+        provider,
+        tools,
+        input,
+        context_tag,
+        project,
+        StandaloneBugPipelineOptions {
+            min_severity,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Runs the standalone bug pipeline with explicit [`StandaloneBugPipelineOptions`].
+pub async fn run_standalone_bug_pipeline_with_options(
+    provider: &dyn AiProvider,
+    tools: Option<Arc<ToolBox>>,
+    input: BugInput,
+    context_tag: Option<&str>,
+    project: ProjectId,
+    opts: StandaloneBugPipelineOptions,
+) -> Result<StandaloneBugOutcome> {
+    let min_severity = opts.min_severity;
     let project_label = match project {
         ProjectId::Linux => "Linux kernel",
         ProjectId::Sashiko => "Sashiko",
@@ -2892,7 +2945,7 @@ pub async fn run_standalone_bug_pipeline_with_min_severity(
         project_label, input.problem, input.subsystems
     );
 
-    let runner = SessionRunner::new(provider).with_max_turns(20);
+    let runner = SessionRunner::new(provider).with_max_turns(opts.max_session_turns.max(1));
     let mut tokens_in = 0usize;
     let mut tokens_out = 0usize;
     let mut tokens_cached = 0usize;
@@ -2986,28 +3039,49 @@ pub async fn run_standalone_bug_pipeline_with_min_severity(
         .and_then(|v| serde_json::to_string_pretty(v).ok())
         .unwrap_or_else(|| "[]".to_string());
 
-    let mut norm_session = NormalizeSession {
-        problem: &input.problem,
-        reasoning: &input.reasoning,
-        locations: &raw_locations_str,
-        master_sha: &master_sha,
-        maintainers_hint,
-        tools: tools.clone(),
-        context_tag: context_tag.map(str::to_string),
-        project,
-    };
+    let canonical_desc_candidate = input
+        .reasoning
+        .split("\n\nSeverity Explanation:\n")
+        .next()
+        .unwrap_or(input.reasoning.as_str())
+        .trim();
+    let norm = if opts.reuse_canonical_input
+        && !effective_source_files.is_empty()
+        && crate::workflows::linux_scan::validate_canonical_bug_title(&input.problem).is_ok()
+        && crate::workflows::linux_scan::validate_canonical_bug_description(
+            canonical_desc_candidate,
+        )
+        .is_ok()
+    {
+        NormalizationJson {
+            canonical_title: input.problem.trim().to_string(),
+            canonical_description: canonical_desc_candidate.to_string(),
+            affected_source_files: effective_source_files.clone(),
+            affected_symbols: None,
+        }
+    } else {
+        let mut norm_session = NormalizeSession {
+            problem: &input.problem,
+            reasoning: &input.reasoning,
+            locations: &raw_locations_str,
+            master_sha: &master_sha,
+            maintainers_hint,
+            tools: tools.clone(),
+            context_tag: context_tag.map(str::to_string),
+            project,
+        };
 
-    let norm_result = runner
-        .run(&mut norm_session)
-        .await
-        .map_err(|e| wrap_standalone_bug_pipeline_error(e, tokens_in, tokens_out, tokens_cached))?;
-    add_usage(
-        &norm_result.usage,
-        &mut tokens_in,
-        &mut tokens_out,
-        &mut tokens_cached,
-    );
-    let norm = norm_result.output;
+        let norm_result = runner.run(&mut norm_session).await.map_err(|e| {
+            wrap_standalone_bug_pipeline_error(e, tokens_in, tokens_out, tokens_cached)
+        })?;
+        add_usage(
+            &norm_result.usage,
+            &mut tokens_in,
+            &mut tokens_out,
+            &mut tokens_cached,
+        );
+        norm_result.output
+    };
 
     let mut verified_files = Vec::new();
     let sanitized_norm_files: Vec<String> = norm
@@ -3040,8 +3114,16 @@ pub async fn run_standalone_bug_pipeline_with_min_severity(
     let title_prefix = extract_title_prefix(&norm.canonical_title);
 
     debug!("--- {} ---", BugStage::Verification.title());
-    let prefetched_context =
+    let mut prefetched_context =
         prefetch_bug_locations(tools.as_ref(), &master_sha, &effective_locations).await;
+    if let Some(ref extra) = opts.extra_context
+        && !extra.trim().is_empty()
+    {
+        if !prefetched_context.is_empty() {
+            prefetched_context.push_str("\n\n");
+        }
+        prefetched_context.push_str(extra.trim());
+    }
     let mut verify_session = VerifySession {
         title: &norm.canonical_title,
         description: &norm.canonical_description,
@@ -3087,37 +3169,50 @@ pub async fn run_standalone_bug_pipeline_with_min_severity(
         .unwrap_or_else(|| "[]".to_string());
 
     debug!("--- {} ---", BugStage::OriginTracing.title());
-    let tracing_runner = SessionRunner::new(provider).with_max_turns(30);
-    let mut tracing_session = TracingSession {
-        input: &input,
-        master_sha: master_sha.clone(),
-        verification_reasoning: verification.verification_reasoning.clone(),
-        relevant_locations: verified_locations_str.clone(),
-        tools: tools.clone(),
-        context_tag: context_tag.map(str::to_string),
-        project,
-    };
-    let tracing_result = tracing_runner
-        .run(&mut tracing_session)
-        .await
-        .map_err(|e| wrap_standalone_bug_pipeline_error(e, tokens_in, tokens_out, tokens_cached))?;
-    add_usage(
-        &tracing_result.usage,
-        &mut tokens_in,
-        &mut tokens_out,
-        &mut tokens_cached,
-    );
-    let tracing_output = tracing_result.output;
-    let introducing_commit_sha = match tracing_output.introducing_commit_sha {
-        Some(sha) => Some(sha),
-        None => {
-            deterministic_blame_fallback(tools.as_ref(), &verified_locations, &master_sha).await
+    let introducing_commit_sha = if opts.fast_origin_tracing {
+        deterministic_blame_fallback(tools.as_ref(), &verified_locations, &master_sha).await
+    } else {
+        let tracing_runner = SessionRunner::new(provider).with_max_turns(30);
+        let mut tracing_session = TracingSession {
+            input: &input,
+            master_sha: master_sha.clone(),
+            verification_reasoning: verification.verification_reasoning.clone(),
+            relevant_locations: verified_locations_str.clone(),
+            tools: tools.clone(),
+            context_tag: context_tag.map(str::to_string),
+            project,
+        };
+        let tracing_result = tracing_runner
+            .run(&mut tracing_session)
+            .await
+            .map_err(|e| {
+                wrap_standalone_bug_pipeline_error(e, tokens_in, tokens_out, tokens_cached)
+            })?;
+        add_usage(
+            &tracing_result.usage,
+            &mut tokens_in,
+            &mut tokens_out,
+            &mut tokens_cached,
+        );
+        let tracing_output = tracing_result.output;
+        match tracing_output.introducing_commit_sha {
+            Some(sha) => Some(sha),
+            None => {
+                deterministic_blame_fallback(tools.as_ref(), &verified_locations, &master_sha).await
+            }
         }
     };
     let introduced_in_commit = format_commit(tools.as_ref(), introducing_commit_sha).await;
 
-    let verified_prefetched =
+    let mut verified_prefetched =
         prefetch_bug_locations(tools.as_ref(), &master_sha, &verified_locations).await;
+    if !verified_prefetched.is_empty()
+        && let Some(ref extra) = opts.extra_context
+        && !extra.trim().is_empty()
+    {
+        verified_prefetched.push_str("\n\n");
+        verified_prefetched.push_str(extra.trim());
+    }
     let effective_prefetched = if !verified_prefetched.is_empty() {
         verified_prefetched
     } else {
@@ -9217,5 +9312,256 @@ F:	drivers/net/ethernet/intel/e1000/
         );
         let resolved = resolve_security_eval_sha(repo, &fixed_bug).await;
         assert_eq!(resolved.as_deref(), Some(vuln_sha.as_str()));
+    }
+
+    #[test]
+    fn test_verify_session_linux_prompt_has_partial_consequence_guard() {
+        let session = VerifySession {
+            project: ProjectId::Linux,
+            title: "kvm: arm64: nv: unhandled S1_MMU_DISABLED in pgshift_level_to_ttl()",
+            description: "pgshift_level_to_ttl() truncates negative s8 sentinel.",
+            subsystem: "KVM/arm64",
+            affected_files: &["arch/arm64/kvm/nested.c".to_string()],
+            locations: None,
+            master_sha: "08f97454b7fa39bfcf82524955c771d2d693d6fe".to_string(),
+            tools: None,
+            context_tag: None,
+            prefetched_context: String::new(),
+        };
+        let prompt = session.system_prompt();
+        assert!(prompt.contains("PARTIAL-CONSEQUENCE GUARD"));
+        assert!(prompt.contains("explicit start_line and end_line ranges"));
+
+        let opts = StandaloneBugPipelineOptions::default();
+        assert_eq!(opts.min_severity, crate::db::SeverityFloor::High);
+        assert!(!opts.fast_origin_tracing);
+        assert!(!opts.reuse_canonical_input);
+        assert!(opts.extra_context.is_none());
+        assert_eq!(opts.max_session_turns, 20);
+    }
+
+    struct RecordingQueuedMockProvider {
+        responses: std::sync::Mutex<std::collections::VecDeque<String>>,
+        requests: std::sync::Mutex<Vec<AiRequest>>,
+    }
+
+    impl RecordingQueuedMockProvider {
+        fn new(responses: Vec<String>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn captured_requests(&self) -> Vec<AiRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AiProvider for RecordingQueuedMockProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.requests.lock().unwrap().push(request);
+            let text = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected extra AI request in RecordingQueuedMockProvider");
+            Ok(AiResponse {
+                content: Some(text),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 32768,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_standalone_bug_pipeline_with_options_fast_paths_and_fallback() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let repo = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = crate::git_cmd::in_dir(repo).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        std::fs::create_dir_all(repo.join("arch/arm64/kvm"))?;
+        std::fs::write(
+            repo.join("arch/arm64/kvm/nested.c"),
+            "u8 pgshift_level_to_ttl(s8 level)\n{\n\treturn level & 3;\n}\n",
+        )?;
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "kvm: arm64: add nested ttl helper"]);
+        let sha = run_git(&["rev-parse", "HEAD"]);
+
+        let mut tb = ToolBox::new(repo.to_path_buf());
+        tb.set_virtual_head(sha.clone());
+        let tools = Some(Arc::new(tb));
+
+        // 1. Canonical input + fast_origin_tracing + extra_context: skips NormalizeSession & TracingSession.
+        let canonical_desc = "Trigger / Preconditions: Guest runs with S1_MMU_DISABLED (-127).\n\
+            Failure Mechanism: pgshift_level_to_ttl() masks s8 level with 3, returning bogus TTL.\n\
+            Impact: Missed Stage-2 VNCR TLB invalidation.";
+        let fast_provider = RecordingQueuedMockProvider::new(vec![
+            json!({
+                "verification_reasoning": "Confirmed bogus (level & 3) return value.",
+                "is_false_positive": false,
+                "refutation_evidence": null,
+                "impact_severity": "High",
+                "relevant_code_locations": [{
+                    "file": "arch/arm64/kvm/nested.c",
+                    "function_or_symbol": "pgshift_level_to_ttl",
+                    "line": 3
+                }]
+            })
+            .to_string(),
+            json!({
+                "severity": "High",
+                "severity_explanation": "Corrupts guest Stage-2 TLB invalidation range."
+            })
+            .to_string(),
+        ]);
+
+        let canonical_input = BugInput {
+            problem: "KVM: arm64: nv: unhandled S1_MMU_DISABLED in pgshift_level_to_ttl()"
+                .to_string(),
+            reasoning: format!(
+                "{canonical_desc}\n\nSeverity Explanation:\nStage-1 specialist note"
+            ),
+            locations: Some(json!([{
+                "file": "arch/arm64/kvm/nested.c",
+                "function_or_symbol": "pgshift_level_to_ttl",
+                "line": 3
+            }])),
+            subsystems: Vec::new(),
+            source_files: vec!["arch/arm64/kvm/nested.c".to_string()],
+            commit_sha: Some(sha.clone()),
+            patchset_id: None,
+            patch_id: None,
+            baseline_sha: Some(sha.clone()),
+            review_id: None,
+            min_severity: None,
+        };
+
+        let outcome = run_standalone_bug_pipeline_with_options(
+            &fast_provider,
+            tools.clone(),
+            canonical_input,
+            Some("[test] "),
+            ProjectId::Linux,
+            StandaloneBugPipelineOptions {
+                min_severity: crate::db::SeverityFloor::Medium,
+                fast_origin_tracing: true,
+                reuse_canonical_input: true,
+                extra_context: Some(
+                    "<file_invariants>\n- S1_MMU_DISABLED is -127\n</file_invariants>".to_string(),
+                ),
+                max_session_turns: 4,
+            },
+        )
+        .await?;
+
+        let reqs = fast_provider.captured_requests();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "expected only VerifySession and SeveritySession LLM calls"
+        );
+        for (idx, req) in reqs.iter().enumerate() {
+            let joined = format!("{req:?}");
+            assert!(
+                joined.contains("S1_MMU_DISABLED is -127"),
+                "request {idx} missing injected extra_context"
+            );
+        }
+        match outcome {
+            StandaloneBugOutcome::Verified(v) => {
+                assert_eq!(v.canonical_description, canonical_desc);
+                assert!(!v.canonical_description.contains("Stage-1 specialist note"));
+                assert!(
+                    v.introduced_in_commit
+                        .as_deref()
+                        .is_some_and(|c| c.contains("add nested ttl helper")),
+                    "expected deterministic git blame origin attribution, got {:?}",
+                    v.introduced_in_commit
+                );
+            }
+            other => panic!("expected Verified outcome, got {other:?}"),
+        }
+
+        // 2. Non-canonical title falls back to NormalizeSession even when reuse_canonical_input=true.
+        let fallback_provider = RecordingQueuedMockProvider::new(vec![
+            json!({
+                "canonical_title": "KVM: arm64: nv: unhandled S1_MMU_DISABLED in pgshift_level_to_ttl()",
+                "canonical_description": canonical_desc,
+                "affected_source_files": ["arch/arm64/kvm/nested.c"]
+            })
+            .to_string(),
+            json!({
+                "verification_reasoning": "Confirmed.",
+                "is_false_positive": false,
+                "refutation_evidence": null,
+                "impact_severity": "Medium",
+                "relevant_code_locations": [{"file": "arch/arm64/kvm/nested.c", "line": 3}]
+            })
+            .to_string(),
+            json!({
+                "severity": "Medium",
+                "severity_explanation": "Medium bug."
+            })
+            .to_string(),
+        ]);
+        let non_canonical_input = BugInput {
+            problem: "unprefixed non canonical title".to_string(),
+            reasoning: canonical_desc.to_string(),
+            locations: Some(json!([{"file": "arch/arm64/kvm/nested.c", "line": 3}])),
+            subsystems: Vec::new(),
+            source_files: vec!["arch/arm64/kvm/nested.c".to_string()],
+            commit_sha: Some(sha.clone()),
+            patchset_id: None,
+            patch_id: None,
+            baseline_sha: Some(sha),
+            review_id: None,
+            min_severity: None,
+        };
+        let fallback_outcome = run_standalone_bug_pipeline_with_options(
+            &fallback_provider,
+            tools,
+            non_canonical_input,
+            None,
+            ProjectId::Linux,
+            StandaloneBugPipelineOptions {
+                min_severity: crate::db::SeverityFloor::Medium,
+                fast_origin_tracing: true,
+                reuse_canonical_input: true,
+                extra_context: None,
+                max_session_turns: 4,
+            },
+        )
+        .await?;
+        assert!(matches!(
+            fallback_outcome,
+            StandaloneBugOutcome::Verified(_)
+        ));
+        assert_eq!(fallback_provider.captured_requests().len(), 3);
+        Ok(())
     }
 }
