@@ -31,6 +31,7 @@ In-depth coverage from the premier Linux news source.
 * [Debating the role of large language models in the kernel community](https://lwn.net/Articles/1083275/)
 * [Development statistics for the 7.2 kernel](https://lwn.net/Articles/1088776/)
 * [An update on the Sashiko patch-review system](https://lwn.net/Articles/1096963/)
+* [GCC development with large-language models](https://lwn.net/Articles/1098672/)
 * [The 2026 Maintainers Summit](https://lwn.net/Articles/1099594/)
 * [Development statistics for the 7.3 kernel](https://lwn.net/Articles/1100241/)
 
