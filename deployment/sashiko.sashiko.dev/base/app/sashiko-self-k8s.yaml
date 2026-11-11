@@ -56,10 +56,9 @@ spec:
       containers:
         - name: sashiko
           image: us-docker.pkg.dev/GCP_PROJECT_ID/sashiko-repository/sashiko:next
-          # The image entrypoint provisions the tree of whichever project
-          # SASHIKO__PROJECT__KIND names, here the Sashiko repository, and
-          # then execs the binary.
-          command: ["/bin/bash", "/usr/local/bin/docker-entrypoint.sh"]
+          # The image ENTRYPOINT runs tini -> docker-entrypoint.sh, which
+          # provisions the tree of whichever project SASHIKO__PROJECT__KIND
+          # names, here the Sashiko repository, and then execs the binary.
           args: ["--debug"]
           imagePullPolicy: Always
           resources:

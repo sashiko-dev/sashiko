@@ -49,7 +49,6 @@ spec:
       containers:
         - name: sashiko
           image: us-docker.pkg.dev/GCP_PROJECT_ID/sashiko-repository/sashiko:next
-          command: ["/bin/bash", "/usr/local/bin/docker-entrypoint.sh"]
           imagePullPolicy: Always
           resources:
             requests:

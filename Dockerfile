@@ -37,6 +37,7 @@ FROM debian:bookworm-slim
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     procps \
+    tini \
     git \
     libssl3 \
     ca-certificates \
@@ -81,4 +82,4 @@ ENV SASHIKO__DATABASE__URL=/data/db/sashiko.db \
 
 EXPOSE 8080
 
-ENTRYPOINT ["docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
