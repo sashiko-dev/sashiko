@@ -405,30 +405,41 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
         .unwrap_or_default();
 
     let in_reply_to = match message.in_reply_to() {
-        HeaderValue::Text(t) => Some(clean_display_name(t)).filter(|s| !s.is_empty()),
+        HeaderValue::Text(t) => {
+            Some(clean_display_name(t.trim_matches(['<', '>']))).filter(|s| !s.is_empty())
+        }
         HeaderValue::TextList(l) => l
             .iter()
-            .map(|s| clean_display_name(s))
+            .map(|s| clean_display_name(s.trim_matches(['<', '>'])))
             .find(|s| !s.is_empty()),
         _ => None,
     };
 
-    let references = match message.references() {
-        HeaderValue::Text(t) => {
-            let cleaned = clean_display_name(t);
-            if cleaned.is_empty() {
-                vec![]
-            } else {
-                vec![cleaned]
-            }
-        }
+    let references: Vec<String> = match message.references() {
+        HeaderValue::Text(t) => t
+            .split_whitespace()
+            .map(|s| clean_display_name(s.trim_matches(['<', '>'])))
+            .filter(|s| !s.is_empty())
+            .collect(),
         HeaderValue::TextList(l) => l
             .iter()
-            .map(|s| clean_display_name(s))
+            .flat_map(|s| s.split_whitespace())
+            .map(|s| clean_display_name(s.trim_matches(['<', '>'])))
             .filter(|s| !s.is_empty())
             .collect(),
         _ => vec![],
     };
+
+    // Mailers such as quilt mail omit In-Reply-To and record the parent
+    // message ID only in References (RFC 5322 section 3.6.4, where the final
+    // entry names the immediate parent). Ignore self-references.
+    let in_reply_to = in_reply_to.or_else(|| {
+        references
+            .iter()
+            .rev()
+            .find(|r| r.as_str() != message_id)
+            .cloned()
+    });
 
     let (index, total) = parse_subject_index(&subject);
     let version = parse_subject_version(&subject);
@@ -2209,6 +2220,62 @@ On Thu, Oct 22, Author wrote:\r\n\
                 3
             ),
             "[PATCH v3] lra: Handle subregs in get_dependent_filter."
+        );
+    }
+
+    #[test]
+    fn test_references_fallback_populates_in_reply_to() {
+        // quilt mail omits In-Reply-To and sets References to the cover letter.
+        let quilt_patch = b"Message-Id: <20261105170157.453569788@infradead.org>\r\n\
+From: Peter Zijlstra <peterz@infradead.org>\r\n\
+Subject: [PATCH 1/3] sched/fair: Use guard in sched_group_set_idle()\r\n\
+References: <20261105165525.011876858@infradead.org>\r\n\
+\r\n\
+--- a/kernel/sched/fair.c\r\n\
++++ b/kernel/sched/fair.c\r\n\
+@@ -1 +1 @@\r\n\
+-old\r\n\
++new\r\n";
+        let (meta, patch) = parse_email(quilt_patch).unwrap();
+        assert_eq!(
+            meta.in_reply_to.as_deref(),
+            Some("20261105165525.011876858@infradead.org")
+        );
+        assert_eq!(
+            meta.references,
+            vec!["20261105165525.011876858@infradead.org"]
+        );
+        assert!(patch.is_some());
+
+        // Multiple References entries pick the immediate parent (last non-self entry).
+        let multi_ref = b"Message-ID: <leaf@example.com>\r\n\
+From: Thomas Gleixner <tglx@kernel.org>\r\n\
+Subject: [patch 2/2] timers: cleanup\r\n\
+References: <root@example.com> <parent@example.com> <leaf@example.com>\r\n\
+\r\n\
+--- a/kernel/time/timer.c\r\n\
++++ b/kernel/time/timer.c\r\n\
+@@ -1 +1 @@\r\n\
+-old\r\n\
++new\r\n";
+        let (meta_multi, _) = parse_email(multi_ref).unwrap();
+        assert_eq!(
+            meta_multi.in_reply_to.as_deref(),
+            Some("parent@example.com")
+        );
+
+        // Explicit In-Reply-To always takes precedence over References.
+        let explicit = b"Message-ID: <child@example.com>\r\n\
+From: Author <a@example.com>\r\n\
+Subject: [PATCH 1/2] part\r\n\
+In-Reply-To: <direct-parent@example.com>\r\n\
+References: <root@example.com> <other@example.com>\r\n\
+\r\n\
+diff --git a/f.c b/f.c\r\n";
+        let (meta_explicit, _) = parse_email(explicit).unwrap();
+        assert_eq!(
+            meta_explicit.in_reply_to.as_deref(),
+            Some("direct-parent@example.com")
         );
     }
 }
