@@ -295,17 +295,20 @@ pub fn promote_reply_patch_subject(subject: &str, version: u32) -> String {
         return stripped.to_string();
     }
 
-    static RE_BRACKET_VER: OnceLock<Regex> = OnceLock::new();
-    let re_ver =
-        RE_BRACKET_VER.get_or_init(|| Regex::new(r"(?i)\[([^\]]*?)\bv\d+\b([^\]]*?)\]").unwrap());
-    if let Some(caps) = re_ver.captures(stripped)
-        && let Some(m) = caps.get(0)
-    {
-        let mut out = String::with_capacity(stripped.len() + 4);
-        out.push_str(&stripped[..m.start()]);
-        out.push_str(&format!("[{}v{}{}]", &caps[1], version, &caps[2]));
-        out.push_str(&stripped[m.end()..]);
-        return out;
+    static RE_BRACKETS: OnceLock<Regex> = OnceLock::new();
+    let re_brackets = RE_BRACKETS.get_or_init(|| Regex::new(r"\[([^\]]*)\]").unwrap());
+    for caps in re_brackets.captures_iter(stripped) {
+        if let Some(content) = caps.get(1)
+            && let Some((v_start, v_end, _)) = find_bracket_version_span(content.as_str())
+        {
+            let abs_start = content.start() + v_start;
+            let abs_end = content.start() + v_end;
+            let mut out = String::with_capacity(stripped.len() + 4);
+            out.push_str(&stripped[..abs_start]);
+            out.push_str(&format!("v{version}"));
+            out.push_str(&stripped[abs_end..]);
+            return out;
+        }
     }
 
     static RE_BRACKET_TAG: OnceLock<Regex> = OnceLock::new();
@@ -633,25 +636,92 @@ pub fn parse_subject_index(subject: &str) -> (u32, u32) {
     (1, 1)
 }
 
-pub fn parse_subject_version(subject: &str) -> Option<u32> {
-    static RE_VER: OnceLock<Regex> = OnceLock::new();
-    // Strategy:
-    // 1. Inside [...] blocks: find vN preceded by word boundary (e.g. [PATCH v2], [v2])
-    // 2. Start of string: ^vN followed by word boundary
-    // 3. Following PATCH: PATCH followed by non-word chars and vN (e.g. PATCHv2, [PATCH] v2)
-    let re = RE_VER.get_or_init(|| {
-        Regex::new(r"(?i)(?:\[[^\]]*?\bv(\d+)\b[^\]]*?\]|^\s*v(\d+)\b|PATCH\W*v(\d+)\b)").unwrap()
-    });
+/// Locate an integer revision token `v<N>` / `V<N>` inside a single bracketed
+/// group, skipping dotted tokens such as `V1.1`, `v6.6`, or `foo.v2`.
+fn find_bracket_version_span(group: &str) -> Option<(usize, usize, u32)> {
+    let bytes = group.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].eq_ignore_ascii_case(&b'v') {
+            let digits_start = i + 1;
+            let mut digits_end = digits_start;
+            while digits_end < bytes.len() && bytes[digits_end].is_ascii_digit() {
+                digits_end += 1;
+            }
+            if digits_end > digits_start {
+                let before = &group[..i];
+                let valid_before = before.is_empty()
+                    || before
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| !c.is_alphanumeric() && c != '.' && c != '_')
+                    || ["patch", "rfc"].iter().any(|kw| {
+                        before
+                            .len()
+                            .checked_sub(kw.len())
+                            .and_then(|split| {
+                                let head = before.get(..split)?;
+                                let tail = before.get(split..)?;
+                                Some((head, tail))
+                            })
+                            .is_some_and(|(head, tail)| {
+                                tail.eq_ignore_ascii_case(kw)
+                                    && head.chars().next_back().is_none_or(|c| {
+                                        !c.is_alphanumeric() && c != '.' && c != '_'
+                                    })
+                            })
+                    });
+                let after = &group[digits_end..];
+                let valid_after = after
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '.' && c != '_');
+                if valid_before
+                    && valid_after
+                    && let Ok(ver) = group[digits_start..digits_end].parse::<u32>()
+                {
+                    return Some((i, digits_end, ver));
+                }
+                i = digits_end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
 
-    if let Some(caps) = re.captures(subject) {
-        if let Some(m) = caps.get(1) {
-            return m.as_str().parse().ok();
+pub fn parse_subject_version(subject: &str) -> Option<u32> {
+    // 1. Inside [...] blocks: scan tokens so dotted kernel/revision numbers
+    //    (e.g. [STABLE v6.6 v2], [patch V1.1 02/38]) do not shadow or
+    //    impersonate integer patch revisions.
+    static RE_BRACKETS: OnceLock<Regex> = OnceLock::new();
+    let re_brackets = RE_BRACKETS.get_or_init(|| Regex::new(r"\[([^\]]*)\]").unwrap());
+    for caps in re_brackets.captures_iter(subject) {
+        if let Some(content) = caps.get(1)
+            && let Some((_, _, ver)) = find_bracket_version_span(content.as_str())
+        {
+            return Some(ver);
         }
-        if let Some(m) = caps.get(2) {
-            return m.as_str().parse().ok();
-        }
-        if let Some(m) = caps.get(3) {
-            return m.as_str().parse().ok();
+    }
+
+    // 2. Start of string (^vN) or following PATCH (PATCHv2, [PATCH] v2: ...),
+    //    provided the token is neither preceded nor followed by a dot.
+    static RE_OUTSIDE: OnceLock<Regex> = OnceLock::new();
+    let re_outside =
+        RE_OUTSIDE.get_or_init(|| Regex::new(r"(?i)(?:^\s*v(\d+)|PATCH([^\w.]*)v(\d+))").unwrap());
+    for caps in re_outside.captures_iter(subject) {
+        let Some(digits) = caps.get(1).or_else(|| caps.get(3)) else {
+            continue;
+        };
+        let after = &subject[digits.end()..];
+        if after
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '.' && c != '_')
+            && let Ok(ver) = digits.as_str().parse::<u32>()
+        {
+            return Some(ver);
         }
     }
     None
@@ -1609,6 +1679,22 @@ Body";
 
         // Edge case: [PATCH] v3: ...
         assert_eq!(parse_subject_version("[PATCH] v3: subject"), Some(3));
+
+        // Dotted revision tags and kernel target versions are not integer revisions
+        assert_eq!(
+            parse_subject_version("[patch V1.1 02/38] x86/paravirt"),
+            None
+        );
+        assert_eq!(parse_subject_version("[PATCH v6.6] net: fix"), None);
+        assert_eq!(parse_subject_version("[STABLE v6.12 1/4] net: fix"), None);
+        assert_eq!(
+            parse_subject_version("[STABLE v6.6 v2 1/2] net: fix"),
+            Some(2)
+        );
+        assert_eq!(
+            promote_reply_patch_subject("Re: [PATCH v6.6] net: fix", 2),
+            "[PATCH v2 v6.6] net: fix"
+        );
     }
 
     #[test]
