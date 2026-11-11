@@ -129,8 +129,8 @@ worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
-# Reasoning effort on Argon models: "low", "mid" (default), "high", or
-# "dynamic". Other models ignore it.
+# Reasoning effort on Gemini models: "low", "mid" (default on Gemini 4+),
+# "high", or "dynamic". Ignored on non-Gemini providers.
 # effort = "mid"
 # Skip the model run for a patch whose diff matches, modulo rebase noise,
 # a patch already reviewed with no findings. The patch gets a Skipped

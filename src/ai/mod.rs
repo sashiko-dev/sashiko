@@ -156,8 +156,8 @@ impl ReasoningEffort {
     }
 }
 
-/// Configurable reasoning effort mode for models that support effort levels
-/// (currently Argon 4).
+/// Configurable reasoning effort mode for Gemini models that support
+/// per-stage `thinkingConfig.thinkingLevel`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum EffortMode {
@@ -236,11 +236,79 @@ impl std::fmt::Display for EffortMode {
     }
 }
 
-/// Returns whether `model` supports configurable reasoning effort levels.
+fn normalize_gemini_model_id(model: &str) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    lower
+        .strip_prefix("publishers/google/models/")
+        .or_else(|| lower.strip_prefix("models/"))
+        .unwrap_or(&lower)
+        .to_string()
+}
+
+/// Returns whether `model` names a Gemini family model (`gemini` or `gemini-*`).
+pub fn is_gemini_model_name(model: &str) -> bool {
+    let id = normalize_gemini_model_id(model);
+    id == "gemini" || id.starts_with("gemini-")
+}
+
+/// Returns whether `model` names a pre-Gemini-4 release (such as `gemini-1.5-*`,
+/// `gemini-2.5-*`, `gemini-3.1-*`, or `gemini-pro`).
 ///
-/// Currently only Argon 4 (`gemini-4-argon`) supports this setting.
+/// Legacy Gemini models reject 128K `maxOutputTokens` without Long Decodes v2
+/// continuation and do not enable per-stage `EffortMode` unless explicitly
+/// configured.
+pub fn is_legacy_gemini_model(model: &str) -> bool {
+    let id = normalize_gemini_model_id(model);
+    if id == "gemini" {
+        return true;
+    }
+    let Some(rest) = id.strip_prefix("gemini-") else {
+        return false;
+    };
+    for legacy in ["pro", "ultra", "nano", "flash", "exp", "latest"] {
+        if rest == legacy || rest.starts_with(&format!("{legacy}-")) {
+            return true;
+        }
+    }
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 {
+        return rest[..digits].parse::<u32>().is_ok_and(|major| major < 4);
+    }
+    false
+}
+
+/// Returns whether `model` enables configurable per-stage reasoning effort and
+/// Long Decodes v2 continuation by default.
+///
+/// Matches Gemini 4+ models (`gemini-4-argon`, `gemini-4-carbon`, `gemini-5-*`,
+/// and codename releases such as `gemini-argon-preview`) while excluding
+/// pre-Gemini-4 (`gemini-1*`, `gemini-2*`, `gemini-3*`) and non-Gemini models.
 pub fn model_supports_effort(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("argon")
+    is_gemini_model_name(model) && !is_legacy_gemini_model(model)
+}
+
+/// Returns whether `(provider, model)` accepts per-stage `AiRequest::reasoning_effort`
+/// when `[review] effort` or `--effort` is explicitly configured.
+///
+/// Note: `stdio-gemini` is the daemon's generic worker IPC transport shared by
+/// OpenAI, Bedrock, Vertex, Ollama, vLLM, and Gemini, so it gates on
+/// [`is_gemini_model_name`] just like `vertex`.
+pub fn provider_accepts_per_stage_effort(provider: &str, model: &str) -> bool {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "gemini" => !model.trim().is_empty(),
+        "vertex" | "stdio-gemini" => is_gemini_model_name(model),
+        _ => false,
+    }
+}
+
+/// Returns whether `(provider, model)` enables default per-stage `EffortMode`
+/// when `[review] effort` is left unset.
+pub fn provider_defaults_to_effort(provider: &str, model: &str) -> bool {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "gemini" => !model.trim().is_empty() && !is_legacy_gemini_model(model),
+        "vertex" | "stdio-gemini" => model_supports_effort(model),
+        _ => false,
+    }
 }
 
 /// A generic AI request containing conversation history and configuration.
@@ -792,7 +860,7 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
 #[cfg(feature = "vertex")]
 fn resolve_vertex_max_tokens(ai: &AiSettings) -> u32 {
     let model = &ai.model;
-    let is_gemini = model.starts_with("gemini");
+    let is_gemini = is_gemini_model_name(model);
     ai.vertex
         .as_ref()
         .and_then(|v| v.max_tokens)
@@ -1142,7 +1210,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 .or_else(|| std::env::var("GOOGLE_CLOUD_LOCATION").ok())
                 .unwrap_or_else(|| "us-east5".to_string());
             let enable_caching = vertex.map(|v| v.prompt_caching).unwrap_or(true);
-            let is_gemini = model.starts_with("gemini");
+            let is_gemini = is_gemini_model_name(&model);
             let max_tokens = resolve_vertex_max_tokens(ai);
             let thinking = vertex.and_then(|v| v.thinking.clone()).or_else(|| {
                 if is_gemini {

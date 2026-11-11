@@ -4039,11 +4039,7 @@ async fn run_review_tool_with_cmd_and_overrides(
         cmd.arg("--cheap");
     }
 
-    if let Some(effort) = settings
-        .review
-        .effort
-        .or_else(|| settings.effective_effort())
-    {
+    if let Some(effort) = settings.effective_effort() {
         cmd.arg("--effort").arg(effort.as_str());
     }
 

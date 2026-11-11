@@ -573,7 +573,7 @@ impl GeminiClient {
 
         let max_tokens = settings
             .and_then(|s| s.max_tokens)
-            .unwrap_or_else(|| crate::settings::default_gemini_max_tokens_for_model(&model));
+            .unwrap_or_else(|| crate::settings::default_gemini_provider_max_tokens(&model));
 
         let client = Self::create_http_client(&api_key);
 
@@ -2784,6 +2784,10 @@ mod tests {
 
         let argon_client = GeminiClient::new_with_settings("gemini-4-argon".to_string(), None);
         assert_eq!(argon_client.max_tokens, 131_072);
+        let carbon_client = GeminiClient::new_with_settings("gemini-4-carbon".to_string(), None);
+        assert_eq!(carbon_client.max_tokens, 131_072);
+        let alias_client = GeminiClient::new_with_settings("custom-gemini-alias".to_string(), None);
+        assert_eq!(alias_client.max_tokens, 131_072);
 
         let explicit_settings = crate::settings::GeminiSettings {
             max_tokens: Some(65_536),

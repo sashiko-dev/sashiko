@@ -374,8 +374,8 @@ pub struct GeminiSettings {
     pub explicit_prompt_caching: Option<bool>,
     /// Max output tokens per `generateContent` request, thinking included.
     /// Sent as `generationConfig.maxOutputTokens`. When unset, defaults to
-    /// `131_072` on models with Long Decodes v2 (`CONTINUATION` support, such
-    /// as Argon) and is omitted (`0`) on other Gemini models so the backend
+    /// `131_072` on Gemini 4+ models with Long Decodes v2 (`CONTINUATION`
+    /// support) and is omitted (`0`) on pre-Gemini-4 models so the backend
     /// uses the model's native output ceiling.
     #[serde(default)]
     pub max_tokens: Option<u32>,
@@ -394,7 +394,7 @@ pub struct GeminiSettings {
     pub auth_token_command: Option<String>,
     /// Optional default thinking level sent as `thinkingConfig.thinkingLevel`
     /// (`"LOW"`, `"MEDIUM"`, `"HIGH"`) when a stage does not specify a
-    /// per-request reasoning effort. Every stage specifies one on Argon
+    /// per-request reasoning effort. Every stage specifies one on Gemini 4+
     /// models, where only `"LOW"` matters: it selects `EffortMode::Low` when
     /// `[review] effort` is unset.
     #[serde(default)]
@@ -402,7 +402,7 @@ pub struct GeminiSettings {
 }
 
 /// Default `max_tokens` for Long Decodes v2 models (`CONTINUATION` support,
-/// such as Argon), where thinking counts toward the budget and unary hops
+/// such as Gemini 4+), where thinking counts toward the budget and unary hops
 /// continue up to this cap.
 pub(crate) fn default_gemini_max_tokens() -> u32 {
     131_072
@@ -411,13 +411,25 @@ pub(crate) fn default_gemini_max_tokens() -> u32 {
 /// Resolves the default `max_tokens` for a Gemini `model` when neither
 /// `[ai.vertex]` nor `[ai.gemini]` sets `max_tokens`.
 ///
-/// Models with Long Decodes v2 continuation (matched via
-/// [`model_supports_effort`]) default to `131_072` so multi-hop continuation
-/// is enabled. All other Gemini models default to `0` (omitting
-/// `generationConfig.maxOutputTokens` so the backend uses the model's native
-/// output ceiling instead of rejecting a 128k value with 400 INVALID_ARGUMENT).
+/// Gemini 4+ models (matched via [`model_supports_effort`]) default to
+/// `131_072` so multi-hop continuation is enabled. Pre-Gemini-4 and non-Gemini
+/// model identifiers default to `0` (omitting `generationConfig.maxOutputTokens`
+/// so the backend uses the model's native output ceiling instead of rejecting
+/// a 128k value with 400 INVALID_ARGUMENT).
+#[cfg(any(feature = "vertex", test))]
 pub(crate) fn default_gemini_max_tokens_for_model(model: &str) -> u32 {
     if model_supports_effort(model) {
+        default_gemini_max_tokens()
+    } else {
+        0
+    }
+}
+
+/// Resolves the default `max_tokens` when `provider = "gemini"` is already
+/// selected and `[ai.gemini] max_tokens` is unset, enabling `131_072` for any
+/// non-legacy model identifier (including bare internal aliases).
+pub(crate) fn default_gemini_provider_max_tokens(model: &str) -> u32 {
+    if !model.trim().is_empty() && !crate::ai::is_legacy_gemini_model(model) {
         default_gemini_max_tokens()
     } else {
         0
@@ -1217,9 +1229,9 @@ pub struct ReviewSettings {
     #[serde(default = "default_max_total_output_tokens")]
     pub max_total_output_tokens: usize,
     /// Reasoning effort mode (`"low"`, `"mid"` or its alias `"medium"`,
-    /// `"high"`, or `"dynamic"`) for models that support configurable effort
-    /// levels (currently Argon 4). Defaults to `"mid"` when the model
-    /// supports effort levels and is ignored otherwise.
+    /// `"high"`, or `"dynamic"`) for Gemini models. Defaults to `"mid"` on
+    /// Gemini 4+ models when unset, and is always honored on Gemini when
+    /// explicitly set.
     #[serde(default)]
     pub effort: Option<EffortMode>,
     /// Default queue dispatch priority for patchsets without matching priority rules.
@@ -1263,20 +1275,25 @@ pub struct ReviewSettings {
     pub skip_unchanged_clean_require_same_baseline: bool,
     #[serde(skip)]
     pub stages: Option<Vec<String>>,
+    /// Set when `apply_overrides` switches `ai.provider` to `stdio-gemini` or
+    /// `stdio-claude`, making the `--effort` CLI flag passed by the parent
+    /// daemon/benchmark process authoritative inside the worker subprocess.
+    #[serde(skip)]
+    pub stdio_worker_authoritative: bool,
 }
 
 impl ReviewSettings {
     /// Resolves the effective reasoning effort mode for `model`.
     ///
-    /// Returns `None` when `model` does not support configurable effort levels
-    /// (currently only Argon 4 supports it). When `model` supports effort
-    /// levels, returns the configured `effort` or defaults to
-    /// [`EffortMode::Mid`].
+    /// When `self.effort` is explicitly set, honors it for any Gemini model
+    /// (`gemini-*`). When unset, defaults to [`EffortMode::Mid`] for Gemini 4+
+    /// models (matched via [`model_supports_effort`]) and returns `None`
+    /// otherwise.
     pub fn effective_effort(&self, model: &str) -> Option<EffortMode> {
-        if !model_supports_effort(model) {
-            return None;
+        if let Some(effort) = self.effort {
+            return crate::ai::is_gemini_model_name(model).then_some(effort);
         }
-        Some(self.effort.unwrap_or(EffortMode::Mid))
+        model_supports_effort(model).then_some(EffortMode::Mid)
     }
 
     /// Computes the initial priority for a patchset based on subject regex rules.
@@ -1507,13 +1524,21 @@ impl Settings {
         }
         self.ai.resume |= overrides.resume;
         self.review.cheap |= overrides.cheap;
+        let is_stdio_worker = overrides.ai_provider.as_deref().is_some_and(|p| {
+            p.eq_ignore_ascii_case("stdio-gemini") || p.eq_ignore_ascii_case("stdio-claude")
+        });
         if let Some(provider) = overrides.ai_provider {
             self.ai.provider = provider;
         }
         if let Some(model) = overrides.ai_model {
             self.ai.model = model;
         }
-        if let Some(effort) = overrides.effort {
+        if is_stdio_worker {
+            // The parent process already resolved `settings.effective_effort()`
+            // against the real provider and passed `--effort` iff active.
+            self.review.stdio_worker_authoritative = true;
+            self.review.effort = overrides.effort;
+        } else if let Some(effort) = overrides.effort {
             self.review.effort = Some(effort);
         }
         if overrides.read_only {
@@ -1533,17 +1558,22 @@ impl Settings {
 
     /// Resolves the effective reasoning effort mode for this configuration.
     ///
-    /// Returns `None` when `self.ai.model` does not support configurable
-    /// effort levels (currently only Argon 4 supports it). When the model
-    /// supports effort levels, resolves `[review] effort`, falls back to
+    /// When `[review] effort` (or `--effort`) is explicitly configured, honors
+    /// it for any Gemini provider/model. When unset, returns `None` unless the
+    /// configured provider and model default to per-stage effort (Gemini 4+ and
+    /// non-legacy aliases on `provider = "gemini"`), falling back to
     /// [`EffortMode::Low`] if the provider's global thinking level is set to
-    /// `"low"`, and otherwise defaults to [`EffortMode::Mid`].
+    /// `"low"` and otherwise defaulting to [`EffortMode::Mid`].
     pub fn effective_effort(&self) -> Option<EffortMode> {
-        if !model_supports_effort(&self.ai.model) {
-            return None;
+        if self.review.stdio_worker_authoritative {
+            return self.review.effort;
         }
         if let Some(effort) = self.review.effort {
-            return Some(effort);
+            return crate::ai::provider_accepts_per_stage_effort(&self.ai.provider, &self.ai.model)
+                .then_some(effort);
+        }
+        if !crate::ai::provider_defaults_to_effort(&self.ai.provider, &self.ai.model) {
+            return None;
         }
         if self.has_global_low_thinking_level() {
             return Some(EffortMode::Low);
@@ -2544,15 +2574,43 @@ mod tests {
         assert_eq!(gemini.max_tokens, None);
         assert_eq!(GeminiSettings::default().max_tokens, None);
 
+        for model in [
+            "gemini-4-argon",
+            "gemini-4-carbon",
+            "gemini-4-flash",
+            "gemini-5-pro",
+            "Gemini-Argon-Preview",
+            "publishers/google/models/gemini-4-carbon",
+        ] {
+            assert_eq!(
+                default_gemini_max_tokens_for_model(model),
+                131_072,
+                "{model} should default to 131_072 max_tokens"
+            );
+        }
+        for legacy in [
+            "gemini-3.1-pro-preview",
+            "gemini-3-flash-preview",
+            "gemini-2.5-pro",
+            "gemini-1.5-pro",
+            "gemini-pro",
+            "gemini-flash-latest",
+            "claude-sonnet-4-6",
+        ] {
+            assert_eq!(
+                default_gemini_max_tokens_for_model(legacy),
+                0,
+                "{legacy} should omit default max_tokens"
+            );
+        }
         assert_eq!(
-            default_gemini_max_tokens_for_model("gemini-4-argon"),
+            default_gemini_provider_max_tokens("custom-gemini-alias"),
             131_072
         );
         assert_eq!(
-            default_gemini_max_tokens_for_model("gemini-3.1-pro-preview"),
+            default_gemini_provider_max_tokens("gemini-3.1-pro-preview"),
             0
         );
-        assert_eq!(default_gemini_max_tokens_for_model("gemini-2.5-pro"), 0);
 
         let capped: GeminiSettings = toml::from_str("max_tokens = 65536").unwrap();
         assert_eq!(capped.max_tokens, Some(65_536));
@@ -2681,36 +2739,48 @@ mod tests {
     }
 
     #[test]
-    fn test_effort_mode_is_gated_on_model_and_defaults_to_mid_for_argon() {
+    fn test_effort_mode_is_gated_on_model_and_defaults_to_mid_for_gemini4_plus() {
         let mut review: ReviewSettings = toml::from_str("concurrency = 1").unwrap();
         assert_eq!(review.effort, None);
 
-        // Non-Argon models do not support configurable effort levels.
+        // Pre-Gemini-4 and non-Gemini models do not default to EffortMode when unset.
         assert_eq!(review.effective_effort("gemini-3.1-pro-preview"), None);
+        assert_eq!(review.effective_effort("gemini-3-flash-preview"), None);
+        assert_eq!(review.effective_effort("gemini-2.5-pro"), None);
         assert_eq!(review.effective_effort("claude-sonnet-4-6"), None);
 
-        // Argon models default to EffortMode::Mid when effort is unset.
-        assert_eq!(
-            review.effective_effort("gemini-4-argon"),
-            Some(EffortMode::Mid)
-        );
-        assert_eq!(
-            review.effective_effort("Gemini-Argon-Preview"),
-            Some(EffortMode::Mid)
-        );
+        // Gemini 4+ models default to EffortMode::Mid when effort is unset across codenames.
+        for model in [
+            "gemini-4-argon",
+            "gemini-4-carbon",
+            "gemini-4-flash",
+            "gemini-5-pro",
+            "Gemini-Argon-Preview",
+            "Gemini-Carbon-Preview",
+        ] {
+            assert_eq!(
+                review.effective_effort(model),
+                Some(EffortMode::Mid),
+                "{model} should default to Mid effort"
+            );
+        }
 
-        // Explicit "high" and "dynamic" are respected on Argon and ignored on non-Argon.
+        // Explicit effort is honored on any Gemini model and ignored on non-Gemini models.
         review.effort = Some(EffortMode::High);
         assert_eq!(
-            review.effective_effort("gemini-4-argon"),
+            review.effective_effort("gemini-4-carbon"),
             Some(EffortMode::High)
         );
-        assert_eq!(review.effective_effort("gemini-3.1-pro-preview"), None);
+        assert_eq!(
+            review.effective_effort("gemini-3.1-pro-preview"),
+            Some(EffortMode::High)
+        );
+        assert_eq!(review.effective_effort("claude-sonnet-4-6"), None);
 
         let dynamic: ReviewSettings =
             toml::from_str("concurrency = 1\neffort = \"dynamic\"").unwrap();
         assert_eq!(
-            dynamic.effective_effort("gemini-4-argon"),
+            dynamic.effective_effort("gemini-4-carbon"),
             Some(EffortMode::Dynamic)
         );
 
@@ -2718,12 +2788,18 @@ mod tests {
             toml::from_str("concurrency = 1\neffort = \"medium\"").unwrap();
         assert_eq!(mid_alias.effort, Some(EffortMode::Mid));
 
-        // Settings::effective_effort delegates to review.effective_effort(&ai.model).
+        // Settings::effective_effort incorporates both provider and model.
         let mut settings = Settings::new().unwrap();
-        settings.ai.model = "gemini-4-argon".to_string();
+        settings.ai.provider = "gemini".to_string();
+        settings.ai.model = "gemini-4-carbon".to_string();
         settings.review.effort = None;
         assert_eq!(settings.effective_effort(), Some(EffortMode::Mid));
 
+        // Bare model aliases under provider = "gemini" also default to Mid.
+        settings.ai.model = "custom-gemini-alias".to_string();
+        assert_eq!(settings.effective_effort(), Some(EffortMode::Mid));
+
+        settings.ai.model = "gemini-4-argon".to_string();
         settings.review.effort = Some(EffortMode::Dynamic);
         assert_eq!(settings.effective_effort(), Some(EffortMode::Dynamic));
 
@@ -2733,6 +2809,50 @@ mod tests {
         settings.review.effort = Some(EffortMode::Low);
         assert_eq!(settings.effective_effort(), Some(EffortMode::Low));
 
+        // Explicit effort is honored even on Gemini 3 models, but ignored on non-Gemini providers
+        // (including non-Gemini daemon workers routed over the stdio-gemini IPC transport).
+        settings.ai.model = "gemini-3.1-pro-preview".to_string();
+        assert_eq!(settings.effective_effort(), Some(EffortMode::Low));
+        settings.ai.provider = "claude".to_string();
+        settings.ai.model = "claude-sonnet-4-6".to_string();
+        assert_eq!(settings.effective_effort(), None);
+        settings.ai.provider = "stdio-gemini".to_string();
+        settings.ai.model = "gpt-5.4".to_string();
+        assert_eq!(settings.effective_effort(), None);
+        settings.review.effort = None;
+        assert_eq!(settings.effective_effort(), None);
+        settings.ai.model = "gemini-4-carbon".to_string();
+        assert_eq!(settings.effective_effort(), Some(EffortMode::Mid));
+
+        // Worker subprocesses spawned with --ai-provider stdio-gemini treat the parent's
+        // --effort flag as authoritative, preserving bare Gemini aliases while keeping
+        // non-Gemini daemon workers (even with effort set in Settings.toml) at None.
+        let mut bare_worker = Settings::new().unwrap();
+        bare_worker.ai.provider = "gemini".to_string();
+        bare_worker.ai.model = "custom-gemini-alias".to_string();
+        let parent_effort = bare_worker.effective_effort();
+        assert_eq!(parent_effort, Some(EffortMode::Mid));
+        bare_worker.apply_overrides(Overrides {
+            ai_provider: Some("stdio-gemini".to_string()),
+            effort: parent_effort,
+            ..Default::default()
+        });
+        assert_eq!(bare_worker.effective_effort(), Some(EffortMode::Mid));
+
+        let mut openai_worker = Settings::new().unwrap();
+        openai_worker.ai.provider = "openai".to_string();
+        openai_worker.ai.model = "gpt-5.4".to_string();
+        openai_worker.review.effort = Some(EffortMode::Dynamic);
+        assert_eq!(openai_worker.effective_effort(), None);
+        openai_worker.apply_overrides(Overrides {
+            ai_provider: Some("stdio-gemini".to_string()),
+            effort: None,
+            ..Default::default()
+        });
+        assert_eq!(openai_worker.effective_effort(), None);
+
+        settings.ai.provider = "gemini".to_string();
+        settings.ai.model = "gemini-4-carbon".to_string();
         settings.review.effort = None;
         settings.ai.gemini = Some(GeminiSettings {
             thinking_level: Some("LOW".to_string()),
