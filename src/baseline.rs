@@ -854,8 +854,59 @@ pub fn extract_version_tag(subject: &str) -> Option<String> {
     static VERSION_TAG_RE: OnceLock<Regex> = OnceLock::new();
     let re = VERSION_TAG_RE
         .get_or_init(|| Regex::new(r"(?i)\bv?(\d+\.\d+(?:\.\d+)?(?:-rc\d+)?(?:\.y)?)\b").unwrap());
-    re.captures(subject)
-        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_lowercase()))
+    for caps in re.captures_iter(subject) {
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        let Some(ver_match) = caps.get(1) else {
+            continue;
+        };
+        let ver = ver_match.as_str().to_lowercase();
+        if is_bracketed_patch_revision_tag(subject, full.start(), full.end(), &ver) {
+            continue;
+        }
+        return Some(ver);
+    }
+    None
+}
+
+/// Returns true when a matched `X.Y` token sits inside a non-stable `[...]`
+/// subject prefix and represents a dotted patch revision (`[patch V1.1 02/38]`,
+/// `[PATCH v2.1 1/3]`) rather than a baseline release tag.
+fn is_bracketed_patch_revision_tag(subject: &str, start: usize, end: usize, ver: &str) -> bool {
+    let Some(open) = subject[..start].rfind('[') else {
+        return false;
+    };
+    if subject[open..start].contains(']') {
+        return false;
+    }
+    let Some(rel_close) = subject[end..].find(']') else {
+        return false;
+    };
+    let group = &subject[open + 1..end + rel_close];
+    let mut has_patch_or_rfc = false;
+    for tok in group.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '.' && c != '_') {
+        if tok.eq_ignore_ascii_case("stable") {
+            return false;
+        }
+        if tok.eq_ignore_ascii_case("patch")
+            || tok.eq_ignore_ascii_case("rfc")
+            || tok.eq_ignore_ascii_case("resend")
+        {
+            has_patch_or_rfc = true;
+        }
+    }
+    let Some((maj_s, min_s)) = ver.split_once('.') else {
+        return false;
+    };
+    if !maj_s.bytes().all(|b| b.is_ascii_digit()) || !min_s.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let (Ok(major), Ok(minor)) = (maj_s.parse::<u32>(), min_s.parse::<u32>()) else {
+        return false;
+    };
+    let starts_with_v = subject.as_bytes()[start].eq_ignore_ascii_case(&b'v');
+    major < 3 && (major, minor) != (2, 6) && (starts_with_v || has_patch_or_rfc)
 }
 
 pub fn extract_gcc_release_branch(subject: &str) -> Option<u32> {
@@ -1218,6 +1269,25 @@ mod tests {
                 "{subject}"
             );
         }
+
+        // Dotted patch revision tags (such as [patch V1.1 02/38]) must not
+        // synthesize bogus LocalRef("v1.1") baseline candidates.
+        for subject in [
+            "[patch V1.1 02/38] x86/paravirt: cleanup",
+            "[PATCH v2.1 1/3] sched/fair: fix",
+            "[RFC PATCH v1.2] timers: prototype",
+        ] {
+            assert_eq!(extract_version_tag(subject), None, "{subject}");
+            assert_eq!(
+                registry.resolve_candidates(&files, subject, None).await,
+                fallback,
+                "{subject}"
+            );
+        }
+        assert_eq!(
+            extract_version_tag("[patch V1.1 02/38] x86: fix regression in v6.12"),
+            Some("6.12".to_string())
+        );
     }
 
     #[tokio::test]
