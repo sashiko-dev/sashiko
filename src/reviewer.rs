@@ -3127,32 +3127,41 @@ impl Reviewer {
                                             }
                                         }
                                         let project = ctx.settings.project.kind.unwrap_or_default();
+                                        let mindex = crate::maintainers::get_global_maintainers()
+                                            .unwrap_or_else(|| {
+                                                crate::maintainers::MaintainersIndex::load_for_project(
+                                                    project,
+                                                    std::path::Path::new(
+                                                        &ctx.settings.git.repository_path,
+                                                    ),
+                                                )
+                                            });
                                         let matched_subsystems: Vec<_> = if project
                                             .uses_maintainers()
                                         {
-                                            if let Some(mindex) =
-                                                crate::maintainers::get_global_maintainers()
-                                            {
-                                                mindex.attribute_files(&source_files)
-                                            } else if let Ok(mindex) =
-                                                crate::maintainers::MaintainersIndex::from_top_of_trunk(
-                                                    &ctx.settings.git.repository_path,
-                                                )
-                                            {
+                                            if mindex.is_ready_for_reconcile() {
                                                 mindex.attribute_files(&source_files)
                                             } else {
                                                 Vec::new()
                                             }
                                         } else {
-                                            crate::workflows::linux_bug::extract_directory_subsystems_for_project(
-                                                &source_files,
-                                                project,
-                                            )
-                                            .into_iter()
-                                            .map(
-                                                crate::db::AttributedSubsystem::from_path_prefix,
-                                            )
-                                            .collect()
+                                            let mut subs: Vec<_> =
+                                                crate::workflows::linux_bug::extract_directory_subsystems_for_project(
+                                                    &source_files,
+                                                    project,
+                                                )
+                                                .into_iter()
+                                                .map(
+                                                    crate::db::AttributedSubsystem::from_path_prefix,
+                                                )
+                                                .collect();
+                                            subs.extend(
+                                                mindex
+                                                    .bugs_access_sections(&source_files)
+                                                    .into_iter()
+                                                    .map(crate::db::AttributedSubsystem::from_upstream_grant),
+                                            );
+                                            subs
                                         };
 
                                         let input = crate::api::BugInput {

@@ -1966,13 +1966,7 @@ impl LinuxScanState {
             }
 
             let subsystems: Vec<crate::db::AttributedSubsystem> = maintainers
-                .map(|mindex| {
-                    mindex
-                        .match_files(&source_files)
-                        .into_iter()
-                        .map(crate::db::AttributedSubsystem::from_maintainers)
-                        .collect()
-                })
+                .map(|mindex| mindex.attribute_files(&source_files))
                 .unwrap_or_default();
 
             inputs.push(crate::api::BugInput {
@@ -2511,6 +2505,33 @@ mod tests {
         assert_eq!(
             inputs[1].commit_sha.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
+        );
+
+        let maintainers_raw = "\
+Maintainers List
+----------------
+
+CIFS/SMB3
+M:\tSteve French <sfrench@samba.org>
+F:\tfs/smb/
+";
+        let mut mindex =
+            crate::maintainers::MaintainersIndex::from_reader(maintainers_raw.as_bytes()).unwrap();
+        mindex.set_bugs_access(vec![crate::bugs_access::RawAccessGrant {
+            section: Some("SMB SERVER GROUP".into()),
+            paths: vec!["fs/smb/server/".into()],
+            read: vec!["ksmbd-dev@example.org".into()],
+            ..Default::default()
+        }]);
+        let attributed_inputs = state.to_candidate_bug_inputs(Some(&mindex));
+        assert_eq!(
+            attributed_inputs[1].subsystems,
+            vec![
+                crate::db::AttributedSubsystem::from_maintainers("CIFS/SMB3"),
+                crate::db::AttributedSubsystem::from_upstream_grant(
+                    "bugs_access::custom:smb server group"
+                ),
+            ]
         );
     }
 

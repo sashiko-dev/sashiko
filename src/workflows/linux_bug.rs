@@ -919,10 +919,20 @@ fn resolve_official_subsystems_for_project(
         };
     }
 
-    if !input_subsystems.is_empty() {
+    if !has_tools && !input_subsystems.is_empty() {
         return input_subsystems.to_vec();
     }
-    from_paths()
+    let mut out = from_paths();
+    let global = crate::maintainers::get_global_maintainers();
+    if let Some(index) = loaded_maintainers.or(global.as_deref()) {
+        out.extend(
+            index
+                .bugs_access_sections(verified_files)
+                .into_iter()
+                .map(AttributedSubsystem::from_upstream_grant),
+        );
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2037,10 +2047,20 @@ fn build_candidate_bug_and_enrichment(
         && !input.source_files.is_empty()
         && !project.uses_maintainers()
     {
-        extract_directory_subsystems_for_project(&input.source_files, project)
-            .into_iter()
-            .map(AttributedSubsystem::from_path_prefix)
-            .collect()
+        let mut subs: Vec<_> =
+            extract_directory_subsystems_for_project(&input.source_files, project)
+                .into_iter()
+                .map(AttributedSubsystem::from_path_prefix)
+                .collect();
+        if let Some(index) = crate::maintainers::get_global_maintainers() {
+            subs.extend(
+                index
+                    .bugs_access_sections(&input.source_files)
+                    .into_iter()
+                    .map(AttributedSubsystem::from_upstream_grant),
+            );
+        }
+        subs
     } else {
         input.subsystems.clone()
     };
@@ -2816,15 +2836,15 @@ fn wrap_standalone_bug_pipeline_error(
 
 async fn load_maintainers_for_bug_pipeline(
     tools: Option<&Arc<ToolBox>>,
+    project: ProjectId,
 ) -> Option<Arc<crate::maintainers::MaintainersIndex>> {
     if let Some(idx) = crate::maintainers::get_global_maintainers() {
         return Some(idx);
     }
     let repo_path = tools?.get_worktree_path().to_path_buf();
     tokio::task::spawn_blocking(move || {
-        crate::maintainers::MaintainersIndex::from_top_of_trunk(&repo_path)
-            .ok()
-            .map(Arc::new)
+        let idx = crate::maintainers::MaintainersIndex::load_for_project(project, &repo_path);
+        idx.is_ready_for_reconcile().then_some(idx)
     })
     .await
     .ok()
@@ -3017,22 +3037,22 @@ pub async fn run_standalone_bug_pipeline_with_options(
     }
 
     debug!("--- {} ---", BugStage::Normalization.title());
-    let loaded_maintainers = if project.uses_maintainers() {
-        load_maintainers_for_bug_pipeline(tools.as_ref()).await
+    let loaded_maintainers = load_maintainers_for_bug_pipeline(tools.as_ref(), project).await;
+    let maintainers_hint = if project.uses_maintainers() {
+        loaded_maintainers.as_ref().map(|mindex| {
+            let matched = mindex.match_files(&effective_source_files);
+            if matched.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "Detected Subsystems from MAINTAINERS: {}",
+                    matched.join(", ")
+                )
+            }
+        })
     } else {
         None
     };
-    let maintainers_hint = loaded_maintainers.as_ref().map(|mindex| {
-        let matched = mindex.match_files(&effective_source_files);
-        if matched.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "Detected Subsystems from MAINTAINERS: {}",
-                matched.join(", ")
-            )
-        }
-    });
 
     let raw_locations_str = effective_locations
         .as_ref()
@@ -3361,6 +3381,8 @@ struct DedupAttemptContext<'a> {
     canonical_title: &'a str,
     canonical_description: &'a str,
     verified_locations: Option<&'a Value>,
+    verified_files: &'a [String],
+    official_subsystems: &'a [AttributedSubsystem],
     official_subsystem_names: &'a [String],
     query_vector: &'a crate::ai::vector_search::BugVector,
 }
@@ -3429,16 +3451,20 @@ impl DedupAttemptContext<'_> {
             let logs = serde_json::to_string(full_history).unwrap_or_default();
             let folded = self
                 .db
-                .mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
-                    preserve_triage: true,
-                    ephemeral_id: self.bug_row_id,
-                    canonical_id: existing.id,
-                    reasoning: &reasoning,
-                    logs: None,
-                    tokens_in: None,
-                    tokens_out: None,
-                    tokens_cached: None,
-                })
+                .mark_bug_as_duplicate_with_attribution(
+                    crate::db::MarkDuplicateBugParams {
+                        preserve_triage: true,
+                        ephemeral_id: self.bug_row_id,
+                        canonical_id: existing.id,
+                        reasoning: &reasoning,
+                        logs: None,
+                        tokens_in: None,
+                        tokens_out: None,
+                        tokens_cached: None,
+                    },
+                    Some(self.official_subsystems),
+                    Some(self.verified_files),
+                )
                 .await?;
             if !folded {
                 return Ok(None);
@@ -3606,22 +3632,22 @@ pub async fn process_issue_worker_with_min_severity(
 
     // Normalization and canonical naming.
     debug!("--- {} ---", BugStage::Normalization.title());
-    let loaded_maintainers = if project.uses_maintainers() {
-        load_maintainers_for_bug_pipeline(tools.as_ref()).await
+    let loaded_maintainers = load_maintainers_for_bug_pipeline(tools.as_ref(), project).await;
+    let maintainers_hint = if project.uses_maintainers() {
+        loaded_maintainers.as_ref().map(|mindex| {
+            let matched = mindex.match_files(&effective_source_files);
+            if matched.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "Detected Subsystems from MAINTAINERS: {}",
+                    matched.join(", ")
+                )
+            }
+        })
     } else {
         None
     };
-    let maintainers_hint = loaded_maintainers.as_ref().map(|mindex| {
-        let matched = mindex.match_files(&effective_source_files);
-        if matched.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "Detected Subsystems from MAINTAINERS: {}",
-                matched.join(", ")
-            )
-        }
-    });
 
     let raw_locations_str = effective_locations
         .as_ref()
@@ -3774,6 +3800,8 @@ pub async fn process_issue_worker_with_min_severity(
         canonical_title: &norm.canonical_title,
         canonical_description: &norm.canonical_description,
         verified_locations: verified_locations.as_ref(),
+        verified_files: &verified_files,
+        official_subsystems: &official_subsystems,
         official_subsystem_names: &official_subsystem_names,
         query_vector: &query_vector,
     };
@@ -7488,6 +7516,32 @@ Call Trace:
         assert_eq!(
             similarity_subsystem_names(&attributed),
             vec!["ARM/QUALCOMM SUPPORT".to_string(), "arch/arm64".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_non_linux_subsystem_resolution_includes_bugs_access_grants() {
+        let mut index = crate::maintainers::MaintainersIndex::without_maintainers();
+        index.set_bugs_access(vec![crate::bugs_access::RawAccessGrant {
+            section: Some("NVME DEVICE".into()),
+            paths: vec!["hw/nvme/".into()],
+            read: vec!["nvme-dev@qemu.org".into()],
+            ..Default::default()
+        }]);
+        let files = vec!["hw/nvme/ctrl.c".to_string()];
+        let resolved = resolve_official_subsystems_for_project(
+            true,
+            Some(&index),
+            &[],
+            &files,
+            ProjectId::Qemu,
+        );
+        assert_eq!(
+            resolved,
+            vec![
+                AttributedSubsystem::from_path_prefix("hw/nvme"),
+                AttributedSubsystem::from_upstream_grant("bugs_access::custom:nvme device"),
+            ]
         );
     }
 

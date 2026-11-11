@@ -2921,11 +2921,11 @@ async fn handle_review_command(
     // these settings before dispatch.
     settings.git.repository_path = repo_path.to_string_lossy().into_owned();
 
-    if project.uses_maintainers()
-        && sashiko::maintainers::get_global_maintainers().is_none()
-        && let Ok(idx) = sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&repo_path)
-    {
-        sashiko::maintainers::init_global_maintainers(Arc::new(idx));
+    if sashiko::maintainers::get_global_maintainers().is_none() {
+        let idx = sashiko::maintainers::MaintainersIndex::load_for_project(project, &repo_path);
+        if idx.is_ready_for_reconcile() {
+            sashiko::maintainers::init_global_maintainers(idx);
+        }
     }
     eprintln!("Reviewing: {}", input);
     eprintln!("Using prompts: {}", prompts.display());
@@ -3519,14 +3519,15 @@ async fn handle_scan_command(
     settings.git.repository_path = repo_path.to_string_lossy().into_owned();
     sashiko::ai::validate_provider_credentials(&settings.ai)?;
 
-    if project.uses_maintainers() && sashiko::maintainers::get_global_maintainers().is_none() {
+    if sashiko::maintainers::get_global_maintainers().is_none() {
         let repo_for_maintainers = repo_path.clone();
-        if let Ok(Ok(idx)) = tokio::task::spawn_blocking(move || {
-            sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&repo_for_maintainers)
+        if let Ok(idx) = tokio::task::spawn_blocking(move || {
+            sashiko::maintainers::MaintainersIndex::load_for_project(project, &repo_for_maintainers)
         })
         .await
+            && idx.is_ready_for_reconcile()
         {
-            sashiko::maintainers::init_global_maintainers(Arc::new(idx));
+            sashiko::maintainers::init_global_maintainers(idx);
         }
     }
 
