@@ -133,6 +133,137 @@ fn parse_pickaxe_flag(args: &Value) -> Result<Option<String>> {
     Ok(Some(format!("{prefix}{raw}")))
 }
 
+/// Maximum commit ancestry depth walked by an unscoped `git log -S`/`-G`
+/// pickaxe query when neither `paths` nor an explicit `A..B` range is given.
+///
+/// Without a pathspec or lower-bound commit, git diffs every ancestor tree back
+/// to the root commit whenever fewer than `limit` commits match, burning a full
+/// CPU core and gigabytes of RSS across 1.4M+ kernel commits.
+const UNSCOPED_PICKAXE_MAX_COMMITS: usize = 10_000;
+
+async fn bound_unscoped_pickaxe_range(
+    worktree_path: &Path,
+    range: &str,
+    window: usize,
+) -> (String, bool) {
+    if window == 0
+        || range.contains("..")
+        || range.starts_with(":/")
+        || range.contains("^{/")
+        || range.chars().any(char::is_whitespace)
+    {
+        return (range.to_string(), false);
+    }
+    let ancestor = format!("{range}~{window}^{{commit}}");
+    let mut cmd = crate::git_cmd::in_dir_async(worktree_path);
+    cmd.args([
+        "-c",
+        "core.commitGraph=true",
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "--end-of-options",
+        &ancestor,
+    ]);
+    let exists = capped_output(&mut cmd)
+        .await
+        .is_ok_and(|out| out.status.success());
+
+    if exists {
+        (format!("{range}~{window}..{range}"), true)
+    } else {
+        (range.to_string(), false)
+    }
+}
+
+async fn execute_git_log(
+    args: Value,
+    context: &SashikoToolContext,
+    pickaxe_window: usize,
+) -> Result<Value> {
+    let range_raw = args["range"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Missing range"))?;
+    let range_virt = context.virtualize_ref(range_raw);
+    let range = range_virt.as_str();
+    if range.is_empty() || range.starts_with('-') {
+        return Err(anyhow!("Invalid range"));
+    }
+
+    let limit = args["limit"].as_u64().unwrap_or(10).min(100) as usize;
+    let oneline = args["oneline"].as_bool().unwrap_or(false);
+    let mut paths = parse_paths(&args, &context.worktree_path)?;
+    let line_range = parse_line_range(&args, &context.worktree_path)?;
+    let pickaxe_flag = parse_pickaxe_flag(&args)?;
+
+    if let Some(ref lr) = line_range {
+        if paths.iter().all(|p| p == &lr.path) {
+            // Git forbids combining -L with pathspecs; omit redundant matching pathspec.
+            paths.clear();
+        } else {
+            return Err(anyhow!(
+                "line_range already scopes git_log to '{}'; omit paths or pass only that path",
+                lr.path
+            ));
+        }
+    }
+
+    let (effective_range, bounded_pickaxe) =
+        if pickaxe_flag.is_some() && paths.is_empty() && line_range.is_none() {
+            bound_unscoped_pickaxe_range(&context.worktree_path, range, pickaxe_window).await
+        } else {
+            (range.to_string(), false)
+        };
+
+    let limit_str = limit.to_string();
+    let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+    cmd.args(["-c", "core.commitGraph=true", "log", "-n", &limit_str]);
+    if oneline {
+        cmd.arg("--oneline");
+    }
+    if let Some(ref lr) = line_range {
+        cmd.arg(&lr.flag);
+    }
+    if let Some(ref pf) = pickaxe_flag {
+        cmd.arg(pf);
+    }
+    cmd.arg(&effective_range);
+    if !paths.is_empty() {
+        cmd.arg("--").args(&paths);
+    }
+    cmd.kill_on_drop(true);
+
+    let output = capped_output(&mut cmd).await?;
+    if !output.is_usable() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Ok(Value::String(format!("Error: git log failed: {}", stderr)));
+    }
+
+    let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if raw_stdout.trim().is_empty() {
+        if bounded_pickaxe {
+            return Ok(Value::String(format!(
+                "No commits found in the last {pickaxe_window} commits. Pass 'paths' or an explicit 'A..B' range to search older history."
+            )));
+        }
+        return Ok(Value::String("No commits found.".to_string()));
+    }
+
+    let res = Truncator::truncate_sequential(&raw_stdout, 10_000);
+    let mut out = res.content;
+    if res.truncated {
+        out.push_str(
+            "\n[Truncated: log output exceeded token budget. Use a smaller commit range or set a lower limit.]",
+        );
+    } else if bounded_pickaxe {
+        out.push_str(&format!(
+            "\n[Unscoped pickaxe search bounded to the last {pickaxe_window} commits. Pass 'paths' or an explicit 'A..B' range to search older history.]"
+        ));
+    }
+
+    Ok(Value::String(out))
+}
+
 #[async_trait]
 impl LlmTool<SashikoToolContext> for GitLogTool {
     fn name(&self) -> &'static str {
@@ -213,70 +344,147 @@ impl LlmTool<SashikoToolContext> for GitLogTool {
     }
 
     async fn call(&self, args: Value, context: &SashikoToolContext) -> Result<Value> {
-        let range_raw = args["range"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Missing range"))?;
-        let range_virt = context.virtualize_ref(range_raw);
-        let range = range_virt.as_str();
-        if range.is_empty() || range.starts_with('-') {
-            return Err(anyhow!("Invalid range"));
+        execute_git_log(args, context, UNSCOPED_PICKAXE_MAX_COMMITS).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, RwLock};
+
+    fn make_context(path: &Path) -> SashikoToolContext {
+        SashikoToolContext {
+            worktree_path: path.to_path_buf(),
+            active_patch_files: RwLock::new(Vec::new()),
+            virtual_head: RwLock::new(None),
+            cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    async fn setup_six_commit_repo(dir: &Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test User"],
+        ] {
+            let out = crate::git_cmd::in_dir_async(dir)
+                .args(&args)
+                .output()
+                .await
+                .unwrap();
+            assert!(out.status.success());
         }
 
-        let limit = args["limit"].as_u64().unwrap_or(10).min(100) as usize;
-        let oneline = args["oneline"].as_bool().unwrap_or(false);
-        let mut paths = parse_paths(&args, &context.worktree_path)?;
-        let line_range = parse_line_range(&args, &context.worktree_path)?;
-        let pickaxe_flag = parse_pickaxe_flag(&args)?;
-
-        if let Some(ref lr) = line_range {
-            if paths.iter().all(|p| p == &lr.path) {
-                // Git forbids combining -L with pathspecs; omit redundant matching pathspec.
-                paths.clear();
+        for i in 1..=6 {
+            let symbol = if i == 1 {
+                "ANCIENT_TOKEN_1"
+            } else if i == 5 {
+                "RECENT_TOKEN_5"
             } else {
-                return Err(anyhow!(
-                    "line_range already scopes git_log to '{}'; omit paths or pass only that path",
-                    lr.path
-                ));
-            }
-        }
-
-        let limit_str = limit.to_string();
-        let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
-        cmd.args(["log", "-n", &limit_str]);
-        if oneline {
-            cmd.arg("--oneline");
-        }
-        if let Some(ref lr) = line_range {
-            cmd.arg(&lr.flag);
-        }
-        if let Some(ref pf) = pickaxe_flag {
-            cmd.arg(pf);
-        }
-        cmd.arg(range);
-        if !paths.is_empty() {
-            cmd.arg("--").args(&paths);
-        }
-        cmd.kill_on_drop(true);
-
-        let output = capped_output(&mut cmd).await?;
-        if !output.is_usable() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Ok(Value::String(format!("Error: git log failed: {}", stderr)));
-        }
-
-        let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        if raw_stdout.trim().is_empty() {
-            return Ok(Value::String("No commits found.".to_string()));
-        }
-
-        let res = Truncator::truncate_sequential(&raw_stdout, 10_000);
-        let mut out = res.content;
-        if res.truncated {
-            out.push_str(
-                "\n[Truncated: log output exceeded token budget. Use a smaller commit range or set a lower limit.]",
+                "FILLER"
+            };
+            std::fs::write(dir.join("code.c"), format!("/* {symbol} step {i} */\n")).unwrap();
+            assert!(
+                crate::git_cmd::in_dir_async(dir)
+                    .args(["add", "code.c"])
+                    .output()
+                    .await
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            assert!(
+                crate::git_cmd::in_dir_async(dir)
+                    .args([
+                        "commit",
+                        "--no-gpg-sign",
+                        "-q",
+                        "-m",
+                        &format!("commit {i}")
+                    ])
+                    .output()
+                    .await
+                    .unwrap()
+                    .status
+                    .success()
             );
         }
+    }
 
-        Ok(Value::String(out))
+    #[tokio::test]
+    async fn unscoped_pickaxe_bounds_deep_history_while_paths_and_ranges_search_all() {
+        let temp = tempfile::tempdir().unwrap();
+        setup_six_commit_repo(temp.path()).await;
+        let ctx = make_context(temp.path());
+
+        // With window = 3 on a 6-commit repo, unscoped pickaxe only walks HEAD~3..HEAD (commits 4..=6).
+        let miss = execute_git_log(
+            json!({"range": "HEAD", "pickaxe": "ANCIENT_TOKEN_1", "oneline": true}),
+            &ctx,
+            3,
+        )
+        .await
+        .unwrap();
+        let miss_str = miss.as_str().unwrap();
+        assert!(
+            miss_str.contains("No commits found in the last 3 commits"),
+            "unexpected miss output: {miss_str}"
+        );
+
+        let hit = execute_git_log(
+            json!({"range": "HEAD", "pickaxe": "RECENT_TOKEN_5", "oneline": true}),
+            &ctx,
+            3,
+        )
+        .await
+        .unwrap();
+        let hit_str = hit.as_str().unwrap();
+        assert!(hit_str.contains("commit 5"), "{hit_str}");
+        assert!(
+            hit_str.contains("Unscoped pickaxe search bounded to the last 3 commits"),
+            "{hit_str}"
+        );
+
+        // Passing paths bypasses the unscoped cap and finds commit 1.
+        let path_hit = execute_git_log(
+            json!({
+                "range": "HEAD",
+                "pickaxe": "ANCIENT_TOKEN_1",
+                "paths": ["code.c"],
+                "oneline": true
+            }),
+            &ctx,
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(path_hit.as_str().unwrap().contains("commit 1"));
+
+        // Passing an explicit A..B range also bypasses the unscoped cap.
+        let range_hit = execute_git_log(
+            json!({
+                "range": "HEAD~5..HEAD",
+                "pickaxe": "FILLER",
+                "oneline": true
+            }),
+            &ctx,
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(range_hit.as_str().unwrap().contains("commit 2"));
+
+        // Repositories smaller than UNSCOPED_PICKAXE_MAX_COMMITS search full history unchanged.
+        let small_repo_hit = GitLogTool
+            .call(
+                json!({"range": "HEAD", "pickaxe": "ANCIENT_TOKEN_1", "oneline": true}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let small_str = small_repo_hit.as_str().unwrap();
+        assert!(small_str.contains("commit 1"), "{small_str}");
+        assert!(!small_str.contains("bounded to the last"), "{small_str}");
     }
 }
