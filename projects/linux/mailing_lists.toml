@@ -50,7 +50,6 @@ min_severity = "medium"
 
 # --- Tracked for Web UI only (no outbound emails) ---
 
-["amd-gfx@lists.freedesktop.org"]
 ["driver-core@lists.linux.dev"]
 ["dwarves@vger.kernel.org"]
 ["fuse-devel@lists.linux.dev"]
@@ -116,6 +115,9 @@ subject_prefixes = ["damon"]
 ["devicetree@vger.kernel.org"]
 reply_to = ["author", "list"]
 cc = ["robh@kernel.org", "conor+dt@kernel.org"]
+
+["amd-gfx@lists.freedesktop.org"]
+reply_to = ["author", "list"]
 
 ["dri-devel@lists.freedesktop.org"]
 reply_to = ["author", "list"]
