@@ -1,6 +1,6 @@
 # Running the Sashiko Daemon (Server Mode)
 
-While `sashiko review` runs standalone local reviews without a server or database, Sashiko can also run as a continuous **daemon** for automated mailing list (`lore.kernel.org` / NNTP) and forge (GitHub/GitLab) monitoring, hosting the Web UI, and serving remote CLI requests via `sashiko-cli`.
+While `sashiko review` runs standalone local reviews without a server or database, Sashiko can also run as a continuous **daemon** for automated mailing list (NNTP, such as `lore.kernel.org` or `inbox.sourceware.org`) and forge (GitHub/GitLab) monitoring, hosting the Web UI, and serving remote CLI requests via `sashiko-cli`. Each daemon instance serves one configured project (`--project linux` by default).
 
 See also:
 - [Main README](../README.md) for an overview and local review quick start
@@ -10,7 +10,7 @@ See also:
 ## Prerequisites
 
 - **Rust**: Version 1.90 or later.
-- **Git**: For managing the repository and reference kernel tree.
+- **Git**: For managing the repository and target project tree (Linux kernel by default).
 - **LLM Provider API Key**: Access to an LLM provider (see the [LLM Provider Configuration Guide](llm-providers.md)).
 
 ## Building from Source
@@ -67,12 +67,12 @@ worktree_dir = "review_trees"
 For a full reference of every setting, see the [Configuration Reference](configuration.md). The default `Settings.toml` includes sections for:
 
 - **Database**: SQLite database path (`sashiko.db`).
-- **NNTP & Mailing Lists**: Server details, optional TLS, and `lore.kernel.org` groups to monitor.
+- **NNTP & Mailing Lists**: Server details, optional TLS, and NNTP mailing list groups to monitor (such as `lore.kernel.org` for Linux or `inbox.sourceware.org` for GCC).
 - **AI**: Provider and model selection (see [LLM Provider Configuration Guide](llm-providers.md)).
 - **Server**: API and Web UI host, port, and `[server.acl]` capabilities.
-- **Git**: Path to the reference kernel repository and optional `[[git.custom_remotes]]`.
+- **Git**: Path to the reference target repository and optional `[[git.custom_remotes]]`.
 - **Review**: Concurrency, token limits, and worktree settings.
-- **Forge** *(Experimental)*: GitHub/GitLab webhook integration (optional, unsupported). See the [Forge Setup Guide](FORGE_SETUP.md) ([GitHub](GITHUB_SETUP.md), [GitLab](GITLAB_SETUP.md), [Webhook Security](WEBHOOK_SECURITY.md)).
+- **Forge**: GitHub/GitLab webhook integration (used in production on `sashiko.sashiko.dev`; general third-party setups remain experimental). See the [Forge Setup Guide](FORGE_SETUP.md) ([GitHub](GITHUB_SETUP.md), [GitLab](GITLAB_SETUP.md), [Webhook Security](WEBHOOK_SECURITY.md)).
   - When enabling `[forge]`, the NNTP (mailing list) ingestor is disabled by default. To monitor both, set `disable_nntp = false` in `[forge]`.
 - **Subsystems**: Map file patterns or mailing list recipients to subsystems for targeted reviews and email policies.
 
@@ -125,9 +125,9 @@ For the complete command list, see the [CLI Reference](sashiko-cli.md).
 Sashiko implements stateless JWT-based authorization and login via sign-in links:
 
 - **Capability-based ACLs**: API mutations are controlled by `[server.acl]` in `Settings.toml`. Administrators assign user identities to specific capability arrays (`admins`, `ingest`, `cancel`, `review`), adhering to the principle of least privilege.
-- **Bug Tracker Access**: Two additional arrays cover the Linux kernel bug tracker:
-  - `security`: Lists the kernel security team, whose members can read and comment on every bug and inspect raw AI transcripts without gaining mutation capabilities.
+- **Bug Tracker Access**: Two additional arrays cover the pre-existing bug tracker:
+  - `security`: Lists security team members, who can read and comment on every bug and inspect raw AI transcripts without gaining mutation capabilities.
   - `bug_reporters`: Lists principals permitted to file bugs over HTTP (empty by default so only admins can).
-  - Subsystem maintainer authority over individual bugs is resolved dynamically per request from `MAINTAINERS`.
+  - For Linux deployments, subsystem maintainer authority over individual bugs is also resolved dynamically per request from `MAINTAINERS` and `projects/linux/upstream_maintainers.toml`.
 - **Blocklist & Fail-Closed Default**: An explicit `blocklist` array denies access unconditionally, overriding all capabilities and admin rights. If `[server.acl]` is omitted or empty, the server operates in a fail-closed mode where no remote mutations are permitted.
 - **Data Retention**: The server operates without persistent user accounts and retains no personal user data aside from explicit comments, actions, and review history metadata submitted onto hosted bugs.

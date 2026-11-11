@@ -85,20 +85,21 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `--no-default-features`: Minimal build for `sashiko` local review (`sashiko init`, `sashiko review`) and `sashiko-cli` without `libsql`, `axum`, `lettre`, or `jsonwebtoken` (`--features cache` adds the local AI response cache).
 
 ## Configuration, Prompts & Docs
-- `Settings.toml` & `projects/linux/mailing_lists.toml`: Main application and per-mailing-list tracking/delivery policy configuration (see `projects/linux/MAINTAINERS_GUIDE.md` for Linux maintainer onboarding and policy guidance).
-- `projects/sashiko/prompts/`: First-party review prompts for reviewing Sashiko itself (`--project sashiko`): review procedures (`*.md`), maintainer notes (`maintainers/`), and code notes (`notes/`).
-- `projects/linux/prompts/`: The Linux review prompts (bundled as `kernel/`): review procedures, maintainer notes (`maintainers/`) and code notes (`notes/`); its `README.md` describes the layout.
-- `projects/qemu/prompts/`: The QEMU review prompts (`--project qemu`): review procedures (`*.md`) and maintainer notes (`maintainers/`); generated code notes (`notes/`) are not produced for QEMU yet.
-- `projects/zephyr/prompts/`: The Zephyr review prompts (`--project zephyr`), laid out like the QEMU prompts; each rule cites the Zephyr document or source file it comes from. See `docs/zephyr-review.md`.
+- `Settings.toml` & `projects/<project>/mailing_lists.toml`: Main application and per-mailing-list tracking/delivery policy configuration (`projects/linux/mailing_lists.toml` by default; see `projects/linux/MAINTAINERS_GUIDE.md` for Linux maintainer onboarding and policy guidance).
+- `projects/linux/prompts/`: Primary Linux kernel review prompts (bundled as `kernel/`): review procedures, maintainer notes (`maintainers/`), and code notes (`notes/`); its `README.md` describes the layout.
+- `projects/gcc/prompts/`: Official GCC pilot review prompts (`--project gcc`): review procedures (`*.md`), maintainer notes (`maintainers/`), and generated code notes (`notes/`).
+- `projects/sashiko/prompts/`: First-party review prompts for reviewing Sashiko itself (`--project sashiko`): review procedures (`*.md`), maintainer notes (`projects/sashiko/prompts/maintainers/`), and code notes (`notes/`).
+- `projects/qemu/prompts/`: QEMU pilot review prompts (`--project qemu`): review procedures (`*.md`) and maintainer notes (`maintainers/`); generated code notes (`notes/`) are not produced for QEMU yet.
+- `projects/zephyr/prompts/`: Zephyr RTOS pilot review prompts (`--project zephyr`), laid out like the QEMU prompts; each rule cites the Zephyr document or source file it comes from. See `docs/zephyr-review.md`.
 - `static/`: Web UI assets (`static/index.html`, images).
 - `docs/`: User and operator documentation (`configuration.md`, `daemon.md`, `sashiko-cli.md`, `llm-providers.md`, `benchmarking.md`, `zephyr-review.md`, forge setup guides).
 - `designs/`: Architecture and design documents.
 
 # Benchmarking
 
-**CRITICAL RULE:** Never run the full (`benchmark.json`), small (`benchmark_small.json`), or versioned (`benchmark_versioned.json`) benchmarks without an explicit human request.
+**CRITICAL RULE:** Never run the full (`benchmark.json`), standard (`benchmark_small.json`, `benchmark_100.json`), or versioned (`benchmark_versioned.json`) benchmarks without an explicit human request.
 
-See `docs/benchmarking.md` for full setup and CLI options (`sashiko benchmark <path>` or `cargo run --bin sashiko -- benchmark <path>`). Available suites in `projects/linux/benchmarks/`:
+See `docs/benchmarking.md` for full setup and CLI options (`sashiko [--project <project>] benchmark <path>` or `cargo run --bin sashiko -- benchmark <path>`). Primary Linux suites live in `projects/linux/benchmarks/` (and GCC pilot suites live in `projects/gcc/benchmarks/`):
 - `benchmark.json` (999 entries, full suite)
 - `benchmark_small.json` (99 entries, standard suite)
 - `benchmark_tiny.json` (9 entries, quick iteration)
