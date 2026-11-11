@@ -485,30 +485,71 @@ impl Ingestor {
         }
     }
 
-    async fn process_nntp_cycle(&self) -> Result<()> {
-        let mut client = NntpClient::connect(
+    async fn ensure_nntp_client(
+        &self,
+        client: &mut Option<NntpClient>,
+        consecutive_failures: &mut usize,
+    ) -> Result<bool> {
+        const MAX_CONSECUTIVE_CONNECT_FAILURES: usize = 3;
+
+        if client.as_ref().is_some_and(NntpClient::is_connected) {
+            return Ok(true);
+        }
+        *client = None;
+
+        match NntpClient::connect(
             &self.settings.nntp.server,
             self.settings.nntp.port,
             self.settings.nntp.tls,
         )
-        .await?;
+        .await
+        {
+            Ok(connected) => {
+                *consecutive_failures = 0;
+                *client = Some(connected);
+                Ok(true)
+            }
+            Err(e) => {
+                *consecutive_failures += 1;
+                if *consecutive_failures >= MAX_CONSECUTIVE_CONNECT_FAILURES {
+                    return Err(anyhow!(
+                        "Aborting NNTP cycle after {} consecutive connection failures: {}",
+                        *consecutive_failures,
+                        e
+                    ));
+                }
+                warn!(
+                    "NNTP reconnect failed (attempt {}/{}): {}",
+                    *consecutive_failures, MAX_CONSECUTIVE_CONNECT_FAILURES, e
+                );
+                Ok(false)
+            }
+        }
+    }
 
-        'groups: for (name, group_name) in self.get_tracked_groups().await? {
+    async fn process_nntp_cycle(&self) -> Result<()> {
+        let groups = self.get_tracked_groups().await?;
+        if groups.is_empty() {
+            return Ok(());
+        }
+
+        let mut client: Option<NntpClient> = None;
+        let mut consecutive_connect_failures = 0usize;
+
+        'groups: for (name, group_name) in groups {
+            if !self
+                .ensure_nntp_client(&mut client, &mut consecutive_connect_failures)
+                .await?
+            {
+                continue;
+            }
+            let active_client = client.as_mut().expect("checked connected above");
             let group_name = &group_name;
 
-            let info = match client.group(group_name).await {
+            let info = match active_client.group(group_name).await {
                 Ok(i) => i,
                 Err(e) => {
                     error!("Failed to select group {}: {}", group_name, e);
-                    if let Ok(new_client) = NntpClient::connect(
-                        &self.settings.nntp.server,
-                        self.settings.nntp.port,
-                        self.settings.nntp.tls,
-                    )
-                    .await
-                    {
-                        client = new_client;
-                    }
                     continue;
                 }
             };
@@ -565,8 +606,7 @@ impl Ingestor {
             // Fetch ALL pending messages
             while current < info.high {
                 let next_id = current + 1;
-                // info!("Fetching article {}", next_id);
-                match client.article(&next_id.to_string()).await {
+                match active_client.article(&next_id.to_string()).await {
                     Ok(lines) => {
                         self.sender
                             .send(Event::ArticleFetched {
@@ -612,16 +652,7 @@ impl Ingestor {
                             }
                         } else {
                             error!("Failed to fetch article {}: {}", next_id, e);
-                            if let Ok(new_client) = NntpClient::connect(
-                                &self.settings.nntp.server,
-                                self.settings.nntp.port,
-                                self.settings.nntp.tls,
-                            )
-                            .await
-                            {
-                                client = new_client;
-                            }
-                            break; // Stop and retry later (transient error or connection lost)
+                            break; // Reconnect lazily on the next group if the socket closed.
                         }
                     }
                 }
@@ -633,7 +664,11 @@ impl Ingestor {
             }
         }
 
-        client.quit().await?;
+        if let Some(mut active_client) = client
+            && let Err(e) = active_client.quit().await
+        {
+            debug!("NNTP QUIT at cycle end failed: {}", e);
+        }
         Ok(())
     }
 
@@ -1630,5 +1665,136 @@ index bbc440c93e08..1123ef3ccf90 100644
             err.contains("transport 'nohelper' not allowed"),
             "expected git to refuse the helper transport, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_nntp_cycle_recovers_after_failed_reconnect() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Connection 1 (g1): greet, then drop socket on GROUP g1.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.write_all(b"200 ready\r\n").await.unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut cmd = String::new();
+                reader.read_line(&mut cmd).await.unwrap();
+                assert_eq!(cmd.trim(), "GROUP test.g1");
+            }
+
+            // Connection 2 (reconnect for g2): drop immediately before greeting so connect fails.
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                drop(stream);
+            }
+
+            // Connection 3 (reconnect for g3): succeed and serve article 2.
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                stream.get_mut().write_all(b"200 ready\r\n").await.unwrap();
+                loop {
+                    let mut cmd = String::new();
+                    if stream.read_line(&mut cmd).await.unwrap() == 0 {
+                        break;
+                    }
+                    let resp = match cmd.trim() {
+                        "GROUP test.g3" => "211 2 1 2 test.g3\r\n",
+                        "ARTICLE 2" => "220 2 <m2@example.test> article\r\nSubject: ok\r\n.\r\n",
+                        "QUIT" => {
+                            stream.get_mut().write_all(b"205 bye\r\n").await.unwrap();
+                            break;
+                        }
+                        other => panic!("unexpected NNTP command: {other}"),
+                    };
+                    stream.get_mut().write_all(resp.as_bytes()).await.unwrap();
+                }
+            }
+        });
+
+        let mut settings = Settings::new().unwrap();
+        settings.nntp.server = address.ip().to_string();
+        settings.nntp.port = address.port();
+        settings.mailing_lists.track = vec![
+            "g1:test.g1".into(),
+            "g2:test.g2".into(),
+            "g3:test.g3".into(),
+        ];
+        settings.database.url = ":memory:".into();
+
+        let db = Arc::new(Database::new(&settings.database).await.unwrap());
+        db.migrate().await.unwrap();
+        db.ensure_mailing_list("g3", "test.g3").await.unwrap();
+        db.update_last_article_num("test.g3", 1).await.unwrap();
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let consumer = tokio::spawn(async move {
+            let mut fetched = Vec::new();
+            while let Some(Event::ArticleFetched {
+                group,
+                article_id,
+                receipt,
+                ..
+            }) = receiver.recv().await
+            {
+                if let Some(mut r) = receipt {
+                    r.settle();
+                }
+                fetched.push((group, article_id));
+            }
+            fetched
+        });
+
+        let ingestor = Ingestor::new(settings, db.clone(), sender, None, true);
+        ingestor.process_nntp_cycle().await.unwrap();
+        server.await.unwrap();
+        drop(ingestor);
+
+        let fetched = consumer.await.unwrap();
+        assert_eq!(fetched, vec![("test.g3".to_string(), "2".to_string())]);
+        assert_eq!(db.get_last_article_num("test.g3").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_nntp_cycle_aborts_after_consecutive_connect_failures() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_srv = accepts.clone();
+
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accepts_srv.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        let mut settings = Settings::new().unwrap();
+        settings.nntp.server = address.ip().to_string();
+        settings.nntp.port = address.port();
+        settings.mailing_lists.track = (1..=8).map(|i| format!("g{i}:test.g{i}")).collect();
+        settings.database.url = ":memory:".into();
+
+        let db = Arc::new(Database::new(&settings.database).await.unwrap());
+        db.migrate().await.unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+        let ingestor = Ingestor::new(settings, db, sender, None, true);
+
+        let err = ingestor.process_nntp_cycle().await.unwrap_err();
+        server.abort();
+
+        assert!(
+            err.to_string()
+                .contains("Aborting NNTP cycle after 3 consecutive connection failures"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(accepts.load(Ordering::SeqCst), 3);
     }
 }
