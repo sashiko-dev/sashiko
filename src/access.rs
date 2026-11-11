@@ -414,17 +414,14 @@ impl FromRequestParts<Arc<crate::server::AppState>> for Principal {
         parts: &mut Parts,
         state: &Arc<crate::server::AppState>,
     ) -> Result<Self, Self::Rejection> {
-        if state.settings.server.testing_mode {
+        if !parts
+            .headers
+            .contains_key(axum::http::header::AUTHORIZATION)
+            && state.settings.server.testing_mode
+        {
             return Ok(Principal::testing_operator());
         }
         let user = crate::auth::AuthUser::from_request_parts(parts, state).await?;
-        if user
-            .sid
-            .as_deref()
-            .is_some_and(|sid| state.settings.server.acl.is_blocklisted(sid))
-        {
-            return Err((StatusCode::UNAUTHORIZED, "Token has been revoked."));
-        }
         let max_access = match user.max_bug_access.as_deref() {
             Some(s) => match BugAccess::parse(s) {
                 Some(level) => Some(level),
@@ -446,23 +443,35 @@ impl FromRequestParts<Arc<crate::server::AppState>> for Principal {
     }
 }
 
-/// Extractor for routes that are not bug routes but embed bug summaries, such
-/// as the patchset and review views. Those stay readable without a session, so
-/// a missing or invalid token resolves to the anonymous principal and the
-/// embedded bugs are filtered out rather than the whole page being refused.
+/// Extractor for routes that remain readable without a session (such as
+/// patchset, review, and capability-addressed bug views). Omitting the
+/// `Authorization` header (or presenting the local operator token) resolves to
+/// the anonymous principal; presenting an invalid, expired, or revoked token is
+/// rejected rather than silently downgraded to anonymous.
 pub struct OptionalPrincipal(pub Principal);
 
 impl FromRequestParts<Arc<crate::server::AppState>> for OptionalPrincipal {
-    type Rejection = std::convert::Infallible;
+    type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &Arc<crate::server::AppState>,
     ) -> Result<Self, Self::Rejection> {
-        match Principal::from_request_parts(parts, state).await {
-            Ok(principal) => Ok(OptionalPrincipal(principal)),
-            Err(_) => Ok(OptionalPrincipal(Principal::anonymous())),
+        if !parts
+            .headers
+            .contains_key(axum::http::header::AUTHORIZATION)
+            || crate::server::presents_local_token(&parts.headers, state)
+        {
+            let fallback = if state.settings.server.testing_mode {
+                Principal::testing_operator()
+            } else {
+                Principal::anonymous()
+            };
+            return Ok(OptionalPrincipal(fallback));
         }
+        Principal::from_request_parts(parts, state)
+            .await
+            .map(OptionalPrincipal)
     }
 }
 
@@ -486,9 +495,9 @@ impl TranscriptAccess {
 
 /// A principal together with the local-token evidence the HTTP edge saw.
 ///
-/// Extracted infallibly: an anonymous caller resolves to a principal holding
-/// nothing rather than a rejection, because the routes this guards also serve
-/// public data and must not start refusing it.
+/// An anonymous caller (no `Authorization` header) resolves to a principal
+/// holding nothing, while any invalid, expired, or revoked `Authorization`
+/// header is rejected rather than downgraded to anonymous.
 #[derive(Debug, Clone)]
 pub struct TranscriptPrincipal {
     principal: Principal,
@@ -562,20 +571,32 @@ impl TranscriptPrincipal {
 }
 
 impl FromRequestParts<Arc<crate::server::AppState>> for TranscriptPrincipal {
-    type Rejection = std::convert::Infallible;
+    type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &Arc<crate::server::AppState>,
     ) -> Result<Self, Self::Rejection> {
         let local_operator = crate::server::presents_local_token(&parts.headers, state);
-        let principal = match Principal::from_request_parts(parts, state).await {
-            Ok(principal) => principal,
-            Err(_) => Principal::anonymous(),
-        };
+        if !parts
+            .headers
+            .contains_key(axum::http::header::AUTHORIZATION)
+            || local_operator
+        {
+            let principal = if state.settings.server.testing_mode {
+                Principal::testing_operator()
+            } else {
+                Principal::anonymous()
+            };
+            return Ok(Self {
+                principal,
+                local_operator,
+            });
+        }
+        let principal = Principal::from_request_parts(parts, state).await?;
         Ok(Self {
             principal,
-            local_operator,
+            local_operator: false,
         })
     }
 }

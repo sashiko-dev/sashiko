@@ -747,8 +747,8 @@
                 if (res.status === 401) {
                     console.warn("Session token expired or rejected by server (401 Unauthorized), logging out.");
                     logoutAuth();
-                } else if (res.status === 403 && resource === '/api/auth/refresh') {
-                    console.warn("Session refresh forbidden (403 Forbidden), logging out.");
+                } else if (res.status === 403 && (resource === '/api/auth/refresh' || resource === '/api/config')) {
+                    console.warn("Session rejected (403 Forbidden), logging out.");
                     logoutAuth();
                 }
             }
