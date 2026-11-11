@@ -577,6 +577,29 @@ impl BaselineRegistry {
             }
         }
 
+        // OBJTOOL in Linux MAINTAINERS points at maintainer-tip.rst via P:
+        // without a T: line, while patches land on tip.git objtool/core and
+        // objtool/urgent.
+        let objtool_count = files.iter().filter(|f| is_objtool_file(f)).count();
+        if objtool_count > 0
+            && !tree_counts
+                .keys()
+                .any(|(u, b)| is_tip_tree_url(u) && b.as_deref() == Some("objtool/core"))
+            && let Some(tip_url) = self
+                .entries
+                .iter()
+                .flat_map(|e| &e.trees)
+                .map(|(url, _)| url)
+                .find(|url| is_tip_tree_url(url))
+                .cloned()
+        {
+            let key = (tip_url, Some("objtool/core".to_string()));
+            *tree_counts.entry(key.clone()).or_insert(0) += objtool_count;
+            tree_subsystems
+                .entry(key)
+                .or_insert_with(|| "OBJTOOL".to_string());
+        }
+
         if tree_counts.is_empty() {
             return Vec::new();
         }
@@ -726,11 +749,48 @@ impl BaselineRegistry {
         // Sort descending by score
         scored_candidates.sort_by_key(|b| std::cmp::Reverse(b.0));
 
+        let prefer_urgent = subject_lower.contains("urgent");
         let mut unique_filtered = Vec::new();
-        for (_, res) in scored_candidates {
-            if !unique_filtered.contains(&res) {
-                unique_filtered.push(res);
+        let mut tip_master_urls: Vec<String> = Vec::new();
+        let push_unique = |list: &mut Vec<BaselineResolution>, item: BaselineResolution| {
+            if !list.contains(&item) {
+                list.push(item);
             }
+        };
+
+        for (_, res) in scored_candidates {
+            if let BaselineResolution::RemoteTarget {
+                ref url,
+                branch: Some(ref branch),
+                ..
+            } = res
+                && is_tip_tree_url(url)
+            {
+                if !tip_master_urls.contains(url) {
+                    tip_master_urls.push(url.clone());
+                }
+                if let Some(subsys) = branch.strip_suffix("/core")
+                    && !subsys.is_empty()
+                {
+                    let urgent = self.resolve_url(url, Some(format!("{subsys}/urgent")));
+                    if prefer_urgent {
+                        push_unique(&mut unique_filtered, urgent);
+                        push_unique(&mut unique_filtered, res);
+                    } else {
+                        push_unique(&mut unique_filtered, res);
+                        push_unique(&mut unique_filtered, urgent);
+                    }
+                    continue;
+                }
+            }
+            push_unique(&mut unique_filtered, res);
+        }
+
+        for tip_url in tip_master_urls {
+            push_unique(
+                &mut unique_filtered,
+                self.resolve_url(&tip_url, Some("master".to_string())),
+            );
         }
 
         unique_filtered
@@ -827,6 +887,17 @@ fn is_non_linux_project_url(url: &str) -> bool {
 /// The branch a mainline remote develops on.
 fn mainline_branch(project: Option<ProjectId>) -> &'static str {
     project.map_or("master", ProjectId::mainline_branch)
+}
+
+fn is_tip_tree_url(url: &str) -> bool {
+    let lower = url.trim_end_matches('/').to_ascii_lowercase();
+    lower.ends_with("/tip/tip.git") || lower.ends_with("/tip.git")
+}
+
+fn is_objtool_file(file: &str) -> bool {
+    file.starts_with("tools/objtool/")
+        || file.starts_with("include/linux/objtool")
+        || file == "Documentation/tools/objtool.txt"
 }
 
 fn sanitize_diff_path(raw: &str) -> Option<&str> {
@@ -2450,5 +2521,80 @@ index 1111111..2222222 100644
 +y
 ";
         assert_eq!(extract_files_from_diff(mixed), vec!["kernel/irq/manage.c"]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_tip_urgent_master_and_objtool() {
+        let tip_url = "git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git".to_string();
+        let entries = vec![
+            MaintainersEntry {
+                subsystem: "SCHEDULER".to_string(),
+                trees: vec![(tip_url.clone(), Some("sched/core".to_string()))],
+                patterns: vec!["kernel/sched/".to_string()],
+            },
+            MaintainersEntry {
+                subsystem: "OBJTOOL".to_string(),
+                trees: Vec::new(),
+                patterns: vec!["tools/objtool/".to_string()],
+            },
+        ];
+        let mut remote_map = HashMap::new();
+        remote_map.insert(tip_url.clone(), "tip".to_string());
+        let registry = BaselineRegistry {
+            entries,
+            remote_map,
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
+            project: None,
+            fetch_remotes: Vec::new(),
+            mainline_remote: None,
+        };
+
+        let sched_files = vec!["kernel/sched/fair.c".to_string()];
+        let tip_branches = |cands: &[BaselineResolution]| -> Vec<String> {
+            cands
+                .iter()
+                .filter_map(|c| match c {
+                    BaselineResolution::RemoteTarget {
+                        name,
+                        branch: Some(b),
+                        ..
+                    } if name == "tip" => Some(b.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let normal = registry
+            .resolve_candidates(
+                &sched_files,
+                "[PATCH 0/3] sched/fair: Fix cgroup::idle preemption",
+                None,
+            )
+            .await;
+        assert_eq!(
+            tip_branches(&normal),
+            vec!["sched/core", "sched/urgent", "master"]
+        );
+
+        let urgent = registry
+            .resolve_candidates(&sched_files, "[PATCH sched/urgent] sched/fair: Fix", None)
+            .await;
+        assert_eq!(
+            tip_branches(&urgent),
+            vec!["sched/urgent", "sched/core", "master"]
+        );
+
+        let objtool = registry
+            .resolve_candidates(
+                &["tools/objtool/check.c".to_string()],
+                "[PATCH] objtool: Fix jump table handling",
+                None,
+            )
+            .await;
+        assert_eq!(
+            tip_branches(&objtool),
+            vec!["objtool/core", "objtool/urgent", "master"]
+        );
     }
 }
