@@ -434,7 +434,10 @@ impl Database {
                FROM preexisting_disclosures d
               WHERE d.bug_id IS NOT NULL AND {LIVE_ROW}"
         );
-        let mut rows = self.conn.query(&sql, libsql::params![oldest_live]).await?;
+        let mut rows = self
+            .read_conn()
+            .query(&sql, libsql::params![oldest_live])
+            .await?;
         let mut out = std::collections::HashSet::new();
         while let Some(row) = rows.next().await? {
             let bug_id: i64 = row.get(0)?;
@@ -494,7 +497,7 @@ impl Database {
             for _ in 0..2 {
                 params.extend(chunk.iter().map(|f| libsql::Value::Text((*f).to_string())));
             }
-            let mut rows = self.conn.query(&sql, params).await?;
+            let mut rows = self.read_conn().query(&sql, params).await?;
             while let Some(row) = rows.next().await? {
                 let bug = Self::parse_bug_row_core(&row)?;
                 found.insert(bug.id, bug);
@@ -514,7 +517,7 @@ impl Database {
         &self,
         files: &[String],
     ) -> Result<Vec<PreexistingDisclosure>> {
-        disclosures_in_files_on(&self.conn, files, chrono::Utc::now().timestamp()).await
+        disclosures_in_files_on(self.read_conn(), files, chrono::Utc::now().timestamp()).await
     }
 
     /// The live disclosures of the review of `patch_message_id` (mailed, or
@@ -530,7 +533,7 @@ impl Database {
         );
         let oldest_live = chrono::Utc::now().timestamp() - RESERVATION_TTL_SECS;
         let mut rows = self
-            .conn
+            .read_conn()
             .query(&sql, libsql::params![patch_message_id, oldest_live])
             .await?;
         let mut found = BTreeMap::new();
@@ -538,7 +541,7 @@ impl Database {
             let disclosure = disclosure_from_row(&row)?;
             found.insert(disclosure.id, disclosure);
         }
-        attach_files(&self.conn, &mut found).await?;
+        attach_files(self.read_conn(), &mut found).await?;
         Ok(found.into_values().collect())
     }
 

@@ -7802,7 +7802,7 @@ async fn request_link(
                 lifetime.max(0) as u64,
             );
             if state.settings.smtp.is_some() {
-                let _ = state.db.conn.query("SELECT 1", ()).await;
+                let _ = state.db.read_conn().query("SELECT 1", ()).await;
             }
             tracing::debug!(
                 "Ignored sign-in link request for ineligible or rate-limited address: {}",

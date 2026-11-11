@@ -233,7 +233,7 @@ impl Database {
     /// patchset does not exist or is the first version in its lineage.
     pub async fn get_previous_patchset_id(&self, patchset_id: i64) -> Result<Option<i64>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT previous_patchset_id FROM patchsets WHERE id = ? LIMIT 1",
                 libsql::params![patchset_id],
@@ -527,7 +527,7 @@ impl Database {
 
     async fn fetch_chain_patchset_row(&self, id: i64) -> Result<Option<ChainPatchsetRow>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT id, thread_id, cover_letter_message_id, COALESCE(subject, ''),
                         COALESCE(author, ''), COALESCE(date, 0), mr_url, mr_number,
@@ -567,7 +567,7 @@ impl Database {
 
         for ps in std::iter::once(curr_ps).chain(ancestors.iter()) {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT p.id, p.patchset_id, p.message_id, COALESCE(p.part_index, 1),
                             p.previous_patch_id, p.diff, m.author, m.body, m.thread_id
@@ -604,7 +604,7 @@ impl Database {
                 && !cover_is_a_patch(clid)
             {
                 let mut mrows = self
-                    .conn
+                    .read_conn()
                     .query(
                         "SELECT body FROM messages WHERE message_id = ? LIMIT 1",
                         libsql::params![clid.as_str()],
@@ -821,7 +821,7 @@ impl Database {
         patch_id: i64,
     ) -> Result<Option<i64>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT id FROM reviews
                  WHERE patchset_id = ? AND patch_id = ? AND status = 'Reviewed'
@@ -846,7 +846,7 @@ impl Database {
     ) -> Result<Vec<PriorFindingItem>> {
         let source_message_id = Some(normalize_msgid(source_message_id)).filter(|m| !m.is_empty());
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT severity, severity_explanation, COALESCE(problem, ''),
                         locations
@@ -968,7 +968,7 @@ impl Database {
             }
             let limit = remaining.min(MAX_ROWS_PER_THREAD) as i64;
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(&thread_sql, libsql::params![tid, limit])
                 .await?;
             while let Some(r) = rows.next().await? {
@@ -1037,7 +1037,7 @@ impl Database {
              LIMIT ?"
         );
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 &sql,
                 libsql::params![serde_json::to_string(parent_candidates)?, limit as i64],
@@ -1087,7 +1087,10 @@ impl Database {
                 "SELECT message_id FROM patches
                  WHERE message_id IN (SELECT value FROM json_each(?))",
             ] {
-                let mut rows = self.conn.query(sql, libsql::params![json.as_str()]).await?;
+                let mut rows = self
+                    .read_conn()
+                    .query(sql, libsql::params![json.as_str()])
+                    .await?;
                 while let Some(r) = rows.next().await? {
                     let hit: Option<String> = r.get(0)?;
                     if let Some(norm) = hit.and_then(|h| norm_by_candidate.get(&h)) {
@@ -1104,7 +1107,7 @@ impl Database {
         let mut raw: Vec<(i64, libsql::Value)> = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(SQL_IN_BATCH) {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT id, body FROM messages
                      WHERE id IN (SELECT value FROM json_each(?))",
@@ -1154,7 +1157,7 @@ impl Database {
         };
 
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT id, comment_source, remote_comment_id, in_reply_to_id,
                         author, author_association, commit_id, file_path, line,
