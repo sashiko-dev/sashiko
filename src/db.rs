@@ -2252,13 +2252,22 @@ impl Database {
     /// (for claimed worker handles, `patchsets.status = 'In Review'` and
     /// `meta('patchset_active_gen:<id>')` matches the claim generation; for
     /// unscoped handles, the patchset exists and is not `'Cancelled'`).
+    ///
+    /// Queries `tx_conn` under `tx_lock` so a concurrent open cursor on `conn`
+    /// pinning an older WAL snapshot never hides a claim just committed on
+    /// `tx_conn`.
     pub async fn is_patchset_claim_active(&self, patchset_id: i64) -> Result<bool> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
         if let Some(claim) = self.patchset_claim {
             if claim.patchset_id != patchset_id {
                 return Ok(false);
             }
             let mut rows = self
-                .conn
+                .tx_conn
                 .query(
                     "SELECT 1 FROM patchsets ps
                      JOIN meta m ON m.key = 'patchset_active_gen:' || CAST(ps.id AS TEXT)
@@ -2268,10 +2277,13 @@ impl Database {
                     libsql::params![claim.patchset_id, claim.generation],
                 )
                 .await?;
-            Ok(rows.next().await?.is_some())
+            let active = rows.next().await?.is_some();
+            drop(rows);
+            Ok(active)
         } else {
+            let tx_db = self.with_connection(self.tx_conn.clone());
             Ok(!matches!(
-                self.get_patchset_status(patchset_id).await?.as_deref(),
+                tx_db.get_patchset_status(patchset_id).await?.as_deref(),
                 None | Some("Cancelled")
             ))
         }
@@ -2285,12 +2297,17 @@ impl Database {
         &self,
         expected_patchset_id: Option<i64>,
     ) -> Result<bool> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
         if let Some(claim) = self.patchset_claim {
             if expected_patchset_id.is_some_and(|pid| pid != claim.patchset_id) {
                 return Ok(false);
             }
             let mut rows = self
-                .conn
+                .tx_conn
                 .query(
                     "SELECT 1 FROM patchsets ps
                      JOIN meta m ON m.key = 'patchset_active_gen:' || CAST(ps.id AS TEXT)
@@ -2300,7 +2317,9 @@ impl Database {
                     libsql::params![claim.patchset_id, claim.generation],
                 )
                 .await?;
-            Ok(rows.next().await?.is_some())
+            let active = rows.next().await?.is_some();
+            drop(rows);
+            Ok(active)
         } else {
             Ok(true)
         }
@@ -12454,9 +12473,14 @@ impl Database {
         patchset_id: i64,
         patch_id_filter: Option<i64>,
     ) -> Result<Vec<ReleaseReview>> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
         let mut rows = match patch_id_filter {
             Some(patch_id) => {
-                self.conn
+                self.tx_conn
                     .query(
                         "SELECT r.id, r.patch_id, r.inline_review, r.summary, m.message_id, p.part_index
                      FROM reviews r
@@ -12470,7 +12494,7 @@ impl Database {
                     .await?
             }
             None => {
-                self.conn
+                self.tx_conn
                     .query(
                         "SELECT r.id, r.patch_id, r.inline_review, r.summary, m.message_id, p.part_index
                      FROM reviews r
@@ -12506,6 +12530,7 @@ impl Database {
                 findings: Vec::new(),
             });
         }
+        drop(rows);
 
         if reviews.is_empty() {
             return Ok(reviews);
@@ -12525,7 +12550,7 @@ impl Database {
             );
             let params: Vec<libsql::Value> =
                 chunk.iter().map(|r| libsql::Value::Integer(r.id)).collect();
-            let mut findings_rows = self.conn.query(&sql, params).await?;
+            let mut findings_rows = self.tx_conn.query(&sql, params).await?;
             while let Some(f_row) = findings_rows.next().await? {
                 let review_id: i64 = f_row.get(0)?;
                 let severity_int: i64 = f_row.get(1).unwrap_or(1);
@@ -12741,8 +12766,13 @@ impl Database {
         &self,
         patchset_id: i64,
     ) -> Result<std::collections::HashMap<i64, String>> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
         let mut rows = self
-            .conn
+            .tx_conn
             .query(
                 "SELECT p.id,
                         CASE
@@ -12774,22 +12804,30 @@ impl Database {
             let status: String = row.get(1)?;
             statuses.insert(patch_id, status);
         }
+        drop(rows);
         Ok(statuses)
     }
 
     pub async fn get_patchset_status(&self, id: i64) -> Result<Option<String>> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
         let mut rows = self
-            .conn
+            .tx_conn
             .query(
                 "SELECT status FROM patchsets WHERE id = ?",
                 libsql::params![id],
             )
             .await?;
-        if let Some(row) = rows.next().await? {
-            Ok(Some(row.get(0)?))
+        let status = if let Some(row) = rows.next().await? {
+            Some(row.get(0)?)
         } else {
-            Ok(None)
-        }
+            None
+        };
+        drop(rows);
+        Ok(status)
     }
 
     pub async fn cancel_outbox_for_patchset(&self, id: i64, reason: &str) -> Result<()> {
@@ -34385,6 +34423,151 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
             .await?;
         assert!(meta_rows.next().await?.is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_patchset_claim_and_release_queries_visible_with_open_read_cursor() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("patchset_claim_snapshot.db");
+        let settings = DatabaseSettings {
+            url: db_path.to_string_lossy().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await?;
+        db.migrate().await?;
+
+        let t_id = db
+            .create_thread("msg_wal_claim_root", "[PATCH] net: fix", 1000)
+            .await?;
+        db.create_message(
+            "msg_wal_claim_p1",
+            t_id,
+            None,
+            "Author <a@example.com>",
+            "[PATCH] net: fix",
+            1000,
+            "commit body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                t_id,
+                None,
+                "msg_wal_claim_p1",
+                "[PATCH] net: fix",
+                "Author <a@example.com>",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let patch_id = db
+            .create_patch(
+                ps_id,
+                "msg_wal_claim_p1",
+                1,
+                "diff --git a/net/foo.c b/net/foo.c\n",
+            )
+            .await?;
+
+        // Seed rows so a stepped cursor on `db.conn` stays open across `.await`
+        // and pins `db.conn` to the pre-claim WAL read snapshot.
+        for i in 0..3 {
+            db.execute(
+                "INSERT INTO email_outbox (kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES ('review_notification', 'Pending', '[]', '[]', ?, ?, '', 'body', 1700000000)",
+                libsql::params![format!("Seed {i}"), format!("<seed-{i}>")],
+            )
+            .await?;
+        }
+        let mut pinned_cursor = db
+            .conn
+            .query("SELECT id FROM email_outbox ORDER BY id ASC", ())
+            .await?;
+        assert!(pinned_cursor.next().await?.is_some());
+
+        // Claiming on `tx_conn` while `db.conn` is pinned must remain visible
+        // to `is_patchset_claim_active` and `get_patchset_status`.
+        let generation = db
+            .claim_patchset_for_review_with_gen(ps_id)
+            .await?
+            .expect("expected Pending patchset to be claimed");
+        let worker_db = db.with_patchset_claim(ps_id, generation);
+
+        // Sanity-check that `db.conn` really is pinned on the pre-claim snapshot.
+        let mut stale_rows = db
+            .conn
+            .query(
+                "SELECT status FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await?;
+        let stale_status: String = stale_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(stale_status, "Pending");
+        drop(stale_rows);
+
+        assert!(worker_db.is_patchset_claim_active(ps_id).await?);
+        assert!(
+            worker_db
+                .is_patchset_claim_active_for_outbox(Some(ps_id))
+                .await?
+        );
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("In Review")
+        );
+
+        // Complete a review and patchset while `db.conn` is still pinned, and
+        // verify post-review release/outbox queries see the committed rows.
+        let rev_id = worker_db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        worker_db
+            .complete_review(
+                rev_id,
+                "Reviewed",
+                "Summary text",
+                None,
+                None,
+                Some("Inline body"),
+                None,
+            )
+            .await?;
+        worker_db.update_patch_status(patch_id, "Reviewed").await?;
+        assert!(
+            worker_db
+                .complete_patchset_review_status(ps_id, "Reviewed")
+                .await?
+        );
+
+        let statuses = worker_db.get_patch_statuses_for_patchset(ps_id).await?;
+        assert_eq!(
+            statuses.get(&patch_id).map(String::as_str),
+            Some("Reviewed")
+        );
+        let completed = worker_db.get_completed_reviews_for_release(ps_id).await?;
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, rev_id);
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("Reviewed")
+        );
+
+        drop(pinned_cursor);
         Ok(())
     }
 
