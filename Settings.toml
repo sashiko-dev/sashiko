@@ -48,6 +48,8 @@ server = "nntp.lore.kernel.org"
 port = 119
 # Wrap the session in TLS (NNTPS). Servers listen for NNTPS on 563.
 # tls = false
+# Maximum concurrent NNTP worker connections polling tracked mailing lists.
+# concurrency = 4
 
 # [smtp]
 # **WARNING: BE VERY CAREFUL WHEN ENABLING EMAIL SENDING.**

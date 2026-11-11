@@ -99,6 +99,7 @@ Optional. Controls forge (GitHub/GitLab) webhook integration, GitHub App comment
 | `server` | string | `""` | NNTP server hostname. Empty disables NNTP ingestion; the shipped `Settings.toml` uses `"nntp.lore.kernel.org"`. |
 | `port` | integer | `119` | NNTP server port. |
 | `tls` | bool | `false` | Wrap the session in TLS (implicit NNTPS). |
+| `concurrency` | integer | `4` | Maximum number of concurrent NNTP worker connections polling tracked mailing lists in parallel (must be at least `1`). |
 
 Setting `tls` does not change `port`; set it to `563` as well when
 enabling NNTPS. The certificate is verified against the host trust

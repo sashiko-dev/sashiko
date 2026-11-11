@@ -181,10 +181,18 @@ pub struct NntpSettings {
     /// operator turning this on also moves `port` to 563.
     #[serde(default)]
     pub tls: bool,
+    /// Maximum number of concurrent NNTP worker connections polling tracked
+    /// mailing lists in parallel.
+    #[serde(default = "default_nntp_concurrency")]
+    pub concurrency: usize,
 }
 
 fn default_nntp_port() -> u16 {
     119
+}
+
+fn default_nntp_concurrency() -> usize {
+    4
 }
 
 impl Default for NntpSettings {
@@ -193,6 +201,7 @@ impl Default for NntpSettings {
             server: String::new(),
             port: default_nntp_port(),
             tls: false,
+            concurrency: default_nntp_concurrency(),
         }
     }
 }
@@ -1601,6 +1610,9 @@ impl Settings {
                     .to_string(),
             );
         }
+        if self.nntp.concurrency == 0 {
+            return Err("[nntp] concurrency must be at least 1".to_string());
+        }
         #[cfg(feature = "server")]
         if let Err(e) = crate::email_policy::EmailPolicyConfig::load(&self.review.email_policy_path)
         {
@@ -2181,6 +2193,26 @@ mod tests {
         let tls_nntp: NntpSettings =
             toml::from_str("server = \"news.internal.example\"\nport = 563\ntls = true\n").unwrap();
         assert!(tls_nntp.tls);
+        assert_eq!(tls_nntp.concurrency, 4);
+
+        let custom_nntp: NntpSettings =
+            toml::from_str("server = \"nntp.lore.kernel.org\"\nconcurrency = 8\n").unwrap();
+        assert_eq!(custom_nntp.concurrency, 8);
+    }
+
+    #[test]
+    fn test_nntp_zero_concurrency_rejected_for_daemon() {
+        let mut settings = Settings::new().unwrap();
+        settings.database.url = "sashiko.db".into();
+        settings.git.repository_path = "third_party/linux".into();
+        settings.review.worktree_dir = Some("review_trees".into());
+        settings.nntp.concurrency = 0;
+
+        let err = settings.validate_for_daemon().unwrap_err();
+        assert!(
+            err.contains("[nntp] concurrency must be at least 1"),
+            "{err}"
+        );
     }
 
     #[test]
