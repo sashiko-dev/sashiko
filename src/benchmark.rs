@@ -2330,13 +2330,14 @@ async fn run_benchmark_scans(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
 
+    let total_concurrency = settings.review.concurrency.max(1);
     info!(
         "--- Phase 2 (Scan): Running sashiko scan across {} unique target(s) (concurrency: {}) ---",
         targets.len(),
-        settings.review.concurrency
+        total_concurrency
     );
 
-    for spec in &targets {
+    for (target_idx, spec) in targets.iter().enumerate() {
         if commit_has_completed_review(db, &spec.commit_key)
             .await
             .unwrap_or(false)
@@ -2389,6 +2390,37 @@ async fn run_benchmark_scans(
             )
             .await?;
 
+        info!(
+            "Starting scan target [{}] {subject}",
+            target_idx.saturating_add(1)
+        );
+        let commit_label = spec.commit_key.clone();
+        let progress_cb = move |ev: crate::scan::ScanProgressEvent| match ev {
+            crate::scan::ScanProgressEvent::ResolvedTargets { chunks_count, .. } => {
+                info!("[{commit_label}] Partitioned into {chunks_count} chunk(s)");
+            }
+            crate::scan::ScanProgressEvent::ChunkFinished {
+                chunk_id,
+                findings_count,
+                early_exited,
+            } => {
+                info!(
+                    "[{commit_label}] Chunk finished: {chunk_id} (candidates: {findings_count}, early_exit: {early_exited})"
+                );
+            }
+            crate::scan::ScanProgressEvent::CandidateVerified {
+                canonical_title,
+                severity,
+            } => {
+                info!("[{commit_label}] Verified [{severity}]: {canonical_title}");
+            }
+            crate::scan::ScanProgressEvent::CandidateDiscarded { problem, .. } => {
+                info!("[{commit_label}] Discarded candidate: {problem}");
+            }
+            _ => {}
+        };
+        let progress_ref: &crate::scan::ScanProgressCallback<'_> = &progress_cb;
+
         let prep: Result<(PathBuf, Vec<PathBuf>, Option<String>)> = match spec.scan_fixture {
             Some(ref rel) => provision_scan_fixture_repo(
                 suite_dir,
@@ -2417,7 +2449,7 @@ async fn run_benchmark_scans(
                     repo_path,
                     paths: scan_paths,
                     git_ref,
-                    concurrency: settings.review.concurrency.max(1),
+                    concurrency: total_concurrency,
                     max_files: 10_000,
                     max_chunks: None,
                     exclude: Vec::new(),
@@ -2427,7 +2459,7 @@ async fn run_benchmark_scans(
                     stages: None,
                     effort: settings.effective_effort(),
                 };
-                crate::scan::run_scan(scan_opts, settings, None)
+                crate::scan::run_scan(scan_opts, settings, Some(progress_ref))
                     .await
                     .map_err(|e| format!("{e:#}"))
             }
@@ -2443,6 +2475,7 @@ async fn run_benchmark_scans(
             Some(review_id),
         )
         .await?;
+        info!("Finished scan target: {subject}");
     }
 
     if paths.worktree_dir.exists()
