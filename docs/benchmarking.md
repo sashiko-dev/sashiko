@@ -11,19 +11,26 @@ ground-truth descriptions.
 
 - `Settings.toml` (or `~/.config/sashiko.toml`) with a configured LLM provider
   and git repository path
-- A benchmark JSON file (Linux suites are provided in `projects/linux/benchmarks/`)
+- A benchmark JSON file (primary Linux kernel suites live in
+  `projects/linux/benchmarks/`, and GCC pilot suites live in
+  `projects/gcc/benchmarks/`)
 
 ## Quick start
 
 ```bash
-# Run a benchmark suite (creates an isolated database and run directory automatically)
+# Run a Linux kernel benchmark suite (creates an isolated database and run directory automatically)
 sashiko benchmark projects/linux/benchmarks/benchmark_tiny.json
+
+# Run a GCC benchmark suite
+sashiko --project gcc benchmark projects/gcc/benchmarks/benchmark_10.json
 
 # Or via cargo
 cargo run --bin sashiko -- benchmark projects/linux/benchmarks/benchmark_tiny.json
 ```
 
 ## Benchmark files
+
+### Linux kernel (`projects/linux/benchmarks/`)
 
 | File | Description |
 |------|-------------|
@@ -35,6 +42,14 @@ cargo run --bin sashiko -- benchmark projects/linux/benchmarks/benchmark_tiny.js
 | `projects/linux/benchmarks/benchmark_arm64.json` | arm64 core (non-KVM) bugs fixed in 2026, checked the same way (62 entries). |
 | `projects/linux/benchmarks/benchmark_preexisting.json` | Tests detection of pre-existing bugs. |
 | `projects/linux/benchmarks/benchmark_versioned.json` | Multi-version LKML patchset stories (`v1..vN`) testing prior-feedback verification, reviewer attribution, and false-positive suppression. |
+
+### GCC pilot (`projects/gcc/benchmarks/`, run with `--project gcc`)
+
+| File | Description |
+|------|-------------|
+| `projects/gcc/benchmarks/benchmark_10.json` | Minimal GCC set for quick iteration (10 entries). |
+| `projects/gcc/benchmarks/benchmark_100.json` | Standard GCC set for development iteration (100 entries). |
+| `projects/gcc/benchmarks/benchmark.json` | Full GCC benchmark suite. |
 
 Each file contains entries with a `Commit` hash (or target patch `Message-ID` for
 versioned mbox entries), an optional `Fixed-by` reference, an optional
@@ -193,11 +208,12 @@ credited reviewer or a listed co-reviewer.
 ## Command-line options
 
 ```
-sashiko benchmark [OPTIONS] <FILE>
+sashiko [--project <PROJECT>] benchmark [OPTIONS] <FILE>
 ```
 
 | Argument / Flag | Description |
 |-----------------|-------------|
+| `--project <PROJECT>` | Project profile to benchmark (`linux` default, `gcc`, `sashiko`, `qemu`, `zephyr`). |
 | `<FILE>` / `-f, --file <FILE>` | Path to the benchmark JSON file (required). |
 | `-r, --repo <PATH_OR_URL>` | Override the target git repository path or URL. |
 | `--db <PATH>` | Explicit SQLite database path to create or re-analyze. |

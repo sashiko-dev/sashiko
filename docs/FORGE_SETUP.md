@@ -1,9 +1,9 @@
 # Forge Integration Setup
 
-> **Experimental / Unsupported:** Git forge integration is experimental and
-> unofficial. It is provided as-is, without guarantees of stability or
-> correctness. Use it at your own risk. Breaking changes may occur without
-> notice, and community support is best-effort only.
+> **Status:** GitHub pull-request review runs in production for Sashiko's own
+> repository (`sashiko.sashiko.dev`). General third-party GitHub and GitLab
+> forge deployments remain experimental and best-effort: breaking configuration
+> changes may still occur without notice.
 
 This guide explains how to integrate Sashiko with Git forges (GitHub, GitLab, etc.) for automatic code review.
 
@@ -149,7 +149,7 @@ Configure the reference repository:
 
 ```toml
 [git]
-repository_path = "/path/to/kernel/repo"
+repository_path = "/path/to/target/repo"
 ```
 
 **Note:** The repository must be accessible and contain the commits referenced in webhooks.

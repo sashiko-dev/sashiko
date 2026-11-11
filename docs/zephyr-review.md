@@ -1,8 +1,8 @@
 # Reviewing Zephyr
 
 Sashiko can review commits in a local checkout of
-[Zephyr RTOS](https://github.com/zephyrproject-rtos/zephyr). Support is
-experimental and covers local review only: there is no hosted Zephyr instance, and
+[Zephyr RTOS](https://github.com/zephyrproject-rtos/zephyr). Support is a pilot
+covering local review only: there is no public hosted Zephyr instance, and
 Sashiko does not ingest Zephyr pull requests.
 
 > [!IMPORTANT]
