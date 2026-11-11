@@ -11,12 +11,18 @@ metadata:
   annotations:
     iam.gke.io/gcp-service-account: sashiko-app@GCP_PROJECT_ID.iam.gserviceaccount.com
 ---
+# Requests pd-ssd (premium-rwo: 15,000 IOPS / 240 MB/s at 500 GiB) rather than
+# the default pd-balanced (3,000 IOPS / 140 MB/s), which saturates during WAL
+# checkpoints and repository repacks. PVC storageClassName is immutable on
+# existing claims, so migrating a live deployment requires snapshotting and
+# recreating the claim during maintenance.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: sashiko-data-pvc
   namespace: sashiko
 spec:
+  storageClassName: premium-rwo
   accessModes:
     - ReadWriteOnce
   resources:
@@ -129,7 +135,7 @@ spec:
             - name: SASHIKO__AI__MAX_INTERACTIONS
               value: "100"
             - name: SASHIKO__REVIEW__CONCURRENCY
-              value: "24"
+              value: "36"
             - name: SASHIKO__REVIEW__EFFORT
               value: "high"
             - name: SASHIKO__LINUX_BUG__ENABLED
