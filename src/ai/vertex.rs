@@ -46,9 +46,9 @@ enum ModelFamily {
 }
 
 fn detect_model_family(model: &str) -> Result<ModelFamily> {
-    if model.starts_with("claude") {
+    if model.trim().to_ascii_lowercase().starts_with("claude") {
         Ok(ModelFamily::Claude)
-    } else if model.starts_with("gemini") {
+    } else if crate::ai::is_gemini_model_name(model) {
         Ok(ModelFamily::Gemini)
     } else {
         bail!(

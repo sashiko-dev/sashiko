@@ -11,6 +11,6 @@ max_input_tokens = 900000
 # Reviews run concurrently up to this many patches. Sized for one developer's
 # machine; the daemon's own Settings.toml uses a much larger fan-out.
 concurrency = 4
-# Reasoning effort on Argon models: "low", "mid" (default), "high", or
-# "dynamic". Other models ignore it.
+# Reasoning effort on Gemini models: "low", "mid" (default on Gemini 4+),
+# "high", or "dynamic". Ignored on non-Gemini providers.
 # effort = "mid"
