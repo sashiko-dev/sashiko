@@ -24,6 +24,8 @@ use tracing::{debug, warn};
 
 pub const LINUX_NEXT_URL: &str =
     "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
+const STABLE_LINUX_URL: &str = "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git";
+const MAX_ACTIVE_STABLE_BRANCHES: usize = 8;
 
 /// Limit on waiting for each git command of the ancestry check; the check
 /// runs two. With a commit-graph each takes milliseconds even on a kernel
@@ -398,7 +400,25 @@ impl BaselineRegistry {
         );
 
         // 1.5 Version Tag from Subject
-        candidates.extend(subject_version_candidates(subject, has_non_linux_mainline));
+        let subject_candidates = subject_version_candidates(subject, has_non_linux_mainline);
+        let has_subject_version = !subject_candidates.is_empty();
+        candidates.extend(subject_candidates);
+
+        // 1.6 Explicit baseline version tag stated in cover letter or changelog
+        if let Some(body_text) = body
+            && let Some(tag) = extract_body_version_tag(body_text)
+        {
+            candidates.push(BaselineResolution::LocalRef(format!("v{tag}")));
+        }
+
+        // 1.7 Unversioned Linux stable backports ([PATCH stable backport] or
+        //     leading "commit <sha> upstream." without an explicit X.Y tag)
+        if !has_non_linux_mainline
+            && !has_subject_version
+            && is_unversioned_stable_backport(subject, body)
+        {
+            candidates.extend(self.active_stable_branch_candidates().await);
+        }
 
         // 2. Subsystem Heuristic
         let heuristic_candidates = self.resolve_subsystem_heuristic(files, subject);
@@ -850,6 +870,48 @@ impl BaselineRegistry {
         }
         name.to_string()
     }
+
+    async fn active_stable_branch_candidates(&self) -> Vec<BaselineResolution> {
+        let stable_remote = self
+            .remote_map
+            .get(STABLE_LINUX_URL)
+            .map(String::as_str)
+            .unwrap_or("stable");
+        if stable_remote.is_empty() || stable_remote.starts_with('-') {
+            return Vec::new();
+        }
+        let count_arg = format!("--count={MAX_ACTIVE_STABLE_BRANCHES}");
+        let pattern = format!("refs/remotes/{stable_remote}/linux-*.y");
+        let Some(output) = run_offline_git(
+            &self.repo_path,
+            &[
+                "for-each-ref",
+                "--sort=-version:refname",
+                "--sort=-committerdate",
+                &count_arg,
+                "--format=%(refname:short)",
+                &pattern,
+            ],
+        )
+        .await
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let prefix = format!("{stable_remote}/");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(&prefix))
+            .filter(|branch| is_valid_stable_branch_name(branch))
+            .map(|branch| BaselineResolution::RemoteTarget {
+                url: STABLE_LINUX_URL.to_string(),
+                name: stable_remote.to_string(),
+                branch: Some(branch.to_string()),
+            })
+            .collect()
+    }
 }
 
 fn ordered_mainline_remotes(
@@ -1104,7 +1166,7 @@ fn subject_version_candidates(
     if !has_non_linux_mainline && let Some((first, last)) = stable_versions {
         for version in std::iter::once(first).chain(last) {
             candidates.push(BaselineResolution::RemoteTarget {
-                url: "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git".to_string(),
+                url: STABLE_LINUX_URL.to_string(),
                 name: "stable".to_string(),
                 branch: Some(format!("linux-{version}.y")),
             });
@@ -1115,6 +1177,108 @@ fn subject_version_candidates(
         candidates.push(BaselineResolution::LocalRef(format!("v{version}")));
     }
     candidates
+}
+
+/// Extract an explicit `vX.Y[.Z][-rcN]` baseline tag declared in non-quoted
+/// pre-diff cover-letter or changelog prose (for example `"The series applies
+/// on top of v7.0-rc3"` or `"- Rebase on v7.2-rc1"`).
+pub fn extract_body_version_tag(body: &str) -> Option<String> {
+    static BODY_TAG_RE: OnceLock<Regex> = OnceLock::new();
+    let re = BODY_TAG_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(?:applies(?:\s+cleanly)?\s+(?:on(?:\s+top\s+of)?|to|against)|(?:re)?based?\s+(?:on(?:\s+top\s+of)?|onto|against))\s+v(\d+\.\d+(?:\.\d+)?(?:-rc\d+)?)\b",
+        )
+        .unwrap()
+    });
+
+    for line in body.lines() {
+        if line.starts_with("diff --git ")
+            || line.starts_with("--- a/")
+            || line.starts_with("--- /dev/null")
+            || line.starts_with("@@ -")
+        {
+            break;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('>') {
+            continue;
+        }
+        if let Some(caps) = re.captures(trimmed)
+            && let Some(m) = caps.get(1)
+        {
+            let ver = m.as_str().to_lowercase();
+            let base = ver.split('-').next().unwrap_or(&ver);
+            let mut parts = base.split('.');
+            if let (Some(maj_s), Some(min_s)) = (parts.next(), parts.next())
+                && let (Ok(major), Ok(minor)) = (maj_s.parse::<u32>(), min_s.parse::<u32>())
+                && (major >= 3 || (major == 2 && minor == 6))
+            {
+                return Some(ver);
+            }
+        }
+    }
+    None
+}
+
+fn is_valid_stable_branch_name(branch: &str) -> bool {
+    let Some(ver) = branch
+        .strip_prefix("linux-")
+        .and_then(|s| s.strip_suffix(".y"))
+    else {
+        return false;
+    };
+    let Some((major, minor)) = ver.split_once('.') else {
+        return false;
+    };
+    !major.is_empty()
+        && !minor.is_empty()
+        && major.bytes().all(|b| b.is_ascii_digit())
+        && minor.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn has_upstream_backport_marker(body: &str) -> bool {
+    for line in body.lines().take(40) {
+        let trimmed = line.trim();
+        if trimmed == "---"
+            || trimmed.starts_with("diff --git ")
+            || trimmed.starts_with("--- a/")
+            || trimmed.starts_with("@@ -")
+        {
+            break;
+        }
+        if trimmed.starts_with('>') {
+            continue;
+        }
+        if let Some(rest) = trimmed
+            .strip_prefix("commit ")
+            .or_else(|| trimmed.strip_prefix("Commit "))
+        {
+            let rest = rest.strip_suffix('.').unwrap_or(rest);
+            if let Some(sha) = rest
+                .strip_suffix(" upstream")
+                .or_else(|| rest.strip_suffix(" UPSTREAM"))
+                && CommitId::parse(sha.trim()).is_some()
+            {
+                return true;
+            }
+        }
+        if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            let inner = inner.trim();
+            if let Some(sha) = inner
+                .strip_prefix("Upstream commit ")
+                .or_else(|| inner.strip_prefix("upstream commit "))
+                && CommitId::parse(sha.trim()).is_some()
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_unversioned_stable_backport(subject: &str, body: Option<&str>) -> bool {
+    crate::patch::subject_prefix_tokens(subject).any(|tok| tok.eq_ignore_ascii_case("stable"))
+        || body.is_some_and(has_upstream_backport_marker)
 }
 
 fn explicit_stable_versions(subject: &str) -> Option<(&str, Option<&str>)> {
@@ -2596,5 +2760,117 @@ index 1111111..2222222 100644
             tip_branches(&objtool),
             vec!["objtool/core", "objtool/urgent", "master"]
         );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_body_version_tag_and_unversioned_stable_backport() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "--quiet"]).await;
+        git(repo, &["config", "user.email", "test@example.com"]).await;
+        git(repo, &["config", "user.name", "Test User"]).await;
+
+        let commit_at = |msg: &'static str, date: &'static str| async move {
+            let out = crate::git_cmd::in_dir_async(repo)
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .args(["commit", "--quiet", "--allow-empty", "-m", msg])
+                .output()
+                .await
+                .unwrap();
+            assert!(out.status.success(), "git commit failed: {:?}", out);
+            git(repo, &["rev-parse", "HEAD"]).await
+        };
+
+        let old_sha = commit_at("old eol", "2025-01-01T00:00:00Z").await;
+        git(
+            repo,
+            &["update-ref", "refs/remotes/stable/linux-6.17.y", &old_sha],
+        )
+        .await;
+
+        let lts_sha = commit_at("lts", "2026-10-01T00:00:00Z").await;
+        git(
+            repo,
+            &["update-ref", "refs/remotes/stable/linux-6.12.y", &lts_sha],
+        )
+        .await;
+        git(
+            repo,
+            &["update-ref", "refs/remotes/stable/linux-6.18.y", &lts_sha],
+        )
+        .await;
+
+        let mut remote_map = HashMap::new();
+        remote_map.insert(STABLE_LINUX_URL.to_string(), "stable".to_string());
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map,
+            custom_remotes: None,
+            repo_path: repo.to_path_buf(),
+            project: Some(ProjectId::Linux),
+            fetch_remotes: Vec::new(),
+            mainline_remote: None,
+        };
+
+        // 1. Cover-letter baseline tag ("applies on top of v7.0-rc3")
+        let cover_body = "Hi!\n\nThe series applies on top of v7.0-rc3 and reworks /proc/interrupts.\n> applies on top of v6.1\n";
+        let cands = registry
+            .resolve_candidates(
+                &[],
+                "[patch V5 00/15] Improve /proc/interrupts further",
+                Some(cover_body),
+            )
+            .await;
+        assert_eq!(
+            cands[0],
+            BaselineResolution::LocalRef("v7.0-rc3".to_string())
+        );
+        assert_eq!(
+            extract_body_version_tag("Commit msg\n---\nChanges in v4:\n- Rebase on v7.2-rc1\n"),
+            Some("7.2-rc1".to_string())
+        );
+        assert_eq!(
+            extract_body_version_tag("Based on v1.1 of the RFC series\n"),
+            None
+        );
+
+        // 2. Unversioned [PATCH stable backport] with "commit <sha> upstream."
+        let backport_body =
+            "commit 4096fd0e8eaea13ebe5206700b33f49635ae18e5 upstream.\n\nFix leak.\n";
+        let backport_cands = registry
+            .resolve_candidates(
+                &[],
+                "[PATCH stable backport] clockevents: Fix resource leak",
+                Some(backport_body),
+            )
+            .await;
+        let stable_branches: Vec<String> = backport_cands
+            .iter()
+            .filter_map(|c| match c {
+                BaselineResolution::RemoteTarget {
+                    name,
+                    branch: Some(b),
+                    ..
+                } if name == "stable" => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stable_branches,
+            vec!["linux-6.18.y", "linux-6.12.y", "linux-6.17.y"]
+        );
+
+        // 3. Normal mainline patch carrying Cc: stable@vger.kernel.org must NOT
+        //    trigger stable branch candidates.
+        let mainline_body =
+            "Fix race.\n\nCc: stable@vger.kernel.org\nSigned-off-by: Dev <d@k.org>\n";
+        let mainline_cands = registry
+            .resolve_candidates(&[], "[PATCH] clockevents: Fix race", Some(mainline_body))
+            .await;
+        assert!(!mainline_cands.iter().any(|c| matches!(
+            c,
+            BaselineResolution::RemoteTarget { name, .. } if name == "stable"
+        )));
     }
 }
