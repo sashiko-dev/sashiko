@@ -815,6 +815,10 @@ mod tests {
                 .lists
                 .contains_key("devicetree@vger.kernel.org")
         );
+        assert!(crate::email_router::EmailRouter::is_ignored_author(
+            &linux_config,
+            "\"tip-bot2 for Peter Zijlstra\" <tip-bot2@linutronix.de>"
+        ));
 
         let sashiko_config = EmailPolicyConfig::load("projects/sashiko/mailing_lists.toml")
             .expect("Production projects/sashiko/mailing_lists.toml failed to parse");
