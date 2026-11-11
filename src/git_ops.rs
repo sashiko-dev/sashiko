@@ -892,10 +892,20 @@ pub async fn drop_commit_graph(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Runs one `git commit-graph write`, returning git's own output.
+/// Runs one `git commit-graph write` with incremental changed-path Bloom
+/// filters bounded per pass so startup and maintenance walks stay fast on
+/// repositories with over a million commits.
 async fn run_commit_graph_write(repo_path: &Path) -> Result<std::process::Output> {
     Ok(crate::git_cmd::in_dir_async(repo_path)
-        .args(["commit-graph", "write", "--reachable"])
+        .args([
+            "-c",
+            "core.commitGraph=true",
+            "commit-graph",
+            "write",
+            "--reachable",
+            "--changed-paths",
+            "--max-new-filters=50000",
+        ])
         .output()
         .await?)
 }
@@ -927,25 +937,7 @@ pub async fn pack_stats(repo_path: &Path) -> Result<(usize, u64)> {
     Ok((packs, bytes))
 }
 
-/// Rebuilds the commit-graph from the current object database,
-/// dropping a graph that turns the write away and walking again.
-///
-/// The graph records what the object database holds at the moment of
-/// the walk.  A fetch running beside it costs the graph only the
-/// commits that fetch installs.  A repack is what leaves an entry
-/// with no object behind it, and the object-store lock this takes is
-/// what keeps one out.
-///
-/// The walk consults the graph already in place, so one naming lost
-/// objects fails the write the way it fails a fetch.  Nothing else
-/// here needs that graph, so drop it and rebuild from the object
-/// database alone.  This is the only pass that writes a graph, and
-/// git's verify passes a graph that is merely behind the refs, so
-/// the write cannot be made conditional on one.
-pub async fn write_commit_graph(repo_path: &Path) -> Result<()> {
-    let lock = get_object_store_lock();
-    let _guard = lock.lock().await;
-
+async fn write_commit_graph_locked(repo_path: &Path) -> Result<()> {
     debug!("Writing commit-graph for {:?}", repo_path);
     let started = std::time::Instant::now();
 
@@ -976,6 +968,27 @@ pub async fn write_commit_graph(repo_path: &Path) -> Result<()> {
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// Rebuilds the commit-graph from the current object database,
+/// dropping a graph that turns the write away and walking again.
+///
+/// The graph records what the object database holds at the moment of
+/// the walk.  A fetch running beside it costs the graph only the
+/// commits that fetch installs.  A repack is what leaves an entry
+/// with no object behind it, and the object-store lock this takes is
+/// what keeps one out.
+///
+/// The walk consults the graph already in place, so one naming lost
+/// objects fails the write the way it fails a fetch.  Nothing else
+/// here needs that graph, so drop it and rebuild from the object
+/// database alone.  This is the only pass that writes a graph, and
+/// git's verify passes a graph that is merely behind the refs, so
+/// the write cannot be made conditional on one.
+pub async fn write_commit_graph(repo_path: &Path) -> Result<()> {
+    let lock = get_object_store_lock();
+    let _guard = lock.lock().await;
+    write_commit_graph_locked(repo_path).await
 }
 
 /// Rebuilds the commit-graph in the background once a recovery has
@@ -1035,6 +1048,8 @@ pub async fn repack_repository(repo_path: &Path) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+
+    write_commit_graph_locked(repo_path).await?;
 
     info!(
         "Repacked {:?} in {:.1}s",
@@ -3616,5 +3631,77 @@ mod tests {
             "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
             "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_repack_repository_writes_commit_graph_with_bloom_filters() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .await?;
+
+        std::fs::write(repo_path.join("a.c"), "int a(void) { return 1; }\n")?;
+        let add_out = crate::git_cmd::in_dir_async(&repo_path)
+            .args(["add", "a.c"])
+            .output()
+            .await?;
+        assert!(add_out.status.success());
+        let commit_out = crate::git_cmd::in_dir_async(&repo_path)
+            .args(["commit", "--no-gpg-sign", "-m", "initial"])
+            .output()
+            .await?;
+        assert!(
+            commit_out.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit_out.stderr)
+        );
+
+        repack_repository(&repo_path).await?;
+
+        let info_dir = object_dir(&repo_path, "info").await?;
+        let single_graph = info_dir.join("commit-graph");
+        let graph_bytes = if single_graph.exists() {
+            std::fs::read(&single_graph)?
+        } else {
+            let split_dir = info_dir.join("commit-graphs");
+            let mut found = None;
+            for entry in std::fs::read_dir(&split_dir)? {
+                let p = entry?.path();
+                if p.extension().is_some_and(|e| e == "graph") {
+                    found = Some(std::fs::read(&p)?);
+                    break;
+                }
+            }
+            found.expect("expected single or split commit-graph file")
+        };
+        // Git commit-graph format stores 4-byte chunk IDs BIDX and BDAT when
+        // changed-path Bloom filters are written.
+        assert!(
+            graph_bytes.windows(4).any(|w| w == b"BIDX")
+                && graph_bytes.windows(4).any(|w| w == b"BDAT"),
+            "expected BIDX/BDAT changed-path Bloom filter chunks in commit-graph"
+        );
+
+        let verify = crate::git_cmd::in_dir_async(&repo_path)
+            .args(["-c", "core.commitGraph=true", "commit-graph", "verify"])
+            .output()
+            .await?;
+        assert!(
+            verify.status.success(),
+            "git commit-graph verify failed: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        Ok(())
     }
 }
