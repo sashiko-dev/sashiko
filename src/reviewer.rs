@@ -1299,9 +1299,17 @@ impl Reviewer {
                             );
                         }
 
+                        // The row was read when the review was claimed and
+                        // still says In Review. queue_patchset_notifications
+                        // queues only for a Reviewed patchset, so hand it the
+                        // status that was just written.
+                        let completed = PatchsetRow {
+                            status: Some(final_status.to_string()),
+                            ..patchset.clone()
+                        };
                         if review_success
-                            && patchset.embargo_until.is_some()
-                            && let Err(e) = Self::release_patchset_results(&ctx, &patchset).await
+                            && completed.embargo_until.is_some()
+                            && let Err(e) = Self::release_patchset_results(&ctx, &completed).await
                         {
                             error!(
                                 "Failed to release clean patchset {} immediately: {}",
