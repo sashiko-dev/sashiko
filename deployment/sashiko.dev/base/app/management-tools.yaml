@@ -12,11 +12,16 @@ data:
     echo "--- Environment setup complete ---"
   backup-db.sh: |
     #!/bin/bash
-    set -e
+    set -euo pipefail
     DB_PATH="/data/db/sashiko.db"
     BUCKET="${BACKUP_BUCKET:-gs://BACKUP_BUCKET}"
     TIMESTAMP=$(date '+%Y-%m-%d_%Hh-%Mm-%Ss-%Z')
-    TEMP_BACKUP="/data/sashiko_backup.db"
+    SCRATCH_DIR="/mnt/local-ssd"
+    if [ ! -d "$SCRATCH_DIR" ]; then
+        SCRATCH_DIR="/data"
+    fi
+    TEMP_BACKUP="${SCRATCH_DIR}/sashiko_backup.db"
+    trap 'rm -f "$TEMP_BACKUP"' EXIT
 
     echo "--- Starting Backup at $(date) ---"
 
@@ -28,14 +33,14 @@ data:
     echo "Cleaning remaining artifacts just in case..."
     rm -f "$TEMP_BACKUP"
 
-    echo "Creating consistent SQLite snapshot..."
+    echo "Creating consistent SQLite snapshot in $TEMP_BACKUP..."
     sqlite3 "$DB_PATH" "VACUUM INTO '$TEMP_BACKUP'"
 
     echo "Uploading to Cloud Storage..."
     gsutil cp "$TEMP_BACKUP" "${BUCKET}/sashiko_${TIMESTAMP}.db"
 
     echo "Cleaning up..."
-    rm "$TEMP_BACKUP"
+    rm -f "$TEMP_BACKUP"
 
     echo "--- Backup Complete: sashiko_${TIMESTAMP}.db ---"
 ---
@@ -111,10 +116,21 @@ spec:
             - "/bin/sh"
             - "-c"
             - "/usr/local/bin/setup-env.sh && /usr/local/bin/backup-db.sh"
+            # Bounds sequential backup file-cache memory in cgroup v2 so
+            # VACUUM INTO + gsutil cp cannot evict 50+ GiB on the shared node.
+            resources:
+              requests:
+                cpu: "500m"
+                memory: "2Gi"
+              limits:
+                cpu: "4"
+                memory: "8Gi"
             volumeMounts:
             - name: sashiko-storage
               mountPath: /data
               subPath: data-dir
+            - name: backup-scratch-ssd
+              mountPath: /mnt/local-ssd
             - name: scripts
               mountPath: /usr/local/bin/backup-db.sh
               subPath: backup-db.sh
@@ -126,6 +142,13 @@ spec:
           - name: sashiko-storage
             persistentVolumeClaim:
               claimName: sashiko-data-pvc
+          # Uses n2d-pool's second 375 GB Local SSD (/mnt/disks/ssd1) to stage
+          # VACUUM INTO snapshots off the persistent volume and avoid contending
+          # with review worktrees on ssd0.
+          - name: backup-scratch-ssd
+            hostPath:
+              path: /mnt/disks/ssd1
+              type: Directory
           - name: scripts
             configMap:
               name: sashiko-management-scripts
