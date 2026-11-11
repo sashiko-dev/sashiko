@@ -263,6 +263,7 @@ pub async fn prefetch_external_definitions_for_chunks(
     }
 
     let already_extracted = extract_defined_names(&content, 0, total_lines.saturating_sub(1));
+    let local_struct_member_types = extract_file_struct_member_types(&content);
     let mut per_chunk_symbols: Vec<Vec<String>> = Vec::with_capacity(chunk_ranges_1based.len());
     let mut per_chunk_ranges: Vec<HashMap<String, Vec<(usize, usize)>>> =
         Vec::with_capacity(chunk_ranges_1based.len());
@@ -278,13 +279,27 @@ pub async fn prefetch_external_definitions_for_chunks(
         let mut symbols_to_lookup = extract_type_names(&content, start_0, end_0);
         let mut called_functions = extract_called_functions(&content, &[(start_0, end_0)]);
 
+        // Expand file-local struct/union containers to their external member field types
+        // before stripping intra-file names (`already_extracted`). Exempt expanded member
+        // types from `find_opaque_types` because chained expressions (`ctx->member.field`)
+        // do not bind a standalone variable of the member type.
+        let mut expanded_members = HashSet::new();
+        for sym in &symbols_to_lookup {
+            if let Some(members) = local_struct_member_types.get(sym) {
+                expanded_members.extend(members.iter().cloned());
+            }
+        }
+        symbols_to_lookup.extend(expanded_members.iter().cloned());
+
         for sym in &already_extracted {
             symbols_to_lookup.remove(sym);
         }
 
         let opaque = find_opaque_types(&symbols_to_lookup, &file_ranges, &snapshot);
         for sym in &opaque {
-            symbols_to_lookup.remove(sym);
+            if !expanded_members.contains(sym) {
+                symbols_to_lookup.remove(sym);
+            }
         }
 
         called_functions.retain(|f| !already_extracted.contains(f));
@@ -293,7 +308,7 @@ pub async fn prefetch_external_definitions_for_chunks(
 
         let mut chunk_syms: Vec<String> = symbols_to_lookup.into_iter().collect();
         chunk_syms.sort();
-        chunk_syms.truncate(40);
+        chunk_syms.truncate(55);
         for sym in &chunk_syms {
             union_symbols.insert(sym.clone());
         }
@@ -305,15 +320,68 @@ pub async fn prefetch_external_definitions_for_chunks(
     if let Some((dir, _)) = file_path.rsplit_once('/') {
         caller_dirs.insert(dir);
     }
+    let scoped_pathspecs = build_chunk_prefetch_pathspecs(file_path);
+    let scoped_refs: Vec<&str> = scoped_pathspecs.iter().map(String::as_str).collect();
     let all_symbols: Vec<String> = union_symbols.into_iter().collect();
-    let resolved = resolve_symbol_definitions(
+    let mut resolved = resolve_symbol_definitions_with_pathspecs(
         repository,
         &mut snapshot,
         &all_symbols,
         &caller_dirs,
         Some(&path_buf),
+        &scoped_refs,
+        80,
     )
     .await?;
+
+    // 2nd-hop nested struct/enum type resolution for embedded member structs inside Hop-1 headers.
+    let mut hop1_to_hop2: HashMap<String, Vec<String>> = HashMap::new();
+    let mut hop2_union: BTreeSet<String> = BTreeSet::new();
+    for (sym, (def_path, start, end)) in &resolved {
+        if !def_path.to_string_lossy().ends_with(".h") {
+            continue;
+        }
+        if let Ok(def_content) = snapshot.read(def_path).await {
+            let mut nested = extract_type_names(&def_content, *start, *end);
+            nested.retain(|n| {
+                !already_extracted.contains(n) && !resolved.contains_key(n) && !n.ends_with("_ops")
+            });
+            if !nested.is_empty() {
+                let mut list: Vec<String> = nested.into_iter().collect();
+                list.sort();
+                list.truncate(6);
+                for n in &list {
+                    hop2_union.insert(n.clone());
+                }
+                hop1_to_hop2.insert(sym.clone(), list);
+            }
+        }
+    }
+    if !hop2_union.is_empty() {
+        let hop2_vec: Vec<String> = hop2_union.into_iter().take(24).collect();
+        let header_only_specs: Vec<&str> = scoped_refs
+            .iter()
+            .copied()
+            .filter(|s| *s == "*.h" || s.ends_with('/'))
+            .collect();
+        if let Ok(hop2_resolved) = resolve_symbol_definitions_with_pathspecs(
+            repository,
+            &mut snapshot,
+            &hop2_vec,
+            &caller_dirs,
+            Some(&path_buf),
+            if header_only_specs.is_empty() {
+                &scoped_refs
+            } else {
+                &header_only_specs
+            },
+            40,
+        )
+        .await
+        {
+            resolved.extend(hop2_resolved);
+        }
+    }
 
     let mut outputs = Vec::with_capacity(chunk_ranges_1based.len());
     for (chunk_syms, file_ranges) in per_chunk_symbols
@@ -324,6 +392,13 @@ pub async fn prefetch_external_definitions_for_chunks(
         for sym in &chunk_syms {
             if let Some((def_path, start, end)) = resolved.get(sym) {
                 add_range(&mut range_map, def_path.clone(), *start, *end);
+            }
+            if let Some(nested_syms) = hop1_to_hop2.get(sym) {
+                for nsym in nested_syms {
+                    if let Some((def_path, start, end)) = resolved.get(nsym) {
+                        add_range(&mut range_map, def_path.clone(), *start, *end);
+                    }
+                }
             }
         }
         outputs.push(
@@ -340,6 +415,321 @@ pub async fn prefetch_external_definitions_for_chunks(
     Ok(outputs)
 }
 
+fn is_valid_c_ident(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 4
+        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+fn is_likely_prototype_declaration(path_str: &str, line_content: &str, sym: &str) -> bool {
+    let trimmed = line_content.trim();
+    if trimmed.starts_with("extern ") || trimmed.starts_with("EXPORT_SYMBOL") {
+        return true;
+    }
+    if trimmed.ends_with(';')
+        && !trimmed.contains('=')
+        && !trimmed.starts_with("return ")
+        && !trimmed.starts_with("if ")
+        && !trimmed.starts_with("while ")
+        && let Some(pos) = trimmed.find(sym)
+    {
+        let before = trimmed[..pos].trim();
+        let after = trimmed[pos + sym.len()..].trim_start();
+        if after.starts_with('(')
+            && !before.is_empty()
+            && before
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b' ' | b'\t' | b'*'))
+        {
+            return true;
+        }
+        if path_str.ends_with(".h") && before.is_empty() && after.starts_with('(') {
+            return false;
+        }
+    }
+    false
+}
+
+fn build_external_caller_pathspecs(file_path: &str) -> Vec<String> {
+    let mut specs: BTreeSet<String> = build_chunk_prefetch_pathspecs(file_path)
+        .into_iter()
+        .collect();
+    specs.insert("*.rs".to_string());
+    if file_path.starts_with("rust/") || file_path.ends_with(".rs") {
+        specs.insert("rust/".to_string());
+    }
+    let parts: Vec<&str> = file_path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() >= 3 && parts[0] == "arch" {
+        match parts[2] {
+            "kernel" => {
+                specs.insert("kernel/".to_string());
+            }
+            "mm" => {
+                specs.insert("mm/".to_string());
+            }
+            "net" => {
+                specs.insert("net/".to_string());
+            }
+            _ => {}
+        }
+    }
+    specs.into_iter().collect()
+}
+
+/// Prefetches 1-hop external call-site and vtable-registration windows for non-`static`
+/// functions defined in `file_path` at `target_sha`, returning `(whole_file_callers, per_chunk_callers)`.
+pub async fn prefetch_external_callers_for_chunks(
+    repository: &Path,
+    target_sha: &str,
+    file_path: &str,
+    per_chunk_exported_fns: &[Vec<String>],
+    max_file_chars: usize,
+    max_chars_per_chunk: usize,
+) -> Result<(String, Vec<String>)> {
+    if per_chunk_exported_fns.is_empty() {
+        return Ok((String::new(), Vec::new()));
+    }
+    let mut union_syms = BTreeSet::new();
+    for chunk_fns in per_chunk_exported_fns {
+        for sym in chunk_fns {
+            if is_valid_c_ident(sym) {
+                union_syms.insert(sym.clone());
+            }
+        }
+    }
+    if union_syms.is_empty() {
+        return Ok((
+            String::new(),
+            vec![String::new(); per_chunk_exported_fns.len()],
+        ));
+    }
+
+    let mut snapshot = SourceSnapshot::new(repository, target_sha).await?;
+    let all_syms: Vec<String> = union_syms.into_iter().take(60).collect();
+    let pathspecs = build_external_caller_pathspecs(file_path);
+    let revision_prefix = format!("{}:", snapshot.sha);
+    let mut hits_by_sym: HashMap<String, Vec<(PathBuf, usize)>> = HashMap::new();
+
+    for batch in all_syms.chunks(35) {
+        let mut cmd = crate::git_cmd::in_dir_async(repository);
+        cmd.args([
+            "-c",
+            "safe.bareRepository=all",
+            "grep",
+            "--full-name",
+            "--no-color",
+            "-z",
+            "-n",
+            "-I",
+            "-F",
+            "-w",
+        ]);
+        for sym in batch {
+            cmd.arg("-e").arg(sym);
+        }
+        cmd.arg(&snapshot.sha)
+            .arg("--")
+            .args(&pathspecs)
+            .kill_on_drop(true);
+
+        let output = match cmd.output().await {
+            Ok(o) => o,
+            Err(e) => return Err(anyhow!("Failed to run git grep for external callers: {e}")),
+        };
+        if !output.status.success() && output.status.code() != Some(1) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("git grep for external callers failed: {stderr}"));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let Some(rest_line) = line.strip_prefix(&revision_prefix) else {
+                continue;
+            };
+            let Some((path_str, rest)) = rest_line.split_once('\0') else {
+                continue;
+            };
+            if path_str == file_path || !is_prefetchable_source_file(path_str) {
+                continue;
+            }
+            let Some((line_num_str, line_content)) = rest.split_once('\0') else {
+                continue;
+            };
+            let Ok(line_1based) = line_num_str.parse::<usize>() else {
+                continue;
+            };
+            let line_0 = line_1based.saturating_sub(1);
+            for sym in batch {
+                if line_matches_symbol(line_content, sym)
+                    && !is_likely_prototype_declaration(path_str, line_content, sym)
+                {
+                    let entry = hits_by_sym.entry(sym.clone()).or_default();
+                    if entry.len() < 8 {
+                        entry.push((PathBuf::from(path_str), line_0));
+                    }
+                }
+            }
+        }
+    }
+
+    for hits in hits_by_sym.values_mut() {
+        hits.sort_by_key(|(p, line)| {
+            let is_hdr = p.to_string_lossy().ends_with(".h");
+            (usize::from(is_hdr), p.clone(), *line)
+        });
+        hits.truncate(3);
+    }
+
+    let empty_modified = HashMap::new();
+    let mut whole_map: LineRangeMap = BTreeMap::new();
+    for hits in hits_by_sym.values() {
+        for (path, line_0) in hits {
+            add_range(
+                &mut whole_map,
+                path.clone(),
+                line_0.saturating_sub(5),
+                line_0 + 7,
+            );
+        }
+    }
+    let whole_rendered =
+        render_range_map_with_budget(&whole_map, &mut snapshot, &empty_modified, max_file_chars)
+            .await?;
+
+    let mut per_chunk_rendered = Vec::with_capacity(per_chunk_exported_fns.len());
+    for chunk_fns in per_chunk_exported_fns {
+        let mut chunk_map: LineRangeMap = BTreeMap::new();
+        for sym in chunk_fns {
+            if let Some(hits) = hits_by_sym.get(sym) {
+                for (path, line_0) in hits {
+                    add_range(
+                        &mut chunk_map,
+                        path.clone(),
+                        line_0.saturating_sub(5),
+                        line_0 + 7,
+                    );
+                }
+            }
+        }
+        if chunk_map.is_empty() {
+            per_chunk_rendered.push(String::new());
+        } else {
+            per_chunk_rendered.push(
+                render_range_map_with_budget(
+                    &chunk_map,
+                    &mut snapshot,
+                    &empty_modified,
+                    max_chars_per_chunk,
+                )
+                .await?,
+            );
+        }
+    }
+
+    Ok((whole_rendered, per_chunk_rendered))
+}
+
+fn extract_file_struct_member_types(source_code: &str) -> HashMap<String, HashSet<String>> {
+    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .is_err()
+    {
+        return map;
+    }
+    let Some(tree) = parser.parse(source_code, None) else {
+        return map;
+    };
+    let bytes = source_code.as_bytes();
+
+    fn collect_type_idents(n: Node<'_>, src: &[u8], out: &mut HashSet<String>) {
+        if n.kind() == "type_identifier"
+            && let Ok(txt) = n.utf8_text(src)
+        {
+            let s = txt.trim();
+            if s.len() >= 3 && !is_common_c_word(s) {
+                out.insert(s.to_string());
+            }
+        }
+        let mut cursor = n.walk();
+        for child in n.children(&mut cursor) {
+            collect_type_idents(child, src, out);
+        }
+    }
+
+    fn walk_defs(n: Node<'_>, src: &[u8], map: &mut HashMap<String, HashSet<String>>) {
+        match n.kind() {
+            "function_definition" => {}
+            "struct_specifier" | "union_specifier" => {
+                if let Some(body) = n.child_by_field_name("body")
+                    && let Some(name_node) = n.child_by_field_name("name")
+                    && let Ok(name) = name_node.utf8_text(src)
+                {
+                    let mut members = HashSet::new();
+                    collect_type_idents(body, src, &mut members);
+                    members.remove(name.trim());
+                    if !members.is_empty() {
+                        map.entry(name.trim().to_string())
+                            .or_default()
+                            .extend(members);
+                    }
+                }
+            }
+            "type_definition" => {
+                if let Some(ty) = n.child_by_field_name("type") {
+                    walk_defs(ty, src, map);
+                }
+            }
+            "preproc_if" | "preproc_ifdef" | "preproc_elif" | "preproc_else"
+            | "translation_unit" | "declaration" => {
+                let mut cursor = n.walk();
+                for child in n.children(&mut cursor) {
+                    walk_defs(child, src, map);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk_defs(tree.root_node(), bytes, &mut map);
+    map
+}
+
+fn build_chunk_prefetch_pathspecs(file_path: &str) -> Vec<String> {
+    let parts: Vec<&str> = file_path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() <= 1 {
+        return PREFETCH_GREP_PATHSPECS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+    }
+
+    let mut specs = BTreeSet::new();
+    specs.insert("*.h".to_string());
+    if let Some((parent, _)) = file_path.rsplit_once('/')
+        && !parent.is_empty()
+    {
+        specs.insert(format!("{parent}/"));
+        if let Some((grandparent, _)) = parent.rsplit_once('/')
+            && !grandparent.is_empty()
+            && !matches!(
+                grandparent,
+                "drivers" | "fs" | "arch" | "sound" | "tools" | "samples"
+            )
+        {
+            specs.insert(format!("{grandparent}/"));
+        }
+    }
+    if file_path.contains("/kvm/") || file_path.starts_with("virt/kvm/") {
+        specs.insert("virt/kvm/".to_string());
+    }
+    specs.into_iter().collect()
+}
+
 async fn resolve_symbol_definitions(
     repository: &Path,
     snapshot: &mut SourceSnapshot<'_>,
@@ -347,17 +737,38 @@ async fn resolve_symbol_definitions(
     caller_dirs: &HashSet<&str>,
     exclude_file: Option<&Path>,
 ) -> Result<HashMap<String, (PathBuf, usize, usize)>> {
+    resolve_symbol_definitions_with_pathspecs(
+        repository,
+        snapshot,
+        symbols,
+        caller_dirs,
+        exclude_file,
+        PREFETCH_GREP_PATHSPECS,
+        50,
+    )
+    .await
+}
+
+async fn resolve_symbol_definitions_with_pathspecs(
+    repository: &Path,
+    snapshot: &mut SourceSnapshot<'_>,
+    symbols: &[String],
+    caller_dirs: &HashSet<&str>,
+    exclude_file: Option<&Path>,
+    pathspecs: &[&str],
+    batch_size: usize,
+) -> Result<HashMap<String, (PathBuf, usize, usize)>> {
     let mut resolved = HashMap::new();
     if symbols.is_empty() {
         return Ok(resolved);
     }
 
-    const GREP_SYMBOL_BATCH_SIZE: usize = 50;
+    let effective_batch_size = batch_size.max(1);
     let mut candidates: HashMap<String, (Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>)> =
         HashMap::new();
     let revision_prefix = format!("{}:", snapshot.sha);
 
-    for batch in symbols.chunks(GREP_SYMBOL_BATCH_SIZE) {
+    for batch in symbols.chunks(effective_batch_size) {
         let regex_pattern = format!(
             "^((struct|class|enum|union)\\s+(?:GTY\\s*\\(\\(.*?\\)\\)\\s+)?({0})\\b|#define\\s+({0})\\b|([a-zA-Z_][a-zA-Z0-9_ \\t*:<>]+\\s+)?({0})\\s*\\()",
             batch.join("|")
@@ -376,7 +787,7 @@ async fn resolve_symbol_definitions(
             .arg(&regex_pattern)
             .arg(&snapshot.sha)
             .arg("--")
-            .args(PREFETCH_GREP_PATHSPECS)
+            .args(pathspecs)
             .kill_on_drop(true);
 
         let output = match cmd.output().await {
@@ -614,8 +1025,8 @@ pub fn extract_enclosing_block(
 // ---------------------------------------------------------------------------
 
 const PREFETCH_GREP_PATHSPECS: &[&str] = &[
-    "*.c", "*.h", "*.cc", "*.cpp", "*.cxx", "*.C", "*.hh", "*.hpp", "*.tcc", "*.inc", "*.def",
-    "*.pd", "*.f90", "*.F90", "*.md",
+    "*.c", "*.h", "*.rs", "*.cc", "*.cpp", "*.cxx", "*.C", "*.hh", "*.hpp", "*.tcc", "*.inc",
+    "*.def", "*.pd", "*.f90", "*.F90", "*.md",
 ];
 
 // These directories contain userspace reimplementations of kernel primitives
@@ -626,8 +1037,8 @@ fn is_prefetchable_source_file(file: &str) -> bool {
         return false;
     }
     const SOURCE_EXTS: &[&str] = &[
-        ".c", ".h", ".cc", ".cpp", ".cxx", ".C", ".hh", ".hpp", ".tcc", ".inc", ".def", ".pd",
-        ".f90", ".F90",
+        ".c", ".h", ".rs", ".cc", ".cpp", ".cxx", ".C", ".hh", ".hpp", ".tcc", ".inc", ".def",
+        ".pd", ".f90", ".F90",
     ];
     if SOURCE_EXTS.iter().any(|ext| file.ends_with(ext)) {
         return true;
@@ -1424,5 +1835,79 @@ void f(const struct OpaqueHandle *handle, struct PrivOnlyBox *box_ptr) {
         assert!(!opaque.contains("UsedStruct"));
         assert!(!opaque.contains("UsedByValue"));
         assert!(!opaque.contains("ScopedClass"));
+    }
+
+    #[tokio::test]
+    async fn test_chunk_prefetch_chained_local_member_and_rust_external_callers() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let repo = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = crate::git_cmd::in_dir(repo).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+
+        std::fs::create_dir_all(repo.join("include/linux"))?;
+        std::fs::create_dir_all(repo.join("drivers/foo"))?;
+        std::fs::create_dir_all(repo.join("rust/kernel"))?;
+
+        std::fs::write(
+            repo.join("include/linux/ext_sub.h"),
+            "struct ext_sub_state {\n\tint nested_flag;\n};\n",
+        )?;
+        std::fs::write(
+            repo.join("drivers/foo/core.c"),
+            "struct local_ctx {\n\tstruct ext_sub_state sub;\n};\n\nint foo_export_entry(struct local_ctx *ctx)\n{\n\treturn ctx->sub.nested_flag;\n}\n",
+        )?;
+        std::fs::write(
+            repo.join("rust/kernel/foo_wrap.rs"),
+            "pub fn invoke_foo(ptr: *mut core::ffi::c_void) -> i32 {\n    unsafe { foo_export_entry(ptr) }\n}\n",
+        )?;
+
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "initial"]);
+        let sha = run_git(&["rev-parse", "HEAD"]);
+
+        // 1. Chained `ctx->sub.nested_flag` must retain `ext_sub_state` despite no standalone variable.
+        let hdrs = prefetch_external_definitions_for_chunks(
+            repo,
+            &sha,
+            "drivers/foo/core.c",
+            &[(1, 8)],
+            8_000,
+        )
+        .await?;
+        assert_eq!(hdrs.len(), 1);
+        assert!(
+            hdrs[0].contains("struct ext_sub_state") && hdrs[0].contains("nested_flag"),
+            "expected chained local container member struct in prefetched headers, got: {}",
+            hdrs[0]
+        );
+
+        // 2. External caller in `.rs` file must be discovered by `prefetch_external_callers_for_chunks`.
+        let (whole_callers, chunk_callers) = prefetch_external_callers_for_chunks(
+            repo,
+            &sha,
+            "drivers/foo/core.c",
+            &[vec!["foo_export_entry".to_string()]],
+            8_000,
+            4_000,
+        )
+        .await?;
+        assert!(
+            whole_callers.contains("rust/kernel/foo_wrap.rs")
+                && whole_callers.contains("foo_export_entry"),
+            "expected Rust external caller in whole_callers, got: {whole_callers}"
+        );
+        assert!(chunk_callers[0].contains("rust/kernel/foo_wrap.rs"));
+        Ok(())
     }
 }
