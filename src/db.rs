@@ -9473,22 +9473,35 @@ impl Database {
                 msgid_prefix_match || patches_reply_to_new_cover,
             );
 
+            let is_placeholder = existing_subject == "(placeholder)"
+                || existing_status == "Fetching"
+                || (existing_status == "Failed" && existing_received == 0);
+            let is_multipart_cover_and_singleton_patch = (existing_total > 1
+                && existing_subject_index == 0
+                && total_parts == 1
+                && part_index == 1)
+                || (total_parts > 1
+                    && part_index == 0
+                    && existing_total == 1
+                    && existing_subject_index == 1
+                    && !is_placeholder);
+            let totals_compatible = !is_multipart_cover_and_singleton_patch
+                && (total_parts == existing_total || existing_total == 1 || total_parts == 1);
+
             // Relaxed author check logic
             let author_match = crate::patch::authors_match(&existing_author, author);
-            let series_match = (total_parts > 1 && total_parts == existing_total)
-                || existing_total == 1
-                || total_parts == 1;
+            let series_match = totals_compatible;
 
             // The new singleton and the message that defines this patchset are
-            // a cover (0) and a patch (1), in either arrival order.
-            let is_cover_patch_pair =
-                total_parts == 1 && matches!((part_index, existing_subject_index), (0, 1) | (1, 0));
+            // a 0/1 cover and a 1/1 patch, in either arrival order.
+            let is_cover_patch_pair = total_parts == 1
+                && existing_total == 1
+                && matches!((part_index, existing_subject_index), (0, 1) | (1, 0));
             // A cover (0/1) and a patch (1/1) in one thread group even when
             // their authors differ. The rule applies to every source: all
             // messages of an API submission share one thread, and a 1/1 sent
             // into a 0/1 cover's mailing-list thread is taken as its patch.
-            let is_cover_patch_pair_in_thread =
-                same_thread && existing_total == 1 && is_cover_patch_pair;
+            let is_cover_patch_pair_in_thread = same_thread && is_cover_patch_pair;
             let author_or_series_match = if strict_author {
                 author_match || is_cover_patch_pair_in_thread
             } else {
@@ -9502,6 +9515,7 @@ impl Database {
                 let is_late_own_cover = part_index == 0
                     && !Self::is_reply_subject(subject)
                     && existing_subject_index > 0
+                    && totals_compatible
                     && (existing_total > 1
                         || patches_reply_to_new_cover
                         || Self::has_explicit_zero_index(subject))
@@ -9569,22 +9583,19 @@ impl Database {
             let thread_compatible = same_thread
                 || msgid_prefix_match
                 || patches_reply_to_new_cover
-                || (is_singleton && !is_cover_patch_pair);
+                || (is_singleton && existing_total == 1 && !is_cover_patch_pair);
             let is_same_series_redelivery =
                 is_duplicate && same_thread && total_parts == existing_total;
 
             if author_or_series_match
                 && (!strict_author || (date - existing_date).abs() < 86400)
                 && versions_compatible
-                && (total_parts == existing_total || existing_total == 1 || total_parts == 1)
+                && totals_compatible
                 && (subject_match || is_same_series_redelivery)
                 && prefix_match
                 && thread_compatible
                 && (!index_collision || is_same_series_redelivery)
             {
-                let is_placeholder = existing_subject == "(placeholder)"
-                    || existing_status == "Fetching"
-                    || (existing_status == "Failed" && existing_received == 0);
                 matches.push(CandidateMatch {
                     id,
                     subject: existing_subject,

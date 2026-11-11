@@ -812,3 +812,113 @@ Commit message.\r\n\
         assert_eq!(details["status"], "Pending");
     }
 }
+
+/// An independent 1/1 patch — whether posted as a follow-up in the thread of
+/// an incomplete multi-part series (0/N with N > 1) or in a separate thread
+/// with the same cleaned subject — must form its own patchset rather than
+/// merging into the 0/N cover.
+#[tokio::test]
+async fn singleton_reply_does_not_merge_into_multipart_cover() {
+    let cover_id = "20260401100000.000000001@linutronix.de";
+    let followup_id = "87bjad88gj.ffs@tglx";
+
+    let cover = message(
+        cover_id,
+        AUTHOR,
+        "[PATCH 0/4] irqchip: multi-part series overview",
+        None,
+        COVER_BODY,
+    );
+
+    for standalone in [
+        // In-thread standalone 1/1 with a different title.
+        message(
+            followup_id,
+            AUTHOR,
+            "[PATCH] genirq: independent prerequisite fix",
+            Some(cover_id),
+            DIFF,
+        ),
+        // In-thread standalone 1/1 sharing the cover letter's cleaned title.
+        message(
+            followup_id,
+            AUTHOR,
+            "[PATCH] irqchip: multi-part series overview",
+            Some(cover_id),
+            DIFF,
+        ),
+        // Unthreaded standalone 1/1 in a separate thread sharing the cover
+        // letter's cleaned title within 24 hours.
+        message(
+            followup_id,
+            AUTHOR,
+            "[PATCH] irqchip: multi-part series overview",
+            None,
+            DIFF,
+        ),
+    ] {
+        for batch in [[&cover[..], &standalone[..]], [&standalone[..], &cover[..]]] {
+            let db = test_db().await;
+            ingest_list_messages(&db, &batch).await;
+
+            assert_eq!(db.count_patchsets(None, None).await.unwrap(), 2);
+            let cover_ps = db
+                .find_patchset_id_by_msgid(cover_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let standalone_ps = db
+                .find_patchset_id_by_msgid(followup_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(cover_ps, standalone_ps);
+
+            let cover_details = db
+                .get_patchset_details(cover_ps, None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cover_details["total_parts"], 4);
+            assert_eq!(cover_details["received_parts"], 0);
+            assert_eq!(cover_details["status"], ReviewStatus::Incomplete.as_str());
+
+            let standalone_details = db
+                .get_patchset_details(standalone_ps, None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(standalone_details["total_parts"], 1);
+            assert_eq!(standalone_details["received_parts"], 1);
+            assert_eq!(standalone_details["status"], ReviewStatus::Pending.as_str());
+        }
+
+        // Even if the standalone 1/1 reply finishes review before the 0/4 cover
+        // letter arrives, the late 0/4 cover must not hijack the closed 1/1
+        // patchset via is_late_own_cover.
+        let db = test_db().await;
+        ingest_list_messages(&db, &[&standalone[..]]).await;
+        let standalone_ps = db
+            .find_patchset_id_by_msgid(followup_id)
+            .await
+            .unwrap()
+            .unwrap();
+        finish_review(&db, standalone_ps).await;
+        ingest_list_messages(&db, &[&cover[..]]).await;
+
+        assert_eq!(db.count_patchsets(None, None).await.unwrap(), 2);
+        let cover_ps = db
+            .find_patchset_id_by_msgid(cover_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(cover_ps, standalone_ps);
+        let standalone_after = db
+            .get_patchset_details(standalone_ps, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(standalone_after["message_id"], followup_id);
+        assert_eq!(standalone_after["status"], ReviewStatus::Reviewed.as_str());
+    }
+}
