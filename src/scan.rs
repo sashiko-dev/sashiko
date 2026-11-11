@@ -1363,23 +1363,151 @@ fn extract_location_symbols(locations: &serde_json::Value) -> BTreeSet<(String, 
     set
 }
 
+fn strip_title_subsystem_prefix(title: &str) -> &str {
+    let mut rest = title.trim();
+    loop {
+        let Some((head, tail)) = rest.split_once(':') else {
+            break;
+        };
+        // Keep C++/Rust `Type::method` intact.
+        if tail.starts_with(':') {
+            break;
+        }
+        let head_trimmed = head.trim();
+        let word_count = head_trimmed.split_whitespace().count();
+        if head_trimmed.len() <= 28 && word_count <= 3 && !tail.trim().is_empty() {
+            rest = tail.trim();
+        } else {
+            break;
+        }
+    }
+    rest
+}
+
+fn is_dedup_stopword(w: &str) -> bool {
+    matches!(
+        w,
+        "the" | "and" | "for" | "with" | "from" | "when" | "into" | "upon" | "via"
+    )
+}
+
+fn extract_defect_mechanism_tokens(
+    title: &str,
+    syms: &BTreeSet<(String, String)>,
+) -> BTreeSet<String> {
+    let stripped = strip_title_subsystem_prefix(title);
+    let mut excluded: BTreeSet<String> = BTreeSet::new();
+    for (file, sym) in syms {
+        excluded.insert(sym.to_ascii_lowercase());
+        for part in file.split(['/', '.']) {
+            if part.len() >= 3 {
+                excluded.insert(part.to_ascii_lowercase());
+            }
+        }
+    }
+    let filtered: BTreeSet<String> = stripped
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| w.len() >= 3 && !is_dedup_stopword(w) && !excluded.contains(*w))
+        .map(str::to_string)
+        .collect();
+    if filtered.is_empty() {
+        normalize_title_tokens(stripped)
+    } else {
+        filtered
+    }
+}
+
+fn extract_location_lines(locations: &serde_json::Value) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    if let Some(arr) = locations.as_array() {
+        for loc in arr {
+            let file = loc
+                .get("file")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if let Some(line) = loc.get("line").and_then(|v| v.as_i64())
+                && !file.is_empty()
+                && line > 0
+            {
+                out.push((file, line));
+            }
+        }
+    }
+    out
+}
+
+fn min_same_file_line_distance(
+    locs_a: &serde_json::Value,
+    locs_b: &serde_json::Value,
+) -> Option<i64> {
+    let a = extract_location_lines(locs_a);
+    let b = extract_location_lines(locs_b);
+    let mut best: Option<i64> = None;
+    for (fa, la) in &a {
+        for (fb, lb) in &b {
+            if fa == fb {
+                let d = (la - lb).abs();
+                best = Some(best.map_or(d, |cur| cur.min(d)));
+            }
+        }
+    }
+    best
+}
+
+fn extract_title_function_names(title: &str) -> BTreeSet<String> {
+    let mut fns = BTreeSet::new();
+    for raw in title.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':')) {
+        let token = raw.trim_matches(|c: char| matches!(c, '\'' | '"' | '`'));
+        if let Some(stem) = token.strip_suffix("()") {
+            let ident = stem.rsplit("::").next().unwrap_or(stem).trim();
+            if ident.len() >= 3
+                && ident
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                fns.insert(ident.to_ascii_lowercase());
+            }
+        }
+    }
+    fns
+}
+
 fn is_title_and_locations_duplicate(
     existing_title: &str,
     existing_locations: &serde_json::Value,
     cand_title_norm: &str,
+    cand_locations: &serde_json::Value,
     cand_tokens: &BTreeSet<String>,
     cand_syms: &BTreeSet<(String, String)>,
 ) -> bool {
     if existing_title.trim().to_ascii_lowercase() == cand_title_norm {
         return true;
     }
+    let existing_title_fns = extract_title_function_names(existing_title);
+    let cand_title_fns = extract_title_function_names(cand_title_norm);
+    if !existing_title_fns.is_empty()
+        && !cand_title_fns.is_empty()
+        && existing_title_fns.is_disjoint(&cand_title_fns)
+    {
+        return false;
+    }
     let existing_syms = extract_location_symbols(existing_locations);
     let shares_file_and_symbol = !cand_syms.is_empty() && !cand_syms.is_disjoint(&existing_syms);
     if shares_file_and_symbol && !cand_tokens.is_empty() {
-        let existing_tokens = normalize_title_tokens(existing_title);
-        let intersection = cand_tokens.intersection(&existing_tokens).count();
-        let union = cand_tokens.union(&existing_tokens).count();
-        if union > 0 && (intersection as f64 / union as f64) >= 0.45 {
+        let mut combined_syms = existing_syms;
+        combined_syms.extend(cand_syms.iter().cloned());
+        let existing_tokens = extract_defect_mechanism_tokens(existing_title, &combined_syms);
+        let cand_mech_tokens = extract_defect_mechanism_tokens(cand_title_norm, &combined_syms);
+        let intersection = cand_mech_tokens.intersection(&existing_tokens).count();
+        let union = cand_mech_tokens.union(&existing_tokens).count();
+        let threshold = match min_same_file_line_distance(existing_locations, cand_locations) {
+            Some(dist) if dist > 25 => 0.70,
+            _ => 0.45,
+        };
+        if union > 0 && (intersection as f64 / union as f64) >= threshold {
             return true;
         }
     }
@@ -1393,10 +1521,10 @@ pub fn is_in_run_duplicate_input(
     candidate: &crate::api::BugInput,
 ) -> bool {
     let cand_title_norm = candidate.problem.trim().to_ascii_lowercase();
-    let cand_tokens = normalize_title_tokens(&candidate.problem);
     let empty_locs = serde_json::json!([]);
     let cand_locs = candidate.locations.as_ref().unwrap_or(&empty_locs);
     let cand_syms = extract_location_symbols(cand_locs);
+    let cand_tokens = extract_defect_mechanism_tokens(&candidate.problem, &cand_syms);
 
     existing.iter().any(|bug| {
         let existing_locs = bug.locations.as_ref().unwrap_or(&empty_locs);
@@ -1404,6 +1532,7 @@ pub fn is_in_run_duplicate_input(
             &bug.problem,
             existing_locs,
             &cand_title_norm,
+            cand_locs,
             &cand_tokens,
             &cand_syms,
         )
@@ -1413,14 +1542,15 @@ pub fn is_in_run_duplicate_input(
 /// Checks whether `candidate` is an in-run duplicate of any finding in `existing`.
 pub fn is_in_run_duplicate(existing: &[VerifiedScanBug], candidate: &VerifiedScanBug) -> bool {
     let cand_title_norm = candidate.canonical_title.trim().to_ascii_lowercase();
-    let cand_tokens = normalize_title_tokens(&candidate.canonical_title);
     let cand_syms = extract_location_symbols(&candidate.locations);
+    let cand_tokens = extract_defect_mechanism_tokens(&candidate.canonical_title, &cand_syms);
 
     existing.iter().any(|bug| {
         is_title_and_locations_duplicate(
             &bug.canonical_title,
             &bug.locations,
             &cand_title_norm,
+            &candidate.locations,
             &cand_tokens,
             &cand_syms,
         )
@@ -2746,6 +2876,86 @@ pub fn second_fn() -> u32 {
             std::slice::from_ref(&input1),
             &input_same_fn
         ));
+
+        // Two distinct defects inside the exact same function must NOT be collapsed.
+        let sve_bug_a = VerifiedScanBug {
+            canonical_title:
+                "arm64/ptrace: wrong task passed to task_user_regset_view in sve_set_common()"
+                    .to_string(),
+            locations: serde_json::json!([{
+                "file": "arch/arm64/kernel/ptrace.c",
+                "line": 915,
+                "function_or_symbol": "sve_set_common"
+            }]),
+            ..bug1.clone()
+        };
+        let sve_bug_b = VerifiedScanBug {
+            canonical_title: "arm64/ptrace: missing sve_free on fpsimd path in sve_set_common()"
+                .to_string(),
+            locations: serde_json::json!([{
+                "file": "arch/arm64/kernel/ptrace.c",
+                "line": 948,
+                "function_or_symbol": "sve_set_common"
+            }]),
+            ..bug1.clone()
+        };
+        assert!(!is_in_run_duplicate(
+            std::slice::from_ref(&sve_bug_a),
+            &sve_bug_b
+        ));
+
+        let kho_a = crate::api::BugInput {
+            problem: "kho: unchecked xa_erase return value in kho_vmalloc_unpreserve_chunk()"
+                .to_string(),
+            locations: Some(serde_json::json!([{
+                "file": "kernel/kexec_handover.c",
+                "line": 980,
+                "function_or_symbol": "kho_vmalloc_unpreserve_chunk"
+            }])),
+            ..input1.clone()
+        };
+        let kho_b = crate::api::BugInput {
+            problem: "kho: memory leak of chunk struct in kho_vmalloc_unpreserve_chunk()"
+                .to_string(),
+            locations: Some(serde_json::json!([{
+                "file": "kernel/kexec_handover.c",
+                "line": 992,
+                "function_or_symbol": "kho_vmalloc_unpreserve_chunk"
+            }])),
+            ..input1.clone()
+        };
+        assert!(!is_in_run_duplicate_input(
+            std::slice::from_ref(&kho_a),
+            &kho_b
+        ));
+
+        let shared_alloc_loc = serde_json::json!({
+            "file": "arch/arm64/kvm/nested.c",
+            "line": 1215,
+            "function_or_symbol": "kvm_vcpu_allocate_vncr_tlb"
+        });
+        let vncr_fp_cand = crate::api::BugInput {
+            problem: "KVM: arm64: nv: NULL vncr_tlb dereference from kvm_vcpu_load_hw_mmu()"
+                .to_string(),
+            locations: Some(serde_json::json!([
+                {"file": "arch/arm64/kvm/nested.c", "line": 786, "function_or_symbol": "kvm_vcpu_load_hw_mmu"},
+                shared_alloc_loc.clone()
+            ])),
+            ..input1.clone()
+        };
+        let vncr_real_cand = crate::api::BugInput {
+            problem: "KVM: arm64: nv: NULL vncr_tlb dereference in invalidate_vncr_va()"
+                .to_string(),
+            locations: Some(serde_json::json!([
+                {"file": "arch/arm64/kvm/nested.c", "line": 929, "function_or_symbol": "invalidate_vncr_va"},
+                shared_alloc_loc
+            ])),
+            ..input1
+        };
+        assert!(
+            !is_in_run_duplicate_input(std::slice::from_ref(&vncr_fp_cand), &vncr_real_cand),
+            "distinct target functions sharing a background allocator location must never collide"
+        );
     }
 
     #[tokio::test]
