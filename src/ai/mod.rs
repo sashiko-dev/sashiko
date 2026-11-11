@@ -1211,6 +1211,8 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 .unwrap_or_else(|| "us-east5".to_string());
             let enable_caching = vertex.map(|v| v.prompt_caching).unwrap_or(true);
             let is_gemini = is_gemini_model_name(&model);
+            let max_tokens_explicit = vertex.and_then(|v| v.max_tokens).is_some()
+                || (is_gemini && ai.gemini.as_ref().and_then(|g| g.max_tokens).is_some());
             let max_tokens = resolve_vertex_max_tokens(ai);
             let thinking = vertex.and_then(|v| v.thinking.clone()).or_else(|| {
                 if is_gemini {
@@ -1220,15 +1222,18 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 }
             });
             let effort = vertex.and_then(|v| v.effort.clone());
-            Ok(Arc::new(vertex::VertexClient::new(
-                model,
-                project_id,
-                region,
-                enable_caching,
-                max_tokens,
-                thinking,
-                effort,
-            )?))
+            Ok(Arc::new(
+                vertex::VertexClient::new(
+                    model,
+                    project_id,
+                    region,
+                    enable_caching,
+                    max_tokens,
+                    thinking,
+                    effort,
+                )?
+                .with_max_tokens_explicit(max_tokens_explicit),
+            ))
         }
         #[cfg(not(feature = "vertex"))]
         "vertex" => bail!("vertex provider requires the 'vertex' feature"),

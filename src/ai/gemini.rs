@@ -525,6 +525,10 @@ pub struct GeminiClient {
     auth_token_command: Option<String>,
     thinking_level: Option<String>,
     max_tokens: u32,
+    max_tokens_explicit: bool,
+    /// Learned on a 400 INVALID_ARGUMENT rejecting `maxOutputTokens` when
+    /// `max_tokens` was defaulted rather than explicitly configured.
+    max_tokens_unsupported: std::sync::atomic::AtomicBool,
     proxy_url: tokio::sync::OnceCell<String>,
     proxy_guard: tokio::sync::Mutex<Option<std::sync::Arc<ProxyGuard>>>,
     client: RwLock<Client>,
@@ -571,8 +575,9 @@ impl GeminiClient {
             .filter(|s| !s.is_empty())
             .map(str::to_ascii_uppercase);
 
-        let max_tokens = settings
-            .and_then(|s| s.max_tokens)
+        let explicit_max_tokens = settings.and_then(|s| s.max_tokens);
+        let max_tokens_explicit = explicit_max_tokens.is_some();
+        let max_tokens = explicit_max_tokens
             .unwrap_or_else(|| crate::settings::default_gemini_provider_max_tokens(&model));
 
         let client = Self::create_http_client(&api_key);
@@ -585,6 +590,8 @@ impl GeminiClient {
             auth_token_command,
             thinking_level,
             max_tokens,
+            max_tokens_explicit,
+            max_tokens_unsupported: std::sync::atomic::AtomicBool::new(false),
             proxy_url: tokio::sync::OnceCell::new(),
             proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(client),
@@ -918,13 +925,75 @@ pub(crate) fn merge_continuation_response(
     }
 }
 
+pub(crate) fn rejects_max_output_tokens(err: &anyhow::Error) -> bool {
+    let Some(GeminiError::ApiError(status, body)) = err.downcast_ref::<GeminiError>() else {
+        return false;
+    };
+    if *status != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("maxoutputtokens") || lower.contains("max_output_tokens")
+}
+
+pub(crate) fn effective_defaulted_max_tokens(
+    max_tokens: u32,
+    explicit: bool,
+    unsupported: &std::sync::atomic::AtomicBool,
+) -> Option<u32> {
+    if !explicit && unsupported.load(std::sync::atomic::Ordering::Relaxed) {
+        None
+    } else {
+        Some(max_tokens).filter(|&n| n > 0)
+    }
+}
+
+pub(crate) fn strip_max_output_tokens_on_rejection(
+    request: &mut GenerateContentRequest,
+    explicit: bool,
+    unsupported: &std::sync::atomic::AtomicBool,
+    model: &str,
+    err: &anyhow::Error,
+) -> bool {
+    if explicit || !rejects_max_output_tokens(err) {
+        return false;
+    }
+    let Some(cfg) = request.generation_config.as_mut() else {
+        return false;
+    };
+    if cfg.max_output_tokens.take().is_none() {
+        return false;
+    }
+    unsupported.store(true, std::sync::atomic::Ordering::Relaxed);
+    tracing::warn!(
+        "{}Gemini model {} rejected default maxOutputTokens; retrying without maxOutputTokens",
+        crate::ai::get_log_prefix(),
+        model
+    );
+    true
+}
+
 #[async_trait]
 impl GenAiClient for GeminiClient {
     async fn generate_content(
         &self,
         mut request: GenerateContentRequest,
     ) -> Result<GenerateContentResponse> {
-        let mut acc = self.generate_content_single(&request).await?;
+        let mut acc = match self.generate_content_single(&request).await {
+            Ok(resp) => resp,
+            Err(err)
+                if strip_max_output_tokens_on_rejection(
+                    &mut request,
+                    self.max_tokens_explicit,
+                    &self.max_tokens_unsupported,
+                    &self.model,
+                    &err,
+                ) =>
+            {
+                self.generate_content_single(&request).await?
+            }
+            Err(err) => return Err(err),
+        };
         for hop in 1..=MAX_CONTINUATION_HOPS {
             let Some(token) = next_continuation_token(&acc, request.continuation_token.as_deref())
             else {
@@ -1426,11 +1495,13 @@ pub(crate) fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiR
 #[async_trait]
 impl AiProvider for GeminiClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        let gen_req = translate_ai_request_with_options(
-            request,
-            self.thinking_level.as_deref(),
-            Some(self.max_tokens),
-        )?;
+        let max_tokens = effective_defaulted_max_tokens(
+            self.max_tokens,
+            self.max_tokens_explicit,
+            &self.max_tokens_unsupported,
+        );
+        let gen_req =
+            translate_ai_request_with_options(request, self.thinking_level.as_deref(), max_tokens)?;
         let resp = GenAiClient::generate_content(self, gen_req).await?;
         translate_ai_response(resp)
     }
@@ -1478,6 +1549,8 @@ mod tests {
             auth_token_command: None,
             thinking_level: thinking_level.map(str::to_string),
             max_tokens,
+            max_tokens_explicit: false,
+            max_tokens_unsupported: std::sync::atomic::AtomicBool::new(false),
             proxy_url: tokio::sync::OnceCell::new(),
             proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(Client::new()),
@@ -1516,6 +1589,8 @@ mod tests {
             auth_token_command: None,
             thinking_level: None,
             max_tokens: 131_072,
+            max_tokens_explicit: false,
+            max_tokens_unsupported: std::sync::atomic::AtomicBool::new(false),
             proxy_url: tokio::sync::OnceCell::new(),
             proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(Client::new()),
@@ -1544,6 +1619,8 @@ mod tests {
             auth_token_command: Some("echo mock-bearer-token-xyz".to_string()),
             thinking_level: None,
             max_tokens: 131_072,
+            max_tokens_explicit: false,
+            max_tokens_unsupported: std::sync::atomic::AtomicBool::new(false),
             proxy_url: tokio::sync::OnceCell::new(),
             proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(Client::new()),
@@ -1564,6 +1641,8 @@ mod tests {
             auth_token_command: None,
             thinking_level: None,
             max_tokens: 131_072,
+            max_tokens_explicit: false,
+            max_tokens_unsupported: std::sync::atomic::AtomicBool::new(false),
             proxy_url: tokio::sync::OnceCell::new(),
             proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(Client::new()),
@@ -1768,6 +1847,8 @@ mod tests {
             auth_token_command: None,
             thinking_level: None,
             max_tokens: 131_072,
+            max_tokens_explicit: false,
+            max_tokens_unsupported: std::sync::atomic::AtomicBool::new(false),
             proxy_url: tokio::sync::OnceCell::new(),
             proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(test_http::test_client()),
@@ -3266,5 +3347,136 @@ mod tests {
             err.to_string(),
             "Gemini request blocked by prompt feedback (reason: BLOCKLIST)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_default_max_output_tokens_rejection_retries_and_caches_fallback() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let server = tokio::spawn(async move {
+            let mut seen_max_tokens: Vec<Option<u64>> = Vec::new();
+            let responses = [
+                (
+                    "400 Bad Request",
+                    json!({
+                        "error": {
+                            "code": 400,
+                            "message": "Invalid value at 'generation_config.max_output_tokens': maxOutputTokens must be in the range [1, 65536]",
+                            "status": "INVALID_ARGUMENT"
+                        }
+                    }),
+                ),
+                (
+                    "200 OK",
+                    json!({
+                        "candidates": [{
+                            "content": {"role": "model", "parts": [{"text": "ok-1"}]},
+                            "finishReason": "STOP"
+                        }],
+                        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 2, "totalTokenCount": 12}
+                    }),
+                ),
+                (
+                    "200 OK",
+                    json!({
+                        "candidates": [{
+                            "content": {"role": "model", "parts": [{"text": "ok-2"}]},
+                            "finishReason": "STOP"
+                        }],
+                        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 2, "totalTokenCount": 12}
+                    }),
+                ),
+            ];
+
+            for (status, resp_json) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let header_end = loop {
+                    let n = stream.read(&mut tmp).await.unwrap();
+                    assert!(n > 0, "unexpected EOF reading request");
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..header_end]);
+                let content_len: usize = headers
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                while buf.len() < header_end + content_len {
+                    let n = stream.read(&mut tmp).await.unwrap();
+                    assert!(n > 0, "unexpected EOF reading body");
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let body_json: Value =
+                    serde_json::from_slice(&buf[header_end..header_end + content_len]).unwrap();
+                seen_max_tokens.push(
+                    body_json
+                        .get("generationConfig")
+                        .and_then(|g| g.get("maxOutputTokens"))
+                        .and_then(|v| v.as_u64()),
+                );
+
+                let wire = test_http::complete(status, "", &resp_json.to_string());
+                stream.write_all(&wire).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+            seen_max_tokens
+        });
+
+        let client = local_client(&format!("http://{addr}"));
+        let initial_identity = client.cache_identity();
+        let make_req = || AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some("Ping".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+            reasoning_effort: None,
+            conversation_id: None,
+        };
+
+        let first = AiProvider::generate_content(&client, make_req()).await?;
+        assert_eq!(first.content.as_deref(), Some("ok-1"));
+        // Subsequent calls omit maxOutputTokens up front without changing cache_identity.
+        assert_eq!(client.cache_identity(), initial_identity);
+        let second = AiProvider::generate_content(&client, make_req()).await?;
+        assert_eq!(second.content.as_deref(), Some("ok-2"));
+
+        let seen = tokio::time::timeout(Duration::from_secs(5), server).await??;
+        assert_eq!(seen, vec![Some(131_072), None, None]);
+
+        // An explicitly configured max_tokens must fail fast instead of being dropped.
+        let bad_resp = test_http::complete(
+            "400 Bad Request",
+            "",
+            r#"{"error":{"code":400,"message":"maxOutputTokens must be <= 65536","status":"INVALID_ARGUMENT"}}"#,
+        );
+        let err_server = test_http::serve(bad_resp).await;
+        let mut explicit_client = local_client(&err_server.url);
+        explicit_client.max_tokens_explicit = true;
+        let err = AiProvider::generate_content(&explicit_client, make_req())
+            .await
+            .expect_err("explicit max_tokens rejection must propagate");
+        assert!(err.to_string().contains("maxOutputTokens"));
+
+        Ok(())
     }
 }

@@ -148,6 +148,8 @@ pub struct VertexClient {
     client: Client,
     enable_caching: bool,
     max_tokens: u32,
+    max_tokens_explicit: bool,
+    max_tokens_unsupported: std::sync::atomic::AtomicBool,
     thinking: Option<String>,
     effort: Option<String>,
     context_window_size: usize,
@@ -201,11 +203,18 @@ impl VertexClient {
             client: Client::new(),
             enable_caching,
             max_tokens,
+            max_tokens_explicit: true,
+            max_tokens_unsupported: std::sync::atomic::AtomicBool::new(false),
             thinking,
             effort,
             context_window_size,
             credentials,
         })
+    }
+
+    pub(crate) fn with_max_tokens_explicit(mut self, explicit: bool) -> Self {
+        self.max_tokens_explicit = explicit;
+        self
     }
 
     async fn get_access_token(&self) -> Result<String> {
@@ -327,12 +336,31 @@ impl VertexClient {
     }
 
     async fn generate_gemini(&self, request: AiRequest) -> Result<AiResponse> {
+        let max_tokens = gemini::effective_defaulted_max_tokens(
+            self.max_tokens,
+            self.max_tokens_explicit,
+            &self.max_tokens_unsupported,
+        );
         let mut gemini_req = gemini::translate_ai_request_with_options(
             request,
             self.thinking.as_deref(),
-            Some(self.max_tokens),
+            max_tokens,
         )?;
-        let mut acc = self.post_gemini_request(&gemini_req).await?;
+        let mut acc = match self.post_gemini_request(&gemini_req).await {
+            Ok(resp) => resp,
+            Err(err)
+                if gemini::strip_max_output_tokens_on_rejection(
+                    &mut gemini_req,
+                    self.max_tokens_explicit,
+                    &self.max_tokens_unsupported,
+                    &self.model,
+                    &err,
+                ) =>
+            {
+                self.post_gemini_request(&gemini_req).await?
+            }
+            Err(err) => return Err(err),
+        };
         for hop in 1..=gemini::MAX_CONTINUATION_HOPS {
             let Some(token) =
                 gemini::next_continuation_token(&acc, gemini_req.continuation_token.as_deref())
