@@ -792,6 +792,19 @@ async fn list_mailing_lists(
     Ok(Json(result))
 }
 
+const MAX_UNAUTHENTICATED_LIST_PAGE: usize = 20;
+
+fn is_authenticated_reader(
+    state: &Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+    auth: Option<&crate::auth::AuthUser>,
+) -> bool {
+    if is_auth_blocklisted(state, auth) {
+        return false;
+    }
+    state.settings.server.testing_mode || auth.is_some() || presents_local_token(headers, state)
+}
+
 async fn list_patchsets(
     auth: crate::auth::OptionalAuthUser,
     OptionalPrincipal(principal): OptionalPrincipal,
@@ -800,6 +813,11 @@ async fn list_patchsets(
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<PatchsetsResponse>, StatusCode> {
     let page = pagination.page.unwrap_or(1).max(1);
+    if page > MAX_UNAUTHENTICATED_LIST_PAGE
+        && !is_authenticated_reader(&state, &headers, auth.0.as_ref())
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let per_page = pagination.per_page.unwrap_or(50).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
@@ -861,10 +879,17 @@ async fn list_patchsets(
 }
 
 async fn list_messages(
+    auth: crate::auth::OptionalAuthUser,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<MessagesResponse>, StatusCode> {
     let page = pagination.page.unwrap_or(1).max(1);
+    if page > MAX_UNAUTHENTICATED_LIST_PAGE
+        && !is_authenticated_reader(&state, &headers, auth.0.as_ref())
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let per_page = pagination.per_page.unwrap_or(50).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
@@ -1138,6 +1163,9 @@ async fn get_patchset(
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
+        if !is_authenticated_reader(&state, &headers, auth.0.as_ref()) {
+            return Err(StatusCode::FORBIDDEN);
+        }
         debug!("Fetching details for patchset id: {}", id_val);
         state
             .db
@@ -1215,6 +1243,9 @@ async fn get_review(
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Some(ps_id) = query.patchset_id {
+        if !is_authenticated_reader(&state, &headers, auth.0.as_ref()) {
+            return Err(StatusCode::FORBIDDEN);
+        }
         debug!("Fetching latest review for patchset id: {}", ps_id);
         state.db.get_latest_review_for_patchset(ps_id).await
     } else if let Some(id) = query.id {
@@ -1249,6 +1280,9 @@ async fn get_patchset_summary(
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
+        if !is_authenticated_reader(&state, &headers, auth.0.as_ref()) {
+            return Err(StatusCode::FORBIDDEN);
+        }
         debug!("Fetching summary for patchset id: {}", id_val);
         state
             .db
@@ -1302,6 +1336,9 @@ async fn get_review_log(
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Some(ps_id) = query.patchset_id {
+        if !is_authenticated_reader(&state, &headers, auth.0.as_ref()) {
+            return Err(StatusCode::FORBIDDEN);
+        }
         debug!("Fetching latest review log for patchset id: {}", ps_id);
         state.db.get_latest_review_for_patchset(ps_id).await
     } else if let Some(id) = query.id {
@@ -6512,12 +6549,32 @@ F:	*
             per_page: None,
             limit: None,
         };
+        let msgid_query = || PatchQuery {
+            id: "<embargo-srv@example.com>".to_string(),
+            page: None,
+            per_page: None,
+            limit: None,
+        };
         let list_pagination = || Pagination {
             page: Some(1),
             per_page: Some(50),
             q: None,
             mailing_list: None,
         };
+
+        // Anonymous sequential numeric patchset lookup is forbidden.
+        assert_eq!(
+            get_patchset(
+                crate::auth::OptionalAuthUser(None),
+                OptionalPrincipal(Principal::anonymous()),
+                headers.clone(),
+                State(state.clone()),
+                Query(query()),
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
 
         // 1. Anonymous caller sees Embargoed with empty reviews, zeroed list counts,
         // 404 on /api/review, and 403 on release_patchset_embargo.
@@ -6526,7 +6583,7 @@ F:	*
             OptionalPrincipal(Principal::anonymous()),
             headers.clone(),
             State(state.clone()),
-            Query(query()),
+            Query(msgid_query()),
         )
         .await
         .unwrap();
@@ -6574,6 +6631,18 @@ F:	*
 
         // 2. Unrelated subsystem maintainer (davem) and blocklisted maintainer are denied
         // both viewing embargoed results and releasing the embargo.
+        assert_eq!(
+            get_patchset(
+                auth_for("blocked@example.org"),
+                OptionalPrincipal(Principal::resolve("blocked@example.org", acl, Some(&index))),
+                headers.clone(),
+                State(state.clone()),
+                Query(query()),
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
         for email in [
             "davem@davemloft.net",
             "stranger@example.org",
@@ -6585,7 +6654,7 @@ F:	*
                 OptionalPrincipal(p.clone()),
                 headers.clone(),
                 State(state.clone()),
-                Query(query()),
+                Query(msgid_query()),
             )
             .await
             .unwrap();

@@ -390,12 +390,15 @@ async fn assert_late_cover_preserves_review(author: &str) {
     )
     .await;
     assert_eq!(resolved, id, "late cover must keep the reviewed patchset");
+    assert_eq!(review_before["patchset_ref"], PATCH_A);
+    let mut expected_review = review_before;
+    expected_review["patchset_ref"] = serde_json::json!(COVER_A);
     assert_eq!(
         db.get_latest_review_for_patchset(id)
             .await
             .unwrap()
             .unwrap(),
-        review_before
+        expected_review
     );
     assert!(db.get_pending_patchsets(10).await.unwrap().is_empty());
     assert_eq!(
