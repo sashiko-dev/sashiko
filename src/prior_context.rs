@@ -843,55 +843,182 @@ fn is_changelog_heading(trimmed: &str) -> bool {
             && lower.len() <= 24)
 }
 
-fn normalize_patch_diff_lines(diff: &str) -> Vec<&str> {
-    let mut started = !diff.contains("diff --git ");
+fn parse_hunk_header(line: &str) -> Option<(usize, usize, &str)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (ranges, tail) = rest.split_once(" @@")?;
+    let (old_spec, new_spec) = ranges.split_once(" +")?;
+    let parse_count = |spec: &str| -> Option<usize> {
+        match spec.split_once(',') {
+            Some((start, count)) => {
+                start.parse::<usize>().ok()?;
+                count.parse::<usize>().ok()
+            }
+            None => {
+                spec.parse::<usize>().ok()?;
+                Some(1)
+            }
+        }
+    };
+    Some((parse_count(old_spec)?, parse_count(new_spec)?, tail))
+}
+
+fn is_unified_file_header(lines: &[&str], idx: usize) -> bool {
+    idx + 2 < lines.len()
+        && lines[idx].starts_with("--- ")
+        && lines[idx + 1].starts_with("+++ ")
+        && parse_hunk_header(lines[idx + 2]).is_some()
+}
+
+fn is_quilt_separator_line(line: &str) -> bool {
+    line.len() >= 4 && line.bytes().all(|b| b == b'=')
+}
+
+fn is_git_base85_line(line: &str) -> bool {
+    line.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
+        && !line.contains(char::is_whitespace)
+}
+
+fn is_post_diff_footer_line(line: &str) -> bool {
+    if line == "--"
+        || line.starts_with("-- ")
+        || line.starts_with("_______________________________________________")
+    {
+        return true;
+    }
+    [
+        "base-commit:",
+        "prerequisite-patch-id:",
+        "prerequisite-message-id:",
+        "change-id:",
+    ]
+    .iter()
+    .any(|prefix| {
+        line.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
+fn consume_active_hunk_line(line: &str, rem_old: &mut usize, rem_new: &mut usize) -> bool {
+    if *rem_old == 0 && *rem_new == 0 {
+        return false;
+    }
+    if line.starts_with('+') && *rem_new > 0 {
+        *rem_new -= 1;
+        return true;
+    }
+    if line.starts_with('-') && *rem_old > 0 {
+        *rem_old -= 1;
+        return true;
+    }
+    if (line.starts_with(' ') || line.is_empty()) && *rem_old > 0 && *rem_new > 0 {
+        *rem_old -= 1;
+        *rem_new -= 1;
+        return true;
+    }
+    if line.starts_with("\\ ") {
+        return true;
+    }
+    *rem_old = 0;
+    *rem_new = 0;
+    false
+}
+
+fn extract_normalized_diff_lines(diff: &str) -> Option<Vec<&str>> {
+    let lines: Vec<&str> = diff.lines().collect();
+    let mut started = false;
+    let mut in_git_binary = false;
+    let mut in_binary_chunk = false;
+    let mut rem_old = 0usize;
+    let mut rem_new = 0usize;
     let mut out = Vec::new();
-    for line in diff.lines() {
+
+    for (idx, &line) in lines.iter().enumerate() {
+        if consume_active_hunk_line(line, &mut rem_old, &mut rem_new) {
+            out.push(line);
+            continue;
+        }
+        if in_binary_chunk {
+            if line.is_empty() {
+                in_binary_chunk = false;
+                continue;
+            }
+            if is_git_base85_line(line) {
+                out.push(line);
+                continue;
+            }
+            in_binary_chunk = false;
+        }
         if line.starts_with("diff --git ") {
             started = true;
-        }
-        if !started || line.starts_with("index ") {
+            in_git_binary = false;
+            out.push(line);
             continue;
+        }
+        if !started {
+            if is_unified_file_header(&lines, idx) {
+                started = true;
+                out.push(line);
+            }
+            continue;
+        }
+        if is_post_diff_footer_line(line) {
+            break;
+        }
+        if line.is_empty()
+            || line.starts_with("index ")
+            || line.starts_with("Index: ")
+            || is_quilt_separator_line(line)
+        {
+            continue;
+        }
+        if line == "GIT binary patch" {
+            in_git_binary = true;
+            out.push(line);
+            continue;
+        }
+        if in_git_binary && (line.starts_with("literal ") || line.starts_with("delta ")) {
+            in_binary_chunk = true;
+            out.push(line);
+            continue;
+        }
+        if let Some((old_c, new_c, _)) = parse_hunk_header(line) {
+            in_git_binary = false;
+            rem_old = old_c;
+            rem_new = new_c;
         }
         out.push(line);
     }
-    out
+
+    (!out.is_empty()).then_some(out)
 }
 
-/// Drops the line ranges from a hunk header, keeping the function context
-/// that follows them. A rebase onto a tree where earlier code grew or
-/// shrank rewrites `@@ -269,15 +267,13 @@` without touching the hunk.
-fn strip_hunk_ranges(line: &str) -> std::borrow::Cow<'_, str> {
-    if let Some(rest) = line.strip_prefix("@@ ")
-        && let Some(end) = rest.find(" @@")
-    {
-        return std::borrow::Cow::Owned(format!("@@{}", &rest[end + 3..]));
+/// Compares two normalized diff lines, ignoring the line ranges on `@@` hunk
+/// headers while keeping the function context that follows them.
+fn diff_lines_equivalent(a: &str, b: &str) -> bool {
+    match (parse_hunk_header(a), parse_hunk_header(b)) {
+        (Some((_, _, ta)), Some((_, _, tb))) => ta == tb,
+        (None, None) => a == b,
+        _ => false,
     }
-    std::borrow::Cow::Borrowed(line)
 }
 
 /// Reports whether two patch bodies carry the same change.
 ///
 /// The comparison is exact on every diff line, including whitespace, and
-/// ignores only what a rebase rewrites: the mail text before the first
-/// `diff --git` header, the blob SHAs on `index` lines, and the line
-/// ranges on `@@` hunk headers. A body with no `diff --git` header is
-/// equivalent to nothing, itself included: without one there is no diff
-/// to compare, only text.
+/// ignores only what a rebase or repost rewrites: the mail preamble before the
+/// first diff header (`diff --git` or unified `---` / `+++` / `@@`), Quilt
+/// `Index:` separators, blob SHAs on `index` lines, line ranges on `@@` hunk
+/// headers, and post-diff mail signatures or trailers (`-- `, `base-commit:`,
+/// `prerequisite-*:`, `change-id:`, mailing-list footers). A body with no diff
+/// header is equivalent to nothing, itself included.
 pub fn patch_diffs_equivalent(a: &str, b: &str) -> bool {
-    let a = normalize_patch_diff_lines(a);
-    let b = normalize_patch_diff_lines(b);
-    // normalize_patch_diff_lines() starts at the first line that opens
-    // with the header. Given a body with no such line it returns every
-    // line, for callers that diff raw text, or none at all when the
-    // header is only mentioned mid-line. Neither result begins with the
-    // header, and `b` begins as `a` does once the lines below match.
-    a.first()
-        .is_some_and(|line| line.starts_with("diff --git "))
-        && a.len() == b.len()
-        && a.iter()
-            .zip(&b)
-            .all(|(x, y)| strip_hunk_ranges(x) == strip_hunk_ranges(y))
+    let (Some(a), Some(b)) = (
+        extract_normalized_diff_lines(a),
+        extract_normalized_diff_lines(b),
+    ) else {
+        return false;
+    };
+    a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| diff_lines_equivalent(x, y))
 }
 
 /// Computes an in-memory inter-version diff between `prev_diff` (`v_base`) and
@@ -900,8 +1027,13 @@ pub fn compute_inter_version_diff(prev_diff: &str, curr_diff: &str) -> Option<St
     if prev_diff.trim().is_empty() || curr_diff.trim().is_empty() {
         return None;
     }
-    let old_lines = normalize_patch_diff_lines(prev_diff);
-    let new_lines = normalize_patch_diff_lines(curr_diff);
+    if patch_diffs_equivalent(prev_diff, curr_diff) {
+        return Some("(patch diff unchanged)".to_string());
+    }
+    let old_lines =
+        extract_normalized_diff_lines(prev_diff).unwrap_or_else(|| prev_diff.lines().collect());
+    let new_lines =
+        extract_normalized_diff_lines(curr_diff).unwrap_or_else(|| curr_diff.lines().collect());
     if old_lines == new_lines {
         return Some("(patch diff unchanged)".to_string());
     }
@@ -1503,20 +1635,37 @@ mod tests {
         assert!(inter.contains("-+    if (!skb) return -EINVAL;"));
         assert!(inter.contains("++        return -ENOMEM;"));
 
-        // Rebase-only `index` SHA change is detected as unchanged.
-        let v1_rebased = v1.replace("1111111..2222222", "aaaaaaa..bbbbbbb");
+        // Rebase-only `index` SHA, hunk line offset, and post-diff signature /
+        // `base-commit:` changes are all detected as unchanged.
+        let v1_rebased = format!(
+            "{}base-commit: 1111111111111111111111111111111111111111\n-- \n2.47.0\n",
+            v1.replace("1111111..2222222", "aaaaaaa..bbbbbbb")
+                .replace("@@ -1,3 +1,4 @@", "@@ -29,3 +29,4 @@")
+        );
         assert_eq!(
             compute_inter_version_diff(v1, &v1_rebased).as_deref(),
             Some("(patch diff unchanged)")
         );
+
+        // Modified patches do not pollute the rendered interdiff with git
+        // version footers or `base-commit:` trailers.
+        let v1_with_sig = format!("{v1}-- \n2.47.0\n");
+        let v2_with_sig = format!("{v2}-- \n2.48.1\n");
+        let inter_sig = compute_inter_version_diff(&v1_with_sig, &v2_with_sig).unwrap();
+        assert!(!inter_sig.contains("2.47.0"));
+        assert!(!inter_sig.contains("2.48.1"));
     }
 
     #[test]
     fn test_patch_diffs_equivalent_ignores_only_rebase_noise() {
-        let v1 = "From: A <a@example.org>\nSubject: [PATCH v1] foo\n\n---\ndiff --git a/net/foo.c b/net/foo.c\nindex 1111111..2222222 100644\n--- a/net/foo.c\n+++ b/net/foo.c\n@@ -1,3 +1,4 @@\n int f(void) {\n+\treturn 1;\n     return 0;\n }\n";
+        let v1 = "From: A <a@example.org>\nSubject: [PATCH v1] foo\n\n---\ndiff --git a/net/foo.c b/net/foo.c\nindex 1111111..2222222 100644\n--- a/net/foo.c\n+++ b/net/foo.c\n@@ -1,3 +1,4 @@\n int f(void) {\n+\treturn 1;\n     return 0;\n }\n-- \n2.47.0\n";
         let rebased = v1
             .replace("1111111..2222222", "aaaaaaa..bbbbbbb")
-            .replace("[PATCH v1]", "[PATCH v2]");
+            .replace("[PATCH v1]", "[PATCH v2]")
+            .replace(
+                "-- \n2.47.0\n",
+                "\nbase-commit: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\nprerequisite-patch-id: 0123456789abcdef0123456789abcdef01234567\n-- \n2.48.1\n_______________________________________________\nList footer\n",
+            );
         assert!(patch_diffs_equivalent(v1, &rebased));
 
         // A hunk that moved because code above it changed keeps its
@@ -1528,6 +1677,29 @@ mod tests {
             "@@ -1,3 +1,4 @@\n int g(void)",
         );
         assert!(!patch_diffs_equivalent(v1, &other_function));
+
+        // Deleted lines inside an active hunk that look like `-- ` or
+        // `-base-commit:` are part of the hunk, not post-diff footers.
+        let hunk_with_dashes_a = "diff --git a/doc.md b/doc.md\n--- a/doc.md\n+++ b/doc.md\n@@ -1,3 +1,1 @@\n-base-commit: old\n-- item\n keep\n-- \n2.47.0\n";
+        let hunk_with_dashes_b = "diff --git a/doc.md b/doc.md\n--- a/doc.md\n+++ b/doc.md\n@@ -1,3 +1,1 @@\n-base-commit: old\n-- other\n keep\n-- \n2.48.1\n";
+        assert!(!patch_diffs_equivalent(
+            hunk_with_dashes_a,
+            hunk_with_dashes_b
+        ));
+        assert!(patch_diffs_equivalent(
+            hunk_with_dashes_a,
+            &hunk_with_dashes_a.replace("2.47.0", "2.48.1")
+        ));
+
+        // Plain unified / Quilt diffs with `---` / `+++` / `@@` headers match
+        // under the same rebase-noise rules.
+        let quilt_v1 = "Commit msg.\n\nIndex: linux/f.c\n===================================================================\n--- a/f.c\n+++ b/f.c\n@@ -1 +1 @@\n-a\n+b\n-- \n2.47.0\n";
+        let quilt_v2 = "--- a/f.c\n+++ b/f.c\n@@ -10 +12 @@\n-a\n+b\n";
+        assert!(patch_diffs_equivalent(quilt_v1, quilt_v2));
+        assert!(!patch_diffs_equivalent(
+            quilt_v1,
+            &quilt_v2.replace("+b", "+ b")
+        ));
 
         // Whitespace is part of the change: a tab turned into spaces is a
         // different patch, which is what sets this apart from git patch-id.
@@ -1548,14 +1720,9 @@ mod tests {
         let prose = "See the hunk under diff --git a/f.c b/f.c above.\n";
         assert!(!patch_diffs_equivalent(prose, prose));
 
-        // Nor are two bodies with no diff header at all, where the
-        // normalization keeps every line: mail text, blank lines, or a
-        // hunk that lost its header.
-        for headerless in [
-            "Hi,\n\nPlease apply.\n",
-            "   \n",
-            "--- a/f.c\n+++ b/f.c\n@@ -1 +1 @@\n-a\n+b\n",
-        ] {
+        // Nor are bodies with no diff file header at all: mail text, blank
+        // lines, or a bare hunk that lost its file header.
+        for headerless in ["Hi,\n\nPlease apply.\n", "   \n", "@@ -1 +1 @@\n-a\n+b\n"] {
             assert!(!patch_diffs_equivalent(headerless, headerless));
         }
     }

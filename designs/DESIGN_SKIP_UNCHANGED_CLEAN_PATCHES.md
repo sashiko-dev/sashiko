@@ -71,15 +71,17 @@ finite.
 ### 5.1 Identity: exact diff, indexed by Git patch ID
 
 Two patches carry the same change when their diffs are equal line for
-line after dropping what a rebase rewrites: the mail text before the
-first `diff --git` header, the blob SHAs on `index` lines, and the line
-ranges on `@@` hunk headers. The first two are the normalization
-`compute_inter_version_diff` in `src/prior_context.rs` already applies;
-`patch_diffs_equivalent` exposes it as a predicate and adds the third,
-because a hunk that moved only because code above it grew or shrank is
-the same hunk. The function context after the ranges still has to
-match. Whitespace stays significant. A reindented hunk is a different
-patch.
+line after dropping what a rebase or repost rewrites: the mail text
+before the first diff header (`diff --git` or unified `---` / `+++` /
+`@@`), Quilt `Index:` separators, the blob SHAs on `index` lines, the
+line ranges on `@@` hunk headers, and post-diff mail signatures or
+trailers (`-- `, `base-commit:`, `prerequisite-*:`, `change-id:`,
+mailing-list footers). `patch_diffs_equivalent` in `src/prior_context.rs` implements this
+predicate, and `compute_inter_version_diff` shares it so the
+prior-version interdiff and clean-review reuse agree on whether a patch
+changed. The
+function context after the `@@` ranges still has to match. Whitespace
+stays significant. A reindented hunk is a different patch.
 
 The database needs no new column to find candidates. `patches.
 git_patch_id` is computed by the ingest path for every patch and is
@@ -313,11 +315,6 @@ is the commit the binary was built from, so under the strict default
 every rebuild re-reviews everything, and a change that leaves the
 commit alone, such as `review.effort`, is not seen. An operator who
 wants reuse across upgrades sets `any_model` and takes both.
-
-**The diff comparison keeps the mail's tail.** The stored diff runs to
-the end of the mail, so a new git version in the signature or a new
-`base-commit:` trailer makes two copies compare unequal. The skip is
-lost, not misapplied.
 
 **Git patch-id groups patches that differ only in whitespace.** That
 is why the patch ID is only the index and the diffs are compared byte
