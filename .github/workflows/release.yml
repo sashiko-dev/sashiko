@@ -72,7 +72,7 @@ jobs:
           else
             echo "Creating release $TAG..."
             gh release create "$TAG" \
-              --title "Sashiko ${TAG}" \
-              --generate-notes \
+              --title "Sashiko ${TAG} Release" \
+              --notes-from-tag \
               dist/*
           fi
