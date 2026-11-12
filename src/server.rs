@@ -4428,7 +4428,7 @@ mod tests {
         let md_body = md_res.text().await.unwrap();
         assert!(md_body.contains("# Fix Linux Kernel Bug:"));
         assert!(md_body.contains("- **Bug ID**: `linux-12345678`"));
-        assert!(md_body.contains(&format!("Link: http://{}/#/bug/linux-12345678", addr)));
+        assert!(md_body.contains(&format!("Closes: http://{}/#/bug/linux-12345678", addr)));
         assert!(md_body.contains("Reported-by: Sashiko <sashiko@sashiko.dev>"));
 
         let empty_stem = no_redirect
