@@ -16,7 +16,7 @@
 //!
 //! Renders a single bug's verified metadata, defect report, readable community
 //! activity, and project-appropriate commit trailer guidance (`Fixes:`,
-//! `Reported-by:`, `Link:`) in a self-contained Markdown document suitable for
+//! `Reported-by:`, `Closes:`) in a self-contained Markdown document suitable for
 //! handing directly to an AI coding agent tasked with fixing the defect.
 
 use axum::http::HeaderMap;
@@ -208,7 +208,7 @@ fn header_base_url(headers: &HeaderMap) -> Option<String> {
     Some(format!("{scheme}://{host}"))
 }
 
-/// Resolves the public base URL (without trailing slash) used in `Link:`
+/// Resolves the public base URL (without trailing slash) used in `Closes:`
 /// trailers and bug reference links.
 ///
 /// Configured settings (`server.public_base_url`, then `project.domain`) take
@@ -742,7 +742,14 @@ fn push_agent_workflow(out: &mut String, ctx: &BugMarkdownContext<'_>, bugid: &s
     let cli_bugid = shell_quote_if_needed(bugid);
 
     out.push_str("## Agent Workflow\n\n");
-    out.push_str("Follow these steps in order when working on a fix for this bug:\n\n");
+    out.push_str(
+        "Follow these steps in order when working on a fix for this bug. **Do not\n\
+         modify the public Sashiko database** (claiming or assigning bugs, posting\n\
+         reproducers, comments, or proposed fixes, or changing bug state via\n\
+         `sashiko-cli ... bugs action`) and **do not send emails or submit patches\n\
+         upstream** (`git send-email`, `b4 send`, or opening PRs) **unless explicitly\n\
+         requested by the user** — keep all work local by default.\n\n",
+    );
     push_tree_and_repro_steps(out, ctx.project, &cli_url, &cli_bugid);
     push_design_step(out);
     push_commit_step(out, ctx, &fixes, bugid, &reported_by, bug_url);
@@ -776,24 +783,39 @@ fn push_tree_and_repro_steps(out: &mut String, project: ProjectId, cli_url: &str
         " Capture any resulting crash or sanitizer output for the commit log."
     };
 
+    let fixes_branch_hint = if is_linux {
+        " Base your patch on the subsystem's **fixes** tree (e.g. `net`, `bpf`, or mainline),\n   \
+         not `-next` (`net-next`, `bpf-next`, `linux-next`), unless the introducing commit\n   \
+         only exists in `-next`."
+    } else {
+        " Base your patch on the target project's appropriate maintenance or mainline branch."
+    };
+
     out.push_str(&format!(
         "1. **Check if Already Fixed in the Maintainer's Tree**:\n   \
          Confirm the buggy code path still exists in your local checkout and check whether\n   \
          it is already fixed in {tree_check}\n   \
          or under **Prior Fix Candidates** above. If a fix already exists, stop and report\n   \
-         that commit rather than writing a duplicate patch. Also check **Assignee** above\n   \
-         (or `sashiko-cli --server {cli_url} bugs show {cli_bugid}`) before claiming.\n\n\
+         that commit rather than writing a duplicate patch.{fixes_branch_hint} Also check\n   \
+         **Assignee** above (or read-only `sashiko-cli --server {cli_url} bugs show {cli_bugid}`).\n\n\
          2. **Reproduce the Bug (Strongly Prefer Without Changing {code_label})**:\n   \
-         Inspect all callers, entry points, locking, and lifetime invariants. Attempt to\n   \
-         build a standalone reproducer and confirm it triggers the defect **without\n   \
+         Inspect all callers, entry points, locking, and lifetime invariants, and treat the\n   \
+         bug report's root-cause analysis and any suggested fix critically rather than on\n   \
+         faith — if tracing callers and synchronization proves the reported scenario is\n   \
+         impossible in practice (a false positive), **stop and explain why with concrete\n   \
+         code evidence** instead of writing an unnecessary defensive check. Otherwise,\n   \
+         attempt to build a standalone reproducer and confirm it triggers the defect **without\n   \
          changing {code_noun}**{debug_hint},\n   \
          unless told otherwise by the user.{capture_hint} Skip building a reproducer only if the\n   \
          bug is genuinely trivial and obvious directly from static code inspection (or\n   \
          requires unavailable physical hardware).\n\n\
-         3. **Post the Reproducer & Claim the Bug**:\n   \
-         Once reproduced, if `sashiko-cli` is available and authenticated, attach the\n   \
-         reproducer (stored with `--kind reproducer`, visible only to signed-in users) and\n   \
-         claim the bug (if unassigned) using `<your-email>` from `git config user.email`:\n\n",
+         3. **Post the Reproducer & Claim the Bug (Only on Explicit User Request)**:\n   \
+         **Skip this step unless the user explicitly asks you to claim the bug or upload the\n   \
+         reproducer to Sashiko.** Never claim bugs or post anything to the public Sashiko\n   \
+         database on your own initiative. When explicitly requested by the user (and\n   \
+         `sashiko-cli` is available and authenticated), attach the reproducer (stored with\n   \
+         `--kind reproducer`, visible only to signed-in users) and/or claim the bug (if\n   \
+         unassigned) using `<your-email>` from `git config user.email`:\n\n",
         code_label = if is_linux {
             "the Kernel"
         } else {
@@ -808,8 +830,8 @@ fn push_tree_and_repro_steps(out: &mut String, project: ProjectId, cli_url: &str
     );
     push_fenced_block(out, "bash", &claim_cmds);
     out.push_str(
-        "\n   If `sashiko-cli` is unconfigured or lacks comment/maintainer authority (`401`/`403`),\n   \
-         continue locally and include the reproducer in your report to the user.\n\n",
+        "\n   Otherwise (or if `sashiko-cli` is unconfigured or lacks authority),\n   \
+         keep the reproducer local and include it in your report to the user.\n\n",
     );
 }
 
@@ -818,14 +840,15 @@ fn push_design_step(out: &mut String) {
         "4. **Design & Iterate on the Best Fix**:\n   \
          Prefer the smallest, most surgical root-cause fix that follows surrounding\n   \
          subsystem conventions and is easy to review and backport — do not rewrite\n   \
-         surrounding containers/loops or bundle multi-file annotation cleanups when a\n   \
-         targeted local fix suffices. Before settling on your first working patch, check\n   \
-         recent `git log` in the subsystem for how analogous bugs were fixed and evaluate\n   \
-         whether a cleaner, simpler, or more idiomatic approach exists (e.g., reusing an\n   \
-         existing subsystem helper or lock/RCU primitive, fixing symmetric adjacent paths\n   \
-         in the same file, or enforcing the invariant at a single producer instead of\n   \
-         repeating caller checks). If a better approach exists, iterate until the fix is\n   \
-         minimal and idiomatic. Do not add inline comments where surrounding code has\n   \
+         surrounding containers/loops, bundle multi-file annotation cleanups when a\n   \
+         targeted local fix suffices, or blindly copy a fix sketch from the bug report if\n   \
+         the real root cause lies elsewhere. Before settling on your first working patch,\n   \
+         check recent `git log` in the subsystem for how analogous bugs were fixed and\n   \
+         evaluate whether a cleaner, simpler, or more idiomatic approach exists (e.g.,\n   \
+         reusing an existing subsystem helper or lock/RCU primitive, fixing symmetric\n   \
+         adjacent paths in the same file, or enforcing the invariant at a single producer\n   \
+         instead of repeating caller checks). If a better approach exists, iterate until\n   \
+         the fix is minimal and idiomatic. Do not add inline comments where surrounding code has\n   \
          none, and never add comments that merely restate the code or narrate the bug\n   \
          history (only update stale adjacent comments or document genuinely non-obvious\n   \
          invariants).\n\n",
@@ -879,30 +902,40 @@ impl CommitProseDialect {
                 impact_hint: "crash, memory corruption, use-after-free, leak, hang, or wrong\n       \
                               behavior, noting unprivileged or remote reachability naturally only\n       \
                               when relevant",
-                trace_hint: "Whenever a panic, oops, `BUG:`/`WARNING:`, KASAN/UBSAN/KCSAN, or\n       \
-                             lockdep splat was reproduced (or captured in `dmesg`), **include** the\n       \
-                             relevant distilled `dmesg` snippet in the commit log as concrete proof\n       \
-                             that the problem is real and was reproduced in practice — keep any\n       \
-                             diagnostic error line(s), the fault summary, and relevant\n       \
-                             call/alloc/free frames while stripping `[timestamp]` prefixes,\n       \
+                trace_hint: "If possible, **include** the relevant distilled part of `dmesg`\n       \
+                             (e.g., panic, oops, `BUG:`/`WARNING:`, KASAN/UBSAN/KCSAN, or lockdep\n       \
+                             splat) in the commit message to prove that the bug is reproducible in\n       \
+                             real life — keep any diagnostic error line(s), the fault summary, and\n       \
+                             relevant call/alloc/free frames while stripping `[timestamp]` prefixes,\n       \
                              register/stack/module dumps, and unreliable `?` frames (do not invent\n       \
-                             synthetic traces when none was reproduced).",
+                             synthetic traces when none was reproduced). If there is no such\n       \
+                             `dmesg`/panic/splat output that can be included in the commit message\n       \
+                             and a working reproducer exists (verified in Step 2 or attached under\n       \
+                             **Reproducers**), mention the availability of the reproducer attached to\n       \
+                             the bug report **only below the `---` separator line** in the formatted\n       \
+                             patch so reviewers see it without including it in the merged commit\n       \
+                             message.",
                 fix_example: "`Free fp->handle on the error path.`",
-                report_link_tag: "`Link:` / `Closes:`",
+                report_link_tag: "`Closes:` / `Link:`",
             }
         } else {
             Self {
                 subject_example: "`<area>: fix <defect> in <func>()`, not `<area>: check <helper>() in <func>()`",
                 impact_hint: "crash, memory corruption, resource leak, hang, data loss, or wrong\n       \
                               behavior, noting untrusted reachability naturally only when relevant",
-                trace_hint: "Whenever a panic, crash, assertion failure, or sanitizer splat was\n       \
-                             reproduced, **include** the relevant distilled output/trace snippet in\n       \
-                             the commit log as concrete proof that the problem is real and was\n       \
-                             reproduced in practice — keep the failure summary and relevant frames\n       \
-                             while stripping timestamps, register dumps, and noise (do not invent\n       \
-                             synthetic traces when none was reproduced).",
+                trace_hint: "If possible, **include** the relevant distilled crash, panic,\n       \
+                             assertion failure, or sanitizer output in the commit message to prove\n       \
+                             that the bug is reproducible in real life — keep the failure summary\n       \
+                             and relevant frames while stripping timestamps, register dumps, and\n       \
+                             noise (do not invent synthetic traces when none was reproduced). If\n       \
+                             there is no such crash or sanitizer output that can be included in the\n       \
+                             commit message and a working reproducer exists (verified in Step 2 or\n       \
+                             attached under **Reproducers**), mention the availability of the\n       \
+                             reproducer attached to the bug report **only below the `---` separator\n       \
+                             line** in the formatted patch so it is not included in the merged\n       \
+                             commit message.",
                 fix_example: "`Release the handle before returning on error.`",
-                report_link_tag: "`Link:`",
+                report_link_tag: "`Closes:`",
             }
         }
     }
@@ -947,10 +980,12 @@ fn push_commit_prose_guidance(out: &mut String, is_linux: bool, is_critical_sec:
          - **Critical / High Security Vulnerabilities{sec_active_note}**: For critical\n     \
          or high-severity security vulnerabilities (not ordinary bugs), do **not**\n     \
          include the reproducer code or step-by-step trigger recipe in the commit\n     \
-         message (still include the distilled panic/sanitizer snippet when reproduced,\n     \
-         without PoC binary names); if a working reproducer exists (verified in Step 2\n     \
-         or attached under **Reproducers**), mention concisely that a reproducer is\n     \
-         available (never claim a reproducer exists when none was built or attached).\n",
+         message (still include the distilled `dmesg`/panic/sanitizer snippet when\n     \
+         reproduced, without PoC binary names); if a working reproducer exists\n     \
+         (verified in Step 2 or attached under **Reproducers**), note its availability\n     \
+         on the bug report **only below the `---` separator line** so it is not\n     \
+         included in the merged commit message (never claim a reproducer exists when\n     \
+         none was built or attached).\n",
         subject_example = d.subject_example,
         report_link_tag = d.report_link_tag,
         impact_hint = d.impact_hint,
@@ -985,7 +1020,7 @@ fn build_suggested_trailers(
         trailer_block.push_str(&format!("Fixes: {bugid}\n"));
     }
     trailer_block.push_str(&format!("Reported-by: {reported_by}\n"));
-    trailer_block.push_str(&format!("Link: {bug_url}"));
+    trailer_block.push_str(&format!("Closes: {bug_url}"));
     if project == ProjectId::Linux {
         trailer_block.push_str("\nCc: stable@vger.kernel.org");
         trailer_block.push_str(
@@ -1007,15 +1042,16 @@ fn push_trailer_notes(
     push_fixes_bullet(out, fixes);
     if project == ProjectId::Linux {
         out.push_str(&format!(
-            "   - **`Reported-by:`, `Link:` / `Closes:`, & `Cc: stable@vger.kernel.org`**: You\n     \
+            "   - **`Reported-by:`, `Closes:`, & `Cc: stable@vger.kernel.org`**: You\n     \
              **must** include `Reported-by: {reported_by}` immediately followed on the next\n     \
-             line by `Link: {bug_url}` (or `Closes: {bug_url}` when fully resolving the\n     \
-             report per `submitting-patches.rst` / `scripts/checkpatch.pl`). Place\n     \
-             `Cc: stable@vger.kernel.org` (`Cc: stable@kernel.org` for unpublished security\n     \
-             vulnerabilities) **after** `Reported-by:` and `Link:` / `Closes:` (at the end of\n     \
-             the other tags list, right before `Signed-off-by:`) whenever the bug affects\n     \
-             released stable kernels under `Documentation/process/stable-kernel-rules.rst`\n     \
-             (omit only if the defect never affected a released stable kernel).\n   \
+             line by `Closes: {bug_url}` per `submitting-patches.rst` and\n     \
+             `scripts/checkpatch.pl` (use `Link: {bug_url}` instead only if the patch fixes\n     \
+             just part of the reported issue). Place `Cc: stable@vger.kernel.org`\n     \
+             (`Cc: stable@kernel.org` for unpublished security vulnerabilities) **after**\n     \
+             `Reported-by:` and `Closes:` (at the end of the other tags list, right before\n     \
+             `Signed-off-by:`) whenever the bug affects released stable kernels under\n     \
+             `Documentation/process/stable-kernel-rules.rst` (omit only if the defect never\n     \
+             affected a released stable kernel).\n   \
              - **`Signed-off-by:`**: Per `Documentation/process/coding-assistants.rst`, AI\n     \
              coding assistants must **not** add `Signed-off-by:` tags themselves — leave\n     \
              DCO sign-off for the human submitter to add after reviewing the patch\n     \
@@ -1025,8 +1061,8 @@ fn push_trailer_notes(
         ));
     } else {
         out.push_str(&format!(
-            "   - **`Reported-by:` & `Link:`**: You **must** include `Reported-by: {reported_by}`\n     \
-             and `Link: {bug_url}` so reviewers can inspect the full bug report.\n   \
+            "   - **`Reported-by:` & `Closes:`**: You **must** include `Reported-by: {reported_by}`\n     \
+             and `Closes: {bug_url}` so reviewers can inspect the full bug report.\n   \
              - **`Signed-off-by:`**: Sign off with the human patch author's real name and\n     \
              email (`git commit -s`). Do not emit AI/bot `Co-authored-by:` or\n     \
              `Assisted-by:` trailers unless explicitly requested by the user or required\n     \
@@ -1070,8 +1106,18 @@ fn push_test_and_review_steps(
     } else {
         ""
     };
+    let handoff_note = if project == ProjectId::Linux {
+        "Present the final formatted patch (`git format-patch -1 --stdout HEAD`) and the\n   \
+         suggested maintainer/list recipients from `./scripts/get_maintainer.pl` to the\n   \
+         user for review (never run `git send-email` or `b4 send` unless explicitly\n   \
+         requested by the user)."
+    } else {
+        "Present the final formatted patch (`git format-patch -1 --stdout HEAD`) to the\n   \
+         user for review (never send emails or open upstream PRs unless explicitly\n   \
+         requested by the user)."
+    };
     out.push_str(&format!(
-        "7. **Local Sashiko Self-Review, Iterate Until Perfect, & Post Proposed Fix**:\n   \
+        "7. **Local Sashiko Self-Review, Iterate Until Perfect, & Post Proposed Fix (Only on Explicit User Request)**:\n   \
          When `sashiko` is available locally, run\n   \
          `sashiko review --project {project_flag} --agent HEAD` on the committed patch.{sob_review_note}\n   \
          Resolve every valid finding — and if self-review reveals a cleaner design,\n   \
@@ -1079,8 +1125,10 @@ fn push_test_and_review_steps(
          the reproducer, and re-run `sashiko review` until the review is clean or every\n   \
          remaining finding is verified against concrete code to be a false positive\n   \
          (briefly note any dismissed false positives when reporting back to the user).\n   \
-         Finally, when `sashiko-cli` is available and authenticated, attach the verified\n   \
-         patch as a proposed fix:\n\n"
+         {handoff_note}\n   \
+         Finally, **only if explicitly requested by the user** (never post comments,\n   \
+         patches, or state changes to the public Sashiko database without an explicit\n   \
+         user request), attach the verified patch as a proposed fix:\n\n"
     ));
     let fix_cmd = format!(
         "git format-patch -1 --stdout HEAD | \\\n  \
@@ -1388,7 +1436,7 @@ mod tests {
         assert!(md.contains(
             "Fixes: 3330ee8db989 (\"smb: server: add durable handle\")\n\
              Reported-by: Sashiko <sashiko@sashiko.dev>\n\
-             Link: https://sashiko.dev/#/bug/linux-7f9a2c4b\n\
+             Closes: https://sashiko.dev/#/bug/linux-7f9a2c4b\n\
              Cc: stable@vger.kernel.org\n\
              # Signed-off-by: Real Name <email>"
         ));
@@ -1419,11 +1467,21 @@ mod tests {
         assert!(md.contains("- **Assignee**: `alice@kernel.org`"));
         assert!(md.contains("Check if Already Fixed in the Maintainer's Tree"));
         assert!(md.contains("corresponding subsystem maintainer's tree"));
+        assert!(md.contains("Base your patch on the subsystem's **fixes** tree"));
+        assert!(md.contains("impossible in practice (a false positive), **stop and explain why with concrete\n   code evidence**"));
         assert!(md.contains("without\n   changing the kernel"));
+        assert!(md.contains("**Do not\nmodify the public Sashiko database**"));
+        assert!(md.contains("**do not send emails or submit patches\nupstream**"));
+        assert!(md.contains("**unless explicitly\nrequested by the user**"));
+        assert!(md.contains("Post the Reproducer & Claim the Bug (Only on Explicit User Request)"));
+        assert!(md.contains(
+            "**Skip this step unless the user explicitly asks you to claim the bug or upload the\n   reproducer to Sashiko.**"
+        ));
         assert!(md.contains("sashiko-cli --server https://sashiko.dev bugs action"));
         assert!(md.contains("--action comment --kind reproducer --comment-file <repro_path>"));
         assert!(md.contains("--action assign --assignee \"<your-email>\""));
         assert!(md.contains("smallest, most surgical root-cause fix"));
+        assert!(md.contains("blindly copy a fix sketch from the bug report"));
         assert!(md.contains("cleaner, simpler, or more idiomatic"));
         assert!(md.contains("Do not add inline comments where surrounding code has\n   none"));
         assert!(md.contains("`Documentation/process/submitting-patches.rst`"));
@@ -1434,11 +1492,10 @@ mod tests {
         assert!(md.contains("Keep the commit log as\n     minimal as possible"));
         assert!(md.contains("on its own in offline `git log` without opening"));
         assert!(md.contains("never\n     padded template sections"));
-        assert!(md.contains(
-            "concrete proof\n       that the problem is real and was reproduced in practice"
-        ));
+        assert!(md.contains("prove that the bug is reproducible in\n       real life"));
         assert!(md.contains("diagnostic error line(s), the fault summary"));
         assert!(md.contains("stripping `[timestamp]` prefixes,\n       register/stack/module dumps, and unreliable `?` frames"));
+        assert!(md.contains("mention the availability of the reproducer attached to\n       the bug report **only below the `---` separator line**"));
         assert!(md.contains("two-column `CPU0` /\n       `CPU1` race timeline"));
         assert!(md.contains("Always state what the patch does in imperative\n       mood"));
         assert!(md.contains("not immediately obvious from the diff itself, explain why"));
@@ -1448,10 +1505,12 @@ mod tests {
         assert!(md.contains("Every sentence must earn its place"));
         assert!(md.contains("PoC-specific\n     interface/variable names"));
         assert!(md.contains("do **not**\n     include the reproducer code"));
+        assert!(md.contains(
+            "(still include the distilled `dmesg`/panic/sanitizer snippet when\n     reproduced"
+        ));
         assert!(
-            md.contains("(still include the distilled panic/sanitizer snippet when reproduced")
+            md.contains("never claim a reproducer exists when\n     none was built or attached")
         );
-        assert!(md.contains("never claim a reproducer exists when none was built or attached"));
         assert!(!md.contains("Signed-off-by: Your Name"));
         assert!(md.contains("# Signed-off-by: Real Name <email>"));
         assert!(md.contains("AI\n     coding assistants must **not** add `Signed-off-by:` tags"));
@@ -1460,11 +1519,11 @@ mod tests {
         ));
         assert!(md.contains(
             "Reported-by: Sashiko <sashiko-bot@kernel.org>\n\
-             Link: https://sashiko.dev/#/bug/linux-97b284e0-576e-4373-b62f-eb132f482b91\n\
+             Closes: https://sashiko.dev/#/bug/linux-97b284e0-576e-4373-b62f-eb132f482b91\n\
              Cc: stable@vger.kernel.org\n\
              # Signed-off-by: Real Name <email>"
         ));
-        assert!(md.contains("**after** `Reported-by:` and `Link:` / `Closes:`"));
+        assert!(md.contains("**after**\n     `Reported-by:` and `Closes:`"));
         assert!(md.contains("Re-run your reproducer against the patched kernel"));
         assert!(md.contains("./scripts/checkpatch.pl --no-signoff"));
         assert!(md.contains("`sashiko review --project linux --agent HEAD`"));
@@ -1472,6 +1531,10 @@ mod tests {
             md.contains("ignore **only** the `High`-severity missing-`Signed-off-by:` finding")
         );
         assert!(md.contains("verified against concrete code to be a false positive"));
+        assert!(md.contains("./scripts/get_maintainer.pl"));
+        assert!(md.contains(
+            "never run `git send-email` or `b4 send` unless explicitly\n   requested by the user"
+        ));
         assert!(md.contains("--action comment --kind proposed_fix --comment-file -"));
     }
 
