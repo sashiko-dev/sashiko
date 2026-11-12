@@ -35,3 +35,9 @@
 [[grant]]
 section = "ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)"
 paths = ["arch/*/boot/dts/", "drivers/soc/", "drivers/firmware/"]
+
+# Subsystem developer group to screen and fix bugs
+# https://github.com/sashiko-dev/sashiko/issues/867
+[[grant]]
+section = "BTRFS FILE SYSTEM"
+read_write = [ "fdmanana@suse.com", "wqu@suse.com", "neelx@suse.com", "johannes.thumshirn@wdc.com", "boris@bur.io" ]
