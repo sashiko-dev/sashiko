@@ -13774,6 +13774,7 @@ impl Database {
                 part_index: row.get(1)?,
                 git_patch_id: row.get::<Option<String>>(2)?.filter(|s| !s.is_empty()),
                 clean_subject: crate::patch::clean_subject(&subj),
+                diff: String::new(),
                 existing_prev_id: None,
                 existing_prev_status: None,
             });
@@ -13801,6 +13802,7 @@ impl Database {
                 part_index: row.get(1)?,
                 git_patch_id: row.get::<Option<String>>(2)?.filter(|s| !s.is_empty()),
                 clean_subject: crate::patch::clean_subject(&subj),
+                diff: String::new(),
                 existing_prev_id: row.get(4)?,
                 existing_prev_status: row.get(5)?,
             });
@@ -13813,6 +13815,10 @@ impl Database {
             }
             return Ok(());
         }
+
+        tx_db
+            .populate_candidate_lineage_diffs(&mut prev_patches, &mut curr_patches)
+            .await?;
 
         let (mut assignments, mut matched_prev_ids) =
             patch_lineage::match_patch_lineage(&prev_patches, &curr_patches);
@@ -13874,6 +13880,61 @@ impl Database {
             tx.commit().await?;
         }
 
+        Ok(())
+    }
+
+    async fn populate_candidate_lineage_diffs(
+        &self,
+        prev_patches: &mut [patch_lineage::LineagePatch],
+        curr_patches: &mut [patch_lineage::LineagePatch],
+    ) -> Result<()> {
+        let prev_gpids: std::collections::HashSet<&str> = prev_patches
+            .iter()
+            .filter_map(|p| p.git_patch_id.as_deref())
+            .collect();
+        let shared_gpids: std::collections::HashSet<String> = curr_patches
+            .iter()
+            .filter_map(|p| p.git_patch_id.as_deref())
+            .filter(|g| prev_gpids.contains(g))
+            .map(str::to_string)
+            .collect();
+        if shared_gpids.is_empty() {
+            return Ok(());
+        }
+
+        let ids: Vec<i64> = prev_patches
+            .iter()
+            .chain(curr_patches.iter())
+            .filter(|p| {
+                p.git_patch_id
+                    .as_deref()
+                    .is_some_and(|g| shared_gpids.contains(g))
+            })
+            .map(|p| p.id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let json = serde_json::to_string(&ids)?;
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT id, diff FROM patches WHERE id IN (SELECT value FROM json_each(?))",
+                libsql::params![json.as_str()],
+            )
+            .await?;
+        let mut diffs_by_id = std::collections::HashMap::with_capacity(ids.len());
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let diff = crate::compression::get_compressed_string(&row, 1)?;
+            diffs_by_id.insert(id, diff);
+        }
+        for p in prev_patches.iter_mut().chain(curr_patches.iter_mut()) {
+            if let Some(diff) = diffs_by_id.remove(&p.id) {
+                p.diff = diff;
+            }
+        }
         Ok(())
     }
 
@@ -32329,6 +32390,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reconcile_patch_lineage_uses_patch_diffs_equivalent() {
+        let db = setup_db().await;
+        let mr_url = "https://github.com/owner/repo/pull/99";
+        let author = "Alice <alice@example.com>";
+
+        let t1 = db
+            .ensure_thread_for_message("pr-99-v1@sashiko.local", 1000)
+            .await
+            .unwrap();
+        let ps1 = db
+            .create_patchset(
+                t1,
+                Some("pr-99-v1@sashiko.local"),
+                "pr-99-v1@sashiko.local",
+                "[PR #99] Series",
+                author,
+                1000,
+                2,
+                1,
+                "",
+                "",
+                Some(1),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_mr_metadata(ps1, Some(mr_url), Some("Series"), Some(99), None)
+            .await
+            .unwrap();
+
+        for (mid, subj) in [
+            ("pr99-v1-p1@sashiko.local", "net: rebased clean patch"),
+            ("pr99-v1-p2@sashiko.local", "net: reindented patch"),
+        ] {
+            db.create_message(
+                mid,
+                t1,
+                Some("pr-99-v1@sashiko.local"),
+                author,
+                subj,
+                1000,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let v1_rebased_diff = "diff --git a/net/a.c b/net/a.c\nindex 1111111..2222222 100644\n--- a/net/a.c\n+++ b/net/a.c\n@@ -1 +1 @@\n-old\n+\tkeep\n-- \n2.47.0\n";
+        let v1_indent_diff = "diff --git a/net/b.c b/net/b.c\nindex 3333333..4444444 100644\n--- a/net/b.c\n+++ b/net/b.c\n@@ -1 +1 @@\n-old\n+\treturn 1;\n";
+
+        let p1_v1 = db
+            .create_patch_with_git_patch_id(
+                ps1,
+                "pr99-v1-p1@sashiko.local",
+                1,
+                v1_rebased_diff,
+                Some("1111111111111111111111111111111111111111"),
+            )
+            .await
+            .unwrap();
+        let p2_v1 = db
+            .create_patch_with_git_patch_id(
+                ps1,
+                "pr99-v1-p2@sashiko.local",
+                2,
+                v1_indent_diff,
+                Some("2222222222222222222222222222222222222222"),
+            )
+            .await
+            .unwrap();
+
+        let t2 = db
+            .ensure_thread_for_message("pr-99-v2@sashiko.local", 2000)
+            .await
+            .unwrap();
+        let ps2 = db
+            .create_patchset(
+                t2,
+                Some("pr-99-v2@sashiko.local"),
+                "pr-99-v2@sashiko.local",
+                "[PR #99 v2] Series",
+                author,
+                2000,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_mr_metadata(ps2, Some(mr_url), Some("Series"), Some(99), None)
+            .await
+            .unwrap();
+
+        for (mid, subj) in [
+            ("pr99-v2-p1@sashiko.local", "net: rebased clean patch"),
+            ("pr99-v2-p2@sashiko.local", "net: reindented patch"),
+        ] {
+            db.create_message(
+                mid,
+                t2,
+                Some("pr-99-v2@sashiko.local"),
+                author,
+                subj,
+                2000,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let v2_rebased_diff = "diff --git a/net/a.c b/net/a.c\nindex aaaaaaa..bbbbbbb 100644\n--- a/net/a.c\n+++ b/net/a.c\n@@ -25 +27 @@\n-old\n+\tkeep\nbase-commit: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n-- \n2.48.1\n";
+        let v2_indent_diff = v1_indent_diff.replace("+\treturn 1;", "+    return 1;");
+
+        db.create_patch_with_git_patch_id(
+            ps2,
+            "pr99-v2-p1@sashiko.local",
+            1,
+            v2_rebased_diff,
+            Some("1111111111111111111111111111111111111111"),
+        )
+        .await
+        .unwrap();
+        db.create_patch_with_git_patch_id(
+            ps2,
+            "pr99-v2-p2@sashiko.local",
+            2,
+            &v2_indent_diff,
+            Some("2222222222222222222222222222222222222222"),
+        )
+        .await
+        .unwrap();
+
+        let details = db
+            .get_patchset_details(ps2, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let patches = details["patches"].as_array().unwrap();
+        assert_eq!(patches.len(), 2);
+        assert_eq!(patches[0]["previous_patch"]["id"], p1_v1);
+        assert_eq!(patches[0]["previous_patch"]["status"], "unchanged");
+        assert_eq!(patches[1]["previous_patch"]["id"], p2_v1);
+        assert_eq!(patches[1]["previous_patch"]["status"], "modified");
+    }
+
+    #[tokio::test]
     async fn test_version_lineage_signal_2_b4_change_id_and_signal_3_message_ref() {
         let db = setup_db().await;
         let author = "Bob <bob@kernel.org>";
@@ -33117,12 +33343,14 @@ mod tests {
         )
         .await
         .unwrap();
+        let prep_diff =
+            "diff --git a/drv.c b/drv.c\n--- a/drv.c\n+++ b/drv.c\n@@ -1 +1 @@\n-old\n+prep\n";
         let p1_b1 = db
             .create_patch_with_git_patch_id(
                 ps_b1,
                 "sig5-v1-p1@kernel.org",
                 1,
-                "diff prep",
+                prep_diff,
                 Some(shared_gpid),
             )
             .await
@@ -33263,7 +33491,7 @@ mod tests {
                 ps_b2,
                 "sig5-v2-p1@kernel.org",
                 1,
-                "diff prep",
+                prep_diff,
                 Some(shared_gpid),
             )
             .await
@@ -33361,7 +33589,7 @@ mod tests {
             ps_b3,
             "sig5-v3-p1@kernel.org",
             1,
-            "diff prep",
+            prep_diff,
             Some(shared_gpid),
         )
         .await

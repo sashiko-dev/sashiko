@@ -29,6 +29,7 @@ pub(super) struct LineagePatch {
     pub part_index: i64,
     pub git_patch_id: Option<String>,
     pub clean_subject: String,
+    pub diff: String,
     pub existing_prev_id: Option<i64>,
     pub existing_prev_status: Option<String>,
 }
@@ -39,10 +40,15 @@ pub(super) type LineageAssignments = HashMap<i64, (Option<i64>, Option<&'static 
 /// Runs the content-based matching tiers in order and returns the links
 /// found together with the previous patch IDs they consumed.
 ///
-/// 1. Identical `git_patch_id` links as `unchanged`.
-/// 2. Identical cleaned subject links as `modified`.
-/// 3. Identical summary under a compatible subsystem prefix links as
-///    `modified` (see `summaries_link`).
+/// 1. Identical `git_patch_id` links first, preferring exact diff equivalence
+///    and then identical cleaned subject.
+/// 2. Identical cleaned subject links next.
+/// 3. Identical summary under a compatible subsystem prefix links last (see
+///    `summaries_link`).
+///
+/// Every linked pair gets status `"unchanged"` when `patch_diffs_equivalent`
+/// holds and `"modified"` otherwise, so whitespace-only edits sharing a
+/// `git_patch_id` still link while reporting `"modified"`.
 pub(super) fn match_patch_lineage(
     prev_patches: &[LineagePatch],
     curr_patches: &[LineagePatch],
@@ -55,16 +61,20 @@ pub(super) fn match_patch_lineage(
     };
 
     tiers.assign(
-        "unchanged",
         |prev, curr| {
             curr.git_patch_id.is_some()
                 && prev.git_patch_id.as_deref() == curr.git_patch_id.as_deref()
         },
-        |prev, curr| usize::from(prev.clean_subject != curr.clean_subject),
+        |prev, curr| {
+            let diff_mismatch = usize::from(!crate::prior_context::patch_diffs_equivalent(
+                &prev.diff, &curr.diff,
+            ));
+            let subj_mismatch = usize::from(prev.clean_subject != curr.clean_subject);
+            diff_mismatch * 2 + subj_mismatch
+        },
     );
 
     tiers.assign(
-        "modified",
         |prev, curr| !curr.clean_subject.is_empty() && prev.clean_subject == curr.clean_subject,
         |_, _| 0,
     );
@@ -72,7 +82,6 @@ pub(super) fn match_patch_lineage(
     let prev_counts = summary_counts(prev_patches);
     let curr_counts = summary_counts(curr_patches);
     tiers.assign(
-        "modified",
         |prev, curr| {
             let (Some(p), Some(c)) = (
                 SubjectParts::parse(&prev.clean_subject),
@@ -107,7 +116,6 @@ impl LineageTiers<'_> {
     /// closest part index, then the earliest part.
     fn assign(
         &mut self,
-        status: &'static str,
         matches: impl Fn(&LineagePatch, &LineagePatch) -> bool,
         rank: impl Fn(&LineagePatch, &LineagePatch) -> usize,
     ) {
@@ -124,6 +132,12 @@ impl LineageTiers<'_> {
                     (rank(prev, curr), dist, prev.part_index)
                 });
             if let Some(prev) = best_prev {
+                let status = if crate::prior_context::patch_diffs_equivalent(&prev.diff, &curr.diff)
+                {
+                    "unchanged"
+                } else {
+                    "modified"
+                };
                 self.matched_prev_ids.insert(prev.id);
                 self.assignments
                     .insert(curr.id, (Some(prev.id), Some(status)));
@@ -213,6 +227,7 @@ mod tests {
             part_index,
             git_patch_id: None,
             clean_subject: subject.to_string(),
+            diff: String::new(),
             existing_prev_id: None,
             existing_prev_status: None,
         }
@@ -300,15 +315,33 @@ mod tests {
 
     #[test]
     fn test_tiers_prefer_git_patch_id_then_exact_subject() {
+        let same_diff = "diff --git a/net/q.c b/net/q.c\n--- a/net/q.c\n+++ b/net/q.c\n@@ -1 +1 @@\n-\ta\n+\tb\n";
         let mut p1 = patch(1, 1, "net: rename the queue helper for clarity");
         p1.git_patch_id = Some("abc".to_string());
+        p1.diff = same_diff.to_string();
         let p2 = patch(2, 2, "net: fix the queue teardown ordering issue");
         let mut c1 = patch(10, 2, "net: rename the queue helper for clarity");
         c1.git_patch_id = Some("abc".to_string());
+        c1.diff = same_diff.to_string();
         let c2 = patch(11, 1, "net: fix the queue teardown ordering issue");
         let (assignments, matched) = match_patch_lineage(&[p1, p2], &[c1, c2]);
         assert_eq!(assignments.get(&10), Some(&(Some(1), Some("unchanged"))));
         assert_eq!(assignments.get(&11), Some(&(Some(2), Some("modified"))));
         assert_eq!(matched.len(), 2);
+    }
+
+    #[test]
+    fn test_whitespace_edit_sharing_git_patch_id_links_as_modified() {
+        let mut p1 = patch(1, 1, "net: fix indentation in rx handler");
+        p1.git_patch_id = Some("abc".to_string());
+        p1.diff = "diff --git a/net/q.c b/net/q.c\n--- a/net/q.c\n+++ b/net/q.c\n@@ -1 +1 @@\n-old\n+\treturn 1;\n".to_string();
+
+        let mut c1 = patch(10, 1, "net: reworded subject and fixed indentation");
+        c1.git_patch_id = Some("abc".to_string());
+        c1.diff = "diff --git a/net/q.c b/net/q.c\n--- a/net/q.c\n+++ b/net/q.c\n@@ -1 +1 @@\n-old\n+    return 1;\n".to_string();
+
+        let (assignments, matched) = match_patch_lineage(&[p1], &[c1]);
+        assert_eq!(assignments.get(&10), Some(&(Some(1), Some("modified"))));
+        assert!(matched.contains(&1));
     }
 }

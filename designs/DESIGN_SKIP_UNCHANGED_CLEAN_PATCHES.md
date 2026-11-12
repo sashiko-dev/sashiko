@@ -77,9 +77,10 @@ before the first diff header (`diff --git` or unified `---` / `+++` /
 line ranges on `@@` hunk headers, and post-diff mail signatures or
 trailers (`-- `, `base-commit:`, `prerequisite-*:`, `change-id:`,
 mailing-list footers). `patch_diffs_equivalent` in `src/prior_context.rs` implements this
-predicate, and `compute_inter_version_diff` shares it so the
-prior-version interdiff and clean-review reuse agree on whether a patch
-changed. The
+predicate, and `compute_inter_version_diff` and
+`Database::reconcile_patch_lineage` share it so the dashboard's
+`unchanged` badge, the prior-version interdiff, and clean-review reuse
+agree on whether a patch changed. The
 function context after the `@@` ranges still has to match. Whitespace
 stays significant. A reindented hunk is a different patch.
 
