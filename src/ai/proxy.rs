@@ -14,7 +14,7 @@
 
 use crate::ai::gemini::{GeminiClient, GenerateContentRequest};
 use crate::ai::quota::QuotaManager;
-use crate::ai::{AiErrorClass, classify_ai_error};
+use crate::ai::{AiErrorClass, classify_ai_error, classify_ai_error_detail};
 use axum::{
     extract::{Json, State},
     http::StatusCode,
@@ -46,7 +46,10 @@ pub async fn handle_generate(
             Err(e) => {
                 match classify_ai_error(&e) {
                     AiErrorClass::RateLimit { retry_after } => {
-                        state.quota_manager.report_quota_error(retry_after).await;
+                        state
+                            .quota_manager
+                            .report_quota_error(retry_after, classify_ai_error_detail(&e))
+                            .await;
                         continue;
                     }
                     AiErrorClass::Transient { retry_after } => {

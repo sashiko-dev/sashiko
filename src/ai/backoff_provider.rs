@@ -42,7 +42,7 @@ use tracing::warn;
 use crate::ai::quota::QuotaManager;
 use crate::ai::{
     AiErrorClass, AiProvider, AiProviderDecorator, AiRequest, AiResponse, CacheStats,
-    ProviderCapabilities, classify_ai_error, get_log_prefix,
+    ProviderCapabilities, classify_ai_error, classify_ai_error_detail, get_log_prefix,
 };
 
 /// Maximum number of attempts (initial try plus retries) for a single call
@@ -400,7 +400,9 @@ impl AiProvider for BackoffProvider {
                             // Account-wide: block every concurrent request
                             // until it clears. The next iteration's
                             // wait_for_access() performs the sleep.
-                            self.quota.report_quota_error(retry_after).await;
+                            self.quota
+                                .report_quota_error(retry_after, classify_ai_error_detail(&e))
+                                .await;
                         }
                         AiErrorClass::Transient { retry_after } => {
                             // Server-side blip. Exponential backoff with
