@@ -42,6 +42,11 @@ pub enum ClaudeContent {
     },
     Thinking {
         thinking: String,
+        /// api.anthropic.com always sets this, and it is what allows a
+        /// thinking block to be sent back to the model.  Anthropic-compatible
+        /// gateways do not necessarily return it, so accept a response without
+        /// one: the block is not replayed unless a signature is known.
+        #[serde(default)]
         signature: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
@@ -556,6 +561,7 @@ pub fn apply_cache_control(request: &mut ClaudeRequest) {
 
 pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
     let mut thought_signature = String::new();
+    let mut thought_is_signed = true;
     let mut content = String::new();
     let mut thought = String::new();
     let mut tool_calls = Vec::new();
@@ -571,6 +577,9 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
                 ..
             } => {
                 thought.push_str(thinking);
+                if signature.is_empty() {
+                    thought_is_signed = false;
+                }
                 thought_signature.push_str(signature);
             }
             ClaudeContent::ToolUse { id, name, input } => {
@@ -625,7 +634,10 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
         } else {
             Some(thought)
         },
-        thought_signature: if thought_signature.is_empty() {
+        // A signature authenticates the text of the block it came with, and
+        // the caller replays the whole merged thought under it, so any
+        // unsigned block in the response makes the merged signature unusable.
+        thought_signature: if thought_signature.is_empty() || !thought_is_signed {
             None
         } else {
             Some(thought_signature)
@@ -1162,6 +1174,53 @@ mod tests {
     }
 
     #[test]
+    fn test_translate_assistant_replays_thought_only_with_signature() -> Result<()> {
+        // The history keeps the thought alongside a signature, or without
+        // one when a gateway omitted it.  Only a signed thought may be
+        // replayed: the API rejects an unsigned thinking block.
+        let req = make_request(vec![
+            AiMessage {
+                role: AiRole::Assistant,
+                content: None,
+                thought: Some("Done.".to_string()),
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            AiMessage {
+                role: AiRole::Assistant,
+                content: None,
+                thought: Some("Still thinking.".to_string()),
+                thought_signature: Some("sig_abc".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ]);
+
+        let claude_req = translate_ai_request(&req, false, 4096, None, None)?;
+
+        assert!(
+            claude_req.messages[0].content.is_empty(),
+            "an unsigned thought must not be replayed"
+        );
+
+        assert_eq!(claude_req.messages[1].content.len(), 1);
+        if let ClaudeContent::Thinking {
+            thinking,
+            signature,
+            ..
+        } = &claude_req.messages[1].content[0]
+        {
+            assert_eq!(thinking, "Still thinking.");
+            assert_eq!(signature, "sig_abc");
+        } else {
+            panic!("Expected Thinking block");
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_translate_tool_result() -> Result<()> {
         let req = make_request(vec![AiMessage {
             role: AiRole::Tool,
@@ -1307,6 +1366,58 @@ mod tests {
         assert_eq!(ai_resp.content.as_deref(), Some("Here's my answer."));
         assert_eq!(ai_resp.thought.as_deref(), Some("Let me think..."));
         assert_eq!(ai_resp.thought_signature.as_deref(), Some("sig_abc"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_response_thinking_without_signature() -> Result<()> {
+        // Anthropic-compatible gateways may return a thinking block without
+        // the signature that api.anthropic.com always sets.
+        let body = json!({
+            "id": "msg_4",
+            "content": [
+                {"type": "thinking", "thinking": "Let me think..."},
+                {"type": "text", "text": "Here's my answer."}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 30, "output_tokens": 15}
+        });
+
+        let resp: ClaudeResponse = serde_json::from_value(body)?;
+        let ai_resp = translate_ai_response(&resp)?;
+        assert_eq!(ai_resp.content.as_deref(), Some("Here's my answer."));
+        assert_eq!(ai_resp.thought.as_deref(), Some("Let me think..."));
+        assert_eq!(
+            ai_resp.thought_signature, None,
+            "an unsigned thinking block must not be replayed"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_response_mixed_signed_and_unsigned_thinking() -> Result<()> {
+        // A signature only authenticates the block it was issued for, so a
+        // signed block merged with an unsigned one cannot be replayed either.
+        let body = json!({
+            "id": "msg_5",
+            "content": [
+                {"type": "thinking", "thinking": "First. ", "signature": "sig_a"},
+                {"type": "thinking", "thinking": "Second."},
+                {"type": "text", "text": "Done."}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 30, "output_tokens": 15}
+        });
+
+        let resp: ClaudeResponse = serde_json::from_value(body)?;
+        let ai_resp = translate_ai_response(&resp)?;
+        assert_eq!(ai_resp.thought.as_deref(), Some("First. Second."));
+        assert_eq!(
+            ai_resp.thought_signature, None,
+            "a partially signed thought must not be replayed"
+        );
 
         Ok(())
     }
