@@ -82,6 +82,7 @@ min_severity = "medium"
 ["oe-linux-nfc@lists.linux.dev"]
 ["platform-driver-x86@vger.kernel.org"]
 ["rcu@vger.kernel.org"]
+["linuxppc-dev@lists.ozlabs.org"]
 
 # --- Tracked with Email / Embargo / Patchwork Policies ---
 
