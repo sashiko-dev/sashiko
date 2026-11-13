@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 pub mod command;
+pub mod design_tools;
 pub mod framework;
 pub mod utils;
 
@@ -97,6 +98,32 @@ impl ToolBox {
         }
     }
 
+    /// Creates `(full_toolbox, blind_toolbox)` for a series design assessment,
+    /// sharing read-only baseline tool cache entries while omitting
+    /// `read_series` from `blind_toolbox` so Stage 2 cannot inspect the patch.
+    pub fn new_design_pair(state: Arc<design_tools::DesignToolState>) -> Result<(Self, Self)> {
+        state.validate()?;
+        let shared_cache = Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let make_one = |allow_series: bool| {
+            let context = SashikoToolContext {
+                worktree_path: state.repo_path.clone(),
+                active_patch_files: RwLock::new(Vec::new()),
+                virtual_head: RwLock::new(Some(state.baseline_sha.clone())),
+                cache: Arc::clone(&shared_cache),
+            };
+            let mut registry = ToolRegistry::new();
+            design_tools::register_design_tools(&mut registry, Arc::clone(&state), allow_series);
+            Self {
+                context,
+                registry,
+                cache: Arc::clone(&shared_cache),
+            }
+        };
+
+        Ok((make_one(true), make_one(false)))
+    }
+
     /// Registers an extra tool. Test-only: the review toolbox is fixed, and
     /// this exists so a test can drive the tool loop with a tool of its own.
     #[cfg(test)]
@@ -153,6 +180,9 @@ impl ToolBox {
     /// the execution to the corresponding tool struct.
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
         let name_normalized = name.trim().to_lowercase();
+        if !self.registry.contains(&name_normalized) {
+            anyhow::bail!("Tool not found in registry: {}", name_normalized);
+        }
         let args = utils::normalize_json_numbers(args);
 
         let normalized_args = self.registry.normalize_tool_args(&name_normalized, &args);
