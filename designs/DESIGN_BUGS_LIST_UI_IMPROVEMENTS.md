@@ -12,7 +12,7 @@ Two workflow bottlenecks remain on the Bugs list page (`/#/`, `Bugs` mode):
 |---|---|
 | R1 | **`My Bugs` Toggle Button**: Add a `My Bugs` toggle button inside `#bugFilters` next to `#bugAssigneeFilter` that filters the bugs list to the signed-in user's login email while preserving existing status, severity, security, and subsystem filters. |
 | R2 | **Case-Insensitive Assignee Matching & `me` Alias**: Match `AssigneeFilter::Is` with `COLLATE NOCASE` in `Database::list_bugs` so email case differences between sign-in and assignment never hide assigned bugs, and accept `assignee=me` on `GET /api/bugs` for API/CLI parity. |
-| R3 | **Attachment Badges in Bugs List**: Display distinct `Reproducer` and `Proposed Fix` badges on rows in the Bugs list when a bug (or any readable duplicate in its family) carries corresponding attachments, linking directly to `#/bug/<bugid>?tab=reproducers` and `#/bug/<bugid>?tab=fixes`. |
+| R3 | **Attachment Badges in Bugs List**: Display compact circular sans-serif `r` and `f` badges centered vertically and aligned to the right edge of the `Problem` cell when a bug (or any readable duplicate in its family) carries reproducer or proposed-fix attachments, linking directly to `#/bug/<bugid>?tab=reproducers` and `#/bug/<bugid>?tab=fixes`. |
 | R4 | **Access-Control Parity**: Gate `has_reproducer` on `principal.is_authenticated()` and restrict duplicate-family attachment aggregation to family members readable by `principal` (`readable_bug_ids`), matching `load_redacted_bug_evidence`. |
 
 ## 3. Architecture & Data Flow
@@ -50,5 +50,5 @@ flowchart LR
   - In `resolve_bug_attachment_flags` (`src/server.rs`), collect any `member_id != root_id` when `!principal.has_global_bug_visibility()` and resolve them in a single `readable_bug_ids` call so cross-subsystem duplicates never leak attachment existence.
   - Emit `has_reproducer` (`principal.is_authenticated() && ...`) and `has_proposed_fix` booleans on each item in `GET /api/bugs` (and `GET /api/bug` derived from its already-redacted `evidence["activity"]`).
 - **Web UI Rendering (`static/index.html`)**:
-  - Render semantic pill links (`Reproducer` and `Proposed Fix`) in the Bugs list `Problem` cell using theme- and Okabe-Ito colorblind-safe CSS variables (`--status-inreview` and `--status-reviewed`), linking to `#/bug/<bugid>?tab=reproducers` and `#/bug/<bugid>?tab=fixes`.
+  - Render compact circular sans-serif `r` and `f` links (`.bug-circle-badge`) centered vertically and aligned to the right edge of the Bugs list `Problem` cell (`.bug-problem-cell`), separate from subsystem `.tag` pills, using soft indigo and emerald palettes with dedicated dark-mode and Okabe-Ito colorblind-mode overrides, linking to `#/bug/<bugid>?tab=reproducers` and `#/bug/<bugid>?tab=fixes`.
   - Update `bindRowNav` to ignore clicks on `a[href]` elements inside table rows so clicking a badge navigates directly to the target tab without double-handling row navigation.

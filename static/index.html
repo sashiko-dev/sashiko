@@ -37,6 +37,8 @@
             --bugs-btn-text: #5a32a3; --bugs-btn-border: #6f42c1; --bugs-btn-border-hover: #5a32a3;
             --bugs-btn-glow: rgba(111, 66, 193, 0.2); --bugs-btn-glow-hover: rgba(111, 66, 193, 0.32);
             --whats-new-bg: rgba(214, 127, 5, 0.06); --whats-new-accent: #d67f05;
+            --badge-repro-bg: #eef2ff; --badge-repro-bg-hover: #e0e7ff; --badge-repro-text: #4338ca; --badge-repro-border: #b4c2fc;
+            --badge-fix-bg: #ecfdf5; --badge-fix-bg-hover: #d1fae5; --badge-fix-text: #047857; --badge-fix-border: #86efac;
         }
         @media (prefers-color-scheme: dark) {
             :root {
@@ -60,6 +62,8 @@
                 --bugs-btn-text: #d2a8ff; --bugs-btn-border: #986ee2; --bugs-btn-border-hover: #d2a8ff;
                 --bugs-btn-glow: rgba(188, 140, 255, 0.22); --bugs-btn-glow-hover: rgba(188, 140, 255, 0.35);
                 --whats-new-bg: rgba(240, 136, 62, 0.07); --whats-new-accent: #f0883e;
+                --badge-repro-bg: rgba(99, 102, 241, 0.18); --badge-repro-bg-hover: rgba(99, 102, 241, 0.3); --badge-repro-text: #a5b4fc; --badge-repro-border: rgba(129, 140, 248, 0.45);
+                --badge-fix-bg: rgba(16, 185, 129, 0.16); --badge-fix-bg-hover: rgba(16, 185, 129, 0.28); --badge-fix-text: #6ee7b7; --badge-fix-border: rgba(52, 211, 153, 0.45);
             }
         }
         body.theme-dark {
@@ -83,6 +87,8 @@
             --bugs-btn-text: #d2a8ff; --bugs-btn-border: #986ee2; --bugs-btn-border-hover: #d2a8ff;
             --bugs-btn-glow: rgba(188, 140, 255, 0.22); --bugs-btn-glow-hover: rgba(188, 140, 255, 0.35);
             --whats-new-bg: rgba(240, 136, 62, 0.07); --whats-new-accent: #f0883e;
+            --badge-repro-bg: rgba(99, 102, 241, 0.18); --badge-repro-bg-hover: rgba(99, 102, 241, 0.3); --badge-repro-text: #a5b4fc; --badge-repro-border: rgba(129, 140, 248, 0.45);
+            --badge-fix-bg: rgba(16, 185, 129, 0.16); --badge-fix-bg-hover: rgba(16, 185, 129, 0.28); --badge-fix-text: #6ee7b7; --badge-fix-border: rgba(52, 211, 153, 0.45);
         }
         /* Colorblind Mode Overrides (Okabe-Ito inspired palette) */
         body.colorblind-mode, body.colorblind-mode.theme-light {
@@ -91,6 +97,8 @@
             --bugs-btn-bg: rgba(51, 108, 139, 0.1); --bugs-btn-bg-hover: rgba(51, 108, 139, 0.18);
             --bugs-btn-text: #004D73; --bugs-btn-border: #336C8B; --bugs-btn-border-hover: #004D73;
             --bugs-btn-glow: rgba(51, 108, 139, 0.2); --bugs-btn-glow-hover: rgba(51, 108, 139, 0.32);
+            --badge-repro-bg: rgba(230, 159, 0, 0.14); --badge-repro-bg-hover: rgba(230, 159, 0, 0.24); --badge-repro-text: #8A5F00; --badge-repro-border: rgba(138, 95, 0, 0.42);
+            --badge-fix-bg: rgba(0, 114, 178, 0.12); --badge-fix-bg-hover: rgba(0, 114, 178, 0.22); --badge-fix-text: #004D73; --badge-fix-border: rgba(0, 77, 115, 0.42);
         }
         @media (prefers-color-scheme: dark) {
             body.colorblind-mode:not(.theme-light) {
@@ -99,6 +107,8 @@
                 --bugs-btn-bg: rgba(86, 180, 233, 0.14); --bugs-btn-bg-hover: rgba(86, 180, 233, 0.24);
                 --bugs-btn-text: #79c0ff; --bugs-btn-border: #56B4E9; --bugs-btn-border-hover: #79c0ff;
                 --bugs-btn-glow: rgba(86, 180, 233, 0.22); --bugs-btn-glow-hover: rgba(86, 180, 233, 0.35);
+                --badge-repro-bg: rgba(230, 159, 0, 0.18); --badge-repro-bg-hover: rgba(230, 159, 0, 0.3); --badge-repro-text: #E69F00; --badge-repro-border: rgba(230, 159, 0, 0.45);
+                --badge-fix-bg: rgba(86, 180, 233, 0.16); --badge-fix-bg-hover: rgba(86, 180, 233, 0.28); --badge-fix-text: #56B4E9; --badge-fix-border: rgba(86, 180, 233, 0.45);
             }
         }
         body.colorblind-mode.theme-dark {
@@ -107,6 +117,8 @@
             --bugs-btn-bg: rgba(86, 180, 233, 0.14); --bugs-btn-bg-hover: rgba(86, 180, 233, 0.24);
             --bugs-btn-text: #79c0ff; --bugs-btn-border: #56B4E9; --bugs-btn-border-hover: #79c0ff;
             --bugs-btn-glow: rgba(86, 180, 233, 0.22); --bugs-btn-glow-hover: rgba(86, 180, 233, 0.35);
+            --badge-repro-bg: rgba(230, 159, 0, 0.18); --badge-repro-bg-hover: rgba(230, 159, 0, 0.3); --badge-repro-text: #E69F00; --badge-repro-border: rgba(230, 159, 0, 0.45);
+            --badge-fix-bg: rgba(86, 180, 233, 0.16); --badge-fix-bg-hover: rgba(86, 180, 233, 0.28); --badge-fix-text: #56B4E9; --badge-fix-border: rgba(86, 180, 233, 0.45);
         }
 
         * { box-sizing: border-box; }
@@ -295,10 +307,22 @@
 
         /* Tags, Lineage & Pagination */
         .tag { display: inline-block; background: var(--tag-bg); color: var(--tag-text); padding: 1px 4px; border-radius: 3px; font-size: 0.75em; margin-right: 4px; border: 1px solid var(--tag-bg); vertical-align: middle; }
-        .bug-attachment-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 0.75em; font-weight: 600; margin-right: 4px; vertical-align: middle; text-decoration: none; background: transparent; border: 1px solid currentColor; }
-        a.bug-attachment-badge:hover { text-decoration: none; background: var(--hover); }
-        .bug-badge-reproducer { color: var(--status-inreview); }
-        .bug-badge-proposed-fix { color: var(--status-reviewed); }
+        .bug-problem-td { vertical-align: middle; }
+        .bug-problem-cell { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+        .bug-problem-main { flex: 1; min-width: 0; }
+        .bug-attachment-badges { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; margin-left: auto; }
+        .bug-circle-badge {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 20px; height: 20px; border-radius: 50%;
+            font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-size: 12px; font-weight: 600; line-height: 1; text-decoration: none;
+            transition: background-color 0.12s ease, border-color 0.12s ease, transform 0.12s ease;
+        }
+        a.bug-circle-badge:hover { text-decoration: none; transform: translateY(-0.5px); }
+        .bug-badge-reproducer { background: var(--badge-repro-bg); color: var(--badge-repro-text); border: 1px solid var(--badge-repro-border); padding-bottom: 1px; }
+        a.bug-badge-reproducer:hover { background: var(--badge-repro-bg-hover); border-color: var(--badge-repro-text); }
+        .bug-badge-proposed-fix { background: var(--badge-fix-bg); color: var(--badge-fix-text); border: 1px solid var(--badge-fix-border); }
+        a.bug-badge-proposed-fix:hover { background: var(--badge-fix-bg-hover); border-color: var(--badge-fix-text); }
         .pagination { display: flex; justify-content: center; align-items: center; gap: 8px; margin-top: 12px; font-size: 0.9em; }
 
         /* Stats Bar & Footer */
@@ -1912,12 +1936,13 @@
             const bugRef = encodeURIComponent(bug.bugid || bug.slug || bug.id);
             const badges = [];
             if (bug.has_reproducer) {
-                badges.push(`<a href="#/bug/${bugRef}?tab=reproducers" class="bug-attachment-badge bug-badge-reproducer" title="Reproducer attached — view Reproducers tab">reproducer</a>`);
+                badges.push(`<a href="#/bug/${bugRef}?tab=reproducers" class="bug-circle-badge bug-badge-reproducer" title="Reproducer attached — view Reproducers tab" aria-label="Reproducer attached">r</a>`);
             }
             if (bug.has_proposed_fix) {
-                badges.push(`<a href="#/bug/${bugRef}?tab=fixes" class="bug-attachment-badge bug-badge-proposed-fix" title="Proposed fix attached — view Fixes tab">proposed fix</a>`);
+                badges.push(`<a href="#/bug/${bugRef}?tab=fixes" class="bug-circle-badge bug-badge-proposed-fix" title="Proposed fix attached — view Fixes tab" aria-label="Proposed fix attached">f</a>`);
             }
-            return badges.join('');
+            if (badges.length === 0) return '';
+            return `<div class="bug-attachment-badges">${badges.join('')}</div>`;
         }
 
         function renderDateCell(unix) {
@@ -2041,10 +2066,8 @@
                     } else if (state.listMode === 'bugs') {
                         bindRowNav(row, `#/bug/${encodeURIComponent(p.bugid || p.slug || p.id)}`);
                         const attachmentBadgesHtml = renderBugAttachmentBadges(p);
-                        const subsystemPills = (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0)
-                            ? p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : '';
-                        const tagsHtml = (attachmentBadgesHtml || subsystemPills)
-                            ? `<div style="margin-top:2px">${attachmentBadgesHtml}${subsystemPills}</div>` : '';
+                        const tagsHtml = (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0)
+                            ? '<div style="margin-top:2px">' + p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>' : '';
                         const fixedByHtml = p.fixed_in_commit
                             ? `<div class="text-muted-sm" style="margin-top:2px;">Fixed by: <code>${escapeHtml(formatCommitRef(p.fixed_in_commit))}</code></div>` : '';
                         const sevStr = p.severity || 'Unknown';
@@ -2056,7 +2079,7 @@
                         const discoveriesTitle = `${discoveriesCount} ${discoveriesCount === 1 ? 'discovery' : 'discoveries'} (${toolsCount} ${toolsCount === 1 ? 'tool' : 'tools'}, ${modelsCount} ${modelsCount === 1 ? 'model' : 'models'})`;
 
                         row.innerHTML = `
-                            <td><div>${escapeHtml(p.problem) || '(no description)'}</div>${tagsHtml}${fixedByHtml}</td>
+                            <td class="bug-problem-td"><div class="bug-problem-cell"><div class="bug-problem-main"><div>${escapeHtml(p.problem) || '(no description)'}</div>${tagsHtml}${fixedByHtml}</div>${attachmentBadgesHtml}</div></td>
                             <td style="line-height:1.2;">${sevHtml}</td>
                             <td style="line-height:1.2;">${renderSecurityCell(p)}</td>
                             <td title="${escapeHtml(discoveriesTitle)}">${discoveriesCount}</td>
