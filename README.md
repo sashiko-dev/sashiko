@@ -92,7 +92,7 @@ Evaluated against historical commits whose bugs had originally passed human revi
 
 | Project | Benchmark Suite | Sashiko | Model | Effort | Bugs Detected |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Linux Kernel** | [`projects/linux/benchmarks/benchmark.json`](projects/linux/benchmarks/benchmark.json) | `v0.9.0` | Gemini 4 Argon | `high` | **67.5%** |
+| **Linux Kernel** | [`projects/linux/benchmarks/benchmark.json`](projects/linux/benchmarks/benchmark.json) | `v0.9.3` | Gemini 4 Carbon | `high` | **75.8%** |
 | **GCC** | [`projects/gcc/benchmarks/benchmark.json`](projects/gcc/benchmarks/benchmark.json) | `v0.7.0` | Gemini 4 Argon | `high` | **58.5%** |
 
 Based on manual sampling of Linux kernel reviews, the false-positive rate is under **20%** (mostly gray-area concerns). As with any LLM-based tool, Sashiko's output is probabilistic and may vary across runs on the same input.
