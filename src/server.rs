@@ -2856,18 +2856,25 @@ async fn list_bugs(
         }
         None => None,
     };
-    let assignee = query
+    let assignee = match query
         .assignee
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|who| {
-            if who.eq_ignore_ascii_case("none") {
-                crate::db::AssigneeFilter::Unassigned
-            } else {
-                crate::db::AssigneeFilter::Is(who)
+    {
+        Some(who) if who.eq_ignore_ascii_case("none") => {
+            Some(crate::db::AssigneeFilter::Unassigned)
+        }
+        Some(who) if who.eq_ignore_ascii_case("me") => {
+            let me = principal.email().trim();
+            if me.is_empty() {
+                return Err(StatusCode::BAD_REQUEST);
             }
-        });
+            Some(crate::db::AssigneeFilter::Is(me))
+        }
+        Some(who) => Some(crate::db::AssigneeFilter::Is(who)),
+        None => None,
+    };
 
     match state
         .db
@@ -4004,6 +4011,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), 404);
+
+        // Testing mode has no email identity, so assignee=me must be rejected.
+        let me_without_email = reqwest::get(format!("http://{}/api/bugs?assignee=me", addr))
+            .await
+            .unwrap();
+        assert_eq!(me_without_email.status(), 400);
     }
 
     #[tokio::test]
@@ -6075,13 +6088,50 @@ mod tests {
             assert_eq!(body["can_manage"], true);
         }
 
-        let listing: serde_json::Value = get("/api/bugs".to_string(), Some(operator))
+        let listing: serde_json::Value = get("/api/bugs".to_string(), Some(operator.clone()))
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
         assert_eq!(listing["total"], 1);
+
+        // assignee=me resolves to the authenticated caller's email (ignoring
+        // ASCII case against the stored assignee).
+        let empty_mine: serde_json::Value =
+            get("/api/bugs?assignee=me".to_string(), Some(operator.clone()))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(empty_mine["total"], 0);
+
+        let assign_res = client
+            .post(format!("http://{}/api/bug/action?id={}", addr, bug_id))
+            .header("Authorization", format!("Bearer {}", operator))
+            .json(&serde_json::json!({
+                "action": "assign",
+                "assignee": "Operator@Example.org"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(assign_res.status(), 200);
+
+        for query in [
+            "/api/bugs?assignee=me",
+            "/api/bugs?assignee=operator%40example.org",
+        ] {
+            let mine: serde_json::Value = get(query.to_string(), Some(operator.clone()))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(mine["total"], 1, "failed query {query}");
+            assert_eq!(mine["items"][0]["bugid"], "linux-authz01");
+        }
 
         // Mutations are not bypassable from loopback or by knowing bugid.
         let unauthenticated_action = client

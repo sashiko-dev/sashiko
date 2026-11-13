@@ -7302,7 +7302,7 @@ impl Database {
         match params.assignee {
             Some(AssigneeFilter::Unassigned) => conditions.push("assignee IS NULL".into()),
             Some(AssigneeFilter::Is(who)) => {
-                conditions.push("assignee = ?".into());
+                conditions.push("assignee = ? COLLATE NOCASE".into());
                 query_params.push(libsql::Value::Text(who.trim().to_string()));
             }
             None => {}
@@ -7344,7 +7344,7 @@ impl Database {
                 sort_dir
             ),
             Some("assignee") => format!(
-                "ORDER BY assignee IS NULL, assignee {}, created_at DESC, id DESC",
+                "ORDER BY assignee IS NULL, assignee COLLATE NOCASE {}, created_at DESC, id DESC",
                 sort_dir
             ),
             Some("id") => format!("ORDER BY id {}", sort_dir),
@@ -27091,6 +27091,17 @@ mod tests {
             .unwrap();
         assert_eq!(total, 1);
         assert_eq!(items[0].id, mine);
+
+        let (items_upper, total_upper) = db
+            .list_bugs(ListBugsParams {
+                assignee: Some(AssigneeFilter::Is("ME@EXAMPLE.ORG")),
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total_upper, 1);
+        assert_eq!(items_upper[0].id, mine);
 
         let (items, total) = db
             .list_bugs(ListBugsParams {

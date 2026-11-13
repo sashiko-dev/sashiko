@@ -149,7 +149,8 @@ pub struct BugListQuery {
     pub lifecycle_status: Option<String>,
     /// Analysis execution state.
     pub pipeline_state: Option<String>,
-    /// Filters by assignee. The literal `none` selects unassigned bugs.
+    /// Filters by assignee. `none` selects unassigned bugs; `me` selects bugs
+    /// assigned to the authenticated caller.
     pub assignee: Option<String>,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
