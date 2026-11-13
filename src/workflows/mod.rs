@@ -15,6 +15,7 @@
 use crate::project::ProjectId;
 
 pub mod code_notes;
+pub mod design_assessment;
 pub mod e2fsprogs_patch_review;
 pub mod gcc_patch_review;
 pub mod guard;
