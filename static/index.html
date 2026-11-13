@@ -672,9 +672,27 @@
             return (Date.now() / 1000) >= (payload.exp - 5);
         }
 
+        function extractStoredEmail() {
+            const stored = safeStorage.getItem(API_USER_KEY);
+            if (stored && stored.trim() && stored !== 'Authorized User') return stored.trim();
+            const payload = parseJwtPayload(safeStorage.getItem(API_TOKEN_KEY));
+            if (payload && typeof payload.sub === 'string' && payload.sub.trim()) return payload.sub.trim();
+            if (config && config.user && typeof config.user.email === 'string' && config.user.email.trim()) return config.user.email.trim();
+            return null;
+        }
+
         function clearAuthSession() {
+            const prevEmail = extractStoredEmail();
             safeStorage.removeItem(API_TOKEN_KEY);
             safeStorage.removeItem(API_USER_KEY);
+            if (state.bugAssignee) {
+                const cur = state.bugAssignee.trim().toLowerCase();
+                if (cur === 'me' || (prevEmail && cur === prevEmail.toLowerCase())) {
+                    state.bugAssignee = '';
+                    const assigneeInput = document.getElementById('bugAssigneeFilter');
+                    if (assigneeInput) assigneeInput.value = '';
+                }
+            }
             updateAuthUI();
         }
 
@@ -686,7 +704,33 @@
         }
 
         function getAuthEmail() {
-            return getAuthToken() ? safeStorage.getItem(API_USER_KEY) : null;
+            return getAuthToken() ? extractStoredEmail() : null;
+        }
+
+        function isMyBugsActive() {
+            const me = getAuthEmail();
+            if (!state.bugAssignee || !me) return false;
+            const cur = state.bugAssignee.trim().toLowerCase();
+            return cur === 'me' || cur === me.toLowerCase();
+        }
+
+        function getMyBugsTitle() {
+            const me = getAuthEmail();
+            if (!me) return 'Sign in to filter bugs assigned to your account';
+            return isMyBugsActive()
+                ? `Showing bugs assigned to ${me} (click to show all)`
+                : `Show bugs assigned to ${me}`;
+        }
+
+        function syncMyBugsButton() {
+            const btn = document.getElementById('btnMyBugs');
+            if (!btn) return;
+            const me = getAuthEmail();
+            const active = isMyBugsActive();
+            btn.disabled = !me;
+            btn.classList.toggle('active', active);
+            btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+            btn.title = getMyBugsTitle();
         }
 
         function canPerformBugActions() {
@@ -795,16 +839,20 @@
         }
 
         function updateAuthUI() {
+            const hasToken = !!getAuthToken();
             const email = getAuthEmail();
+            const displayUser = email || (hasToken ? 'Authorized User' : 'Guest');
             const emailSpan = document.getElementById('auth-email');
             const btn = document.getElementById('auth-btn');
-            if (!emailSpan || !btn) return;
-            emailSpan.textContent = email || 'Guest';
-            emailSpan.title = email || '';
-            btn.textContent = email ? 'Logout' : 'Login';
-            emailSpan.style.color = email ? 'var(--status-reviewed)' : 'var(--text-muted)';
-            emailSpan.style.fontWeight = email ? 'bold' : 'normal';
-            emailSpan.style.fontStyle = email ? 'normal' : 'italic';
+            if (emailSpan && btn) {
+                emailSpan.textContent = displayUser;
+                emailSpan.title = email || '';
+                btn.textContent = hasToken ? 'Logout' : 'Login';
+                emailSpan.style.color = hasToken ? 'var(--status-reviewed)' : 'var(--text-muted)';
+                emailSpan.style.fontWeight = hasToken ? 'bold' : 'normal';
+                emailSpan.style.fontStyle = hasToken ? 'normal' : 'italic';
+            }
+            syncMyBugsButton();
         }
 
         function toggleAuth() {
@@ -1051,6 +1099,7 @@
                     config = await res.json();
                     document.title = getHeaderTitle();
                     updateAboutModal();
+                    syncMyBugsButton();
                 }
             } catch (e) { console.error("Failed to load config", e); }
         }
@@ -1765,6 +1814,7 @@
                             <option value="fixed" ${state.bugLifecycleStatus === 'fixed' ? 'selected' : ''}>Fixed</option>
                             <option value="closed" ${state.bugLifecycleStatus === 'closed' ? 'selected' : ''}>Closed</option>
                         </select>
+                        <button type="button" id="btnMyBugs" onclick="toggleMyBugs()" class="${isMyBugsActive() ? 'active' : ''}" aria-pressed="${isMyBugsActive() ? 'true' : 'false'}" ${getAuthEmail() ? '' : 'disabled'} title="${escapeHtml(getMyBugsTitle())}">My Bugs</button>
                         <input type="text" id="bugAssigneeFilter" placeholder="Assignee (or none)" value="${escapeHtml(state.bugAssignee)}" style="width: 160px;" onchange="setBugFilter('assignee', this.value)">
                     </div>
                     <input type="text" id="searchInput" placeholder="${state.listMode === 'bugs' ? 'Search bugs (problem, file, commit)' : 'Search (subject, author:, date:)'}" value="${escapeHtml(state.searchQuery)}">
@@ -2053,6 +2103,13 @@
             const input = document.getElementById('searchInput');
             if (!input) return;
             state.searchQuery = input.value.trim();
+            if (state.listMode === 'bugs') {
+                const assigneeInput = document.getElementById('bugAssigneeFilter');
+                if (assigneeInput) {
+                    state.bugAssignee = assigneeInput.value.trim();
+                    syncMyBugsButton();
+                }
+            }
             state.currentPage = 1;
             fetchListData();
         }
@@ -2141,6 +2198,20 @@
             fetchListData();
         }
 
+        function toggleMyBugs() {
+            const me = getAuthEmail();
+            if (!me) {
+                openAuthModal('Please sign in to view bugs assigned to you.');
+                return;
+            }
+            state.bugAssignee = isMyBugsActive() ? '' : me;
+            const assigneeInput = document.getElementById('bugAssigneeFilter');
+            if (assigneeInput) assigneeInput.value = state.bugAssignee;
+            syncMyBugsButton();
+            state.currentPage = 1;
+            fetchListData();
+        }
+
         function setBugFilter(key, value) {
             if (key === 'subsystem') state.bugSubsystem = value.trim();
             if (key === 'min_severity') state.bugMinSeverity = value;
@@ -2149,7 +2220,10 @@
                 state.bugLifecycleStatus = value;
                 loadBugSubsystems(true).then(renderSubsystemDropdown);
             }
-            if (key === 'assignee') state.bugAssignee = value.trim();
+            if (key === 'assignee') {
+                state.bugAssignee = value.trim();
+                syncMyBugsButton();
+            }
             state.currentPage = 1;
             fetchListData();
         }
@@ -2177,6 +2251,7 @@
                 if (statSel) statSel.value = 'open';
                 const assigneeInput = document.getElementById('bugAssigneeFilter');
                 if (assigneeInput) assigneeInput.value = '';
+                syncMyBugsButton();
             }
             state.currentPage = 1;
             fetchListData();
