@@ -437,6 +437,13 @@ pub(crate) const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 pub trait ClassifyAiError {
     fn ai_error_class(&self) -> AiErrorClass;
+
+    /// What the provider itself said about the failure, when the status code
+    /// alone cannot tell one cause from another. Already redacted and
+    /// shortened, so it is safe to put in a log line.
+    fn ai_error_detail(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl ClassifyAiError for RemoteAiError {
@@ -467,33 +474,48 @@ pub(crate) fn is_permanent_transport_error(e: &reqwest::Error) -> bool {
     e.is_builder() || e.is_redirect()
 }
 
-/// Classifies AI errors through typed provider and stdio error downcasts.
-pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
+/// Resolves the typed provider or stdio error inside an [`anyhow::Error`].
+///
+/// Both the class and the detail are read through this, so the list of types
+/// that can be classified exists once.
+fn typed_ai_error(error: &anyhow::Error) -> Option<&dyn ClassifyAiError> {
     if let Some(e) = error.downcast_ref::<RemoteAiError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
     if let Some(e) = error.downcast_ref::<openai_common::OpenAiCompatError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
     if let Some(e) = error.downcast_ref::<claude::ClaudeError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
     if let Some(e) = error.downcast_ref::<claude_cli::ClaudeCliError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
     if let Some(e) = error.downcast_ref::<gemini::GeminiError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
     if let Some(e) = error.downcast_ref::<crate::worker::prompts::ReviewError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
     if let Some(e) = error.downcast_ref::<ollama::OllamaError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
     if let Some(e) = error.downcast_ref::<vllm::VllmError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
-    AiErrorClass::Fatal
+    None
+}
+
+/// Classifies AI errors through typed provider and stdio error downcasts.
+pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
+    typed_ai_error(error)
+        .map(ClassifyAiError::ai_error_class)
+        .unwrap_or(AiErrorClass::Fatal)
+}
+
+/// The provider's own explanation of an AI error, when it gave one.
+pub fn classify_ai_error_detail(error: &anyhow::Error) -> Option<&str> {
+    typed_ai_error(error).and_then(ClassifyAiError::ai_error_detail)
 }
 
 /// Returns true when a failed patch review attempt cannot recover by re-running
@@ -1887,7 +1909,10 @@ mod tests {
             },
         );
         assert_ai_error_class(
-            claude::ClaudeError::OverloadedError(Duration::from_secs(9)),
+            claude::ClaudeError::OverloadedError {
+                retry_after: Duration::from_secs(9),
+                detail: "busy".to_string(),
+            },
             AiErrorClass::Transient {
                 retry_after: Duration::from_secs(9),
             },
@@ -1906,6 +1931,33 @@ mod tests {
         assert_ai_error_class(
             anyhow!("Remote AI Error: rate limit exceeded"),
             AiErrorClass::Fatal,
+        );
+    }
+
+    /// Only a provider that answered with something more than a status code
+    /// contributes a detail, and an empty body contributes nothing.
+    #[test]
+    fn test_classify_ai_error_detail() {
+        let rate_limited: anyhow::Error = claude::ClaudeError::RateLimitExceeded {
+            retry_after: Duration::from_secs(1),
+            detail: "per-minute tokens".to_string(),
+        }
+        .into();
+        assert_eq!(
+            classify_ai_error_detail(&rate_limited),
+            Some("per-minute tokens")
+        );
+
+        let silent: anyhow::Error = claude::ClaudeError::OverloadedError {
+            retry_after: Duration::ZERO,
+            detail: String::new(),
+        }
+        .into();
+        assert_eq!(classify_ai_error_detail(&silent), None);
+
+        assert_eq!(
+            classify_ai_error_detail(&anyhow!("totally unrelated error")),
+            None
         );
     }
 

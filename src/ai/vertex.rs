@@ -277,16 +277,23 @@ impl VertexClient {
             let error_body = res
                 .text()
                 .await
+                .map(|t| claude::loggable_body(&t))
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
             match status.as_u16() {
                 429 => {
-                    let duration = retry_after_duration.unwrap_or(Duration::from_secs(60));
-                    Err(ClaudeError::RateLimitExceeded(duration))?
+                    let retry_after = retry_after_duration.unwrap_or(Duration::from_secs(60));
+                    Err(ClaudeError::RateLimitExceeded {
+                        retry_after,
+                        detail: error_body,
+                    })?
                 }
                 500..=599 => {
-                    let duration = retry_after_duration.unwrap_or(Duration::from_secs(0));
-                    Err(ClaudeError::OverloadedError(duration))?
+                    let retry_after = retry_after_duration.unwrap_or(Duration::from_secs(0));
+                    Err(ClaudeError::OverloadedError {
+                        retry_after,
+                        detail: error_body,
+                    })?
                 }
                 400 => Err(ClaudeError::InvalidRequest(error_body))?,
                 401 | 403 => Err(ClaudeError::AuthenticationError(error_body))?,
