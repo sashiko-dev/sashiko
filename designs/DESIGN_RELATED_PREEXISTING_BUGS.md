@@ -10,11 +10,11 @@ filters them out. This feature mentions a pre-existing bug **only when it is cle
 |---|---|---|
 | R1 | Relevant: same code, or a very similar bug to the one being fixed | Deterministic pre-filter plus an LLM selection stage that has to cite concrete code |
 | R2 | First non-RFC posting only; never an RFC, never a later round | Gate computed before the review starts |
-| R3 | On by default; can be disabled per mailing list | `related_preexisting.enabled` policy knob |
+| R3 | On by default; can be disabled per mailing list | `report_preexisting_bugs` policy knob |
 | R4 | Proportionate | Budget based on patch size, hard cap of 2 |
 | R5 | Not security-sensitive, and still present once the patch is applied | Per-candidate **disclosure check** stage, with tools, on the patched tree |
 | R6 | Report once; record when and with which patch | New `preexisting_disclosures` table |
-| R7 | Configurable severity floor, Medium+ by default | `related_preexisting.min_severity` policy knob |
+| R7 | Configurable severity floor, Medium+ by default | `report_preexisting_bugs` policy knob (`true` = `"medium"`, or `"low"`/`"medium"`/`"high"`/`"critical"`) |
 
 ## 2. Relevant current-state facts
 
@@ -86,15 +86,15 @@ Per mailing list, at least for now:
   without breaking the config format.
 
 ```toml
-[defaults.related_preexisting]
-enabled = true
-min_severity = "medium"    # low | medium | high | critical
+[defaults]
+report_preexisting_bugs = true   # true ("medium") | false | "none" | "low" | "medium" | "high" | "critical"
 
-["netdev@vger.kernel.org".related_preexisting]
-enabled = false
+["linux-mm@kvack.org"]
+report_preexisting_bugs = false
 ```
 - Typed: `RelatedPreexistingPolicy { enabled: bool, min_severity: SeverityFloor }` in defaults, and an
-  `Option` of each field per list. `SeverityFloor` has no `Unknown` level.
+  `Option` of each field per list (`RelatedPreexistingOverride`). `SeverityFloor` has no `Unknown` level.
+  The legacy `[defaults.related_preexisting]` / `["<list>".related_preexisting]` table form remains accepted as a `serde` alias.
 - Resolution across matched lists: any `enabled = false` ⇒ off. The effective `min_severity` is the
   **strictest** (highest) of the explicit values, otherwise the default. If no list matched, the defaults apply.
 

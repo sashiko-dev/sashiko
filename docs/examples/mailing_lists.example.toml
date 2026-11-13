@@ -35,6 +35,12 @@ cc = []
 # every list, not only to that section.
 ignored_emails = []
 
+# Mention 1-2 closely related, non-security-sensitive pre-existing bugs on
+# the first non-RFC posting of a series (each bug at most once). Accepts
+# true, false ("none"), or a severity floor ("low".."critical"; true uses
+# "medium").
+report_preexisting_bugs = true
+
 # --- Author-only delivery (inherits defaults when mute_all = false) ---
 # ["intel-xe@lists.freedesktop.org"]
 # mute_all = false
@@ -45,6 +51,12 @@ ignored_emails = []
 # embargo_hours = 0
 # subject_prefixes = ["bpf", "bpf-next"]
 # reply_to = ["author", "list", "recipients"]
+
+# --- Opt out of related pre-existing bug mentions ---
+# ["linux-mm@kvack.org"]
+# mute_all = false
+# reply_to = ["author", "list", "recipients"]
+# report_preexisting_bugs = false
 
 # --- Custom NNTP group override ---
 # Needed only when the group is not the reversed domain followed by the
