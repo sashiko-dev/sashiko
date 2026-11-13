@@ -110,12 +110,13 @@ fn default_true() -> bool {
 /// Whether reviews mention pre-existing bugs that relate to the patch, and
 /// how severe such a bug must be. See
 /// designs/DESIGN_RELATED_PREEXISTING_BUGS.md.
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+///
+/// Configured via `report_preexisting_bugs = true | false | "none" | "low" |
+/// "medium" | "high" | "critical"`, or via the legacy `related_preexisting`
+/// table (`{ enabled = ..., min_severity = ... }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelatedPreexistingPolicy {
-    #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_related_preexisting_min_severity")]
     pub min_severity: SeverityFloor,
 }
 
@@ -132,13 +133,86 @@ impl Default for RelatedPreexistingPolicy {
     }
 }
 
+impl<'de> Deserialize<'de> for RelatedPreexistingPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let over = RelatedPreexistingOverride::deserialize(deserializer)?;
+        let defaults = Self::default();
+        Ok(Self {
+            enabled: over.enabled.unwrap_or(defaults.enabled),
+            min_severity: over.min_severity.unwrap_or(defaults.min_severity),
+        })
+    }
+}
+
 /// Per-list override of [`RelatedPreexistingPolicy`]; unset fields fall back
-/// to `[defaults.related_preexisting]`.
-#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+/// to `defaults.report_preexisting_bugs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RelatedPreexistingOverride {
     pub enabled: Option<bool>,
     pub min_severity: Option<SeverityFloor>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRelatedPreexistingTable {
+    enabled: Option<bool>,
+    min_severity: Option<SeverityFloor>,
+}
+
+impl<'de> Deserialize<'de> for RelatedPreexistingOverride {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PreexistingVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PreexistingVisitor {
+            type Value = RelatedPreexistingOverride;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "a boolean, \"none\", a severity floor (\"low\", \"medium\", \"high\", \"critical\"), or a table",
+                )
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(RelatedPreexistingOverride {
+                    enabled: Some(v),
+                    min_severity: None,
+                })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<Self::Value, E> {
+                if raw.trim().eq_ignore_ascii_case("none") {
+                    return Ok(RelatedPreexistingOverride {
+                        enabled: Some(false),
+                        min_severity: None,
+                    });
+                }
+                let floor = raw.parse::<SeverityFloor>().map_err(|_| {
+                    E::custom(format!(
+                        "invalid severity {raw:?}: expected true, false, \"none\", \"low\", \"medium\", \"high\", or \"critical\""
+                    ))
+                })?;
+                Ok(RelatedPreexistingOverride {
+                    enabled: Some(true),
+                    min_severity: Some(floor),
+                })
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let raw = RawRelatedPreexistingTable::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(RelatedPreexistingOverride {
+                    enabled: raw.enabled,
+                    min_severity: raw.min_severity,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(PreexistingVisitor)
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -160,8 +234,8 @@ pub struct DefaultListPolicy {
     pub patchwork: PatchworkPolicy,
     #[serde(default)]
     pub embargo_hours: u32,
-    #[serde(default)]
-    pub related_preexisting: RelatedPreexistingPolicy,
+    #[serde(default, alias = "related_preexisting")]
+    pub report_preexisting_bugs: RelatedPreexistingPolicy,
 }
 
 impl Default for DefaultListPolicy {
@@ -175,7 +249,7 @@ impl Default for DefaultListPolicy {
             ignored_emails: Vec::new(),
             patchwork: PatchworkPolicy::default(),
             embargo_hours: 0,
-            related_preexisting: RelatedPreexistingPolicy::default(),
+            report_preexisting_bugs: RelatedPreexistingPolicy::default(),
         }
     }
 }
@@ -197,8 +271,8 @@ pub struct MailingListPolicy {
     #[serde(default)]
     pub patchwork: PatchworkPolicy,
     pub embargo_hours: Option<u32>,
-    #[serde(default)]
-    pub related_preexisting: RelatedPreexistingOverride,
+    #[serde(default, alias = "related_preexisting")]
+    pub report_preexisting_bugs: RelatedPreexistingOverride,
 }
 
 pub type SubsystemPolicy = MailingListPolicy;
@@ -354,7 +428,7 @@ impl EmailPolicyConfig {
         &self,
         addresses: impl IntoIterator<Item = &'a str>,
     ) -> RelatedPreexistingPolicy {
-        let defaults = self.defaults.related_preexisting;
+        let defaults = self.defaults.report_preexisting_bugs;
         let addresses: Vec<String> = addresses.into_iter().map(extract_bare_email).collect();
         let mut resolved: Option<RelatedPreexistingPolicy> = None;
         for (list_key, list_policy) in &self.lists {
@@ -362,7 +436,7 @@ impl EmailPolicyConfig {
             if !addresses.contains(&list_bare) {
                 continue;
             }
-            let over = list_policy.related_preexisting;
+            let over = list_policy.report_preexisting_bugs;
             let enabled = over.enabled.unwrap_or(defaults.enabled);
             let min_severity = over.min_severity.unwrap_or(defaults.min_severity);
             resolved = Some(match resolved {
@@ -584,6 +658,72 @@ mod tests {
     }
 
     #[test]
+    fn test_report_preexisting_bugs_flat_key() {
+        let config = EmailPolicyConfig::parse_content(
+            r#"
+            [defaults]
+            report_preexisting_bugs = "high"
+
+            ["linux-mm@kvack.org"]
+            report_preexisting_bugs = false
+
+            ["netdev@vger.kernel.org"]
+            report_preexisting_bugs = "none"
+
+            ["bpf@vger.kernel.org"]
+            report_preexisting_bugs = "critical"
+
+            ["damon@lists.linux.dev"]
+            report_preexisting_bugs = true
+            "#,
+        )
+        .unwrap();
+
+        let other = config.related_preexisting_for(["other@example.org"]);
+        assert!(other.enabled);
+        assert_eq!(other.min_severity, SeverityFloor::High);
+
+        let mm = config.related_preexisting_for(["linux-mm@kvack.org"]);
+        assert!(!mm.enabled);
+
+        let net = config.related_preexisting_for(["netdev@vger.kernel.org"]);
+        assert!(!net.enabled);
+
+        // `true` enables reporting while preserving the configured default floor.
+        let damon = config.related_preexisting_for(["damon@lists.linux.dev"]);
+        assert!(damon.enabled);
+        assert_eq!(damon.min_severity, SeverityFloor::High);
+
+        let bpf_damon =
+            config.related_preexisting_for(["bpf@vger.kernel.org", "damon@lists.linux.dev"]);
+        assert!(bpf_damon.enabled);
+        assert_eq!(bpf_damon.min_severity, SeverityFloor::Critical);
+
+        let mm_bpf = config.related_preexisting_for(["linux-mm@kvack.org", "bpf@vger.kernel.org"]);
+        assert!(!mm_bpf.enabled);
+
+        // Opt-in list when defaults disable reporting.
+        let opt_in = EmailPolicyConfig::parse_content(
+            r#"
+            [defaults]
+            report_preexisting_bugs = false
+
+            ["bpf@vger.kernel.org"]
+            report_preexisting_bugs = true
+            "#,
+        )
+        .unwrap();
+        assert!(
+            !opt_in
+                .related_preexisting_for(["other@example.org"])
+                .enabled
+        );
+        let bpf_opt_in = opt_in.related_preexisting_for(["bpf@vger.kernel.org"]);
+        assert!(bpf_opt_in.enabled);
+        assert_eq!(bpf_opt_in.min_severity, SeverityFloor::Medium);
+    }
+
+    #[test]
     fn test_related_preexisting_rejects_invalid_config() {
         let err = EmailPolicyConfig::parse_content(
             r#"
@@ -594,6 +734,38 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("invalid severity"), "{err}");
+
+        let err = EmailPolicyConfig::parse_content(
+            r#"
+            ["bpf@vger.kernel.org"]
+            report_preexisting_bugs = "no"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid severity"), "{err}");
+
+        let err = EmailPolicyConfig::parse_content(
+            r#"
+            ["bpf@vger.kernel.org"]
+            report_preexisting_bugs = 42
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("boolean"), "{err}");
+
+        let err = EmailPolicyConfig::parse_content(
+            r#"
+            ["bpf@vger.kernel.org"]
+            report_preexisting_bugs = false
+            ["bpf@vger.kernel.org".related_preexisting]
+            enabled = true
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate field"), "{err}");
 
         let err = EmailPolicyConfig::parse_content(
             r#"
