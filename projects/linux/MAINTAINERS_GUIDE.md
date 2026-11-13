@@ -139,6 +139,7 @@ All per-mailing-list ingestion, embargo, email delivery, and Patchwork settings 
 *   **`ignored_emails`:** Author email addresses whose submissions will be muted.
 *   **`embargo_hours`:** Hours to wait before publishing a review with findings (default: `0`). Clean reviews are released immediately after the complete patchset review succeeds.
 *   **`subject_prefixes`:** Optional subject prefix tags (e.g. `["net", "net-next"]`) used to disambiguate `embargo_hours` when a patch is cross-posted to multiple mailing lists.
+*   **`report_preexisting_bugs`:** Controls whether reviews of the first non-RFC posting of a series mention closely related, non-security-sensitive pre-existing bugs (`true` by default, using a `"medium"` minimum severity; at most one bug on small patches and two on larger patches, and each bug is mentioned at most once across all reviews). Set `report_preexisting_bugs = false` (or `"none"`) to disable related pre-existing bug mentions for your list (for cross-posted series, any matched list with `false` disables them), or set `"low"`, `"medium"`, `"high"`, or `"critical"` to adjust the minimum severity floor (the strictest matched floor wins).
 
 **Web UI tracking only (default):** Adding an empty section `["amd-gfx@lists.freedesktop.org"]` tracks and reviews patches from the list for the Web UI without sending outbound emails (`reply_to = []`):
 
@@ -160,6 +161,15 @@ reply_to = ["author"]
 embargo_hours = 0
 subject_prefixes = ["bpf", "bpf-next"]
 reply_to = ["author", "list", "recipients"]
+```
+
+**Disabling related pre-existing bug mentions:**
+
+```toml
+["linux-mm@kvack.org"]
+reply_to = ["author", "list", "recipients"]
+embargo_hours = 24
+report_preexisting_bugs = false
 ```
 
 **Configuration:** To request a change to your mailing list configuration in [`projects/linux/mailing_lists.toml`](mailing_lists.toml), please open a GitHub Pull Request or Issue, or email the development mailing list (`sashiko@lists.linux.dev`).
