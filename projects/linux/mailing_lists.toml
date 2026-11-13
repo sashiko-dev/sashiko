@@ -382,6 +382,7 @@ reply_to = ["author", "list"]
 ["linux-mm@kvack.org"]
 reply_to = ["author", "list", "recipients"]
 embargo_hours = 24
+report_preexisting_bugs = false
 
 ["linux-sound@vger.kernel.org"]
 reply_to = ["author", "list"]
