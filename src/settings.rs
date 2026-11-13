@@ -1249,6 +1249,10 @@ pub struct ReviewSettings {
     /// Combine exploratory analysis stages into a single stage to reduce cost and latency.
     #[serde(default)]
     pub cheap: bool,
+    /// Run an experimental series-level design assessment alongside bug review
+    /// in local `sashiko review` runs. Ignored by the daemon.
+    #[serde(default)]
+    pub design: bool,
     /// Skip the model run for a patch whose diff matches, modulo rebase
     /// noise, a patch already reviewed to completion with no findings.
     /// The patch gets a Skipped review that names the review it inherits
@@ -1494,6 +1498,7 @@ pub struct Overrides {
     pub no_ai: bool,
     pub resume: bool,
     pub cheap: bool,
+    pub design: bool,
     pub ai_provider: Option<String>,
     pub ai_model: Option<String>,
     pub effort: Option<EffortMode>,
@@ -1524,6 +1529,7 @@ impl Settings {
         }
         self.ai.resume |= overrides.resume;
         self.review.cheap |= overrides.cheap;
+        self.review.design |= overrides.design;
         let is_stdio_worker = overrides.ai_provider.as_deref().is_some_and(|p| {
             p.eq_ignore_ascii_case("stdio-gemini") || p.eq_ignore_ascii_case("stdio-claude")
         });
@@ -2112,6 +2118,7 @@ mod tests {
         assert!(!settings.ai.resume);
         assert!(settings.review.stages.is_none());
         assert!(!settings.review.cheap);
+        assert!(!settings.review.design);
 
         let changed = settings.apply_overrides(Overrides {
             repository_path: Some("from_flag".to_string()),
@@ -2123,6 +2130,7 @@ mod tests {
             effort: Some(EffortMode::Dynamic),
             stages: Some(vec!["pre-screen".to_string()]),
             cheap: true,
+            design: true,
             read_only: true,
             port: Some(9090),
         });
@@ -3181,5 +3189,39 @@ concurrency = 4
         let settings = Settings::load(Some(&path)).unwrap();
         let err = settings.validate_for_daemon().unwrap_err();
         assert!(err.contains("[git.custom_remotes] invalid only_branches entry"));
+    }
+
+    #[test]
+    fn test_review_design_setting_defaults_false_and_accepts_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Settings.toml");
+        let toml = r#"
+            [ai]
+            provider = "gemini"
+            model = "gemini-4-argon"
+            [review]
+            concurrency = 2
+        "#;
+        std::fs::write(&path, toml).unwrap();
+        let mut settings = Settings::load(Some(&path)).unwrap();
+        assert!(!settings.review.design);
+
+        settings.apply_overrides(Overrides {
+            design: true,
+            ..Default::default()
+        });
+        assert!(settings.review.design);
+
+        let toml_enabled = r#"
+            [ai]
+            provider = "gemini"
+            model = "gemini-4-argon"
+            [review]
+            concurrency = 2
+            design = true
+        "#;
+        std::fs::write(&path, toml_enabled).unwrap();
+        let loaded = Settings::load(Some(&path)).unwrap();
+        assert!(loaded.review.design);
     }
 }

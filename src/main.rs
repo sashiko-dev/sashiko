@@ -157,6 +157,10 @@ enum Commands {
         #[arg(long)]
         cheap: bool,
 
+        /// Run an experimental series-level design assessment alongside bug review
+        #[arg(long)]
+        design: bool,
+
         /// Verify and report pre-existing bugs in the touched code
         #[arg(long)]
         report_preexisting: bool,
@@ -535,6 +539,7 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             no_ai,
             resume,
             cheap,
+            design,
             ai_provider,
             model,
             effort,
@@ -544,6 +549,7 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             no_ai: *no_ai,
             resume: *resume,
             cheap: *cheap,
+            design: *design,
             ai_provider: ai_provider.clone(),
             ai_model: model.clone(),
             effort: effort.or(cli.effort),
@@ -2244,9 +2250,11 @@ fn watch_for_resize(
 struct ProgressState {
     project: ProjectId,
     patches: std::collections::BTreeMap<i64, PatchState>,
+    design: Option<PatchState>,
     /// The status each patch was last reported with, so the appending display
     /// speaks only when one of them changes.
     last_status: std::collections::BTreeMap<i64, String>,
+    last_design_status: Option<String>,
     total_turns: usize,
     terminal_width: usize,
     terminal_rows: usize,
@@ -2271,7 +2279,9 @@ struct ProgressState {
 /// Display label for a stage. Held in the stage tables so that adding a stage
 /// needs no edit here.
 fn stage_short_name(project: ProjectId, stage: &str) -> &'static str {
-    sashiko::workflows::stage_short_label(project, stage).unwrap_or("Unknown")
+    sashiko::workflows::design_assessment::design_stage_short_label(stage)
+        .or_else(|| sashiko::workflows::stage_short_label(project, stage))
+        .unwrap_or("Unknown")
 }
 
 struct TruncatingWriter {
@@ -2581,6 +2591,13 @@ fn paint_progress_plain(
         state.last_status.insert(idx, label.clone());
         writeln!(out, "      [Patch {}] {} | {}", idx, p.subject, label)?;
     }
+    if let Some(ref d) = state.design {
+        let label = status_label(state.project, d, false);
+        if state.last_design_status.as_ref() != Some(&label) {
+            state.last_design_status = Some(label.clone());
+            writeln!(out, "      [Design] {} | {}", d.subject, label)?;
+        }
+    }
 
     out.flush()
 }
@@ -2730,9 +2747,9 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
         return Ok(());
     }
 
-    // One line per patch and one for the overall bar. Reserving happens once, and
-    // again when that count changes, which it does as the patches become known.
-    let wanted = state.patches.len() + 1;
+    // One line per patch, an optional series design row, and one for the
+    // overall bar. Reserving happens once, and again when that count changes.
+    let wanted = state.patches.len() + usize::from(state.design.is_some()) + 1;
     if !state.reservation_capable || !worth_reserving(wanted, state.terminal_rows) {
         // A display that has outgrown the screen was holding a region until now,
         // and hands it back on the way to saying its piece a line at a time.
@@ -2755,60 +2772,42 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
     let top = state.terminal_rows.saturating_sub(state.reserved) + 1;
 
     for (&idx, p) in &state.patches {
-        write!(out, "\x1b[{};1H\x1b[2K", top + lines_printed)?;
-        let status_str = status_label(state.project, p, true);
-
-        // Calculate available width for subject to guarantee status is never truncated
-        let fixed_overhead = 16 + 3; // "      [Patch X] " + " | "
-        let status_len = status_str.chars().count();
-        let available_for_subject = limit
-            .saturating_sub(fixed_overhead)
-            .saturating_sub(status_len);
-
-        let target_subject_width = 30;
-        let subject_width = std::cmp::min(target_subject_width, available_for_subject);
-
-        let mut subject_padded = if p.subject.chars().count() > subject_width {
-            if subject_width > 3 {
-                let taken: String = p.subject.chars().take(subject_width - 3).collect();
-                format!("{}...", taken.trim_end())
-            } else {
-                "...".to_string()
-            }
-        } else {
-            p.subject.clone()
-        };
-
-        let padding_chars = subject_width.saturating_sub(subject_padded.chars().count());
-        if padding_chars > 0 {
-            subject_padded.push_str(&" ".repeat(padding_chars));
-        }
-
-        let mut tw = TruncatingWriter::new(limit);
-        let _ = tw.write_segment(out, &format!("      [Patch {}] ", idx), None, false);
-        let _ = tw.write_segment(out, &subject_padded, None, false);
-        let _ = tw.write_segment(out, " | ", None, false);
-
-        let (status_color, status_bold) = match &p.status {
-            PatchStatus::Queued => (None, false),
-            PatchStatus::PreScreening | PatchStatus::Planning => (Some(Color::Cyan), false),
-            PatchStatus::Reviewing => (Some(Color::Cyan), true),
-            PatchStatus::Finished => (Some(Color::Green), true),
-            PatchStatus::Failed => (Some(Color::Red), true),
-        };
-        let _ = tw.write_segment(out, &status_str, status_color, status_bold);
-
+        paint_progress_row(
+            state.project,
+            &format!("      [Patch {}] ", idx),
+            p,
+            top + lines_printed,
+            limit,
+            out,
+        )?;
+        lines_printed += 1;
+    }
+    if let Some(ref d) = state.design {
+        paint_progress_row(
+            state.project,
+            "      [Design]  ",
+            d,
+            top + lines_printed,
+            limit,
+            out,
+        )?;
         lines_printed += 1;
     }
 
-    let total_patches = state.patches.len();
+    let total_patches = state.patches.len() + usize::from(state.design.is_some());
     if total_patches > 0 {
         let total_stages: usize = state
             .patches
             .values()
+            .chain(state.design.iter())
             .map(|p| patch_stage_total(state.project, p))
             .sum();
-        let completed_stages: usize = state.patches.values().map(|p| p.completed_stages).sum();
+        let completed_stages: usize = state
+            .patches
+            .values()
+            .chain(state.design.iter())
+            .map(|p| p.completed_stages)
+            .sum();
         let width = 20;
         let (display_completed_stages, percent, filled) =
             calculate_progress_metrics(total_stages, completed_stages, width);
@@ -2848,6 +2847,58 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
         split = state.terminal_rows - state.reserved
     )?;
     out.flush()
+}
+
+fn paint_progress_row(
+    project: ProjectId,
+    prefix: &str,
+    p: &PatchState,
+    row: usize,
+    limit: usize,
+    out: &mut impl WriteColor,
+) -> std::io::Result<()> {
+    write!(out, "\x1b[{row};1H\x1b[2K")?;
+    let status_str = status_label(project, p, true);
+
+    let fixed_overhead = prefix.chars().count() + 3; // prefix + " | "
+    let status_len = status_str.chars().count();
+    let available_for_subject = limit
+        .saturating_sub(fixed_overhead)
+        .saturating_sub(status_len);
+
+    let target_subject_width = 30;
+    let subject_width = std::cmp::min(target_subject_width, available_for_subject);
+
+    let mut subject_padded = if p.subject.chars().count() > subject_width {
+        if subject_width > 3 {
+            let taken: String = p.subject.chars().take(subject_width - 3).collect();
+            format!("{}...", taken.trim_end())
+        } else {
+            "...".to_string()
+        }
+    } else {
+        p.subject.clone()
+    };
+
+    let padding_chars = subject_width.saturating_sub(subject_padded.chars().count());
+    if padding_chars > 0 {
+        subject_padded.push_str(&" ".repeat(padding_chars));
+    }
+
+    let mut tw = TruncatingWriter::new(limit);
+    let _ = tw.write_segment(out, prefix, None, false);
+    let _ = tw.write_segment(out, &subject_padded, None, false);
+    let _ = tw.write_segment(out, " | ", None, false);
+
+    let (status_color, status_bold) = match &p.status {
+        PatchStatus::Queued => (None, false),
+        PatchStatus::PreScreening | PatchStatus::Planning => (Some(Color::Cyan), false),
+        PatchStatus::Reviewing => (Some(Color::Cyan), true),
+        PatchStatus::Finished => (Some(Color::Green), true),
+        PatchStatus::Failed => (Some(Color::Red), true),
+    };
+    let _ = tw.write_segment(out, &status_str, status_color, status_bold);
+    Ok(())
 }
 
 /// Stages this patch will have run by the time it is finished.
@@ -2954,8 +3005,10 @@ async fn handle_review_command(
     let progress_state = std::sync::Arc::new(std::sync::Mutex::new(ProgressState {
         project,
         patches: std::collections::BTreeMap::new(),
+        design: None,
         total_turns: 0,
         last_status: std::collections::BTreeMap::new(),
+        last_design_status: None,
         terminal_width: display.size.1,
         terminal_rows: display.size.0,
         color_choice: display.color,
@@ -3096,6 +3149,75 @@ async fn handle_review_command(
                     render_progress(&mut s);
                 }
             }
+            ProgressEvent::DesignReviewQueued { subject } => {
+                s.design = Some(PatchState {
+                    index: 0,
+                    subject,
+                    status: PatchStatus::Queued,
+                    planned_stages: sashiko::workflows::design_assessment::DESIGN_STAGE_NAMES
+                        .iter()
+                        .map(|n| (*n).to_string())
+                        .collect(),
+                    active_stages: std::collections::BTreeSet::new(),
+                    completed_stages: 0,
+                    active_stage_turns: std::collections::HashMap::new(),
+                    preliminary_stages: 0,
+                });
+            }
+            ProgressEvent::DesignReviewAttempt {
+                attempt,
+                max_attempts,
+            } => {
+                if attempt > 1 {
+                    info!(
+                        "Series design assessment retry (attempt {}/{})",
+                        attempt, max_attempts
+                    );
+                    if let Some(ref mut d) = s.design {
+                        d.status = PatchStatus::Queued;
+                        d.active_stages.clear();
+                        d.active_stage_turns.clear();
+                        d.completed_stages = 0;
+                    }
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::DesignReviewStageStarted { stage } => {
+                if let Some(ref mut d) = s.design {
+                    d.status = PatchStatus::Reviewing;
+                    d.active_stages.insert(stage);
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::DesignReviewStageTurn { stage, turn, .. } => {
+                if let Some(ref mut d) = s.design {
+                    d.active_stage_turns.insert(stage, turn);
+                }
+                s.total_turns += 1;
+                render_progress(&mut s);
+            }
+            ProgressEvent::DesignReviewStageFinished { stage } => {
+                if let Some(ref mut d) = s.design {
+                    d.active_stages.remove(&stage);
+                    d.active_stage_turns.remove(&stage);
+                    d.completed_stages += 1;
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::DesignReviewFinished => {
+                if let Some(ref mut d) = s.design {
+                    d.status = PatchStatus::Finished;
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::DesignReviewFailed => {
+                if let Some(ref mut d) = s.design {
+                    d.status = PatchStatus::Failed;
+                    d.active_stages.clear();
+                    d.active_stage_turns.clear();
+                    render_progress(&mut s);
+                }
+            }
             ProgressEvent::ReviewComplete { partial } => {
                 // The region goes back before this prints, and the frame it was
                 // holding stays: it is the review's final state, a hundred per
@@ -3103,7 +3225,8 @@ async fn handle_review_command(
                 // it, start below the frame instead of inside it or over it.
                 finish_progress(&mut s);
                 eprintln!("Review {}", if partial { "incomplete" } else { "complete" });
-                let any_stage_completed = s.patches.values().any(|p| p.completed_stages > 0);
+                let any_stage_completed = s.patches.values().any(|p| p.completed_stages > 0)
+                    || s.design.as_ref().is_some_and(|d| d.completed_stages > 0);
                 if partial && cfg!(feature = "cache") && any_stage_completed {
                     eprintln!(
                         "Run it again with --resume to continue from the answers it recorded"
@@ -3961,6 +4084,102 @@ fn write_related_preexisting(out: &mut impl WriteColor, review: &Value) -> std::
     Ok(())
 }
 
+/// Prints the experimental series-level design assessment when `[review] design`
+/// or `--design` was enabled. Like pre-existing findings, design concerns are
+/// advisory and do not set a non-zero exit code.
+fn write_design_assessment(out: &mut impl WriteColor, review: &Value) -> std::io::Result<()> {
+    let Some(da) = review.get("design_assessment") else {
+        return Ok(());
+    };
+    let verdict = da
+        .get("verdict")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let verdict_color = match verdict {
+        "sound" => Color::Green,
+        "much_better_alternative" => Color::Red,
+        "concerns" => Color::Yellow,
+        _ => Color::Cyan,
+    };
+
+    write!(out, "\nDesign Assessment (experimental): ")?;
+    write_colored(out, verdict_color, verdict)?;
+    writeln!(out)?;
+
+    if let Some(problem) = da
+        .get("problem_statement")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        write_indented_field(out, "Problem", problem)?;
+    }
+
+    let concerns = da
+        .get("concerns")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if concerns.is_empty() {
+        if let Some(reason) = da
+            .get("verdict_reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            write_indented_field(out, "Note", reason)?;
+        }
+        return Ok(());
+    }
+
+    for item in concerns {
+        let sig = item
+            .get("significance")
+            .and_then(Value::as_str)
+            .unwrap_or("important")
+            .to_ascii_uppercase();
+        let cat = item
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or("other");
+        let summary = item
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let patch_prefix = item
+            .get("patch_index")
+            .and_then(Value::as_u64)
+            .map(|idx| format!("Patch {idx}: "))
+            .unwrap_or_default();
+
+        writeln!(out, "- [{sig} | {cat}] {patch_prefix}{summary}")?;
+        if let Some(req) = item
+            .get("request")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            write_indented_field(out, "Request", req)?;
+        }
+        if let Some(anchors) = item.get("anchors").and_then(Value::as_array) {
+            for anchor in anchors.iter().take(2) {
+                let kind = anchor.get("kind").and_then(Value::as_str).unwrap_or("");
+                let reference = anchor.get("ref").and_then(Value::as_str).unwrap_or("");
+                let quote = anchor
+                    .get("quote")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if !reference.is_empty() && !quote.is_empty() {
+                    writeln!(out, "    Anchor ({kind} {reference}): {quote}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_review_result(
     out: &mut impl WriteColor,
     result: &Value,
@@ -3992,13 +4211,21 @@ fn write_review_result(
         .and_then(Value::as_array)
         .is_some_and(|items| !items.is_empty());
     let has_preexisting = (report_preexisting && !preexisting_findings.is_empty()) || has_related;
+    let has_design_concerns = review
+        .get("design_assessment")
+        .and_then(|da| da.get("concerns"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty());
 
     if total == 0 && !result_has_error(result) {
-        write_colored(
-            out,
-            Color::Green,
-            no_patch_findings_message(has_preexisting),
-        )?;
+        let msg = if has_preexisting {
+            no_patch_findings_message(true)
+        } else if has_design_concerns {
+            "\nNo bug findings.\n"
+        } else {
+            no_patch_findings_message(false)
+        };
+        write_colored(out, Color::Green, msg)?;
     } else if total > 0 {
         writeln!(out, "\nFindings:")?;
         write_finding_counts(out, &counts)?;
@@ -4013,6 +4240,7 @@ fn write_review_result(
     }
 
     write_related_preexisting(out, review)?;
+    write_design_assessment(out, review)?;
 
     if let Some(inline) = result.get("inline_review").and_then(|v| v.as_str())
         && !inline.trim().is_empty()
@@ -5417,7 +5645,9 @@ mod tests {
         ProgressState {
             project: ProjectId::Linux,
             patches: std::collections::BTreeMap::new(),
+            design: None,
             last_status: std::collections::BTreeMap::new(),
+            last_design_status: None,
             total_turns: 0,
             terminal_width: display.size.1,
             terminal_rows: display.size.0,
@@ -6478,6 +6708,60 @@ mod tests {
 
         let cheap = Cli::parse_from(["sashiko", "review", "--cheap"]);
         assert!(cli_overrides(&cheap).cheap);
+        assert!(!cli_overrides(&cheap).design);
+
+        let design = Cli::parse_from(["sashiko", "review", "--design"]);
+        assert!(cli_overrides(&design).design);
+    }
+
+    #[test]
+    fn test_write_review_result_renders_design_assessment_section() {
+        let result = serde_json::json!({
+            "review": {
+                "findings": [],
+                "design_assessment": {
+                    "verdict": "concerns",
+                    "verdict_reason": "Module parameter adds driver-specific uAPI.",
+                    "problem_statement": "Device resets under heavy polling need configurable rx copybreak thresholds.",
+                    "comparison_summary": "Ethtool netlink already exposes rx-copybreak.",
+                    "concerns": [
+                        {
+                            "category": "interface",
+                            "patch_index": 1,
+                            "disposition": "stands",
+                            "significance": "important",
+                            "confidence": "high",
+                            "summary": "Exposes rx_copybreak via module_param instead of ethtool.",
+                            "request": "Implement tunable RX_COPYBREAK via ethtool_ops.",
+                            "quote": "module_param(rx_copybreak, uint, 0644);",
+                            "anchors": [
+                                {
+                                    "kind": "maintainer_note",
+                                    "ref": "netdev.md",
+                                    "quote": "Do not add new module parameters in network drivers."
+                                }
+                            ],
+                            "reasoning": "Violates netdev uAPI policy."
+                        }
+                    ],
+                    "all_candidates": [],
+                    "dismissed_concerns": []
+                }
+            },
+            "tokens_in": 100,
+            "tokens_out": 20,
+            "tokens_cached": 50
+        });
+
+        let mut buf = termcolor::Buffer::no_color();
+        write_review_result(&mut buf, &result, "HEAD", false).unwrap();
+        let text = String::from_utf8(buf.into_inner()).unwrap();
+        assert!(text.contains("\nNo bug findings.\n"));
+        assert!(text.contains("Design Assessment (experimental): concerns"));
+        assert!(text.contains("[IMPORTANT | interface] Patch 1: Exposes rx_copybreak"));
+        assert!(text.contains("Request: Implement tunable RX_COPYBREAK via ethtool_ops."));
+        assert!(text.contains("Anchor (maintainer_note netdev.md): Do not add new module"));
+        assert!(!result_has_high_or_critical_findings(&result));
     }
 
     #[test]
