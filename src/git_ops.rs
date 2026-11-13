@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::git_cmd::GitCommandExt;
 use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
@@ -26,6 +27,10 @@ use tracing::{debug, error, info, warn};
 mod apply_error;
 use apply_error::GitAmError;
 pub use apply_error::PatchApplyFailure;
+mod remote_writes;
+#[cfg(any(feature = "server", test))]
+pub(crate) use remote_writes::PendingWrites;
+use remote_writes::finish_write;
 
 pub const GIT_PROTOCOL_RESTRICTIONS: &[&str] = &[
     "-c",
@@ -70,6 +75,19 @@ impl GitWorktree {
         if commit_hash.is_empty() || commit_hash.starts_with('-') {
             return Err(anyhow!("Invalid commit revision: {}", commit_hash));
         }
+        let mut worktree = Self::allocate(repo_path, parent_dir).await?;
+        if let Err(error) = worktree.populate(commit_hash).await {
+            if let Err(cleanup_error) = worktree.remove().await {
+                warn!("Failed to clean up unpopulated worktree: {}", cleanup_error);
+            }
+            return Err(error);
+        }
+        Ok(worktree)
+    }
+
+    /// Allocate before starting cancellable Git operations so the caller can
+    /// retain ownership and explicitly clean up an interrupted checkout.
+    pub(crate) async fn allocate(repo_path: &Path, parent_dir: Option<&Path>) -> Result<Self> {
         let parent_owned = parent_dir.map(|p| p.to_path_buf());
         let temp_dir = tokio::task::spawn_blocking(move || -> Result<TempDir> {
             if let Some(parent) = parent_owned {
@@ -85,102 +103,67 @@ impl GitWorktree {
         })
         .await??;
         let path = temp_dir.path().to_path_buf();
-        // Wrap temp_dir in GitWorktree before the first await after creation so
-        // any error or cancellation during setup offloads TempDir cleanup (and
-        // worktree unregistration once registered) via Drop::drop.
-        let mut worktree = Self {
+        Ok(Self {
             dir: Some(temp_dir),
-            path: path.clone(),
+            path,
             repo_path: repo_path.to_path_buf(),
             is_managed: false,
-        };
+        })
+    }
 
-        debug!("Creating worktree at {:?}", path);
+    /// Register and populate a newly allocated worktree. On error or future
+    /// cancellation, the owner must call remove before reusing its resources.
+    pub(crate) async fn populate(&mut self, commit_hash: &str) -> Result<()> {
+        if commit_hash.is_empty() || commit_hash.starts_with('-') {
+            return Err(anyhow!("Invalid commit revision: {}", commit_hash));
+        }
+        debug!("Creating worktree at {:?}", self.path);
 
         // Split worktree creation into two phases:
         // 1) metadata update (under lock, fast)
         // 2) file checkout (no lock, parallelizable)
-        let add_res = {
+        let output = {
             let lock = get_worktree_lock();
             let _guard = lock.lock().await;
-            worktree.is_managed = true;
-            crate::git_cmd::in_dir_async(repo_path)
+            self.is_managed = true;
+            crate::git_cmd::in_dir_async(&self.repo_path)
                 .args(["-c", "safe.bareRepository=all"])
                 .arg("worktree")
                 .arg("add")
                 .arg("--detach")
                 .arg("--no-checkout")
                 .arg("--")
-                .arg(&path)
+                .arg(&self.path)
                 .arg(commit_hash)
-                .output()
-                .await
-        };
-
-        let output = match add_res {
-            Ok(out) => out,
-            Err(e) => {
-                if let Err(cleanup_err) = worktree.remove().await {
-                    warn!(
-                        "Failed to clean up worktree {:?} after worktree add I/O error: {}",
-                        path, cleanup_err
-                    );
-                }
-                return Err(e.into());
-            }
+                .output_cancellable()
+                .await?
         };
 
         if !output.status.success() {
-            let err = anyhow!(
+            return Err(anyhow!(
                 "Failed to create worktree: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
-            );
-            if let Err(cleanup_err) = worktree.remove().await {
-                warn!(
-                    "Failed to clean up worktree {:?} after failed add: {}",
-                    path, cleanup_err
-                );
-            }
-            return Err(err);
+            ));
         }
 
         // `commit_hash` is verified not to start with `-` above, and trailing
         // `--` prevents it from being interpreted as a pathspec on both
         // Git 2.39 and newer releases (`git reset` on Git 2.39 rejects
         // `--end-of-options`).
-        let output = match crate::git_cmd::in_dir_async(&path)
+        let output = crate::git_cmd::in_dir_async(&self.path)
             .args(["-c", "safe.bareRepository=all"])
             .args(["reset", "--hard", commit_hash, "--"])
-            .output()
-            .await
-        {
-            Ok(out) => out,
-            Err(e) => {
-                if let Err(cleanup_err) = worktree.remove().await {
-                    warn!(
-                        "Failed to clean up worktree {:?} after reset I/O error: {}",
-                        path, cleanup_err
-                    );
-                }
-                return Err(e.into());
-            }
-        };
+            .output_cancellable()
+            .await?;
 
         if !output.status.success() {
-            let err = anyhow!(
+            return Err(anyhow!(
                 "Failed to populate worktree: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
-            );
-            if let Err(cleanup_err) = worktree.remove().await {
-                warn!(
-                    "Failed to clean up worktree {:?} after failed reset: {}",
-                    path, cleanup_err
-                );
-            }
-            return Err(err);
+            ));
         }
 
-        Ok(worktree)
+        Ok(())
     }
 
     pub async fn new_scratch_clone(
@@ -311,19 +294,7 @@ impl GitWorktree {
         if three_way {
             cmd.arg("--3way");
         }
-        let mut child = cmd
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(patch_content.as_bytes()).await?;
-        }
-
-        Ok(child.wait_with_output().await?)
+        Ok(crate::git_cmd::output(&mut cmd, Some(patch_content.as_bytes())).await?)
     }
 
     async fn abort_git_am(&self) {
@@ -331,7 +302,7 @@ impl GitWorktree {
             .args(["-c", "safe.bareRepository=all"])
             .arg("am")
             .arg("--abort")
-            .output()
+            .output_cancellable()
             .await;
     }
 
@@ -439,7 +410,7 @@ impl GitWorktree {
         debug!("Resetting worktree to {}", ref_name);
         let output = crate::git_cmd::in_dir_async(&self.path)
             .args(["reset", "--hard", ref_name])
-            .output()
+            .output_cancellable()
             .await?;
 
         if !output.status.success() {
@@ -452,7 +423,7 @@ impl GitWorktree {
         // Also clean untracked files to be safe
         let clean_output = crate::git_cmd::in_dir_async(&self.path)
             .args(["clean", "-fdx"])
-            .output()
+            .output_cancellable()
             .await?;
 
         if !clean_output.status.success() {
@@ -465,8 +436,7 @@ impl GitWorktree {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub async fn remove(mut self) -> Result<()> {
+    pub(crate) async fn remove_directory(&mut self) -> Result<()> {
         // Delete the checkout directory on the blocking pool before acquiring
         // `get_worktree_lock()` so recursive filesystem deletion runs
         // concurrently without holding the global worktree mutex. Because
@@ -476,25 +446,28 @@ impl GitWorktree {
         // after `dir.close()` and only needs to unlink the small
         // `$GIT_DIR/worktrees/<name>` administrative entry.
         if let Some(dir) = self.dir.take() {
-            let path = self.path.clone();
-            match tokio::task::spawn_blocking(move || dir.close()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Ok(Err(e)) => {
-                    warn!(
-                        "Failed to remove temporary worktree directory {:?}: {}",
-                        path, e
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Blocking task removing temporary worktree directory {:?} failed: {}",
-                        path, e
-                    );
-                }
+            match tokio::task::spawn_blocking(move || dir.close()).await? {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Pruning metadata cannot make failed filesystem cleanup a
+                // success. Callers must not start another attempt after this.
+                Err(e) => return Err(e.into()),
             }
         }
-        if !std::mem::replace(&mut self.is_managed, false) {
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn remove(mut self) -> Result<()> {
+        let directory = self.remove_directory().await;
+        // Even a failed checkout deletion must not skip unregistering it.
+        // Preserve that failure so callers do not retry into another checkout.
+        let registration = self.remove_registration().await;
+        directory.and(registration)
+    }
+
+    async fn remove_registration(&mut self) -> Result<()> {
+        if !self.is_managed {
             return Ok(());
         }
         debug!("Removing worktree at {:?}", self.path);
@@ -508,7 +481,7 @@ impl GitWorktree {
                 .arg("-f")
                 .arg("--")
                 .arg(&self.path)
-                .output()
+                .output_cancellable()
                 .await?;
             if rm_out.status.success() {
                 rm_out
@@ -521,7 +494,7 @@ impl GitWorktree {
                 crate::git_cmd::in_dir_async(&self.repo_path)
                     .args(["-c", "safe.bareRepository=all"])
                     .args(["worktree", "prune"])
-                    .output()
+                    .output_cancellable()
                     .await?
             }
         };
@@ -532,6 +505,7 @@ impl GitWorktree {
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
+        self.is_managed = false;
         Ok(())
     }
 }
@@ -1164,7 +1138,185 @@ fn get_global_config_lock() -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
-fn get_worktree_lock() -> Arc<AsyncMutex<()>> {
+/// A cancelled caller must not kill a configuration writer while it owns
+/// config.lock. The task retains the mutex until Git finishes its atomic write.
+async fn finish_config_write<F, T>(write: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let guard = get_global_config_lock().lock_owned().await;
+    finish_write(async move {
+        let _guard = guard;
+        write.await
+    })
+    .await
+}
+
+struct RemoteConfigChanges {
+    just_added: bool,
+    refspecs_changed: bool,
+    url_changed: bool,
+}
+
+async fn configure_remote(
+    repo_path: &Path,
+    name: &str,
+    url: &str,
+    refspecs: Option<&[String]>,
+) -> Result<RemoteConfigChanges> {
+    let mut just_added = false;
+    let mut refspecs_changed = false;
+    let mut url_changed = false;
+
+    let config_url_key = format!("remote.{}.url", name);
+    let check = crate::git_cmd::in_dir_async(repo_path)
+        .args(["config", "--get", &config_url_key])
+        .output_cancellable()
+        .await?;
+
+    let old_url = if check.status.success() {
+        let current_url = String::from_utf8_lossy(&check.stdout).trim().to_string();
+        if !are_git_urls_equivalent(&current_url, url) {
+            url_changed = true;
+        }
+        Some(current_url)
+    } else {
+        just_added = true;
+        None
+    };
+
+    // Configure fetch refspecs in .git/config. If selective refspecs are
+    // provided, configure them; otherwise ensure the default wildcard refspec
+    // is restored. Compare against current configuration to avoid unnecessary
+    // writes across await points.
+    let config_key = format!("remote.{}.fetch", name);
+    let current_out = crate::git_cmd::in_dir_async(repo_path)
+        .args(["config", "--get-all", &config_key])
+        .output_cancellable()
+        .await?;
+
+    let current_refspecs: Vec<String> = if current_out.status.success() {
+        String::from_utf8_lossy(&current_out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let default_refspec = format!("+refs/heads/*:refs/remotes/{}/*", name);
+    let target_refspecs: Option<Vec<&str>> = match refspecs {
+        Some(specs) if !specs.is_empty() => Some(specs.iter().map(String::as_str).collect()),
+        Some(_) => Some(vec![default_refspec.as_str()]),
+        None => {
+            if current_refspecs.is_empty() {
+                Some(vec![default_refspec.as_str()])
+            } else {
+                None
+            }
+        }
+    };
+
+    if let Some(target) = target_refspecs.as_ref() {
+        let target_refspecs_owned: Vec<String> = target.iter().map(|s| (*s).to_string()).collect();
+
+        if current_refspecs != target_refspecs_owned {
+            refspecs_changed = true;
+        }
+    }
+
+    // Delete old tracking refs and clear timestamps BEFORE updating config,
+    // so that a failure during deletion or task cancellation leaves the old config
+    // intact rather than leaving stale refs paired with new config.
+    // For 'origin', never delete tracking refs (e.g. mirror clone transitioning to upstream).
+    if (url_changed || refspecs_changed) && name != "origin" {
+        delete_remote_tracking_refs(repo_path, name).await?;
+    }
+    if url_changed || refspecs_changed {
+        let timestamp_dir = repo_path.join(".sashiko/fetch_timestamps");
+        let _ = tokio::fs::remove_file(timestamp_dir.join(name)).await;
+        let _ = tokio::fs::remove_file(timestamp_dir.join(format!("{}.fail", name))).await;
+    }
+
+    if just_added {
+        info!("Adding remote {} ({})", name, redact_secret(url));
+        let add = crate::git_cmd::in_dir_async(repo_path)
+            .args(["remote", "add", name, url])
+            .output_cancellable()
+            .await?;
+        if !add.status.success() {
+            let stderr = String::from_utf8_lossy(&add.stderr);
+            if !stderr.contains("already exists") {
+                return Err(anyhow!(
+                    "Failed to add remote: {}",
+                    redact_secret(stderr.trim())
+                ));
+            }
+        }
+    } else if url_changed {
+        if let Some(ref current_url) = old_url {
+            info!(
+                "Updating remote URL for {} from {} to {}",
+                name,
+                redact_secret(current_url),
+                redact_secret(url)
+            );
+        }
+        let update = crate::git_cmd::in_dir_async(repo_path)
+            .args(["remote", "set-url", name, url])
+            .output_cancellable()
+            .await?;
+        if !update.status.success() {
+            return Err(anyhow!(
+                "Failed to update remote URL: {}",
+                redact_secret(String::from_utf8_lossy(&update.stderr).trim())
+            ));
+        }
+    }
+
+    if refspecs_changed && let Some(target) = target_refspecs {
+        let unset = crate::git_cmd::in_dir_async(repo_path)
+            .args(["config", "--unset-all", &config_key])
+            .output_cancellable()
+            .await?;
+        if !unset.status.success()
+            && unset.status.code() != Some(5)
+            && unset.status.code() != Some(1)
+        {
+            let stderr = String::from_utf8_lossy(&unset.stderr);
+            return Err(anyhow!(
+                "Failed to reset fetch refspecs for {}: {}",
+                name,
+                redact_secret(stderr.trim())
+            ));
+        }
+        for spec in &target {
+            let add_spec = crate::git_cmd::in_dir_async(repo_path)
+                .args(["config", "--add", &config_key, spec])
+                .output_cancellable()
+                .await?;
+            if !add_spec.status.success() {
+                let stderr = String::from_utf8_lossy(&add_spec.stderr);
+                return Err(anyhow!(
+                    "Failed to configure fetch refspec for {}: {}",
+                    name,
+                    redact_secret(stderr.trim())
+                ));
+            }
+        }
+    }
+
+    Ok(RemoteConfigChanges {
+        just_added,
+        refspecs_changed,
+        url_changed,
+    })
+}
+
+pub(crate) fn get_worktree_lock() -> Arc<AsyncMutex<()>> {
     static WORKTREE_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
     WORKTREE_LOCK
         .get_or_init(|| Arc::new(AsyncMutex::new(())))
@@ -1225,11 +1377,11 @@ async fn fetch_remote(
     args: &[&str],
     timeout: std::time::Duration,
 ) -> std::result::Result<(), String> {
-    let fetch_future = crate::git_cmd::in_dir_async(repo_path)
+    let mut command = crate::git_cmd::in_dir_async(repo_path);
+    let fetch_future = command
         .args(GIT_PROTOCOL_RESTRICTIONS)
         .args(args)
-        .kill_on_drop(true)
-        .output();
+        .output_cancellable();
 
     match tokio::time::timeout(timeout, fetch_future).await {
         Ok(Ok(fetch)) => {
@@ -1458,7 +1610,7 @@ async fn delete_remote_tracking_refs(repo_path: &Path, name: &str) -> Result<()>
     let prefix = format!("refs/remotes/{}/", name);
     let out = crate::git_cmd::in_dir_async(repo_path)
         .args(["for-each-ref", "--format=%(refname)", &prefix])
-        .output()
+        .output_cancellable()
         .await?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1477,18 +1629,9 @@ async fn delete_remote_tracking_refs(repo_path: &Path, name: &str) -> Result<()>
         }
     }
     if !stdin_input.is_empty() {
-        use tokio::io::AsyncWriteExt;
-        let mut child = crate::git_cmd::in_dir_async(repo_path)
-            .args(["update-ref", "--stdin", "--no-deref"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(stdin_input.as_bytes()).await;
-            let _ = stdin.shutdown().await;
-        }
-        let output = child.wait_with_output().await?;
+        let mut command = crate::git_cmd::in_dir_async(repo_path);
+        command.args(["update-ref", "--stdin", "--no-deref"]);
+        let output = crate::git_cmd::output(&mut command, Some(stdin_input.as_bytes())).await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!(
@@ -1558,7 +1701,13 @@ pub async fn refresh_remote_with_policy(
     refspecs: Option<&[String]>,
 ) -> Result<FetchOutcome> {
     // 1. Validate repo_path to prevent git from traversing up to parent repos
-    if !repo_path.join(".git").exists() && !repo_path.join("HEAD").exists() {
+    if !tokio::fs::try_exists(repo_path.join(".git"))
+        .await
+        .unwrap_or(false)
+        && !tokio::fs::try_exists(repo_path.join("HEAD"))
+            .await
+            .unwrap_or(false)
+    {
         return Err(anyhow::anyhow!(
             "{} is not a valid git repository. Run `sashiko repo sync` to clone it.",
             repo_path.display()
@@ -1566,174 +1715,43 @@ pub async fn refresh_remote_with_policy(
     }
 
     // acquire remote-specific lock
-    let lock = get_remote_lock(name);
-    let _guard = lock.lock().await;
+    let remote_guard = Arc::new(get_remote_lock(name).lock_owned().await);
 
-    let mut just_added = false;
-    let mut refspecs_changed = false;
-    let mut url_changed = false;
-
-    // 2. Check if exists (requires global config lock)
-    {
-        let global_lock = get_global_config_lock();
-        let _global_guard = global_lock.lock().await;
-
-        let config_url_key = format!("remote.{}.url", name);
-        let check = crate::git_cmd::in_dir_async(repo_path)
-            .args(["config", "--get", &config_url_key])
-            .output()
-            .await?;
-
-        let old_url = if check.status.success() {
-            let current_url = String::from_utf8_lossy(&check.stdout).trim().to_string();
-            if !are_git_urls_equivalent(&current_url, url) {
-                url_changed = true;
-            }
-            Some(current_url)
-        } else {
-            just_added = true;
-            None
-        };
-
-        // Configure fetch refspecs in .git/config. If selective refspecs are
-        // provided, configure them; otherwise ensure the default wildcard refspec
-        // is restored. Compare against current configuration to avoid unnecessary
-        // writes across await points.
-        let config_key = format!("remote.{}.fetch", name);
-        let current_out = crate::git_cmd::in_dir_async(repo_path)
-            .args(["config", "--get-all", &config_key])
-            .output()
-            .await?;
-
-        let current_refspecs: Vec<String> = if current_out.status.success() {
-            String::from_utf8_lossy(&current_out.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let default_refspec = format!("+refs/heads/*:refs/remotes/{}/*", name);
-        let target_refspecs: Option<Vec<&str>> = match refspecs {
-            Some(specs) if !specs.is_empty() => Some(specs.iter().map(String::as_str).collect()),
-            Some(_) => Some(vec![default_refspec.as_str()]),
-            None => {
-                if current_refspecs.is_empty() {
-                    Some(vec![default_refspec.as_str()])
-                } else {
-                    None
-                }
-            }
-        };
-
-        if let Some(target) = target_refspecs.as_ref() {
-            let target_refspecs_owned: Vec<String> =
-                target.iter().map(|s| (*s).to_string()).collect();
-
-            if current_refspecs != target_refspecs_owned {
-                refspecs_changed = true;
-            }
-        }
-
-        // Delete old tracking refs and clear timestamps BEFORE updating config,
-        // so that a failure during deletion or task cancellation leaves the old config
-        // intact rather than leaving stale refs paired with new config.
-        // For 'origin', never delete tracking refs (e.g. mirror clone transitioning to upstream).
-        if (url_changed || refspecs_changed) && name != "origin" {
-            delete_remote_tracking_refs(repo_path, name).await?;
-        }
-        if url_changed || refspecs_changed {
-            let timestamp_dir = repo_path.join(".sashiko/fetch_timestamps");
-            let _ = std::fs::remove_file(timestamp_dir.join(name));
-            let _ = std::fs::remove_file(timestamp_dir.join(format!("{}.fail", name)));
-        }
-
-        if just_added {
-            info!("Adding remote {} ({})", name, redact_secret(url));
-            let add = crate::git_cmd::in_dir_async(repo_path)
-                .args(["remote", "add", name, url])
-                .output()
-                .await?;
-            if !add.status.success() {
-                let stderr = String::from_utf8_lossy(&add.stderr);
-                if !stderr.contains("already exists") {
-                    return Err(anyhow!(
-                        "Failed to add remote: {}",
-                        redact_secret(stderr.trim())
-                    ));
-                }
-            }
-        } else if url_changed {
-            if let Some(ref current_url) = old_url {
-                info!(
-                    "Updating remote URL for {} from {} to {}",
-                    name,
-                    redact_secret(current_url),
-                    redact_secret(url)
-                );
-            }
-            let update = crate::git_cmd::in_dir_async(repo_path)
-                .args(["remote", "set-url", name, url])
-                .output()
-                .await?;
-            if !update.status.success() {
-                return Err(anyhow!(
-                    "Failed to update remote URL: {}",
-                    redact_secret(String::from_utf8_lossy(&update.stderr).trim())
-                ));
-            }
-        }
-
-        if refspecs_changed && let Some(target) = target_refspecs {
-            let unset = crate::git_cmd::in_dir_async(repo_path)
-                .args(["config", "--unset-all", &config_key])
-                .output()
-                .await?;
-            if !unset.status.success()
-                && unset.status.code() != Some(5)
-                && unset.status.code() != Some(1)
-            {
-                let stderr = String::from_utf8_lossy(&unset.stderr);
-                return Err(anyhow!(
-                    "Failed to reset fetch refspecs for {}: {}",
-                    name,
-                    redact_secret(stderr.trim())
-                ));
-            }
-            for spec in &target {
-                let add_spec = crate::git_cmd::in_dir_async(repo_path)
-                    .args(["config", "--add", &config_key, spec])
-                    .output()
-                    .await?;
-                if !add_spec.status.success() {
-                    let stderr = String::from_utf8_lossy(&add_spec.stderr);
-                    return Err(anyhow!(
-                        "Failed to configure fetch refspec for {}: {}",
-                        name,
-                        redact_secret(stderr.trim())
-                    ));
-                }
-            }
-        }
-    } // Release global lock
+    // 2. Finish configuration changes even if the preparation is cancelled.
+    let (config_repo, config_name, config_url) =
+        (repo_path.to_owned(), name.to_owned(), url.to_owned());
+    let config_refspecs = refspecs.map(<[String]>::to_vec);
+    let config_guard = remote_guard.clone();
+    let RemoteConfigChanges {
+        just_added,
+        refspecs_changed,
+        url_changed,
+    } = finish_config_write(async move {
+        let _guard = config_guard;
+        configure_remote(
+            &config_repo,
+            &config_name,
+            &config_url,
+            config_refspecs.as_deref(),
+        )
+        .await
+    })
+    .await?;
 
     // 3. Lazy Fetch Check
     let timestamp_dir = repo_path.join(".sashiko/fetch_timestamps");
-    if !timestamp_dir.exists() {
-        std::fs::create_dir_all(&timestamp_dir)?;
-    }
+    tokio::fs::create_dir_all(&timestamp_dir).await?;
     let timestamp_file = timestamp_dir.join(name);
     let fail_file = timestamp_dir.join(format!("{}.fail", name));
 
-    let age = std::fs::metadata(&timestamp_file)
+    let age = tokio::fs::metadata(&timestamp_file)
+        .await
         .and_then(|m| m.modified())
         .ok()
         .and_then(|m| std::time::SystemTime::now().duration_since(m).ok());
 
-    let fail_age = std::fs::metadata(&fail_file)
+    let fail_age = tokio::fs::metadata(&fail_file)
+        .await
         .and_then(|m| m.modified())
         .ok()
         .and_then(|m| std::time::SystemTime::now().duration_since(m).ok());
@@ -1875,12 +1893,31 @@ pub async fn refresh_remote_with_policy(
             Err(message) => error_msg = message,
         }
 
-        if !fetch_ok {
-            // Record failure timestamp for backoff
-            if let Ok(file) = std::fs::File::create(&fail_file) {
-                let _ = file.set_len(0);
+        // A retry can skip fetching as soon as refs exist. Own all post-fetch
+        // finalization so cancellation cannot skip HEAD initialization. Keep
+        // bounded network discovery outside the global configuration lock,
+        // and retain remote serialization through the filesystem writes.
+        let (completion_repo, completion_name) = (repo_path.to_owned(), name.to_owned());
+        finish_write(async move {
+            let _guard = remote_guard.clone();
+            if fetch_ok {
+                let head = remote_writes::discover_head(&completion_repo, &completion_name).await;
+                finish_config_write(async move {
+                    let _guard = remote_guard;
+                    remote_writes::update_refs(&completion_repo, &completion_name, head.as_deref())
+                        .await
+                })
+                .await?;
+                let _ = tokio::fs::remove_file(&fail_file).await;
+                let _ = tokio::fs::write(&timestamp_file, []).await;
+            } else {
+                let _ = tokio::fs::write(&fail_file, []).await;
             }
+            Ok(())
+        })
+        .await?;
 
+        if !fetch_ok {
             if can_fallback {
                 warn!(
                     "Fetch failed for {} ({}), but local ref exists and is fresh enough (age: {:?}). Falling back to local ref.",
@@ -1890,87 +1927,6 @@ pub async fn refresh_remote_with_policy(
             } else {
                 error!("{}", error_msg);
                 return Err(anyhow::anyhow!(error_msg));
-            }
-        } else {
-            // Clear any failure file and update success timestamp
-            let _ = std::fs::remove_file(&fail_file);
-            if let Ok(file) = std::fs::File::create(&timestamp_file) {
-                let _ = file.set_len(0);
-            }
-        }
-    }
-
-    // Ensure HEAD is set correctly (if we fetched successfully)
-    if should_fetch && fetch_ok {
-        // Requires global config lock
-        let global_lock = get_global_config_lock();
-        let _global_guard = global_lock.lock().await;
-
-        let set_head = crate::git_cmd::in_dir_async(repo_path)
-            .args(GIT_PROTOCOL_RESTRICTIONS)
-            .args(["remote", "set-head", name, "--auto"])
-            .output()
-            .await?;
-
-        if !set_head.status.success() {
-            // Try common default branch names if --auto could not determine HEAD
-            let mut head_resolved = false;
-            for branch in ["master", "main", "for-next", "for-linus"] {
-                let branch_ref = format!("refs/remotes/{}/{}", name, branch);
-                let branch_exists = crate::git_cmd::in_dir_async(repo_path)
-                    .args(["show-ref", "--verify", "-q", &branch_ref])
-                    .status()
-                    .await
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-
-                if branch_exists {
-                    let set_explicit = crate::git_cmd::in_dir_async(repo_path)
-                        .args(GIT_PROTOCOL_RESTRICTIONS)
-                        .args(["remote", "set-head", name, branch])
-                        .output()
-                        .await?;
-                    if set_explicit.status.success() {
-                        head_resolved = true;
-                        break;
-                    }
-                }
-            }
-
-            if !head_resolved {
-                tracing::debug!(
-                    "Could not set default HEAD for remote {}: {}",
-                    name,
-                    redact_secret(String::from_utf8_lossy(&set_head.stderr).trim())
-                );
-            }
-        }
-
-        // If we fetched 'origin', also keep local tracking branches (master/main) in sync
-        // with origin so local branches do not become stale over time.
-        if name == "origin" {
-            for default_branch in ["master", "main"] {
-                let remote_ref = format!("refs/remotes/origin/{}", default_branch);
-                let local_ref = format!("refs/heads/{}", default_branch);
-                let remote_exists = crate::git_cmd::in_dir_async(repo_path)
-                    .args(["show-ref", "--verify", "-q", &remote_ref])
-                    .status()
-                    .await
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                let local_exists = crate::git_cmd::in_dir_async(repo_path)
-                    .args(["show-ref", "--verify", "-q", &local_ref])
-                    .status()
-                    .await
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-
-                if remote_exists && local_exists {
-                    let _ = crate::git_cmd::in_dir_async(repo_path)
-                        .args(["update-ref", &local_ref, &remote_ref])
-                        .output()
-                        .await;
-                }
             }
         }
     }
@@ -2011,7 +1967,7 @@ pub async fn get_commit_hash(path: &Path, ref_name: &str) -> Result<String> {
     let output = crate::git_cmd::in_dir_async(path)
         .args(["rev-parse", "--verify", "--end-of-options"])
         .arg(format!("{ref_name}^{{commit}}"))
-        .output()
+        .output_cancellable()
         .await?;
 
     if output.status.success() {
@@ -2297,6 +2253,432 @@ mod tests {
         run_test_git(repo.path(), &["add", "value.txt"]).await?;
         run_test_git(repo.path(), &["commit", "-q", "-s", "-m", "base"]).await?;
         Ok(repo)
+    }
+
+    #[tokio::test]
+    async fn allocated_worktree_survives_cancelled_population() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        let parent = tempfile::tempdir()?;
+        let mut worktree = GitWorktree::allocate(repo.path(), Some(parent.path())).await?;
+        let path = worktree.path.clone();
+        let lock = get_worktree_lock();
+        let guard = lock.lock().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                worktree.populate("HEAD"),
+            )
+            .await
+            .is_err()
+        );
+        drop(guard);
+        assert!(path.exists(), "the caller still owns the checkout");
+        worktree.remove().await?;
+        assert!(!path.exists());
+
+        let mut next = GitWorktree::allocate(repo.path(), Some(parent.path())).await?;
+        assert_ne!(path, next.path);
+        next.populate("HEAD").await?;
+        assert_eq!(
+            std::fs::read_to_string(next.path.join("value.txt"))?,
+            "base\n"
+        );
+        next.remove().await?;
+        assert_eq!(std::fs::read_dir(parent.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn allocated_worktree_cleans_up_population_error() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        let parent = tempfile::tempdir()?;
+        let mut worktree = GitWorktree::allocate(repo.path(), Some(parent.path())).await?;
+        let path = worktree.path.clone();
+        assert!(worktree.populate("missing-ref").await.is_err());
+        worktree.remove().await?;
+        assert!(!path.exists());
+        let registered = run_test_git(repo.path(), &["worktree", "list", "--porcelain"]).await?;
+        assert!(!registered.contains(&path.to_string_lossy().to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_directory_cleanup_is_not_reported_as_success() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        let parent = tempfile::tempdir()?;
+        for managed in [false, true] {
+            let mut worktree = GitWorktree::allocate(repo.path(), Some(parent.path())).await?;
+            if managed {
+                worktree.populate("HEAD").await?;
+            }
+            let path = worktree.path.clone();
+            // A non-directory deterministically makes TempDir::close fail,
+            // including when the test is run with elevated filesystem access.
+            std::fs::remove_dir_all(&path)?;
+            std::fs::write(&path, b"not a directory")?;
+            assert!(worktree.remove().await.is_err());
+            assert!(path.is_file());
+            let registered =
+                run_test_git(repo.path(), &["worktree", "list", "--porcelain"]).await?;
+            assert!(!registered.contains(&path.to_string_lossy().to_string()));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_config_writer_retains_its_lock_until_finished() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let path = repo.path().join("config.lock");
+        let writer_path = path.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finish, released) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(finish_config_write(async move {
+            tokio::fs::write(&writer_path, b"in progress").await?;
+            started.send(()).unwrap();
+            released.await?;
+            tokio::fs::remove_file(writer_path).await?;
+            Ok(())
+        }));
+        ready.await?;
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+        assert!(path.exists());
+        let lock = get_global_config_lock();
+        assert!(lock.try_lock().is_err());
+        finish.send(()).unwrap();
+        let _guard = tokio::time::timeout(std::time::Duration::from_secs(60), lock.lock()).await?;
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_remote_reconfiguration_finishes_under_owned_locks() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        let name = "cancelled-reconfiguration";
+        let reference = format!("refs/remotes/{name}/main");
+        run_test_git(repo.path(), &["remote", "add", name, "./old-upstream"]).await?;
+        run_test_git(repo.path(), &["update-ref", &reference, "HEAD"]).await?;
+        let timestamp_dir = repo.path().join(".sashiko/fetch_timestamps");
+        std::fs::create_dir_all(&timestamp_dir)?;
+        std::fs::write(timestamp_dir.join(name), [])?;
+        std::fs::write(timestamp_dir.join(format!("{name}.fail")), [])?;
+
+        let ready = repo.path().join("writer-ready");
+        let release = repo.path().join("writer-release");
+        crate::test_support::write_executable_script(
+            &repo.path().join(".git/hooks/reference-transaction"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = prepared ]; then\n  touch '{}'\n  while [ ! -f '{}' ]; do sleep .01; done\nfi\nexit 0\n",
+                ready.display(),
+                release.display()
+            ),
+        );
+
+        let pending = PendingWrites::default();
+        let caller_pending = pending.clone();
+        let remote_lock = get_remote_lock(name);
+        let path = repo.path().to_owned();
+        let refspec = format!("+refs/heads/topic:refs/remotes/{name}/topic");
+        let caller_refspec = refspec.clone();
+        let caller = tokio::spawn(async move {
+            caller_pending
+                .scope(crate::git_cmd::with_isolated_processes(
+                    refresh_remote_with_policy(
+                        &path,
+                        name,
+                        "./new-upstream",
+                        RemoteFetchPolicy::IfMissing,
+                        Some(&[caller_refspec]),
+                    ),
+                ))
+                .await
+        });
+        let started = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        caller.abort();
+        let result = caller.await;
+        let remote_still_locked = remote_lock.try_lock().is_err();
+        std::fs::write(release, [])?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), pending.finish()).await??;
+        started?;
+        assert!(result.unwrap_err().is_cancelled());
+        assert!(remote_still_locked);
+        assert!(remote_lock.try_lock().is_ok());
+        assert!(get_commit_hash(repo.path(), &reference).await.is_err());
+        assert_eq!(
+            run_test_git(
+                repo.path(),
+                &["config", "--get", &format!("remote.{name}.url")]
+            )
+            .await?,
+            "./new-upstream"
+        );
+        assert_eq!(
+            run_test_git(
+                repo.path(),
+                &["config", "--get-all", &format!("remote.{name}.fetch")]
+            )
+            .await?,
+            refspec
+        );
+        assert!(!timestamp_dir.join(name).exists());
+        assert!(!timestamp_dir.join(format!("{name}.fail")).exists());
+        assert!(!repo.path().join(".git/config.lock").exists());
+        assert!(!repo.path().join(format!(".git/{reference}.lock")).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_fetch_finishes_head_initialization_before_retry() -> Result<()> {
+        let upstream = commit_resolution_repo().await?;
+        run_test_git(upstream.path(), &["branch", "-m", "topic"]).await?;
+        let repo = commit_resolution_repo().await?;
+        let name = "cancelled-head-finalization";
+        let url = upstream.path().to_str().unwrap().to_owned();
+        run_test_git(repo.path(), &["remote", "add", name, &url]).await?;
+        run_test_git(
+            repo.path(),
+            &[
+                "config",
+                &format!("remote.{name}.followRemoteHEAD"),
+                "never",
+            ],
+        )
+        .await?;
+        let upload_pack = repo.path().join("upload-pack");
+        let fetched = repo.path().join("upload-started");
+        let ready = repo.path().join("discovery-ready");
+        let release = repo.path().join("discovery-release");
+        crate::test_support::write_executable_script(
+            &upload_pack,
+            &format!(
+                "#!/bin/sh\nif [ -f '{}' ]; then\n  touch '{}'\n  while [ ! -f '{}' ]; do sleep .01; done\nelse\n  touch '{}'\nfi\nexec git-upload-pack \"$@\"\n",
+                fetched.display(),
+                ready.display(),
+                release.display(),
+                fetched.display()
+            ),
+        );
+        run_test_git(
+            repo.path(),
+            &[
+                "config",
+                &format!("remote.{name}.uploadpack"),
+                upload_pack.to_str().unwrap(),
+            ],
+        )
+        .await?;
+
+        let pending = PendingWrites::default();
+        let caller_pending = pending.clone();
+        let remote_lock = get_remote_lock(name);
+        let path = repo.path().to_owned();
+        let caller_url = url.clone();
+        let caller = tokio::spawn(async move {
+            caller_pending
+                .scope(crate::git_cmd::with_isolated_processes(
+                    ensure_remote_if_missing(&path, name, &caller_url, None),
+                ))
+                .await
+        });
+        let started = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        caller.abort();
+        let result = caller.await;
+        let remote_still_locked = remote_lock.try_lock().is_err();
+        std::fs::write(release, [])?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), pending.finish()).await??;
+        started?;
+        assert!(result.unwrap_err().is_cancelled());
+        assert!(remote_still_locked);
+        assert_eq!(
+            run_test_git(
+                repo.path(),
+                &["symbolic-ref", &format!("refs/remotes/{name}/HEAD")]
+            )
+            .await?,
+            format!("refs/remotes/{name}/topic")
+        );
+        // The completed initialization lets the retry use local refs without
+        // another fetch or HEAD advertisement, even with no working transport.
+        std::fs::remove_file(upload_pack)?;
+        assert!(matches!(
+            refresh_remote_with_policy(repo.path(), name, &url, RemoteFetchPolicy::IfMissing, None)
+                .await?,
+            FetchOutcome::Skipped
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_discovery_preserves_custom_heads_and_common_fallbacks() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let upstream = commit_resolution_repo().await?;
+        run_test_git(upstream.path(), &["branch", "-m", "topic"]).await?;
+        run_test_git(upstream.path(), &["branch", "main"]).await?;
+        let branch = crate::git_cmd::in_dir_async(upstream.path())
+            .arg("branch")
+            .arg(std::ffi::OsStr::from_bytes(b"unrelated-\xff"))
+            .output()
+            .await?;
+        assert!(branch.status.success());
+        let repo = commit_resolution_repo().await?;
+        ensure_remote(
+            repo.path(),
+            "custom-head",
+            upstream.path().to_str().unwrap(),
+            true,
+        )
+        .await?;
+        assert_eq!(
+            run_test_git(
+                repo.path(),
+                &["symbolic-ref", "refs/remotes/custom-head/HEAD"]
+            )
+            .await?,
+            "refs/remotes/custom-head/topic"
+        );
+        let changed = crate::git_cmd::in_dir_async(upstream.path())
+            .args(["symbolic-ref", "HEAD"])
+            .arg(std::ffi::OsStr::from_bytes(b"refs/heads/unrelated-\xff"))
+            .output()
+            .await?;
+        assert!(changed.status.success());
+        ensure_remote(
+            repo.path(),
+            "custom-head",
+            upstream.path().to_str().unwrap(),
+            true,
+        )
+        .await?;
+        let head = crate::git_cmd::in_dir_async(repo.path())
+            .args(["symbolic-ref", "refs/remotes/custom-head/HEAD"])
+            .output()
+            .await?;
+        assert!(head.status.success());
+        assert_eq!(head.stdout, b"refs/remotes/custom-head/unrelated-\xff\n");
+        run_test_git(
+            repo.path(),
+            &["update-ref", "refs/remotes/custom-head/main", "HEAD"],
+        )
+        .await?;
+        // Missing advertised branches retain the existing common-name fallback.
+        remote_writes::update_refs(
+            repo.path(),
+            "custom-head",
+            Some(std::ffi::OsStr::new("missing")),
+        )
+        .await?;
+        assert_eq!(
+            run_test_git(
+                repo.path(),
+                &["symbolic-ref", "refs/remotes/custom-head/HEAD"]
+            )
+            .await?,
+            "refs/remotes/custom-head/main"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_shared_ref_writes_finish_without_stranding_locks() -> Result<()> {
+        for reference in ["refs/heads/master", "refs/heads/main"] {
+            let repo = commit_resolution_repo().await?;
+            run_test_git(repo.path(), &["remote", "add", "origin", "."]).await?;
+            run_test_git(repo.path(), &["branch", "master"]).await?;
+            run_test_git(
+                repo.path(),
+                &["config", "remote.origin.followRemoteHEAD", "always"],
+            )
+            .await?;
+            run_test_git(
+                repo.path(),
+                &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            )
+            .await?;
+            run_test_git(
+                repo.path(),
+                &["update-ref", "refs/remotes/origin/master", "HEAD"],
+            )
+            .await?;
+            let ready = repo.path().join("writer-ready");
+            let release = repo.path().join("writer-release");
+            crate::test_support::write_executable_script(
+                &repo.path().join(".git/hooks/reference-transaction"),
+                &format!(
+                    "#!/bin/sh\nif [ \"$1\" = prepared ] && grep -q ' {reference}$'; then\n  printf '%s' \"$PPID\" > '{}'\n  while [ ! -f '{}' ]; do sleep .01; done\nfi\nexit 0\n",
+                    ready.display(),
+                    release.display()
+                ),
+            );
+            let pending = PendingWrites::default();
+            let caller_pending = pending.clone();
+            let remote_lock = get_remote_lock("cancelled-shared-ref-test");
+            let guard = remote_lock.clone().lock_owned().await;
+            let path = repo.path().to_owned();
+            let caller = tokio::spawn(async move {
+                caller_pending
+                    .scope(crate::git_cmd::with_isolated_processes(
+                        finish_config_write(async move {
+                            let _guard = guard;
+                            remote_writes::update_refs(
+                                &path,
+                                "origin",
+                                Some(std::ffi::OsStr::new("main")),
+                            )
+                            .await
+                        }),
+                    ))
+                    .await
+            });
+            let pgid = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    if let Some(pgid) = std::fs::read_to_string(&ready)
+                        .ok()
+                        .and_then(|value| value.parse::<i32>().ok())
+                    {
+                        break pgid;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            let lockfile = repo.path().join(format!(".git/{reference}.lock"));
+            assert!(lockfile.exists());
+            assert!(remote_lock.try_lock().is_err());
+            assert!(
+                crate::process_group::SHARED_WRITER_GROUPS
+                    .lock()
+                    .unwrap()
+                    .contains(&pgid)
+            );
+            if reference == "refs/heads/main" {
+                // Shutdown must let Git's signal handlers remove its locks,
+                // including when a reference hook prevents normal completion.
+                crate::process_group::terminate_group(pgid);
+            } else {
+                std::fs::write(release, [])?;
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), pending.finish()).await??;
+            assert!(!lockfile.exists());
+            assert!(!repo.path().join(".git/config.lock").exists());
+            assert!(remote_lock.try_lock().is_ok());
+            assert_eq!(
+                run_test_git(repo.path(), &["symbolic-ref", "refs/remotes/origin/HEAD"]).await?,
+                "refs/remotes/origin/main"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]

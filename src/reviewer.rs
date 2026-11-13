@@ -21,6 +21,7 @@ use crate::baseline::{BaselineRegistry, BaselineResolution, CommitId, extract_fi
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity};
 use crate::email_policy::EmailPolicyConfig;
 use crate::email_router::{Action as EmailAction, EmailRouter};
+use crate::git_cmd::GitCommandExt;
 use crate::git_ops::{GitWorktree, PatchApplyFailure, get_commit_hash};
 use crate::prerequisites::{PrerequisitePatch, resolve_prerequisites_from_lore};
 use crate::settings::Settings;
@@ -41,6 +42,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
+
+mod preparation;
+use preparation::{Preparation, Stage as PreparationStage};
 
 #[derive(Clone, Debug, Default)]
 pub struct WorkerSubprocessOverrides {
@@ -923,125 +927,13 @@ impl Reviewer {
             }
         }
 
-        let diffs = match ctx.db.get_patch_diffs(patchset_id).await {
-            Ok(d) => d,
-            Err(e) => {
-                error!("Failed to fetch diffs for {}: {}", patchset_id, e);
-                Self::mark_patchset_failed_unless_cancelled(
-                    &ctx.db,
-                    patchset_id,
-                    &format!("Failed to fetch patch diffs: {e:#}"),
-                )
-                .await;
-                return;
-            }
+        let Some(prepared) = preparation::prepare_patchset(&ctx, &patchset).await else {
+            return;
         };
-
-        // patches_json for input payload (contains all patches)
-        let patches_json: Vec<_> = diffs
-            .iter()
-            .map(|(_id, idx, diff, subj, auth, date, msg_id)| {
-                let is_sha = msg_id.len() == 40 && msg_id.chars().all(|c| c.is_ascii_hexdigit());
-                json!({
-                    "index": idx,
-                    "diff": diff,
-                    "subject": subj,
-                    "author": auth,
-                    "date": date,
-                    "message_id": msg_id,
-                    "commit_id": if is_sha { Some(msg_id) } else { None }
-                })
-            })
-            .collect();
-
-        // Determine Baseline Candidates and check patchset size limits
-        let mut all_files = Vec::new();
-
-        for p in patches_json.iter() {
-            if let Some(diff_str) = p["diff"].as_str() {
-                let files = extract_files_from_diff(diff_str);
-                all_files.extend(files);
-            }
-        }
-
-        all_files.sort();
-        all_files.dedup();
-
-        let body_msg_id = patchset
-            .message_id
-            .as_deref()
-            .or_else(|| patches_json.first().and_then(|p| p["message_id"].as_str()));
-        let body = match body_msg_id {
-            Some(mid) => match ctx.db.get_message_body(mid).await {
-                Ok(b) => b,
-                Err(e) => {
-                    error!(
-                        "Failed to fetch message body {} for patchset {}: {}",
-                        mid, patchset_id, e
-                    );
-                    Self::mark_patchset_failed_unless_cancelled(
-                        &ctx.db,
-                        patchset_id,
-                        &format!("Failed to fetch message body {mid}: {e:#}"),
-                    )
-                    .await;
-                    return;
-                }
-            },
-            None => None,
-        };
-        let subject = patchset.subject.clone().unwrap_or("Unknown".to_string());
-        // A baseline recorded before ingestion required an object ID may be
-        // anything, and anything else resolves nothing, so the series is
-        // reviewed on the candidates it would have had without it.
-        let forced_baseline = match patchset.baseline_id {
-            Some(bid) => match ctx.db.get_baseline_commit(bid).await {
-                Ok(Some(commit)) => CommitId::parse(&commit).or_else(|| {
-                    warn!(
-                        "Ignoring forced baseline of patchset {}: not a commit ID",
-                        patchset_id
-                    );
-                    None
-                }),
-                Ok(None) => None,
-                Err(e) => {
-                    error!(
-                        "Failed to fetch baseline {} for patchset {}: {}",
-                        bid, patchset_id, e
-                    );
-                    Self::mark_patchset_failed_unless_cancelled(
-                        &ctx.db,
-                        patchset_id,
-                        &format!("Failed to fetch baseline {bid}: {e:#}"),
-                    )
-                    .await;
-                    return;
-                }
-            },
-            None => None,
-        };
-        let candidates = if let Some(commit) = forced_baseline {
-            debug!(
-                "Using forced baseline commit {} from ingestion for patchset {}",
-                commit, patchset_id
-            );
-            vec![BaselineResolution::Commit(commit)]
-        } else {
-            ctx.baseline_registry
-                .resolve_candidates(&all_files, &subject, body.as_deref())
-                .await
-        };
-
-        // 1. Find a working baseline (apply series)
-        let (found_baseline, patch_commits, logs) = Self::prepare_baseline_worktree(
-            &ctx,
-            patchset_id,
-            &candidates,
-            &diffs,
-            patchset.message_id.as_deref(),
-            body.as_deref(),
-        )
-        .await;
+        let diffs = prepared.diffs;
+        let found_baseline = prepared.found_baseline;
+        let patch_commits = prepared.patch_commits;
+        let logs = prepared.logs;
 
         let prompts_hash = Some(env!("GIT_HASH"));
 
@@ -1736,24 +1628,24 @@ impl Reviewer {
                 .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
                 .args(args)
                 .kill_on_drop(true)
-                .output(),
+                .output_cancellable(),
         )
         .await;
     }
 
-    async fn prepare_baseline_worktree(
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_baseline_attempts(
         ctx: &ReviewContext,
         patchset_id: i64,
         candidates: &[BaselineResolution],
         diffs: &[(i64, i64, String, String, String, i64, String)],
         target_message_id: Option<&str>,
         prerequisite_metadata: Option<&str>,
-    ) -> (
-        Option<(i64, GitWorktree, String)>,
-        HashMap<i64, String>,
-        String,
-    ) {
-        let mut attempts: Vec<BaselineAttempt> = Vec::new();
+        preparation: &mut Preparation,
+    ) -> Result<(Option<(i64, String)>, HashMap<i64, String>)> {
+        preparation
+            .stage(PreparationStage::ResolvingPrerequisites)
+            .await;
         let prerequisites = match resolve_prerequisites_from_lore(
             &ctx.db,
             patchset_id,
@@ -1769,7 +1661,7 @@ impl Reviewer {
                     redact_secret(&format!("{e:#}")),
                 );
                 warn!("{}", message.trim());
-                attempts.push(BaselineAttempt {
+                preparation.attempts.push(BaselineAttempt {
                     baseline: "prerequisites".to_string(),
                     status: "Failed".to_string(),
                     log: message,
@@ -1794,6 +1686,9 @@ impl Reviewer {
             // Check remote: ensure configured locally without blocking on routine network sync.
             // If local refs exist, ensure_remote_if_missing skips network I/O completely,
             // relying on background sync workers to keep them fresh.
+            if matches!(candidate, BaselineResolution::RemoteTarget { .. }) {
+                preparation.stage(PreparationStage::FetchingBaseline).await;
+            }
             if let BaselineResolution::RemoteTarget { url, name, .. } = candidate
                 && let Err(e) =
                     crate::git_ops::ensure_remote_if_missing(&repo_path, name, url, None).await
@@ -1801,7 +1696,7 @@ impl Reviewer {
                 let msg = format!("Failed to set up remote {}: {}\n", name, e);
                 current_log.push_str(&msg);
                 error!("{}", msg.trim());
-                attempts.push(BaselineAttempt {
+                preparation.attempts.push(BaselineAttempt {
                     baseline: baseline_ref.clone(),
                     status: current_status,
                     log: current_log,
@@ -1810,10 +1705,12 @@ impl Reviewer {
             }
 
             // Resolve SHA
+            preparation.stage(PreparationStage::ResolvingCommit).await;
             let resolved = match get_commit_hash(&repo_path, &baseline_ref).await {
                 Ok(sha) => Ok(sha),
                 Err(e) => match candidate {
                     BaselineResolution::Commit(sha_str) => {
+                        preparation.stage(PreparationStage::FetchingBaseline).await;
                         Self::fetch_missing_commit(&repo_path, mainline_remote, sha_str, candidates)
                             .await
                     }
@@ -1825,7 +1722,7 @@ impl Reviewer {
                 Err(e) => {
                     let msg = format!("Failed to resolve baseline ref {}: {}\n", baseline_ref, e);
                     current_log.push_str(&msg);
-                    attempts.push(BaselineAttempt {
+                    preparation.attempts.push(BaselineAttempt {
                         baseline: baseline_ref.clone(),
                         status: current_status,
                         log: current_log,
@@ -1834,6 +1731,7 @@ impl Reviewer {
                 }
             };
 
+            preparation.stage(PreparationStage::CheckingBaseline).await;
             if !deferred
                 && ctx
                     .baseline_registry
@@ -1846,7 +1744,7 @@ impl Reviewer {
                     baseline_sha,
                     ctx.baseline_registry.mainline_ref()
                 ));
-                attempts.push(BaselineAttempt {
+                preparation.attempts.push(BaselineAttempt {
                     baseline: format!("{} ({})", baseline_ref, baseline_sha),
                     status: "Skipped".to_string(),
                     log: current_log,
@@ -1864,25 +1762,27 @@ impl Reviewer {
             current_log = format!("Trying baseline: {}\n", baseline_display);
 
             // Worktree
-            let worktree = match GitWorktree::new(
-                &repo_path,
-                &baseline_sha,
-                ctx.settings.review.worktree_dir.as_deref().map(Path::new),
-            )
-            .await
+            preparation.stage(PreparationStage::CreatingWorktree).await;
+            preparation.worktree = Some(
+                GitWorktree::allocate(
+                    &repo_path,
+                    ctx.settings.review.worktree_dir.as_deref().map(Path::new),
+                )
+                .await?,
+            );
+            if let Some(worktree) = preparation.worktree.as_mut()
+                && let Err(e) = worktree.populate(&baseline_sha).await
             {
-                Ok(wt) => wt,
-                Err(e) => {
-                    let msg = format!("Failed to create worktree: {}\n", e);
-                    current_log.push_str(&msg);
-                    attempts.push(BaselineAttempt {
-                        baseline: baseline_ref.clone(),
-                        status: current_status,
-                        log: current_log,
-                    });
-                    continue;
-                }
-            };
+                let msg = format!("Failed to create worktree: {}\n", e);
+                current_log.push_str(&msg);
+                preparation.attempts.push(BaselineAttempt {
+                    baseline: baseline_ref.clone(),
+                    status: current_status,
+                    log: current_log,
+                });
+                preparation.cleanup().await?;
+                continue;
+            }
 
             // Apply patches
             let mut patch_commits = HashMap::new();
@@ -1890,8 +1790,11 @@ impl Reviewer {
             let mut apply_logs = String::new();
             let mut review_baseline_sha = baseline_sha.clone();
 
+            preparation
+                .stage(PreparationStage::ApplyingPrerequisites)
+                .await;
             match Self::apply_prerequisites(
-                &worktree,
+                preparation.worktree()?,
                 &prerequisites,
                 &baseline_sha,
                 &mut apply_logs,
@@ -1905,12 +1808,16 @@ impl Reviewer {
                 }
             }
 
+            if !application_failed && !diffs.is_empty() {
+                preparation.stage(PreparationStage::ApplyingPatches).await;
+            }
             for (i, (patch_id, index, diff, subject, author, date_ts, msg_id)) in
                 diffs.iter().enumerate()
             {
                 if application_failed {
                     break;
                 }
+                let worktree = preparation.worktree()?;
                 let mut applied = false;
                 let mut fast_path_taken = false;
 
@@ -1995,63 +1902,36 @@ impl Reviewer {
                 current_log.push_str("Application successful.\n");
                 current_status = "Applied".to_string();
 
-                attempts.push(BaselineAttempt {
+                preparation.attempts.push(BaselineAttempt {
                     baseline: baseline_display.clone(),
                     status: current_status,
                     log: current_log,
                 });
 
                 // Create baseline in DB
-                let baseline_id = {
-                    let (repo_url, branch) = match candidate {
-                        BaselineResolution::RemoteTarget { url, .. } => {
-                            (Some(url.as_str()), Some(baseline_ref.as_str()))
-                        }
-                        _ => (None, Some(baseline_ref.as_str())),
-                    };
-                    ctx.db
-                        .create_baseline(repo_url, branch, Some(&baseline_sha))
-                        .await
-                        .ok() // If fail, we just proceed. Better to have it.
+                preparation.stage(PreparationStage::RecordingBaseline).await;
+                let (repo_url, branch) = match candidate {
+                    BaselineResolution::RemoteTarget { url, .. } => {
+                        (Some(url.as_str()), Some(baseline_ref.as_str()))
+                    }
+                    _ => (None, Some(baseline_ref.as_str())),
                 };
-
-                // Serialize attempts to JSON
-                let logs_json = serde_json::to_string(&attempts).unwrap_or_default();
-
-                if let Some(bid) = baseline_id {
-                    debug!(
-                        "Baseline found for patchset {}: {} ({} attempts)",
-                        patchset_id,
-                        candidate.as_str(),
-                        attempts.len()
-                    );
-                    return (
-                        Some((bid, worktree, review_baseline_sha)),
-                        patch_commits,
-                        logs_json,
-                    );
-                }
-                // Fallback if DB insert fails, though unlikely
-                // We still return success but maybe log error.
-                // We do not continue loop as application succeeded.
-                // Just return success without ID.
-                // This path is tricky. Let's assume ID creation works or we fail this attempt.
-                // If we fail, we clean up.
-                // For now, let's treat it as success but maybe missing ID is fatal for `Some` return.
-                // But `create_baseline` returns Result<i64>.
-                // If it fails, we can't associate baseline.
-                // Let's count it as failure.
-                // Re-push attempt with failure.
-                // Actually we already pushed "Applied".
-                // Let's modify the last attempt status if we can't save to DB.
-                if let Some(last) = attempts.last_mut() {
-                    last.status = "DB Error".to_string();
-                    last.log.push_str("Failed to record baseline in DB.\n");
-                }
+                // A persistence failure is not a patch application failure.
+                let baseline_id = ctx
+                    .db
+                    .create_baseline(repo_url, branch, Some(&baseline_sha))
+                    .await?;
+                debug!(
+                    "Baseline found for patchset {}: {} ({} attempts)",
+                    patchset_id,
+                    candidate.as_str(),
+                    preparation.attempts.len()
+                );
+                return Ok((Some((baseline_id, review_baseline_sha)), patch_commits));
             } else {
                 current_log.push_str(&apply_logs);
                 current_log.push_str("Application failed.\n");
-                attempts.push(BaselineAttempt {
+                preparation.attempts.push(BaselineAttempt {
                     baseline: baseline_display.clone(),
                     status: current_status,
                     log: current_log,
@@ -2059,11 +1939,39 @@ impl Reviewer {
             }
 
             // Clean up failed worktree
-            let _ = worktree.remove().await;
+            preparation.cleanup().await?;
         }
 
-        let logs_json = serde_json::to_string(&attempts).unwrap_or_default();
-        (None, HashMap::new(), logs_json)
+        Ok((None, HashMap::new()))
+    }
+
+    #[cfg(test)]
+    async fn prepare_baseline_worktree(
+        ctx: &ReviewContext,
+        patchset_id: i64,
+        candidates: &[BaselineResolution],
+        diffs: &[preparation::PatchDiff],
+        target_message_id: Option<&str>,
+        prerequisite_metadata: Option<&str>,
+    ) -> (
+        Option<(i64, GitWorktree, String)>,
+        HashMap<i64, String>,
+        String,
+    ) {
+        let mut state = Preparation::unreported(ctx, patchset_id);
+        let (baseline, commits) = Self::prepare_baseline_attempts(
+            ctx,
+            patchset_id,
+            candidates,
+            diffs,
+            target_message_id,
+            prerequisite_metadata,
+            &mut state,
+        )
+        .await
+        .expect("test baseline preparation");
+        let baseline = baseline.map(|(id, sha)| (id, state.worktree.take().unwrap(), sha));
+        (baseline, commits, state.logs())
     }
 
     /// How many times a review completion or notification write is attempted
@@ -5889,7 +5797,7 @@ fi
     }
 
     /// Runs git in a test directory and fails the test if it fails.
-    fn git_in(dir: &Path, args: &[&str]) {
+    pub(super) fn git_in(dir: &Path, args: &[&str]) {
         let out = crate::git_cmd::in_dir(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {:?} failed: {:?}", args, out);
     }
@@ -5941,7 +5849,7 @@ fi
         repo
     }
 
-    async fn stale_head_context(root: &Path, repo: &Path) -> Result<ReviewContext> {
+    pub(super) async fn stale_head_context(root: &Path, repo: &Path) -> Result<ReviewContext> {
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
         settings.git.repository_path = repo.to_str().unwrap().to_string();
