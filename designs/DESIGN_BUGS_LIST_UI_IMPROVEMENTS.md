@@ -34,7 +34,8 @@ flowchart LR
   - In `list_bugs`, recognize `assignee=me` (case-insensitively), resolving to `principal.email()` when non-empty and returning `400 Bad Request` when no email identity is present (such as unauthenticated `testing_mode`).
 - **Web UI (`static/index.html`)**:
   - Harden `getAuthEmail()` so it falls back to the JWT `sub` claim or `config.user.email` if `sashiko_session_email` is missing or holds the legacy `'Authorized User'` placeholder.
-  - Render `<button type="button" id="btnMyBugs">` next to `#bugAssigneeFilter` inside `#bugFilters`:
+  - Expand `#searchInput` across the primary `.controls` row with a visual separator before `[Patchsets | Messages | Bugs]`, and render `#bugFilters` on its own edge-aligned `.bug-filters-bar` toolbar row beneath `.controls` so controls never wrap awkwardly across lines.
+  - Group `#bugAssigneeFilter` and `<button type="button" id="btnMyBugs">` inside `.assignee-filter-group` aligned to the right edge of `#bugFilters`:
     - Marked `.active` (`aria-pressed="true"`) whenever `state.bugAssignee` matches `getAuthEmail()` case-insensitively (or `me`).
     - Clicking toggles `state.bugAssignee` between `getAuthEmail()` and `''`, updates `#bugAssigneeFilter`, resets `state.currentPage = 1`, and refreshes the list without resetting status/severity/subsystem filters.
     - Disabled with an explanatory `title` when no signed-in email is available, and synchronized in `updateAuthUI()`, `setBugFilter()`, and `clearSearch()`.

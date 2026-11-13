@@ -125,13 +125,33 @@
         /* Navigation & Controls */
         .nav { margin-bottom: 20px; min-height: 28px; display: flex; align-items: center; }
         .nav a { cursor: pointer; }
-        .controls { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; align-items: center; }
+        .controls { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; align-items: center; }
         .controls input[type="text"] { background: var(--input-bg); color: var(--text); padding: 4px 8px; font-family: inherit; font-size: inherit; border: 1px solid var(--border); border-radius: 3px; }
-        #searchInput { flex: 1; min-width: 140px; max-width: 360px; }
+        #searchInput { flex: 1; min-width: 180px; }
         .controls button, button, select { padding: 4px 10px; font-family: inherit; font-size: inherit; border: 1px solid var(--border); background: var(--btn-bg); color: var(--text); border-radius: 3px; cursor: pointer; }
         .controls button:hover, button:hover, select:hover { background: var(--hover); }
         .controls button:disabled, button:disabled, select:disabled { opacity: 0.5; cursor: not-allowed; }
         .controls button.active { background: var(--selected); font-weight: bold; }
+        .mode-switcher { display: flex; gap: 8px; margin-left: auto; padding-left: 8px; border-left: 1px solid var(--border); }
+        .bug-filters-bar {
+            display: flex; gap: 8px; margin-bottom: 12px; padding: 6px 8px;
+            background: var(--th-bg); border: 1px solid var(--border-light); border-radius: 4px;
+            flex-wrap: wrap; align-items: center; position: relative;
+        }
+        .bug-filter-label {
+            font-size: 11px; font-weight: 600; color: var(--text-muted);
+            text-transform: uppercase; letter-spacing: 0.04em; padding: 0 2px; user-select: none;
+        }
+        .assignee-filter-group {
+            display: inline-flex; align-items: center; gap: 6px; margin-left: auto;
+        }
+        .assignee-filter-group input[type="text"] {
+            background: var(--input-bg); color: var(--text); padding: 4px 8px; font-family: inherit; font-size: inherit;
+            border: 1px solid var(--border); border-radius: 3px; width: 165px;
+        }
+        #btnMyBugs.active {
+            background: var(--bugs-btn-bg); color: var(--bugs-btn-text); border-color: var(--bugs-btn-border); font-weight: 600;
+        }
 
         /* Bugs Button & Bug Copy Link / Markdown Highlight & Popup Hint */
         #btn-bugs, #btn-copy-bug-link, #btn-bug-markdown {
@@ -1777,57 +1797,61 @@
                         <option value="">All Lists</option>
                         ${listOptions}
                     </select>
-                    <div id="bugFilters" style="display: ${state.listMode === 'bugs' ? 'flex' : 'none'}; gap: 8px; align-items: center; position: relative;">
-                        <div id="subsystemDropdown" class="subsystem-dropdown">
-                            <button type="button" id="subsystemDropdownBtn" class="subsystem-dropdown-btn" onclick="toggleSubsystemDropdown(event)">
-                                ${getSubsystemButtonLabel()}
-                            </button>
-                            <div id="subsystemDropdownMenu" class="subsystem-dropdown-menu" style="display: none;" onclick="event.stopPropagation()">
-                                <div class="subsystem-dropdown-header">
-                                    <input type="text" id="subsystemSearchInput" placeholder="Filter subsystems..." oninput="filterSubsystemsList(this.value)">
-                                    <div class="subsystem-dropdown-actions">
-                                        <a href="javascript:void(0)" onclick="selectAllSubsystems(true)">Select All</a>
-                                        <span>|</span>
-                                        <a href="javascript:void(0)" onclick="selectAllSubsystems(false)">Clear</a>
-                                    </div>
-                                </div>
-                                <div id="subsystemItemsContainer" class="subsystem-items-container"></div>
-                            </div>
-                        </div>
-                        <select id="bugSeveritySelector" onchange="setBugFilter('min_severity', this.value)">
-                            <option value="" ${!state.bugMinSeverity ? 'selected' : ''}>All Severities</option>
-                            <option value="Critical" ${state.bugMinSeverity === 'Critical' ? 'selected' : ''}>Critical</option>
-                            <option value="High" ${state.bugMinSeverity === 'High' ? 'selected' : ''}>High+</option>
-                            <option value="Medium" ${state.bugMinSeverity === 'Medium' ? 'selected' : ''}>Medium+</option>
-                            <option value="Low" ${state.bugMinSeverity === 'Low' ? 'selected' : ''}>Low+</option>
-                        </select>
-                        <select id="bugSecuritySelector" onchange="setBugFilter('security', this.value)">
-                            <option value="" ${!state.bugSecurityFilter ? 'selected' : ''}>All Security</option>
-                            <option value="score:9.0" ${state.bugSecurityFilter === 'score:9.0' ? 'selected' : ''}>CVSS Critical (9.0+)</option>
-                            <option value="score:7.0" ${state.bugSecurityFilter === 'score:7.0' ? 'selected' : ''}>CVSS High+ (7.0+)</option>
-                            <option value="score:4.0" ${state.bugSecurityFilter === 'score:4.0' ? 'selected' : ''}>CVSS Medium+ (4.0+)</option>
-                            <option value="class:vulnerability" ${state.bugSecurityFilter === 'class:vulnerability' ? 'selected' : ''}>Vulnerabilities</option>
-                            <option value="class:not_security,hardening" ${state.bugSecurityFilter === 'class:not_security,hardening' ? 'selected' : ''}>Non-Security / Hardening</option>
-                        </select>
-                        <select id="bugStatusSelector" onchange="setBugFilter('lifecycle_status', this.value)">
-                            <option value="" ${!state.bugLifecycleStatus ? 'selected' : ''}>All Statuses</option>
-                            <option value="new" ${state.bugLifecycleStatus === 'new' ? 'selected' : ''}>New</option>
-                            <option value="open" ${state.bugLifecycleStatus === 'open' ? 'selected' : ''}>Open</option>
-                            <option value="duplicate" ${state.bugLifecycleStatus === 'duplicate' ? 'selected' : ''}>Duplicate</option>
-                            <option value="dismissed" ${state.bugLifecycleStatus === 'dismissed' ? 'selected' : ''}>Dismissed</option>
-                            <option value="fixed" ${state.bugLifecycleStatus === 'fixed' ? 'selected' : ''}>Fixed</option>
-                            <option value="closed" ${state.bugLifecycleStatus === 'closed' ? 'selected' : ''}>Closed</option>
-                        </select>
-                        <button type="button" id="btnMyBugs" onclick="toggleMyBugs()" class="${isMyBugsActive() ? 'active' : ''}" aria-pressed="${isMyBugsActive() ? 'true' : 'false'}" ${getAuthEmail() ? '' : 'disabled'} title="${escapeHtml(getMyBugsTitle())}">My Bugs</button>
-                        <input type="text" id="bugAssigneeFilter" placeholder="Assignee (or none)" value="${escapeHtml(state.bugAssignee)}" style="width: 160px;" onchange="setBugFilter('assignee', this.value)">
-                    </div>
                     <input type="text" id="searchInput" placeholder="${state.listMode === 'bugs' ? 'Search bugs (problem, file, commit)' : 'Search (subject, author:, date:)'}" value="${escapeHtml(state.searchQuery)}">
                     <button onclick="triggerSearch()">Search</button>
                     <button onclick="clearSearch()">Clear</button>
-                    <div style="display: flex; gap: 8px; margin-left: auto;">
+                    <div class="mode-switcher">
                         <button id="btn-patchsets" onclick="setListMode('patchsets')" class="${state.listMode === 'patchsets' ? 'active' : ''}">Patchsets</button>
                         <button id="btn-messages" onclick="setListMode('messages')" class="${state.listMode === 'messages' ? 'active' : ''}">Messages</button>
                         <button id="btn-bugs" style="${config && config.bugs_enabled === false ? 'display: none;' : ''}" onclick="setListMode('bugs')" class="${state.listMode === 'bugs' ? 'active' : ''}" data-hint="Pre-existing bugs discovered during review (available to maintainers)" aria-label="Bugs — Pre-existing bugs discovered during review (available to maintainers)">Bugs</button>
+                    </div>
+                </div>
+                <div id="bugFilters" class="bug-filters-bar" style="display: ${state.listMode === 'bugs' ? 'flex' : 'none'};">
+                    <span class="bug-filter-label">Filters</span>
+                    <div id="subsystemDropdown" class="subsystem-dropdown">
+                        <button type="button" id="subsystemDropdownBtn" class="subsystem-dropdown-btn" onclick="toggleSubsystemDropdown(event)">
+                            ${getSubsystemButtonLabel()}
+                        </button>
+                        <div id="subsystemDropdownMenu" class="subsystem-dropdown-menu" style="display: none;" onclick="event.stopPropagation()">
+                            <div class="subsystem-dropdown-header">
+                                <input type="text" id="subsystemSearchInput" placeholder="Filter subsystems..." oninput="filterSubsystemsList(this.value)">
+                                <div class="subsystem-dropdown-actions">
+                                    <a href="javascript:void(0)" onclick="selectAllSubsystems(true)">Select All</a>
+                                    <span>|</span>
+                                    <a href="javascript:void(0)" onclick="selectAllSubsystems(false)">Clear</a>
+                                </div>
+                            </div>
+                            <div id="subsystemItemsContainer" class="subsystem-items-container"></div>
+                        </div>
+                    </div>
+                    <select id="bugSeveritySelector" onchange="setBugFilter('min_severity', this.value)">
+                        <option value="" ${!state.bugMinSeverity ? 'selected' : ''}>All Severities</option>
+                        <option value="Critical" ${state.bugMinSeverity === 'Critical' ? 'selected' : ''}>Critical</option>
+                        <option value="High" ${state.bugMinSeverity === 'High' ? 'selected' : ''}>High+</option>
+                        <option value="Medium" ${state.bugMinSeverity === 'Medium' ? 'selected' : ''}>Medium+</option>
+                        <option value="Low" ${state.bugMinSeverity === 'Low' ? 'selected' : ''}>Low+</option>
+                    </select>
+                    <select id="bugSecuritySelector" onchange="setBugFilter('security', this.value)">
+                        <option value="" ${!state.bugSecurityFilter ? 'selected' : ''}>All Security</option>
+                        <option value="score:9.0" ${state.bugSecurityFilter === 'score:9.0' ? 'selected' : ''}>CVSS Critical (9.0+)</option>
+                        <option value="score:7.0" ${state.bugSecurityFilter === 'score:7.0' ? 'selected' : ''}>CVSS High+ (7.0+)</option>
+                        <option value="score:4.0" ${state.bugSecurityFilter === 'score:4.0' ? 'selected' : ''}>CVSS Medium+ (4.0+)</option>
+                        <option value="class:vulnerability" ${state.bugSecurityFilter === 'class:vulnerability' ? 'selected' : ''}>Vulnerabilities</option>
+                        <option value="class:not_security,hardening" ${state.bugSecurityFilter === 'class:not_security,hardening' ? 'selected' : ''}>Non-Security</option>
+                    </select>
+                    <select id="bugStatusSelector" onchange="setBugFilter('lifecycle_status', this.value)">
+                        <option value="" ${!state.bugLifecycleStatus ? 'selected' : ''}>All Statuses</option>
+                        <option value="new" ${state.bugLifecycleStatus === 'new' ? 'selected' : ''}>New</option>
+                        <option value="open" ${state.bugLifecycleStatus === 'open' ? 'selected' : ''}>Open</option>
+                        <option value="duplicate" ${state.bugLifecycleStatus === 'duplicate' ? 'selected' : ''}>Duplicate</option>
+                        <option value="dismissed" ${state.bugLifecycleStatus === 'dismissed' ? 'selected' : ''}>Dismissed</option>
+                        <option value="fixed" ${state.bugLifecycleStatus === 'fixed' ? 'selected' : ''}>Fixed</option>
+                        <option value="closed" ${state.bugLifecycleStatus === 'closed' ? 'selected' : ''}>Closed</option>
+                    </select>
+                    <div class="assignee-filter-group">
+                        <span class="bug-filter-label">Assignee</span>
+                        <input type="text" id="bugAssigneeFilter" placeholder="Email or none" value="${escapeHtml(state.bugAssignee)}" onchange="setBugFilter('assignee', this.value)">
+                        <button type="button" id="btnMyBugs" onclick="toggleMyBugs()" class="${isMyBugsActive() ? 'active' : ''}" aria-pressed="${isMyBugsActive() ? 'true' : 'false'}" ${getAuthEmail() ? '' : 'disabled'} title="${escapeHtml(getMyBugsTitle())}">My Bugs</button>
                     </div>
                 </div>
                 <table id="dataTable"><thead id="tableHead"></thead><tbody id="tableBody"></tbody></table>
