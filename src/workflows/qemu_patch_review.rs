@@ -271,7 +271,8 @@ Your task is to (1) deduplicate overlapping items across both lists while preser
 1. Group `concerns` and `dismissed_concerns` that refer to the same underlying root cause AND the same function/lifecycle phase.
 2. Do NOT merge a setup/realize bug with a teardown/unrealize bug in a separate function; if an input concern combines setup and teardown bugs across separate functions, split them into separate items. Similarly, do NOT merge distinct races or bugs in separate functions/handlers, or bugs on different resources/fields (e.g., a leaked MemoryRegion reference vs. a lost vmstate field) even within the same function—either keep them as separate items or explicitly name ALL distinct resources, functions, and failure mechanisms in the item's title/description and explanation fields (`problem` and `severity_explanation` for `findings`, or `description` and `concern_arguments` for `inconclusive_concerns`).
 3. SPECIFICITY REQUIREMENT: When merging overlapping items, preserve and consolidate the most specific details: exact function names, file paths, line numbers when known, and ALL distinct triggering conditions, callers, consequences, and racing tasks/handlers mentioned across the merged items. When a missing cleanup, unchecked error, or incomplete error-path unwind causes both an immediate failure and a downstream resource/state impact (e.g., a leaked device reference, a device left half-realized, or a guest-visible state corruption), explicitly state BOTH consequences in the item's explanation (`severity_explanation` for `findings`, or `concern_arguments` for `inconclusive_concerns`). Preserve and merge the `locations` arrays. Do not invent line numbers; use `null` when unknown.
-4. Set `"preexisting": false` whenever the patch introduces the bug or newly exposes, triggers, or makes reachable a latent defect that could not be triggered before the patch (for example, adding a new caller that violates a helper's preconditions or adding an operation before an existing error path that does not clean it up). Set `"preexisting": true` when the problem already existed at `Baseline SHA` (before the commit/series) and was already triggerable before the patch—even if it lives in the same function, caller/callee, or error path modified by the patch without fixing it. Never dismiss a real bug into `dismissed_concerns` or drop it merely because it is pre-existing; validate it in `findings` or route it to `inconclusive_concerns` with `"preexisting": true`. (If a bug was introduced by an earlier commit in the same series after `Baseline SHA`, it is not pre-existing at `Baseline SHA`.)
+4. Classify each root cause exactly once: never place the same root cause in both `findings` and `inconclusive_concerns`. When some items about one root cause are well-justified and others are contested, merge them into a single item and classify that item.
+5. Set `"preexisting": false` whenever the patch introduces the bug or newly exposes, triggers, or makes reachable a latent defect that could not be triggered before the patch (for example, adding a new caller that violates a helper's preconditions or adding an operation before an existing error path that does not clean it up). Set `"preexisting": true` when the problem already existed at `Baseline SHA` (before the commit/series) and was already triggerable before the patch—even if it lives in the same function, caller/callee, or error path modified by the patch without fixing it. Never dismiss a real bug into `dismissed_concerns` or drop it merely because it is pre-existing; validate it in `findings` or route it to `inconclusive_concerns` with `"preexisting": true`. (If a bug was introduced by an earlier commit in the same series after `Baseline SHA`, it is not pre-existing at `Baseline SHA`.)
 
 ### Step 2: Classification Rules (1: Well-Justified vs. 2: Inconclusive)
 Classify every consolidated item using these strict signal rules. **Repetition is NOT justification: multiple overlapping items are never enough for Category 1 (1a or 1b) unless their reasoning is backed by specific, concrete code proof.**
@@ -310,7 +311,8 @@ For each candidate in `inconclusive_concerns`, use the available Git and file to
 6. **SERIES VALIDATION & PRE-EXISTING BUG RULE:** If other patches in this series are provided in the context, check whether each candidate is resolved, wired up, or refactored in the final state of the series (`Series End Commit`) using tools (`git_read_files` or `git_diff` with `revision` / `target_revision` set to the `Series End Commit`); do not trust promises in commit messages alone. If resolved by the end of the series, dismiss it in `dismissed_concerns` citing the resolving commit. Never dismiss a real bug into `dismissed_concerns` merely because it already existed before this change (`"preexisting": true` findings are routed to the pre-existing bug tracker and are not posted as patch regressions): if a candidate is a real bug that already existed at `Baseline SHA` and is not fixed at `Series End Commit`, report it in `findings` with `"preexisting": true`. Conversely, if a defect was introduced by an earlier commit in the same series (after `Baseline SHA`) and `Target Commit` does not touch, trigger, or worsen it, dismiss it for this commit rather than marking `"preexisting": true`. When referring to other patches within this series in your explanation, DO NOT use ephemeral git hashes; refer to them by their patch subject (e.g. 'commit "virtio-net: fix RSC handling"').
 7. **HISTORY RULE:** For a candidate from the `history` stage, read every commit in its `historical_commits` with `git_show` and confirm that it exists before `Baseline SHA`, that it says what the candidate claims, and that its reason still applies to the code at `Series End Commit`. Dismiss the candidate when the commit does not support the claim, when a later commit before `Baseline SHA` already superseded that reason, or when the claim rests on a mailing list excerpt that neither the historical commit nor the current code confirms. A recurring history of fixes in an area is never a finding on its own; severity follows the consequence of the defect, not its history. The `historical_commits` of a confirmed finding are copied from the candidate automatically.
 8. **DESIGN & DOCUMENTATION RULE:** If a candidate targets illustrative pseudo-code or abbreviated snippets in documentation (`docs/`, `README*` files, code comments), inspect the actual implementation at the series head (`Series End Commit` / `HEAD`). If the actual code properly enforces the invariant, dismiss the documentation concern in `dismissed_concerns` citing the enforcing code.
-9. **SEVERITY CALIBRATION AND COMPLETENESS:** Set `"preexisting": false` whenever the patch introduces the bug or newly exposes, triggers, or makes reachable a latent defect that could not be triggered before the patch; set `"preexisting": true` when the problem already existed at `Baseline SHA` (before the commit/series) and was already triggerable before the patch, even if it lives in the same function, caller/callee, or error path modified by the patch. For each verified issue, assign an accurate severity (`Critical`, `High`, `Medium`, or `Low`) strictly following `severity.md`: reason through all consequences (both immediate failures and downstream state/resource leaks), triggering paths, and reachability, state that reasoning at the start of `severity_explanation`, preserve all distinct function names, file paths, line numbers when known, triggering entry points, and consequences, and formulate a concise bug title (`problem`) under 80 characters starting with a QEMU component prefix (e.g. `virtio:`, `hw/arm:`, `target/i386:`, `migration:`, `qapi:`, `block:`)."#;
+9. **SCOPE AND DUPLICATE RULE:** Verify only the failure mechanism each candidate describes, and report in `findings` only that mechanism (or, under rule 5, the real bug in the same code path). If a candidate has the same root cause as a finding listed in `<validated_findings>` and the same pre-existing status (a defect this change introduces is never a duplicate of a validated pre-existing finding, and the reverse), do not report it again: dismiss it in `dismissed_concerns`, name the validated finding's ID (for example `VF1`) in `reasoning`, and carry forward the candidate's target location in `locations`. Report another defect you notice while verifying only when no validated finding covers it.
+10. **SEVERITY CALIBRATION AND COMPLETENESS:** Set `"preexisting": false` whenever the patch introduces the bug or newly exposes, triggers, or makes reachable a latent defect that could not be triggered before the patch; set `"preexisting": true` when the problem already existed at `Baseline SHA` (before the commit/series) and was already triggerable before the patch, even if it lives in the same function, caller/callee, or error path modified by the patch. For each verified issue, assign an accurate severity (`Critical`, `High`, `Medium`, or `Low`) strictly following `severity.md`: reason through all consequences (both immediate failures and downstream state/resource leaks), triggering paths, and reachability, state that reasoning at the start of `severity_explanation`, preserve all distinct function names, file paths, line numbers when known, triggering entry points, and consequences, and formulate a concise bug title (`problem`) under 80 characters starting with a QEMU component prefix (e.g. `virtio:`, `hw/arm:`, `target/i386:`, `migration:`, `qapi:`, `block:`)."#;
 
 const STAGE_REPORT_INSTRUCTION: &str = r#"# Generate plain-text inline review report
 
@@ -841,6 +843,48 @@ fn set_historical_commits(item: &mut Value, commits: Vec<Value>) {
     }
 }
 
+/// One line per finding that verification validated directly (`VF*`), for
+/// post-verification. Post-verification batches run after verification
+/// and see none of each other's work, so without this list a batch can
+/// confirm, under another ID, a defect verification already reported.
+fn render_validated_findings(state: &QemuPatchReviewState) -> String {
+    if state.verification_findings.is_empty() {
+        return "(none)".to_string();
+    }
+    state
+        .verification_findings
+        .iter()
+        .map(|finding| {
+            let field = |key: &str| finding.get(key).and_then(Value::as_str).unwrap_or("?");
+            let places: Vec<String> = finding
+                .get("locations")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|loc| {
+                    let part = |key: &str| loc.get(key).and_then(Value::as_str).unwrap_or("?");
+                    format!("{}:{}", part("file"), part("function_or_symbol"))
+                })
+                .collect();
+            let origin = match finding.get("preexisting").and_then(Value::as_bool) {
+                Some(true) => "pre-existing",
+                Some(false) => "introduced by this change",
+                None => "origin unknown",
+            };
+            format!(
+                "- {} [{}, {}] {} (at {})",
+                field("id"),
+                field("severity"),
+                origin,
+                field("problem"),
+                places.join(", ")
+            )
+        })
+        .map(|line| sanitize_untrusted_discussion_text(&line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The `<history_context>` and `<history_discussions>` blocks of the
 /// `history` stage prompt.
 fn render_history_blocks(state: &QemuPatchReviewState) -> String {
@@ -1343,6 +1387,11 @@ pub fn post_verification_stage_with_effort(
 
 CRITICAL REVIEW DIRECTIVE: To dismiss a code-behavior candidate issue as a false positive, you must find concrete evidence in the code that proves the issue is invalid and quote that disproving code in `dismissed_concerns[].locations` (for policy-excluded build/linter or out-of-scope meta-concerns under rule 1, carry forward the candidate's target location or commit message snippet in `locations`). If you cannot find concrete proof of safety, you must validate and report the finding in `findings`.{series_context}
 
+Findings Already Validated by Verification (never report these again):
+<validated_findings>
+{{{{validated_findings}}}}
+</validated_findings>
+
 Inconclusive Concern(s) to Verify:
 {{{{candidate_inconclusive_concerns}}}}
 
@@ -1364,7 +1413,8 @@ Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every
     )
     .with_var("candidate_inconclusive_concerns", move |_: &QemuPatchReviewState| {
         candidate_json.clone()
-    });
+    })
+    .with_var("validated_findings", render_validated_findings);
 
     Stage::builder(stage_name)
         .system_prompt(qemu_system_prompt(true))
@@ -1738,6 +1788,23 @@ mod tests {
         assert_eq!(c[1]["cites_commits_outside_history_context"], true);
         assert_eq!(c[2]["historical_commits"][0]["subject"], "untouched");
         assert!(c[2].get("cites_commits_outside_history_context").is_none());
+    }
+
+    #[test]
+    fn test_validated_findings_render_for_post_verification() {
+        let mut state = QemuPatchReviewState::default();
+        assert_eq!(render_validated_findings(&state), "(none)");
+        state.verification_findings = vec![json!({
+            "id": "VF1",
+            "severity": "High",
+            "problem": "target/riscv: gpr vmstate widened without version bump",
+            "preexisting": false,
+            "locations": [{"file": "target/riscv/machine.c", "function_or_symbol": "vmstate_riscv_cpu"}],
+        })];
+        assert_eq!(
+            render_validated_findings(&state),
+            "- VF1 [High, introduced by this change] target/riscv: gpr vmstate widened without version bump (at target/riscv/machine.c:vmstate_riscv_cpu)"
+        );
     }
 
     #[test]
