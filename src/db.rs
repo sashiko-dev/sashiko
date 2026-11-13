@@ -5295,6 +5295,48 @@ impl Database {
             .collect()
     }
 
+    /// Returns `(root_bug_id, family_member_id, enrichment_kind)` tuples for
+    /// reproducer and proposed-fix attachments across each requested bug's
+    /// duplicate family without loading attachment bodies or interaction logs.
+    pub async fn bug_family_attachment_candidates(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<(i64, i64, String)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = self
+            .read_conn()
+            .query(
+                "WITH RECURSIVE ancestors(root, id, parent) AS (
+                    SELECT b.id, b.id, b.duplicate_of_id
+                      FROM bugs b
+                      JOIN json_each(?1) requested ON b.id = requested.value
+                    UNION
+                    SELECT a.root, b.id, b.duplicate_of_id
+                      FROM bugs b
+                      JOIN ancestors a ON b.id = a.parent
+                 ), family(root, id) AS (
+                    SELECT root, id FROM ancestors
+                    UNION
+                    SELECT f.root, b.id
+                      FROM bugs b
+                      JOIN family f ON b.duplicate_of_id = f.id
+                 )
+                 SELECT DISTINCT f.root, f.id, e.kind
+                   FROM family f
+                   JOIN bug_enrichments e ON e.bug_id = f.id
+                  WHERE e.kind IN ('reproducer', 'testcase', 'poc', 'proposed_fix', 'suggested_fix')",
+                libsql::params![serde_json::to_string(ids)?],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((row.get(0)?, row.get(1)?, row.get(2)?));
+        }
+        Ok(out)
+    }
+
     pub async fn resolve_bug_model_and_tool(
         &self,
         bug_id: i64,

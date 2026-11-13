@@ -1658,7 +1658,11 @@ async fn get_bug(
     attach_duplicate_relations(&state, &principal, &bug, &mut val).await?;
     val["can_comment"] = serde_json::Value::Bool(!state.read_only && access.can_comment());
     val["can_manage"] = serde_json::Value::Bool(!state.read_only && access.can_manage());
-    val["evidence"] = load_redacted_bug_evidence(&state, &principal, bug.id).await?;
+    let evidence = load_redacted_bug_evidence(&state, &principal, bug.id).await?;
+    let (has_reproducer, has_proposed_fix) = attachment_flags_from_evidence(&evidence);
+    val["has_reproducer"] = serde_json::Value::Bool(has_reproducer);
+    val["has_proposed_fix"] = serde_json::Value::Bool(has_proposed_fix);
+    val["evidence"] = evidence;
     if let Some(obj) = val.as_object_mut() {
         for key in [
             "raw_input",
@@ -1677,6 +1681,87 @@ async fn get_bug(
 /// Reproducer-like enrichment kinds gated behind authenticated access.
 fn is_reproducer_enrichment_kind(kind: &str) -> bool {
     matches!(kind, "reproducer" | "testcase" | "poc")
+}
+
+/// Proposed-fix enrichment kinds surfaced as unmerged patch attachments.
+///
+/// Merged upstream commits recorded by `fix_check` (`fix_candidate`) are
+/// deliberately excluded because they represent landed fixes already shown via
+/// `fixed_in_commit` and `Fixed` status rather than proposed patches.
+fn is_proposed_fix_enrichment_kind(kind: &str) -> bool {
+    matches!(kind, "proposed_fix" | "suggested_fix")
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BugAttachmentFlags {
+    has_reproducer: bool,
+    has_proposed_fix: bool,
+}
+
+fn attachment_flags_from_evidence(evidence: &serde_json::Value) -> (bool, bool) {
+    let Some(activity) = evidence.get("activity").and_then(|a| a.as_array()) else {
+        return (false, false);
+    };
+    let mut has_reproducer = false;
+    let mut has_proposed_fix = false;
+    for item in activity {
+        if let Some(kind) = item.get("kind").and_then(|k| k.as_str()) {
+            if is_reproducer_enrichment_kind(kind) {
+                has_reproducer = true;
+            } else if is_proposed_fix_enrichment_kind(kind) {
+                has_proposed_fix = true;
+            }
+        }
+    }
+    (has_reproducer, has_proposed_fix)
+}
+
+async fn resolve_bug_attachment_flags(
+    state: &AppState,
+    principal: &Principal,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, BugAttachmentFlags>, StatusCode> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let candidates = state
+        .db
+        .bug_family_attachment_candidates(ids)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let readable_foreign = if principal.has_global_bug_visibility() {
+        None
+    } else {
+        let mut foreign_ids: Vec<i64> = candidates
+            .iter()
+            .filter_map(|&(root_id, member_id, _)| (member_id != root_id).then_some(member_id))
+            .collect();
+        foreign_ids.sort_unstable();
+        foreign_ids.dedup();
+        if foreign_ids.is_empty() {
+            Some(std::collections::HashSet::new())
+        } else {
+            Some(readable_bug_ids(state, principal, &foreign_ids).await?)
+        }
+    };
+
+    let allow_reproducers = principal.is_authenticated();
+    let mut flags_by_bug = std::collections::HashMap::new();
+    for (root_id, member_id, kind) in candidates {
+        if member_id != root_id
+            && let Some(ref readable) = readable_foreign
+            && !readable.contains(&member_id)
+        {
+            continue;
+        }
+        let entry: &mut BugAttachmentFlags = flags_by_bug.entry(root_id).or_default();
+        if allow_reproducers && is_reproducer_enrichment_kind(&kind) {
+            entry.has_reproducer = true;
+        } else if is_proposed_fix_enrichment_kind(&kind) {
+            entry.has_proposed_fix = true;
+        }
+    }
+    Ok(flags_by_bug)
 }
 
 /// Loads a bug's deduplicated family evidence with interaction logs omitted and
@@ -2907,9 +2992,11 @@ async fn list_bugs(
                 .bug_discovery_summaries(&ids)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let attachment_flags = resolve_bug_attachment_flags(&state, &principal, &ids).await?;
             let mut serialized_items = Vec::new();
             for bug in &items {
                 let mut val = serde_json::to_value(bug).unwrap_or(serde_json::json!({}));
+                let flags = attachment_flags.get(&bug.id).copied().unwrap_or_default();
                 val["slug"] = serde_json::Value::String(bug.bugid.clone());
                 val["problem"] = serde_json::Value::String(bug.problem().to_string());
                 val["severity"] = serde_json::to_value(bug.severity()).unwrap();
@@ -2924,6 +3011,8 @@ async fn list_bugs(
                 val["verified_on_sha"] = serde_json::to_value(bug.verified_on_sha()).unwrap();
                 val["is_fixed"] = serde_json::Value::Bool(bug.is_fixed());
                 val["fixed_in_commit"] = serde_json::to_value(bug.fixed_in_commit()).unwrap();
+                val["has_reproducer"] = serde_json::Value::Bool(flags.has_reproducer);
+                val["has_proposed_fix"] = serde_json::Value::Bool(flags.has_proposed_fix);
                 val["raw_input"] = serde_json::to_value(bug.raw_input()).unwrap();
                 val["tokens_in"] = serde_json::Value::Number(bug.tokens_in().into());
                 val["tokens_out"] = serde_json::Value::Number(bug.tokens_out().into());
@@ -5561,6 +5650,30 @@ mod tests {
             .await
             .unwrap();
         }
+        // Attach a reproducer to the hidden duplicate (SECTION B) and a
+        // proposed fix to the accessible sibling duplicate (SECTION A).
+        db.add_bug_enrichment(
+            ids[1],
+            &crate::db::NewBugEnrichment {
+                kind: "reproducer".into(),
+                tool: "hidden-repro".into(),
+                content: Some("hidden reproducer payload".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.add_bug_enrichment(
+            ids[2],
+            &crate::db::NewBugEnrichment {
+                kind: "proposed_fix".into(),
+                tool: "sibling-fix".into(),
+                content: Some("sibling proposed patch".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let settings = Arc::new(crate::settings::Settings::new().unwrap());
         let (sender, _) = mpsc::channel(1);
         let (fetch_sender, _) = mpsc::channel(1);
@@ -5646,6 +5759,13 @@ mod tests {
             assert!(!md_str.contains("candidate confidential content"));
 
             if email == "a@example.org" && id == ids[0] {
+                assert_eq!(body["has_proposed_fix"], true);
+                assert_eq!(body["has_reproducer"], false);
+                let flags = resolve_bug_attachment_flags(&state, &principal, &[ids[0]])
+                    .await
+                    .unwrap();
+                assert!(flags[&ids[0]].has_proposed_fix);
+                assert!(!flags[&ids[0]].has_reproducer);
                 assert!(evidence.contains("Deduplication Check completed"));
                 let Json(enrichments) = get_bug_enrichments(
                     principal.clone(),
@@ -5670,7 +5790,7 @@ mod tests {
                 assert!(!evidence.contains("hidden candidate confidential content"));
 
                 let Json(enrichments) = get_bug_enrichments(
-                    principal,
+                    principal.clone(),
                     State(state.clone()),
                     Query(BugQuery {
                         id: Some(id),
@@ -5701,6 +5821,13 @@ mod tests {
                 assert!(dedup["data_json"].is_null());
             }
             if email == "operator@example.org" {
+                assert_eq!(body["has_proposed_fix"], true);
+                assert_eq!(body["has_reproducer"], true);
+                let flags = resolve_bug_attachment_flags(&state, &principal, &[ids[0]])
+                    .await
+                    .unwrap();
+                assert!(flags[&ids[0]].has_proposed_fix);
+                assert!(flags[&ids[0]].has_reproducer);
                 assert!(evidence.contains("hidden comment confidential content"));
                 assert!(evidence.contains("hidden-model"));
                 assert!(evidence.contains("same defect as canonical"));
@@ -6266,6 +6393,43 @@ mod tests {
         .await
         .unwrap();
 
+        let merged_fix_bug_id = db
+            .create_bug(&crate::db::NewBug {
+                bugid: "linux-merged-fix".to_string(),
+                title: "already fixed upstream issue".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::Fixed,
+                pipeline_state: crate::db::BugPipelineState::Succeeded,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 123457,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![crate::db::AttributedSubsystem::from_maintainers(
+                    "NETWORKING [GENERAL]",
+                )],
+            })
+            .await
+            .unwrap();
+        db.add_bug_enrichment(
+            merged_fix_bug_id,
+            &crate::db::NewBugEnrichment {
+                kind: "fix_candidate".into(),
+                tool: "sashiko:linux_bug:fix_check".into(),
+                content: Some("Fixed upstream".into()),
+                data_json: Some(serde_json::json!({
+                    "status": "merged",
+                    "commit_sha": "deadbeef1234"
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
         let mut settings = crate::settings::Settings::new().unwrap();
         settings.server.testing_mode = false;
         settings.server.jwt_secret = Some(SECRET.to_string());
@@ -6356,6 +6520,8 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), 200);
             let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["has_proposed_fix"], true);
+            assert_eq!(body["has_reproducer"], false);
             let activity_str = body["evidence"]["activity"].to_string();
             assert!(activity_str.contains("PLAIN_COMMENT_TEXT"));
             assert!(activity_str.contains("PROPOSED_FIX_PATCH_TEXT"));
@@ -6402,6 +6568,8 @@ mod tests {
                 .json()
                 .await
                 .unwrap();
+            assert_eq!(body["has_proposed_fix"], true);
+            assert_eq!(body["has_reproducer"], true);
             let activity_str = body["evidence"]["activity"].to_string();
             assert!(activity_str.contains("PLAIN_COMMENT_TEXT"));
             assert!(activity_str.contains("PROPOSED_FIX_PATCH_TEXT"));
@@ -6420,6 +6588,31 @@ mod tests {
                 .unwrap();
             assert!(md.contains("REPRODUCER_FIXTURE_MARKER"));
         }
+
+        // Bugs list surfaces attachment flags while keeping merged fix_candidate
+        // enrichments distinct from proposed_fix attachments.
+        let list_body: serde_json::Value = client
+            .get(format!("http://{}/api/bugs", addr))
+            .header("Authorization", format!("Bearer {}", operator_tok))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let items = list_body["items"].as_array().unwrap();
+        let repro_item = items
+            .iter()
+            .find(|item| item["bugid"] == "linux-repro01")
+            .expect("expected linux-repro01 in bugs list");
+        assert_eq!(repro_item["has_reproducer"], true);
+        assert_eq!(repro_item["has_proposed_fix"], true);
+        let merged_item = items
+            .iter()
+            .find(|item| item["bugid"] == "linux-merged-fix")
+            .expect("expected linux-merged-fix in bugs list");
+        assert_eq!(merged_item["has_reproducer"], false);
+        assert_eq!(merged_item["has_proposed_fix"], false);
     }
 
     #[test]

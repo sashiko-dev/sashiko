@@ -275,6 +275,10 @@
 
         /* Tags, Lineage & Pagination */
         .tag { display: inline-block; background: var(--tag-bg); color: var(--tag-text); padding: 1px 4px; border-radius: 3px; font-size: 0.75em; margin-right: 4px; border: 1px solid var(--tag-bg); vertical-align: middle; }
+        .bug-attachment-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 0.75em; font-weight: 600; margin-right: 4px; vertical-align: middle; text-decoration: none; background: transparent; border: 1px solid currentColor; }
+        a.bug-attachment-badge:hover { text-decoration: none; background: var(--hover); }
+        .bug-badge-reproducer { color: var(--status-inreview); }
+        .bug-badge-proposed-fix { color: var(--status-reviewed); }
         .pagination { display: flex; justify-content: center; align-items: center; gap: 8px; margin-top: 12px; font-size: 0.9em; }
 
         /* Stats Bar & Footer */
@@ -1872,12 +1876,24 @@
 
         function bindRowNav(row, target) {
             const handler = (e) => {
-                if (e.target.closest('.copy-btn')) return;
+                if (e.target.closest('.copy-btn, a[href]')) return;
                 if (e.button === 1 || e.ctrlKey || e.metaKey) window.open(target, '_blank');
                 else if (e.button === 0) navigate(target);
             };
             row.onclick = handler;
             row.onauxclick = handler;
+        }
+
+        function renderBugAttachmentBadges(bug) {
+            const bugRef = encodeURIComponent(bug.bugid || bug.slug || bug.id);
+            const badges = [];
+            if (bug.has_reproducer) {
+                badges.push(`<a href="#/bug/${bugRef}?tab=reproducers" class="bug-attachment-badge bug-badge-reproducer" title="Reproducer attached — view Reproducers tab">reproducer</a>`);
+            }
+            if (bug.has_proposed_fix) {
+                badges.push(`<a href="#/bug/${bugRef}?tab=fixes" class="bug-attachment-badge bug-badge-proposed-fix" title="Proposed fix attached — view Fixes tab">proposed fix</a>`);
+            }
+            return badges.join('');
         }
 
         function renderDateCell(unix) {
@@ -2000,8 +2016,11 @@
                         `;
                     } else if (state.listMode === 'bugs') {
                         bindRowNav(row, `#/bug/${encodeURIComponent(p.bugid || p.slug || p.id)}`);
-                        const tagsHtml = (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0)
-                            ? '<div style="margin-top:2px">' + p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>' : '';
+                        const attachmentBadgesHtml = renderBugAttachmentBadges(p);
+                        const subsystemPills = (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0)
+                            ? p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : '';
+                        const tagsHtml = (attachmentBadgesHtml || subsystemPills)
+                            ? `<div style="margin-top:2px">${attachmentBadgesHtml}${subsystemPills}</div>` : '';
                         const fixedByHtml = p.fixed_in_commit
                             ? `<div class="text-muted-sm" style="margin-top:2px;">Fixed by: <code>${escapeHtml(formatCommitRef(p.fixed_in_commit))}</code></div>` : '';
                         const sevStr = p.severity || 'Unknown';
