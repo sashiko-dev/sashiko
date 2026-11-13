@@ -169,6 +169,26 @@ pub enum ProgressEvent {
     AiReviewFailed {
         patch_index: i64,
     },
+    DesignReviewQueued {
+        subject: String,
+    },
+    DesignReviewStageStarted {
+        stage: String,
+    },
+    DesignReviewStageTurn {
+        stage: String,
+        turn: usize,
+        max_turns: usize,
+    },
+    DesignReviewStageFinished {
+        stage: String,
+    },
+    DesignReviewAttempt {
+        attempt: usize,
+        max_attempts: usize,
+    },
+    DesignReviewFinished,
+    DesignReviewFailed,
     ReviewComplete {
         partial: bool,
     },
@@ -795,14 +815,269 @@ fn format_error_chain(err: &anyhow::Error) -> String {
     parts.join(": ")
 }
 
-/// Lists the failed patches in series order.
+/// Lists the failed patches (and any failed series design assessment) in order.
 fn combined_review_error(mut errors: Vec<(i64, String)>) -> String {
     errors.sort_by_key(|(patch_index, _)| *patch_index);
     errors
         .iter()
-        .map(|(patch_index, err)| format!("patch {patch_index}: {err}"))
+        .map(|(patch_index, err)| {
+            if *patch_index == i64::MAX {
+                format!("design assessment: {err}")
+            } else {
+                format!("patch {patch_index}: {err}")
+            }
+        })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn collect_touched_files_from_patches(patches: &[PatchInput]) -> Vec<String> {
+    let mut touched = std::collections::BTreeSet::new();
+    for p in patches {
+        for path in crate::prior_context::extract_patch_touched_files(&p.diff) {
+            touched.insert(path);
+        }
+    }
+    touched.into_iter().collect()
+}
+
+fn format_series_text_for_design(
+    patches: &[PatchInput],
+    patch_messages: &HashMap<i64, String>,
+) -> String {
+    let total = patches.len();
+    let mut out = String::new();
+    for p in patches {
+        let subj = p.subject.as_deref().unwrap_or("(no subject)");
+        let author = p.author.as_deref().unwrap_or("(unknown)");
+        let body = patch_messages
+            .get(&p.index)
+            .map(String::as_str)
+            .unwrap_or(subj);
+        out.push_str(&format!(
+            "=== Patch {}/{}: {} ===\nAuthor: {}\n\n{}\n\n{}\n\n",
+            p.index,
+            total,
+            subj,
+            author,
+            body.trim(),
+            p.diff.trim_end()
+        ));
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_local_design_assessment(
+    worktree: &GitWorktree,
+    settings: &Settings,
+    subject: &str,
+    patches: &[PatchInput],
+    patch_shas: &HashMap<i64, String>,
+    patch_messages: &HashMap<i64, String>,
+    options: &WorkerOptions,
+    baseline_sha: &str,
+    llm_semaphore: &Arc<Semaphore>,
+    quota: &Arc<crate::ai::quota::QuotaManager>,
+    timeout_seconds: u64,
+    progress: Option<&ProgressCallback<'_>>,
+) -> Result<crate::workflows::design_assessment::DesignAssessmentExecution> {
+    use crate::toolbox::design_tools::DesignToolState;
+    use crate::workflow::WorkflowEvent;
+    use crate::workflows::design_assessment::{
+        DesignAssessmentRunInput, run_design_assessment_pipeline,
+    };
+
+    let resolved_baseline_sha = get_commit_hash(&worktree.path, baseline_sha)
+        .await
+        .with_context(|| {
+            format!("design assessment requires a resolvable baseline commit ({baseline_sha})")
+        })?;
+
+    let mut series_shas = Vec::with_capacity(patches.len());
+    for p in patches {
+        if let Some(sha) = patch_shas.get(&p.index).or(p.commit_id.as_ref()) {
+            series_shas.push(sha.clone());
+        }
+    }
+    let excluded_commits =
+        DesignToolState::collect_excluded_descendants(&worktree.path, &series_shas).await;
+    let series_roots: Vec<String> = series_shas.first().cloned().into_iter().collect();
+
+    let cutoff_ts = patches
+        .iter()
+        .filter_map(|p| p.date)
+        .filter(|&d| d > 0)
+        .min()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let posted_date_ymd = chrono::DateTime::<chrono::Utc>::from_timestamp(cutoff_ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| cutoff_ts.to_string());
+
+    let touched_files = collect_touched_files_from_patches(patches);
+    let sections = if options.project.uses_maintainers()
+        && let Some(maint) = crate::maintainers::get_global_maintainers()
+    {
+        maint.match_files(&touched_files)
+    } else {
+        Vec::new()
+    };
+
+    let notes_candidate = options.prompts.join("maintainers");
+    let maintainer_notes_dir = tokio::fs::metadata(&notes_candidate)
+        .await
+        .is_ok_and(|m| m.is_dir())
+        .then_some(notes_candidate);
+
+    let series_text = Arc::new(format_series_text_for_design(patches, patch_messages));
+    let prior_parts: Vec<String> = patches
+        .iter()
+        .filter_map(|p| {
+            p.prior_version_context
+                .as_ref()
+                .filter(|ctx| !ctx.is_empty_for_audit())
+                .and_then(|ctx| serde_json::to_string_pretty(ctx).ok())
+        })
+        .collect();
+    let prior_context_markdown = if prior_parts.is_empty() {
+        "(none)".to_string()
+    } else {
+        prior_parts.join("\n\n")
+    };
+
+    let tool_state = Arc::new(DesignToolState {
+        repo_path: worktree.path.clone(),
+        baseline_sha: resolved_baseline_sha,
+        cutoff_ts,
+        excluded_commits,
+        series_roots,
+        maintainer_notes_dir,
+        series_text,
+    });
+
+    let ai = &settings.ai;
+    let deadline_budget = (timeout_seconds > 0).then(|| {
+        let deadline = Arc::new(std::sync::Mutex::new(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds),
+        ));
+        Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(deadline))
+    });
+    let retry_budget: Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>> = deadline_budget
+        .as_ref()
+        .map(|b| Arc::clone(b) as Arc<dyn crate::ai::backoff_provider::RetryBudget>);
+
+    let reasoning_effort = settings
+        .effective_effort()
+        .map(crate::ai::EffortMode::verification_stage_effort);
+    let max_attempts = worker_max_attempts(ai);
+    let mut last_error = None;
+
+    for attempt in 1..=max_attempts {
+        emit(
+            progress,
+            ProgressEvent::DesignReviewAttempt {
+                attempt,
+                max_attempts,
+            },
+        );
+        if attempt > 1 {
+            info!(
+                "Restarting series design assessment (attempt {}/{})...",
+                attempt, max_attempts
+            );
+        }
+
+        let provider = crate::ai::create_provider_cached(ai, None)
+            .await
+            .context("Failed to create AI provider")?;
+        let provider = decorate_provider(provider, ai, llm_semaphore, quota, &retry_budget);
+
+        let wf_cb = progress.map(|cb| {
+            move |ev: WorkflowEvent| match ev {
+                WorkflowEvent::StageStarted { stage_name } => {
+                    cb(ProgressEvent::DesignReviewStageStarted {
+                        stage: stage_name.to_string(),
+                    });
+                }
+                WorkflowEvent::StageTurn {
+                    stage_name,
+                    turn,
+                    max_turns,
+                } => {
+                    cb(ProgressEvent::DesignReviewStageTurn {
+                        stage: stage_name.to_string(),
+                        turn,
+                        max_turns,
+                    });
+                }
+                WorkflowEvent::StageFinished { stage_name, .. }
+                | WorkflowEvent::StageSkipped { stage_name } => {
+                    cb(ProgressEvent::DesignReviewStageFinished {
+                        stage: stage_name.to_string(),
+                    });
+                }
+                _ => {}
+            }
+        });
+
+        let run_input = DesignAssessmentRunInput {
+            subject: subject.to_string(),
+            posted_date_ymd: posted_date_ymd.clone(),
+            sections: sections.clone(),
+            num_patches: patches.len(),
+            prior_context_markdown: prior_context_markdown.clone(),
+            custom_prompt: options.custom_prompt.clone(),
+            tool_state: Arc::clone(&tool_state),
+            reasoning_effort,
+        };
+
+        let fut = run_design_assessment_pipeline(
+            provider,
+            run_input,
+            wf_cb
+                .as_ref()
+                .map(|f| f as &(dyn Fn(WorkflowEvent) + Send + Sync)),
+        );
+        let outcome = if let Some(ref budget) = deadline_budget {
+            // Poll via `DeadlineBudget::current_deadline_at` with a 100ms
+            // minimum sleep floor so ongoing idle waits on `llm_semaphore` or
+            // `quota` always exceed the 1ms credit threshold without spinning.
+            tokio::pin!(fut);
+            let min_poll = std::time::Duration::from_millis(100);
+            loop {
+                let now = tokio::time::Instant::now();
+                let target = budget.current_deadline_at(now).max(now + min_poll);
+                tokio::select! {
+                    res = &mut fut => break res,
+                    () = tokio::time::sleep_until(target) => {
+                        let check_now = tokio::time::Instant::now();
+                        if budget.current_deadline_at(check_now) <= check_now {
+                            break Err(anyhow!("Design assessment timed out after {}s", timeout_seconds));
+                        }
+                    }
+                }
+            }
+        } else {
+            fut.await
+        };
+
+        match outcome {
+            Ok(exec) => {
+                info!("Series design assessment completed.");
+                return Ok(exec);
+            }
+            Err(e) => {
+                error!("Series design assessment failed: {}", e);
+                let stop_retrying = crate::ai::is_non_retryable_review_error(&e);
+                last_error = Some(e);
+                if stop_retrying {
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("Design assessment failed")))
 }
 
 /// Records a patch whose review failed, so the report does not present it as
@@ -1201,10 +1476,25 @@ async fn run_worker_in_worktree(
         }));
     }
 
+    let run_design = options.current_tree && settings.review.design;
+
     info!(
-        "Patches applied. Starting AI reviews for {} patches...",
-        patches_to_review.len()
+        "Patches applied. Starting AI reviews for {} patches{}...",
+        patches_to_review.len(),
+        if run_design {
+            " + series design assessment"
+        } else {
+            ""
+        }
     );
+    if run_design {
+        emit(
+            progress,
+            ProgressEvent::DesignReviewQueued {
+                subject: subject.clone(),
+            },
+        );
+    }
     emit(
         progress,
         ProgressEvent::AiReviewStarted {
@@ -1289,23 +1579,70 @@ async fn run_worker_in_worktree(
 
     // A failed patch must not discard the reviews of the other patches, so
     // collect every result and report the failures alongside them.
-    let mut buffered = futures_stream.buffer_unordered(concurrency);
     let mut results = Vec::new();
     let mut review_errors = Vec::new();
     let mut failed_outcomes = Vec::new();
-    while let Some((patch_index, result)) = buffered.next().await {
-        match result {
-            Ok(res) => results.push(res),
+    let mut patch_results_local = std::mem::take(&mut patch_results);
+
+    let patch_reviews_fut = async {
+        let mut buffered = futures_stream.buffer_unordered(concurrency);
+        while let Some((patch_index, result)) = buffered.next().await {
+            match result {
+                Ok(res) => results.push(res),
+                Err(err) => {
+                    if let Some(wf) = err.downcast_ref::<crate::workflow::WorkflowFailure>() {
+                        failed_outcomes.push((patch_index, wf.outcome.clone()));
+                    }
+                    let err = format_error_chain(&err);
+                    mark_patch_review_incomplete(&mut patch_results_local, patch_index, &err);
+                    review_errors.push((patch_index, err));
+                }
+            }
+        }
+    };
+
+    let design_fut = async {
+        if !run_design {
+            return None;
+        }
+        let res = run_local_design_assessment(
+            worktree,
+            settings,
+            &subject,
+            &patches,
+            &patch_shas,
+            &patch_messages,
+            options,
+            baseline_sha,
+            &llm_semaphore,
+            &quota,
+            timeout_seconds,
+            progress,
+        )
+        .await;
+        match &res {
+            Ok(_) => emit(progress, ProgressEvent::DesignReviewFinished),
+            Err(_) => emit(progress, ProgressEvent::DesignReviewFailed),
+        }
+        Some(res)
+    };
+
+    let (_, design_outcome) = tokio::join!(patch_reviews_fut, design_fut);
+    let mut patch_results = patch_results_local;
+
+    let mut design_exec = None;
+    if let Some(res) = design_outcome {
+        match res {
+            Ok(exec) => design_exec = Some(exec),
             Err(err) => {
                 if let Some(wf) = err.downcast_ref::<crate::workflow::WorkflowFailure>() {
-                    failed_outcomes.push((patch_index, wf.outcome.clone()));
+                    failed_outcomes.push((i64::MAX, wf.outcome.clone()));
                 }
-                let err = format_error_chain(&err);
-                mark_patch_review_incomplete(&mut patch_results, patch_index, &err);
-                review_errors.push((patch_index, err));
+                review_errors.push((i64::MAX, format_error_chain(&err)));
             }
         }
     }
+
     results.sort_by_key(|res| res["patch_index"].as_i64().unwrap_or(0));
     failed_outcomes.sort_by_key(|(idx, _)| *idx);
 
@@ -1461,6 +1798,15 @@ async fn run_worker_in_worktree(
             "related_preexisting_dismissed".to_string(),
             json!(combined_related_dismissed),
         );
+        if let Some(exec) = design_exec {
+            total_tokens_in = total_tokens_in.saturating_add(exec.tokens_in);
+            total_tokens_out = total_tokens_out.saturating_add(exec.tokens_out);
+            total_tokens_cached = total_tokens_cached.saturating_add(exec.tokens_cached);
+            combined_history.extend(exec.history);
+            if let Ok(val) = serde_json::to_value(&exec.result) {
+                obj.insert("design_assessment".to_string(), val);
+            }
+        }
     }
 
     let mut combined_result = json!({
@@ -1553,6 +1899,19 @@ pub fn progress_line(event: ProgressEvent) -> Option<String> {
         } if attempt > 1 => format!("patch {patch_index}: retry {attempt}/{max_attempts}"),
         ProgressEvent::AiReviewFinished { patch_index } => format!("patch {patch_index}: done"),
         ProgressEvent::AiReviewFailed { patch_index } => format!("patch {patch_index}: incomplete"),
+        ProgressEvent::DesignReviewStageStarted { stage } => format!("design: {stage} started"),
+        ProgressEvent::DesignReviewStageTurn {
+            stage,
+            turn,
+            max_turns,
+        } => format!("design: {stage} turn {turn}/{max_turns}"),
+        ProgressEvent::DesignReviewStageFinished { stage } => format!("design: {stage} finished"),
+        ProgressEvent::DesignReviewAttempt {
+            attempt,
+            max_attempts,
+        } if attempt > 1 => format!("design: retry {attempt}/{max_attempts}"),
+        ProgressEvent::DesignReviewFinished => "design: done".to_string(),
+        ProgressEvent::DesignReviewFailed => "design: incomplete".to_string(),
         _ => return None,
     };
     Some(line)
@@ -1648,6 +2007,17 @@ pub fn format_agent_review_output(result: &Value) -> Value {
             .filter(|v| v.as_array().is_some_and(|items| !items.is_empty()))
         {
             obj.insert("related_preexisting".into(), related.clone());
+        }
+        if let Some(design_val) = result
+            .get("review")
+            .and_then(|r| r.get("design_assessment"))
+        {
+            let concise = serde_json::from_value::<
+                crate::workflows::design_assessment::DesignAssessmentResult,
+            >(design_val.clone())
+            .map(|da| da.to_agent_value())
+            .unwrap_or_else(|_| design_val.clone());
+            obj.insert("design_assessment".into(), concise);
         }
         if let Some(partial) = result.get("partial") {
             obj.insert("partial".into(), partial.clone());
@@ -2779,5 +3149,70 @@ mod tests {
         );
         // The edited tracker commit populates `subject`
         assert_eq!(review_input.subject, "net: foo: series cover title");
+    }
+
+    #[test]
+    fn format_agent_review_output_includes_concise_design_assessment_and_preserves_clean_status() {
+        let raw = json!({
+            "baseline": "abc1234",
+            "patches": [{"index": 1, "status": "present", "subject": "net: drv: add knob"}],
+            "review": {
+                "findings": [],
+                "concerns": [],
+                "design_assessment": {
+                    "verdict": "concerns",
+                    "verdict_reason": "Standing interface concern.",
+                    "problem_statement": "When NAPI polling saturates, packets drop without tunable rx copybreak.",
+                    "comparison_summary": "Ethtool tunable already exists.",
+                    "concerns": [
+                        {
+                            "category": "interface",
+                            "patch_index": 1,
+                            "disposition": "stands",
+                            "significance": "blocking",
+                            "confidence": "high",
+                            "summary": "Adds module_param instead of ethtool knob",
+                            "request": "Use ethtool tunable",
+                            "quote": "module_param(rx, uint, 0644);",
+                            "anchors": [{"kind": "maintainer_note", "ref": "netdev.md", "quote": "no module_param"}],
+                            "reasoning": "Violates subsystem interface rule"
+                        }
+                    ],
+                    "all_candidates": [
+                        {
+                            "category": "necessity",
+                            "disposition": "refuted",
+                            "confidence": "high",
+                            "summary": "Refuted candidate",
+                            "request": "None",
+                            "quote": "int x;",
+                            "anchors": [{"kind": "file", "ref": "drv.c:1", "quote": "int x;"}],
+                            "reasoning": "Refuted"
+                        }
+                    ],
+                    "dismissed_concerns": [{"summary": "Non-issue", "reason": "Checked"}]
+                }
+            },
+            "tokens_in": 500,
+            "tokens_out": 120,
+            "tokens_cached": 300
+        });
+
+        assert!(!result_has_high_or_critical_findings(&raw));
+        let agent = format_agent_review_output(&raw);
+        assert_eq!(agent["status"], "clean");
+        let da = &agent["design_assessment"];
+        assert_eq!(da["verdict"], "concerns");
+        assert_eq!(da["concerns"].as_array().unwrap().len(), 1);
+        assert!(da.get("all_candidates").is_none());
+        assert!(da.get("dismissed_concerns").is_none());
+
+        assert_eq!(
+            combined_review_error(vec![
+                (i64::MAX, "timed out".to_string()),
+                (1, "truncated".to_string()),
+            ]),
+            "patch 1: truncated; design assessment: timed out"
+        );
     }
 }

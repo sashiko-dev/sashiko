@@ -132,6 +132,9 @@ ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
 # Reasoning effort on Gemini models: "low", "mid" (default on Gemini 4+),
 # "high", or "dynamic". Ignored on non-Gemini providers.
 # effort = "mid"
+# Experimental (sashiko review only; ignored by the daemon): run the series
+# design assessment alongside bug review.
+# design = false
 # Skip the model run for a patch whose diff matches, modulo rebase noise,
 # a patch already reviewed with no findings. The patch gets a Skipped
 # review that names the review it inherits from.
