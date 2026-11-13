@@ -14,6 +14,7 @@
 
 use crate::project::ProjectId;
 
+pub mod code_history;
 pub mod code_notes;
 pub mod gcc_patch_review;
 pub mod guard;
