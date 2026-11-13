@@ -44,12 +44,11 @@ ignored_emails = [
 
 # Mention a pre-existing bug closely related to the first non-RFC posting
 # of a series: in the code the patch touches, or the same defect it fixes.
-# One or two at most, never security-sensitive ones, each only once. A list
-# can opt out with its own ["<list>".related_preexisting] enabled = false;
-# the strictest min_severity among the matched lists wins.
-[defaults.related_preexisting]
-enabled = true
-min_severity = "medium"
+# One or two at most, never security-sensitive ones, each only once. Accepts
+# true, false (or "none"), or a severity floor ("low", "medium", "high",
+# "critical"; true uses "medium"). Any matched list with false turns them
+# off; otherwise the strictest matched floor wins.
+report_preexisting_bugs = true
 
 # --- Tracked for Web UI only (no outbound emails) ---
 
