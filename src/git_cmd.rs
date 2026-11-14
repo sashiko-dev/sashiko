@@ -30,7 +30,9 @@
 //!
 //! Every git command in this crate is built here so that the directory handed
 //! to the constructor, and nothing inherited from the outside, decides which
-//! repository is touched.
+//! repository is touched, and so that the output settings pinned below, the
+//! ones that shape how commits, diffs and branch lists are printed, do not
+//! follow the user's git config.
 
 use std::path::Path;
 
@@ -54,13 +56,47 @@ const INHERITED_LOCATION_VARS: [&str; 11] = [
     "GIT_WORK_TREE",
 ];
 
+/// Settings that change how git prints commits, diffs and branch lists,
+/// each pinned to the value git uses when it is unset. The color settings
+/// and log.decorate default to auto, which already means off on a pipe, so
+/// they are pinned to false.
+///
+/// The user's and the system's git config are still read, and any of these
+/// set there would otherwise reshape output that sashiko parses or hands to
+/// a model: a one-line format.pretty cuts every commit message down to its
+/// subject line, log.date=relative turns dates into "2 days ago", and
+/// color.ui=always puts escape codes into a pipe. Options a call site passes
+/// itself, such as --format, still take precedence over these. Settings that
+/// run other programs, such as diff.external, are not pinned here.
+const PINNED_OUTPUT_CONFIG: [&str; 15] = [
+    "color.branch=false",
+    "color.diff=false",
+    "color.grep=false",
+    "color.ui=false",
+    "column.ui=never",
+    "diff.dstPrefix=b/",
+    "diff.mnemonicPrefix=false",
+    "diff.noprefix=false",
+    "diff.srcPrefix=a/",
+    "format.pretty=medium",
+    "log.abbrevCommit=false",
+    "log.date=default",
+    "log.decorate=false",
+    "log.showRoot=true",
+    "log.showSignature=false",
+];
+
 /// Builds a git command of the given type with the inherited location
-/// variables removed, optionally anchored to a directory.
+/// variables removed and the output settings pinned, optionally anchored to
+/// a directory.
 macro_rules! git_command {
     ($command:ty, $directory:expr) => {{
         let mut command = <$command>::new("git");
         for variable in INHERITED_LOCATION_VARS {
             command.env_remove(variable);
+        }
+        for setting in PINNED_OUTPUT_CONFIG {
+            command.arg("-c").arg(setting);
         }
         if let Some(directory) = $directory {
             command.current_dir(directory);
@@ -191,6 +227,71 @@ mod tests {
         // The constructor removes the variable, so the same command reaches
         // the repository it was pointed at.
         assert_eq!(resolved_git_dir(&mut in_dir(anchor.path())), anchor_git_dir);
+    }
+
+    /// Output settings in a repository's or user's config must not reach
+    /// what git prints for sashiko.
+    #[test]
+    fn test_user_output_settings_do_not_change_what_git_prints() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        let git = |args: &[&str]| -> String {
+            let output = in_dir(repository.path())
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).expect("utf8 output")
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "Test User"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repository.path().join("value.txt"), "changed\n").expect("write file");
+        git(&["add", "value.txt"]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--no-verify",
+            "-m",
+            "change value",
+            "-m",
+            "Explain why the value changes.",
+            "-m",
+            "Fixes: 0123456789ab (\"base\")",
+        ]);
+        for (key, value) in [
+            ("format.pretty", "oneline"),
+            ("log.date", "relative"),
+            ("color.ui", "always"),
+            ("log.decorate", "full"),
+            ("log.abbrevCommit", "true"),
+            ("diff.noprefix", "true"),
+            ("log.showRoot", "false"),
+        ] {
+            git(&["config", key, value]);
+        }
+        let head = git(&["rev-parse", "HEAD"]).trim().to_string();
+
+        let show = git(&["show", "HEAD"]);
+        assert_eq!(show.lines().next(), Some(format!("commit {head}").as_str()));
+        for expected in [
+            "Author: Test User <test@example.com>",
+            "Explain why the value changes.",
+            "Fixes: 0123456789ab (\"base\")",
+            "diff --git a/value.txt b/value.txt",
+        ] {
+            assert!(
+                show.contains(expected),
+                "{expected:?} missing from {show:?}"
+            );
+        }
+        assert!(!show.contains('\u{1b}'), "escape code in {show:?}");
+        assert!(!show.contains(" ago"), "relative date in {show:?}");
     }
 
     /// The test suite must never run with a repository forced on it, because
