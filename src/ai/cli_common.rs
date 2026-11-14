@@ -145,6 +145,8 @@ pub fn build_prompt(request: &AiRequest) -> String {
              To call tools: {\"tool_calls\": [{\"id\": \"c1\", \"function_name\": \"TOOL_NAME\", \"arguments\": {ARGS}}, {\"id\": \"c2\", \"function_name\": \"OTHER_TOOL\", \"arguments\": {ARGS2}}]}\n\
              Put ALL tool calls in ONE tool_calls array. Do NOT output multiple JSON objects.\n\
              For your final answer: {\"content\": \"YOUR RESPONSE\"}\n\
+             The requested answer format applies to the decoded content string, not to this outer JSON envelope.\n\
+             JSON-escape newlines, tabs, quotes, and backslashes inside content. If plain text is requested, do not wrap that text in Markdown code fences.\n\
              Do not mix both. Output exactly one JSON object.\n",
         );
     } else if let Some(instruction) = request
@@ -502,6 +504,17 @@ pub fn parse_inner_response(
         return parse_single_json(&v, &json_str, usage);
     }
 
+    if let Some(content) = recover_content_envelope(&json_str) {
+        return Ok(AiResponse {
+            content: Some(content),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            usage,
+            truncated: false,
+        });
+    }
+
     // Try JSONL: multiple JSON objects on separate lines (model sometimes emits
     // separate tool_calls objects per line instead of one combined object)
     let mut merged_tool_calls: Vec<ToolCall> = Vec::new();
@@ -575,9 +588,9 @@ pub fn parse_inner_response(
     }
 
     // Not parseable as JSON — return raw text
-    warn!(
+    debug!(
         target: "sashiko::ai::cli_provider",
-        "{provider} response not valid JSON, returning as raw content"
+        "{provider} response is raw text rather than a JSON envelope"
     );
     Ok(AiResponse {
         content: Some(text.to_string()),
@@ -587,6 +600,25 @@ pub fn parse_inner_response(
         usage,
         truncated: false,
     })
+}
+
+/// Repairs literal controls only in the documented final-answer envelope.
+/// Malformed tool requests retain their normal validation path.
+fn recover_content_envelope(text: &str) -> Option<String> {
+    // Serde structs also accept positional arrays; the CLI envelope is an object.
+    if !text.trim_start().starts_with('{') {
+        return None;
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ContentEnvelope {
+        content: String,
+    }
+
+    serde_json::from_str::<ContentEnvelope>(&crate::utils::clean_json_string(text))
+        .ok()
+        .map(|envelope| envelope.content)
 }
 
 /// Convert one entry of a `tool_calls` array into a `ToolCall`.
@@ -817,6 +849,8 @@ mod tests {
         assert!(prompt.contains("RESPONSE FORMAT"));
         assert!(prompt.contains("tool_calls"));
         assert!(prompt.contains("<available_tools>"));
+        assert!(prompt.contains("decoded content string"));
+        assert!(prompt.contains("JSON-escape newlines, tabs, quotes, and backslashes"));
     }
 
     #[test]
@@ -885,6 +919,38 @@ mod tests {
             Some("No issues found in this patch.")
         );
         assert!(resp.tool_calls.is_none());
+    }
+
+    #[test]
+    fn recover_fenced_report_with_literal_controls() {
+        let report = "commit abc123\nAuthor: Reviewer\n\n>\treturn 0;\n\nCheck this condition.\n";
+        let text = format!("```json\n{{\"content\":\"{report}\"}}\n```");
+        let response = parse_inner_response("pi-cli", &text, None).unwrap();
+        assert_eq!(response.content.as_deref(), Some(report));
+        assert!(response.tool_calls.is_none());
+        assert!(!response.truncated);
+
+        // Inner fences must still reach the report validator unchanged.
+        let report = "Report\n```c\nreturn 0;\n```";
+        let text = format!("{{\"content\":\"{report}\"}}");
+        let response = parse_inner_response("pi-cli", &text, None).unwrap();
+        assert_eq!(response.content.as_deref(), Some(report));
+    }
+
+    #[test]
+    fn content_recovery_does_not_repair_tools_or_structural_errors() {
+        for text in [
+            "[\"a\tb\"]",
+            "{\"tool_calls\":[{\"function_name\":\"read_file\",\"arguments\":{\"path\":\"a\tb\"}}]}",
+            "{\"content\":\"a\tb\",\"tool_calls\":[]}",
+            "{\"content\":\"a\tb\",\"content\":\"other\"}",
+            "{\"content\":\"a\tb\"",
+            "{\"content\":\"a\tb\"unescaped\"quote\"}",
+        ] {
+            let response = parse_inner_response("pi-cli", text, None).unwrap();
+            assert_eq!(response.content.as_deref(), Some(text));
+            assert!(response.tool_calls.is_none());
+        }
     }
 
     fn spawn_sh(script: &str) -> tokio::process::Child {
