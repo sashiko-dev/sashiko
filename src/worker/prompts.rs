@@ -470,6 +470,28 @@ impl Worker {
             &target_commit_diff_only,
         )
         .await;
+        // A --stages list without the history stage never reads the history.
+        // Names are normalized the way the stage resolver normalizes them,
+        // and the combined analysis stage includes every analysis stage.
+        let wants_history = self.stages.as_ref().is_none_or(|stages| {
+            stages.iter().any(|s| {
+                let name = crate::workflows::guard::normalize_stage_name(s);
+                name == crate::workflows::qemu_patch_review::HISTORY_STAGE_NAME
+                    || name == crate::workflows::linux_patch_review::COMBINED_ANALYSIS_STAGE_NAME
+            })
+        });
+        let code_history = if wants_history {
+            crate::workflows::code_history::collect_code_history(
+                self.project,
+                worktree_path,
+                &target_commit_sha,
+                &fixes_analysis.series_commit_shas,
+                &target_commit_diff_only,
+            )
+            .await
+        } else {
+            None
+        };
 
         let mut state = LinuxPatchReviewState {
             ps_id,
@@ -521,6 +543,7 @@ impl Worker {
             review_inline: String::new(),
             fixes: String::new(),
             fixes_analysis,
+            code_history,
         };
 
         if self.global_history.is_empty() {
