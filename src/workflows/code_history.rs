@@ -1421,6 +1421,42 @@ mod discussions {
                 None
             );
         }
+
+        #[tokio::test]
+        async fn commit_patch_id_skips_a_diff_larger_than_the_capture() {
+            async fn git(repo: &std::path::Path, args: &[&str]) -> String {
+                let out = crate::git_cmd::in_dir_async(repo)
+                    .args(args)
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(out.status.success(), "git {:?} failed: {:?}", args, out);
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            git(repo, &["init", "--quiet"]).await;
+            git(repo, &["config", "user.email", "test@example.com"]).await;
+            git(repo, &["config", "user.name", "Test User"]).await;
+            git(repo, &["config", "commit.gpgsign", "false"]).await;
+            std::fs::write(repo.join("small.c"), "int x;\n").unwrap();
+            git(repo, &["add", "small.c"]).await;
+            git(repo, &["commit", "--quiet", "-m", "small"]).await;
+            let small = git(repo, &["rev-parse", "HEAD"]).await;
+            let id = commit_patch_id(repo, &small).await.unwrap();
+            assert_eq!(id.len(), 40);
+            assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+
+            // The capture is cut at a line boundary below MAX_GIT_STDOUT, so
+            // a length check alone cannot tell it from a complete diff.
+            let line = format!("{}\n", "x".repeat(79));
+            std::fs::write(repo.join("big.c"), line.repeat(8 * 1024)).unwrap();
+            git(repo, &["add", "big.c"]).await;
+            git(repo, &["commit", "--quiet", "-m", "huge"]).await;
+            let huge = git(repo, &["rev-parse", "HEAD"]).await;
+            assert_eq!(commit_patch_id(repo, &huge).await, None);
+        }
     }
 }
 
