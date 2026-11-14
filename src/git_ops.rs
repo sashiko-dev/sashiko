@@ -2375,6 +2375,56 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_commit_show_ignores_user_format_config() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        std::fs::write(repo.path().join("value.txt"), "changed\n")?;
+        run_test_git(repo.path(), &["add", "value.txt"]).await?;
+        run_test_git(
+            repo.path(),
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--no-verify",
+                "-m",
+                "change value",
+                "-m",
+                "Explain why the value changes.",
+                "-m",
+                "Fixes: 0123456789ab (\"base\")\nSigned-off-by: Test User <test@example.com>",
+            ],
+        )
+        .await?;
+        // The commit text a review reads must not follow the user's format
+        // settings, which git reads from the config files.
+        run_test_git(repo.path(), &["config", "format.pretty", "oneline"]).await?;
+        run_test_git(repo.path(), &["config", "log.date", "relative"]).await?;
+
+        let worktree = GitWorktree::from_path(repo.path().to_path_buf(), repo.path().to_path_buf());
+        let message = worktree.get_commit_message("HEAD").await?;
+        let show = worktree.get_commit_show("HEAD").await?;
+        for text in [&message, &show] {
+            assert!(
+                text.contains("Explain why the value changes."),
+                "no body in {text:?}"
+            );
+            assert!(
+                text.contains("Fixes: 0123456789ab (\"base\")"),
+                "no trailer in {text:?}"
+            );
+            assert!(
+                text.contains("Author: Test User <test@example.com>"),
+                "no author in {text:?}"
+            );
+            assert!(!text.contains(" ago"), "relative date in {text:?}");
+        }
+        assert!(!message.contains("+changed"), "patch in {message:?}");
+        assert!(show.contains("+changed"), "no patch in {show:?}");
+        Ok(())
+    }
+
     #[test]
     fn test_is_stale_commit_graph_matches_both_wordings() {
         assert!(is_stale_commit_graph(
