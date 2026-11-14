@@ -54,6 +54,21 @@ const INHERITED_LOCATION_VARS: [&str; 11] = [
     "GIT_WORK_TREE",
 ];
 
+/// Configuration files the test suite reads, as opposed to the developer's.
+///
+/// Production code has to honour the caller's configuration: it decides which
+/// credentials a fetch uses and which URL a remote really points at. The tests
+/// build throwaway repositories and compare git's answers against the values
+/// they set up themselves, and a global `url.<base>.insteadOf` rewrite changes
+/// those answers, because `git remote -v` prints the rewritten URL. A fixture
+/// that expects the URL it added then sees a different one. Point both files
+/// at /dev/null so that only the repository's own configuration is in play.
+#[cfg(test)]
+const TEST_CONFIG_FILES: [(&str, &str); 2] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_SYSTEM", "/dev/null"),
+];
+
 /// Builds a git command of the given type with the inherited location
 /// variables removed, optionally anchored to a directory.
 macro_rules! git_command {
@@ -61,6 +76,12 @@ macro_rules! git_command {
         let mut command = <$command>::new("git");
         for variable in INHERITED_LOCATION_VARS {
             command.env_remove(variable);
+        }
+        #[cfg(test)]
+        {
+            for (variable, value) in TEST_CONFIG_FILES {
+                command.env(variable, value);
+            }
         }
         if let Some(directory) = $directory {
             command.current_dir(directory);
@@ -120,6 +141,46 @@ mod tests {
         envs.filter(|(_, value)| value.is_none())
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn configured_files<'a, I>(envs: I) -> HashSet<(String, String)>
+    where
+        I: Iterator<Item = (&'a OsStr, Option<&'a OsStr>)>,
+    {
+        envs.filter_map(|(name, value)| {
+            value.map(|value| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+        })
+        .collect()
+    }
+
+    /// The tests must read the fixtures' own configuration, not the one the
+    /// developer has in ~/.gitconfig or /etc/gitconfig: a URL rewrite there
+    /// changes what `git remote -v` reports back.
+    #[test]
+    fn test_commands_read_only_the_repository_configuration() {
+        let expected: HashSet<(String, String)> = TEST_CONFIG_FILES
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+
+        let blocking = configured_files(in_dir("/tmp").get_envs());
+        let asynchronous = configured_files(in_dir_async("/tmp").as_std().get_envs());
+        let detached = configured_files(detached_async().as_std().get_envs());
+        for (label, configured) in [
+            ("blocking", blocking),
+            ("asynchronous", asynchronous),
+            ("detached", detached),
+        ] {
+            assert!(
+                expected.is_subset(&configured),
+                "{label} command reads the caller's configuration"
+            );
+        }
     }
 
     #[test]
