@@ -372,6 +372,16 @@ fn is_object_name(rev: &str) -> bool {
 }
 
 async fn run_git(worktree: &Path, args: &[&str]) -> Option<String> {
+    let out = run_git_output(worktree, args).await?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Runs git and keeps the full capture so callers can tell a truncated
+/// stdout from a complete one; `run_git` discards that distinction.
+async fn run_git_output(
+    worktree: &Path,
+    args: &[&str],
+) -> Option<crate::toolbox::command::CappedOutput> {
     let mut cmd = crate::git_cmd::in_dir_async(worktree);
     cmd.args(args);
     cmd.kill_on_drop(true);
@@ -381,7 +391,7 @@ async fn run_git(worktree: &Path, args: &[&str]) -> Option<String> {
     )
     .await;
     match output {
-        Ok(Ok(out)) if out.is_usable() => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(Ok(out)) if out.is_usable() => Some(out),
         Ok(Ok(out)) => {
             debug!(
                 "code history: git {:?} failed: {}",
