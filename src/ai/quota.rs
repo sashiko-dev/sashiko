@@ -303,7 +303,12 @@ impl QuotaManager {
         }
     }
 
-    pub async fn report_quota_error(&self, retry_after: Duration) {
+    /// Blocks all requests for `retry_after` and says why.
+    ///
+    /// `detail` is what the provider answered with, when it said more than the
+    /// status code: it is the only way to tell an account-wide quota from a
+    /// per-model one from a transient gateway limit in the log.
+    pub async fn report_quota_error(&self, retry_after: Duration, detail: Option<&str>) {
         let retry_after = retry_after.min(MAX_RETRY_AFTER);
         let mut guard = self.blocked_until.lock().await;
         let resume_time = Instant::now() + retry_after;
@@ -316,10 +321,17 @@ impl QuotaManager {
             *guard = Some(resume_time);
         }
 
-        warn!(
-            "Quota exhausted! Blocking all LLM requests for {:.2}s",
-            retry_after.as_secs_f64()
-        );
+        match detail {
+            Some(detail) => warn!(
+                "Quota exhausted! Blocking all LLM requests for {:.2}s: {}",
+                retry_after.as_secs_f64(),
+                detail
+            ),
+            None => warn!(
+                "Quota exhausted! Blocking all LLM requests for {:.2}s",
+                retry_after.as_secs_f64()
+            ),
+        }
     }
 }
 
@@ -383,7 +395,9 @@ mod tests {
         assert_eq!(s1, Duration::ZERO);
 
         let t0 = Instant::now();
-        quota.report_quota_error(Duration::from_millis(100)).await;
+        quota
+            .report_quota_error(Duration::from_millis(100), None)
+            .await;
 
         let _ = tokio::time::timeout(Duration::from_secs(5), quota.wait_for_access())
             .await

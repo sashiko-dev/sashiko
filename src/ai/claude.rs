@@ -154,10 +154,18 @@ pub struct ClaudeErrorDetails {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClaudeError {
-    #[error("Rate limit exceeded, retry after {0:?}")]
-    RateLimitExceeded(Duration),
-    #[error("API overloaded, retry after {0:?}")]
-    OverloadedError(Duration),
+    #[error("Rate limit exceeded, retry after {retry_after:?}: {detail}")]
+    RateLimitExceeded {
+        retry_after: Duration,
+        /// Redacted, shortened body of the provider's answer.
+        detail: String,
+    },
+    #[error("API overloaded, retry after {retry_after:?}: {detail}")]
+    OverloadedError {
+        retry_after: Duration,
+        /// Redacted, shortened body of the provider's answer.
+        detail: String,
+    },
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
     #[error("Authentication error: {0}")]
@@ -171,10 +179,10 @@ pub enum ClaudeError {
 impl ClassifyAiError for ClaudeError {
     fn ai_error_class(&self) -> AiErrorClass {
         match self {
-            ClaudeError::RateLimitExceeded(retry_after) => AiErrorClass::RateLimit {
+            ClaudeError::RateLimitExceeded { retry_after, .. } => AiErrorClass::RateLimit {
                 retry_after: *retry_after,
             },
-            ClaudeError::OverloadedError(retry_after)
+            ClaudeError::OverloadedError { retry_after, .. }
             | ClaudeError::TransientError(retry_after, _) => AiErrorClass::Transient {
                 retry_after: *retry_after,
             },
@@ -183,6 +191,16 @@ impl ClassifyAiError for ClaudeError {
             ClaudeError::ApiError(status, _) => {
                 classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
             }
+        }
+    }
+
+    fn ai_error_detail(&self) -> Option<&str> {
+        match self {
+            ClaudeError::RateLimitExceeded { detail, .. }
+            | ClaudeError::OverloadedError { detail, .. } => {
+                (!detail.is_empty()).then_some(detail.as_str())
+            }
+            _ => None,
         }
     }
 }
@@ -203,6 +221,28 @@ pub(crate) fn transport_error(provider: &str, e: reqwest::Error) -> anyhow::Erro
         err_str
     );
     ClaudeError::TransientError(TRANSPORT_RETRY_AFTER, err_str).into()
+}
+
+/// Longest provider error body kept in an error value.
+///
+/// Gateways answer a rejected request with whole HTML pages, while the body
+/// only exists to explain the failure in the one log line that reports it.
+const ERROR_BODY_LIMIT: usize = 1024;
+
+/// Redacts and shortens a response body so it can travel in an error value.
+///
+/// The body of a 429 or 5xx names the quota that was hit or the request the
+/// gateway rejected, which is what tells an account-wide limit apart from a
+/// per-model one or a transient proxy limit. It can also repeat credentials
+/// from the request, hence the redaction, and it can be arbitrarily long,
+/// hence the cut, which falls on a character boundary rather than a byte
+/// offset so multi-byte text cannot panic.
+pub(crate) fn loggable_body(body: &str) -> String {
+    let redacted = redact_secret(body);
+    match redacted.char_indices().nth(ERROR_BODY_LIMIT) {
+        Some((index, _)) => format!("{}...", &redacted[..index]),
+        None => redacted,
+    }
 }
 
 /// Parses a Retry-After in seconds, capped at the quota manager's maximum.
@@ -341,19 +381,25 @@ impl ClaudeClient {
             let error_body = res
                 .text()
                 .await
-                .map(|t| redact_secret(&t))
+                .map(|t| loggable_body(&t))
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
             match status.as_u16() {
                 429 => {
                     // Rate limit - use parsed retry-after or default to 60s
-                    let duration = retry_after_duration.unwrap_or(Duration::from_secs(60));
-                    Err(ClaudeError::RateLimitExceeded(duration))?
+                    let retry_after = retry_after_duration.unwrap_or(Duration::from_secs(60));
+                    Err(ClaudeError::RateLimitExceeded {
+                        retry_after,
+                        detail: error_body,
+                    })?
                 }
                 500..=599 => {
                     // Overloaded / Server Error - use retry-after or exponential backoff
-                    let duration = retry_after_duration.unwrap_or(Duration::from_secs(0));
-                    Err(ClaudeError::OverloadedError(duration))?
+                    let retry_after = retry_after_duration.unwrap_or(Duration::from_secs(0));
+                    Err(ClaudeError::OverloadedError {
+                        retry_after,
+                        detail: error_body,
+                    })?
                 }
                 400 => Err(ClaudeError::InvalidRequest(error_body))?,
                 401 | 403 => Err(ClaudeError::AuthenticationError(error_body))?,
@@ -812,13 +858,19 @@ mod tests {
     fn test_claude_error_classification() {
         let cases = [
             (
-                ClaudeError::RateLimitExceeded(Duration::from_secs(7)),
+                ClaudeError::RateLimitExceeded {
+                    retry_after: Duration::from_secs(7),
+                    detail: "slow down".to_string(),
+                },
                 AiErrorClass::RateLimit {
                     retry_after: Duration::from_secs(7),
                 },
             ),
             (
-                ClaudeError::OverloadedError(Duration::from_secs(11)),
+                ClaudeError::OverloadedError {
+                    retry_after: Duration::from_secs(11),
+                    detail: String::new(),
+                },
                 AiErrorClass::Transient {
                     retry_after: Duration::from_secs(11),
                 },
@@ -1054,6 +1106,73 @@ mod tests {
                 "{status} {header}: {err:#}"
             );
         }
+    }
+
+    /// A 429 is the answer that says which quota was hit, so its body has to
+    /// survive into the error that the quota manager logs.
+    #[tokio::test]
+    async fn test_rate_limit_body_is_kept_and_redacted() {
+        let err = error_for(test_http::complete(
+            "429 Too Many Requests",
+            "",
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit (token=abc123)"}}"#,
+        ))
+        .await;
+
+        assert_eq!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::RateLimit {
+                retry_after: Duration::from_secs(60)
+            }
+        );
+        let detail = crate::ai::classify_ai_error_detail(&err).expect("detail");
+        assert!(
+            detail.contains("Number of request tokens has exceeded"),
+            "{detail}"
+        );
+        assert!(detail.contains("token=[REDACTED]"), "{detail}");
+        assert!(!detail.contains("abc123"), "{detail}");
+        assert!(
+            format!("{err:#}").contains("Number of request tokens has exceeded"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_overloaded_body_is_kept() {
+        let err = error_for(test_http::complete(
+            "503 Service Unavailable",
+            "",
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"upstream capacity"}}"#,
+        ))
+        .await;
+
+        assert_eq!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::Transient {
+                retry_after: Duration::ZERO
+            }
+        );
+        let detail = crate::ai::classify_ai_error_detail(&err).expect("detail");
+        assert!(detail.contains("upstream capacity"), "{detail}");
+    }
+
+    #[test]
+    fn test_loggable_body_is_cut_on_a_character_boundary() {
+        let body = "é".repeat(ERROR_BODY_LIMIT + 100);
+        let shortened = loggable_body(&body);
+        assert!(shortened.ends_with("..."), "{shortened}");
+        assert_eq!(
+            shortened.trim_end_matches('.').chars().count(),
+            ERROR_BODY_LIMIT
+        );
+        assert!(shortened.len() < body.len());
+    }
+
+    #[test]
+    fn test_loggable_body_keeps_short_bodies_intact() {
+        let body = r#"{"error":{"message":"busy"}}"#;
+        assert_eq!(loggable_body(body), body);
     }
 
     // --- ThinkingConfig tests (Bug 1 regression) ---
