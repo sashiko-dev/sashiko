@@ -788,7 +788,7 @@ mod discussions {
     use tokio::io::AsyncWriteExt;
     use tracing::{debug, warn};
 
-    use super::{HistoryCommit, run_git, truncated};
+    use super::{HistoryCommit, run_git, run_git_output, truncated};
     use crate::mbox::{LoreMboxClient, split_mbox};
     use crate::patch::{clean_subject, extract_changelog_from_body, get_subject_prefixes};
     use crate::prior_context::sanitize_untrusted_discussion_text;
@@ -1030,16 +1030,17 @@ mod discussions {
 
     /// The stable patch ID of the commit's diff.
     async fn commit_patch_id(worktree: &Path, full_sha: &str) -> Option<String> {
-        let diff = run_git(worktree, &["show", "--format=", "--no-color", full_sha]).await?;
-        // run_git stops reading at MAX_GIT_STDOUT; a cut diff has a
-        // different patch ID, which would find nothing or the wrong thread.
-        if diff.len() >= super::MAX_GIT_STDOUT {
+        let out = run_git_output(worktree, &["show", "--format=", "--no-color", full_sha]).await?;
+        // run_git_output accepts a capped capture; a cut diff has a different
+        // patch ID, which would find nothing or the wrong thread.
+        if out.stdout_capped {
             debug!(
                 "code history: diff of {} too large for a patch ID",
                 full_sha
             );
             return None;
         }
+        let diff = out.stdout;
         let mut cmd = crate::git_cmd::in_dir_async(worktree);
         cmd.args(["patch-id", "--stable"])
             .stdin(std::process::Stdio::piped())
@@ -1049,7 +1050,7 @@ mod discussions {
         let mut child = cmd.spawn().ok()?;
         let mut stdin = child.stdin.take()?;
         let writer = tokio::spawn(async move {
-            let _ = stdin.write_all(diff.as_bytes()).await;
+            let _ = stdin.write_all(&diff).await;
         });
         let output = tokio::time::timeout(super::GIT_TIMEOUT, child.wait_with_output())
             .await
