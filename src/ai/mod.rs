@@ -903,6 +903,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 .unwrap_or_else(claude::ClaudeClient::default_base_url);
             let thinking = claude.and_then(|c| c.thinking.clone());
             let effort = claude.and_then(|c| c.effort.clone());
+            let client_cert = claude.and_then(|c| c.client_cert.as_deref());
             Ok(Arc::new(claude::ClaudeClient::new(
                 model,
                 enable_caching,
@@ -910,7 +911,8 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 base_url,
                 thinking,
                 effort,
-            )))
+                client_cert,
+            )?))
         }
         "stdio-claude" => Ok(Arc::new(claude::StdioClaudeClient::new())),
         #[cfg(feature = "bedrock")]

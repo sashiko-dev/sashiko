@@ -166,6 +166,7 @@ Settings specific to the Claude API provider (`provider = "claude"`).
 | `prompt_caching` | bool | `true` | Enable Anthropic prompt caching (5-minute TTL). |
 | `max_tokens` | integer | `32768` | Max output tokens per response, thinking included. |
 | `base_url` | string | -- | Full Messages endpoint URL, e.g. `https://proxy.example.com/v1/messages`, for proxies like Portkey. Defaults to `$ANTHROPIC_BASE_URL/v1/messages`, or the Anthropic API. |
+| `client_cert` | path | -- | PEM file holding a certificate and its private key, presented as the TLS client identity to endpoints that authenticate callers with mutual TLS. |
 | `thinking` | string | -- | Thinking mode, sent as `thinking.type`: `"adaptive"` (Opus 4.6, Sonnet 4.6, and later), or `"disabled"` where the model allows it. |
 | `effort` | string | -- | Effort level, sent as `output_config.effort`: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Which levels a model accepts, and its default, vary by model. |
 
