@@ -65,6 +65,18 @@ cp docs/examples/Settings.claude.toml Settings.toml
 - Adaptive thinking and effort via the `thinking` and `effort` settings
   in `[ai.claude]`
 
+**Gateways:** to reach Claude through an Anthropic-compatible gateway,
+point `base_url` at its Messages endpoint. Set `client_cert` when the
+gateway authenticates callers with mutual TLS rather than an API key,
+and pass any headers it requires in `ANTHROPIC_CUSTOM_HEADERS`, one
+`Name: value` per line:
+
+```toml
+[ai.claude]
+base_url = "https://gateway.example.com/v1/messages"
+client_cert = "/path/to/cert-and-key.pem"
+```
+
 ## Claude Code CLI
 
 Uses a local [Claude Code](https://claude.com/claude-code) installation as

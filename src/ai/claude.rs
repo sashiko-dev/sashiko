@@ -236,25 +236,45 @@ impl ClaudeClient {
         base_url: String,
         thinking: Option<String>,
         effort: Option<String>,
-    ) -> Self {
+        client_cert: Option<&std::path::Path>,
+    ) -> Result<Self> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .or_else(|_| std::env::var("ANTHROPIC_AUTH_TOKEN"))
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .unwrap_or_default();
 
         let extra_headers = Self::parse_env_headers();
+        let client = match client_cert {
+            Some(path) => Self::client_with_cert(path)?,
+            None => Client::new(),
+        };
 
-        Self {
+        Ok(Self {
             api_key,
             model,
-            client: Client::new(),
+            client,
             enable_caching,
             max_tokens,
             base_url,
             thinking,
             effort,
             extra_headers,
-        }
+        })
+    }
+
+    fn client_with_cert(path: &std::path::Path) -> Result<Client> {
+        let pem = std::fs::read(path)
+            .with_context(|| format!("Failed to read client certificate {}", path.display()))?;
+        let identity = reqwest::Identity::from_pem(&pem).with_context(|| {
+            format!(
+                "Client certificate {} must hold a PEM certificate and private key",
+                path.display()
+            )
+        })?;
+        Client::builder()
+            .identity(identity)
+            .build()
+            .context("Failed to build Claude HTTP client")
     }
 
     pub fn default_base_url() -> String {
@@ -780,7 +800,9 @@ mod tests {
                 base_url.to_string(),
                 None,
                 None,
+                None,
             )
+            .unwrap()
         };
         let base = client(4096, "https://example.invalid/v1/messages");
         assert_ne!(
@@ -792,6 +814,54 @@ mod tests {
             base.cache_identity(),
             client(4096, "https://proxy.invalid/v1/messages").cache_identity(),
             "a changed base_url must not replay the old endpoint's response"
+        );
+    }
+
+    fn client_cert_file(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        file
+    }
+
+    fn client_with_cert(path: &std::path::Path) -> Result<ClaudeClient> {
+        ClaudeClient::new(
+            "claude-opus-4-7".to_string(),
+            false,
+            4096,
+            "https://example.invalid/v1/messages".to_string(),
+            None,
+            None,
+            Some(path),
+        )
+    }
+
+    #[test]
+    fn client_cert_loads_a_combined_cert_and_key_pem() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let pem = format!("{}{}", cert.cert.pem(), cert.signing_key.serialize_pem());
+        let file = client_cert_file(&pem);
+        client_with_cert(file.path()).unwrap();
+    }
+
+    #[test]
+    fn client_cert_without_a_key_is_rejected() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let file = client_cert_file(&cert.cert.pem());
+        let Err(err) = client_with_cert(file.path()) else {
+            panic!("a certificate without its private key must be rejected");
+        };
+        assert!(format!("{err:#}").contains("private key"), "{err:#}");
+    }
+
+    #[test]
+    fn missing_client_cert_names_the_path() {
+        let Err(err) = client_with_cert(std::path::Path::new("/nonexistent/cert.pem")) else {
+            panic!("a missing certificate file must be rejected");
+        };
+        assert!(
+            format!("{err:#}").contains("/nonexistent/cert.pem"),
+            "{err:#}"
         );
     }
 

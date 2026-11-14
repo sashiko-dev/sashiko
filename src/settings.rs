@@ -352,6 +352,8 @@ pub struct ClaudeSettings {
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
+    pub client_cert: Option<PathBuf>,
+    #[serde(default)]
     pub thinking: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
