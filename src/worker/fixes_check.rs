@@ -565,7 +565,7 @@ pub fn extract_diff_blame_targets(diff_only: &str) -> (Vec<String>, Vec<HunkBlam
     (modified_files, targets)
 }
 
-fn parse_diff_git_pre_path(rest: &str) -> Option<String> {
+pub(crate) fn parse_diff_git_pre_path(rest: &str) -> Option<String> {
     let trimmed = rest.trim();
     let pos = trimmed.find(" b/")?;
     let a_part = &trimmed[..pos];

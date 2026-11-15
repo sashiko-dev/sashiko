@@ -32,7 +32,9 @@ use tracing::{debug, warn};
 
 use crate::prior_context::sanitize_untrusted_discussion_text;
 use crate::project::ProjectId;
-use crate::worker::fixes_check::{HunkBlameTarget, extract_diff_blame_targets};
+use crate::worker::fixes_check::{
+    HunkBlameTarget, extract_diff_blame_targets, parse_diff_git_pre_path,
+};
 
 /// Where a project's patches were reviewed before they were merged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,10 +255,49 @@ struct CommitInfo {
     subject: String,
 }
 
+/// Keeps the per-file sections of a diff whose pre-image path the profile
+/// treats as code, so skipped files cannot use up the blame and identifier
+/// budgets or contribute identifiers of their own. Text without a preceding
+/// git header has no reliable section boundary and is kept.
+fn filter_code_paths(diff_only: &str, profile: &HistoryProfile) -> String {
+    let mut kept = String::with_capacity(diff_only.len());
+    let mut keep = true;
+    for line in diff_only.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            keep = parse_diff_git_pre_path(rest).is_some_and(|path| profile.is_code_path(&path));
+        }
+        if keep {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    kept
+}
+
+/// The files later git commands select. `extract_diff_blame_targets` names
+/// files only from git headers, so a diff without them is scoped by the
+/// pre-image paths of its blame targets instead.
+fn code_files(
+    files: Vec<String>,
+    targets: &[HunkBlameTarget],
+    profile: &HistoryProfile,
+) -> Vec<String> {
+    let mut files: Vec<String> = files
+        .into_iter()
+        .filter(|file| profile.is_code_path(file))
+        .collect();
+    for target in targets {
+        if !files.contains(&target.pre_file) {
+            files.push(target.pre_file.clone());
+        }
+    }
+    files
+}
+
 /// Collects the history of the code `diff_only` changes, as of the parent of
 /// `target_commit_sha`, using the profile of `project`. Returns `None` when
-/// the project has no profile, the patch modifies no existing code lines,
-/// or the parent cannot be resolved.
+/// the project has no profile, the patch modifies no code files or no
+/// existing code lines, or the parent cannot be resolved.
 pub async fn collect_code_history(
     project: ProjectId,
     worktree: &Path,
@@ -275,19 +316,19 @@ pub async fn collect_code_history(
         );
         return None;
     }
-    let (files, targets) = extract_diff_blame_targets(diff_only);
-    let files: Vec<String> = files
-        .into_iter()
-        .filter(|f| profile.is_code_path(f))
-        .collect();
+    // Filter the diff first so hunks and identifiers from skipped files
+    // cannot use up the blame and probe budgets.
+    let diff_only = filter_code_paths(diff_only, &profile);
+    let (files, targets) = extract_diff_blame_targets(&diff_only);
     let targets: Vec<HunkBlameTarget> = targets
         .into_iter()
-        .filter(|t| profile.is_code_path(&t.pre_file))
+        .filter(|target| profile.is_code_path(&target.pre_file))
         .collect();
     if targets.is_empty() {
         debug!("code history: patch modifies no existing code lines");
         return None;
     }
+    let files = code_files(files, &targets, &profile);
     let parent = resolve_parent(worktree, target_commit_sha).await?;
     let mut set = CommitSet::default();
     let discovery = async {
@@ -297,7 +338,7 @@ pub async fn collect_code_history(
             &parent,
             target_commit_sha,
             &files,
-            diff_only,
+            &diff_only,
             series_shas,
             &mut set,
         )
@@ -1561,5 +1602,100 @@ mod tests {
             removed_only_identifiers(diff),
             vec!["ext_zicbom".to_string()]
         );
+    }
+
+    #[test]
+    fn filter_code_paths_drops_skipped_files_before_extraction() {
+        let Some(profile) = HistoryProfile::for_project(ProjectId::Qemu) else {
+            panic!("QEMU has a history profile");
+        };
+        let docs = concat!(
+            "diff --git a/docs/system/riscv/virt.rst b/docs/system/riscv/virt.rst\n",
+            "--- a/docs/system/riscv/virt.rst\n",
+            "+++ b/docs/system/riscv/virt.rst\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-DOC_ONLY_IDENT\n",
+            "+documented\n",
+        );
+        let code = concat!(
+            "diff --git a/target/riscv/csr.c b/target/riscv/csr.c\n",
+            "--- a/target/riscv/csr.c\n",
+            "+++ b/target/riscv/csr.c\n",
+            "@@ -10,1 +10,1 @@\n",
+            "-    riscv_cpu_cfg(env)->ext_zicbom = true;\n",
+            "+    riscv_cpu_cfg(env)->ext_other = true;\n",
+        );
+        let diff = format!("{docs}{code}");
+
+        let filtered = filter_code_paths(&diff, &profile);
+        assert!(!filtered.contains("virt.rst"));
+        assert!(!filtered.contains("DOC_ONLY_IDENT"));
+
+        let (files, targets) = extract_diff_blame_targets(&filtered);
+        assert_eq!(files, vec!["target/riscv/csr.c".to_string()]);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            removed_only_identifiers(&filtered),
+            vec!["ext_zicbom".to_string()]
+        );
+
+        let skipped_only = filter_code_paths(docs, &profile);
+        assert!(skipped_only.is_empty());
+        assert!(extract_diff_blame_targets(&skipped_only).0.is_empty());
+
+        // A leading section without a git header has no boundary to filter
+        // on; it must survive instead of disappearing before extraction.
+        let leading = concat!(
+            "--- a/docs/system/riscv/virt.rst\n",
+            "+++ b/docs/system/riscv/virt.rst\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-LEADING_DOC\n",
+            "+documented\n",
+        );
+        let mixed = filter_code_paths(&format!("{leading}{code}"), &profile);
+        assert!(mixed.contains("LEADING_DOC"));
+        assert!(mixed.contains("target/riscv/csr.c"));
+    }
+
+    #[test]
+    fn code_files_scope_a_diff_without_git_headers() {
+        let Some(profile) = HistoryProfile::for_project(ProjectId::Qemu) else {
+            panic!("QEMU has a history profile");
+        };
+        let diff = concat!(
+            "--- a/target/riscv/csr.c\n",
+            "+++ b/target/riscv/csr.c\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-    riscv_cpu_cfg(env)->ext_zicbom = true;\n",
+            "+    riscv_cpu_cfg(env)->ext_other = true;\n",
+        );
+        assert_eq!(filter_code_paths(diff, &profile), diff);
+
+        let (files, targets) = extract_diff_blame_targets(diff);
+        assert!(files.is_empty());
+        let targets: Vec<HunkBlameTarget> = targets
+            .into_iter()
+            .filter(|target| profile.is_code_path(&target.pre_file))
+            .collect();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            code_files(files, &targets, &profile),
+            vec!["target/riscv/csr.c".to_string()]
+        );
+
+        let docs = concat!(
+            "--- a/docs/system/riscv/virt.rst\n",
+            "+++ b/docs/system/riscv/virt.rst\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-DOC_ONLY_IDENT\n",
+            "+documented\n",
+        );
+        let (files, targets) = extract_diff_blame_targets(docs);
+        let targets: Vec<HunkBlameTarget> = targets
+            .into_iter()
+            .filter(|target| profile.is_code_path(&target.pre_file))
+            .collect();
+        assert!(targets.is_empty());
+        assert!(code_files(files, &targets, &profile).is_empty());
     }
 }
