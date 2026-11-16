@@ -106,6 +106,9 @@ See `docs/benchmarking.md` for full setup and CLI options (`sashiko benchmark <p
 - `benchmark_preexisting.json` (known Linux bugs for testing the pre-existing bug pipeline)
 - `benchmark_versioned.json` (53 multi-version LKML patchset stories testing prior-version feedback verification, attribution, and suppression)
 
+The QEMU project has its own suite in `projects/qemu/benchmarks/`:
+- `benchmark_riscv.json` (80 checked RISC-V bugs fixed in 2025-2026)
+
 # LLM Workflow Design
 
 When designing or modifying workflows and prompts in Sashiko:
