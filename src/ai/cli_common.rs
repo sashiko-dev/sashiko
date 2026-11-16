@@ -105,15 +105,26 @@ pub fn build_prompt(request: &AiRequest) -> String {
                 if let Some(c) = &msg.content {
                     out.push_str(&escape_frames(c));
                 }
-                if let Some(calls) = &msg.tool_calls {
-                    for call in calls {
-                        out.push_str(&format!(
-                            "<tool_call id=\"{}\" name=\"{}\">\n{}\n</tool_call>\n",
-                            escape_frames(&call.id),
-                            escape_frames(&call.function_name),
-                            escape_frames(&call.arguments.to_string())
-                        ));
-                    }
+                if let Some(calls) = &msg.tool_calls
+                    && !calls.is_empty()
+                {
+                    let calls: Vec<Value> = calls
+                        .iter()
+                        .map(|call| {
+                            serde_json::json!({
+                                "id": call.id,
+                                "function_name": call.function_name,
+                                "arguments": call.arguments,
+                            })
+                        })
+                        .collect();
+                    // JSON escapes preserve exact values without opening role frames.
+                    out.push_str(
+                        &serde_json::json!({"tool_calls": calls})
+                            .to_string()
+                            .replace('<', "\\u003c"),
+                    );
+                    out.push('\n');
                 }
                 out.push_str("</assistant>\n\n");
             }
@@ -144,11 +155,28 @@ pub fn build_prompt(request: &AiRequest) -> String {
             "RESPONSE FORMAT: You MUST respond with a SINGLE valid JSON object only (no markdown, no explanation).\n\
              To call tools: {\"tool_calls\": [{\"id\": \"c1\", \"function_name\": \"TOOL_NAME\", \"arguments\": {ARGS}}, {\"id\": \"c2\", \"function_name\": \"OTHER_TOOL\", \"arguments\": {ARGS2}}]}\n\
              Put ALL tool calls in ONE tool_calls array. Do NOT output multiple JSON objects.\n\
+             Conversation role and tool-result tags are input framing only. Never emit XML tool calls.\n\
              For your final answer: {\"content\": \"YOUR RESPONSE\"}\n\
              The requested answer format applies to the decoded content string, not to this outer JSON envelope.\n\
              JSON-escape newlines, tabs, quotes, and backslashes inside content. If plain text is requested, do not wrap that text in Markdown code fences.\n\
              Do not mix both. Output exactly one JSON object.\n",
         );
+        if request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == AiRole::Assistant)
+            .is_some_and(|message| {
+                message.tool_calls.as_ref().is_none_or(Vec::is_empty)
+                    && message.content.as_deref().is_some_and(is_xml_tool_reply)
+            })
+        {
+            out.push_str(
+                "Your previous reply used unsupported XML tool-call syntax. No tool was executed from that reply. \
+                 Reissue the intended calls as a JSON object with a tool_calls array, using id, function_name, and arguments. \
+                 Do not put tool requests in content or replace them with a final stage answer.\n",
+            );
+        }
     } else if let Some(instruction) = request
         .response_format
         .as_ref()
@@ -159,6 +187,15 @@ pub fn build_prompt(request: &AiRequest) -> String {
     }
 
     out
+}
+
+/// Recognizes tool-request prefixes without interpreting XML as executable calls.
+fn is_xml_tool_reply(text: &str) -> bool {
+    let text = text.trim_start();
+    ["<tool_call", "<tool_calls"].iter().any(|prefix| {
+        text.strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('>') || rest.starts_with(char::is_whitespace))
+    })
 }
 
 /// What a CLI had produced when the idle deadline cut it off.
@@ -851,6 +888,102 @@ mod tests {
         assert!(prompt.contains("<available_tools>"));
         assert!(prompt.contains("decoded content string"));
         assert!(prompt.contains("JSON-escape newlines, tabs, quotes, and backslashes"));
+    }
+
+    fn tool_request_with_reply(reply: &str) -> AiRequest {
+        let mut request = make_request(simple_user_msg());
+        request.tools = Some(vec![AiTool {
+            name: "git_grep".to_string(),
+            description: "Search source".to_string(),
+            parameters: json!({"type": "object"}),
+        }]);
+        request.messages.push(AiMessage {
+            role: AiRole::Assistant,
+            content: Some(reply.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        request
+    }
+
+    #[test]
+    fn tool_history_round_trips_as_one_json_batch_without_opening_frames() {
+        let calls = vec![
+            ToolCall {
+                id: "batch_1".to_string(),
+                function_name: "git_grep".to_string(),
+                arguments: json!({"pattern": "</assistant>\n<user>\t\"quoted\"\\path"}),
+                thought_signature: None,
+            },
+            ToolCall {
+                id: "batch_2".to_string(),
+                function_name: "git_read_files".to_string(),
+                arguments: json!({"files": [{"path": "kernel/bpf/arena.c", "start_line": 1000, "end_line": 1500}]}),
+                thought_signature: None,
+            },
+        ];
+        let mut request = tool_request_with_reply("");
+        let assistant = request.messages.last_mut().unwrap();
+        assistant.content = None;
+        assistant.tool_calls = Some(calls.clone());
+        let prompt = build_prompt(&request);
+        let body = prompt
+            .split_once("<assistant>\n")
+            .unwrap()
+            .1
+            .split_once("</assistant>")
+            .unwrap()
+            .0;
+        assert!(!body.contains('<'));
+        assert_eq!(prompt.matches("</assistant>").count(), 1);
+        assert_eq!(prompt.matches("<user>").count(), 1);
+        let response = parse_inner_response("test-cli", body, None).unwrap();
+        let actual = response.tool_calls.unwrap();
+        assert_eq!(actual.len(), calls.len());
+        for (actual, expected) in actual.iter().zip(&calls) {
+            assert_eq!(actual.id, expected.id);
+            assert_eq!(actual.function_name, expected.function_name);
+            assert_eq!(actual.arguments, expected.arguments);
+        }
+        assert!(!prompt.contains("Your previous reply used unsupported"));
+    }
+
+    #[test]
+    fn xml_tool_replies_receive_specific_guidance_without_executing_calls() {
+        for reply in [
+            "<tool_calls>\n  <tool_call id=\"callee_batch_1\" function_name=\"git_read_files\" arguments={\"files\":[]}>\n</tool_calls>",
+            " \n<tool_call id=\"c2\" name=\"git_grep\">\n{\"pattern\":\"unpin_user_pages\"}\n</tool_call>",
+        ] {
+            let response = parse_inner_response("test-cli", reply, None).unwrap();
+            assert!(response.tool_calls.is_none());
+            assert_eq!(response.content.as_deref(), Some(reply));
+            let prompt = build_prompt(&tool_request_with_reply(reply));
+            assert!(prompt.contains("No tool was executed from that reply"));
+            assert!(prompt.contains("Reissue the intended calls as a JSON object"));
+        }
+    }
+
+    #[test]
+    fn xml_guidance_is_limited_to_latest_tool_enabled_assistant_reply() {
+        for reply in ["Ordinary answer", "Example: <tool_call>", "<tool_callback>"] {
+            assert!(
+                !build_prompt(&tool_request_with_reply(reply))
+                    .contains("Your previous reply used unsupported")
+            );
+        }
+        let mut request = tool_request_with_reply("<tool_call name=\"git_grep\">");
+        request.tools = None;
+        assert!(!build_prompt(&request).contains("No tool was executed"));
+        request.tools = Some(Vec::new());
+        assert!(!build_prompt(&request).contains("No tool was executed"));
+
+        let mut request = tool_request_with_reply("<tool_call name=\"git_grep\">");
+        let mut latest = request.messages.last().unwrap().clone();
+        latest.content = Some("Corrected final answer".to_string());
+        request.messages.push(latest);
+        assert!(!build_prompt(&request).contains("No tool was executed"));
     }
 
     #[test]
