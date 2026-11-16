@@ -603,6 +603,46 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
         }
     }
 
+    // Use the patch body's leading "From:" line (git format-patch format) as the
+    // authoritative author instead of the email From header: git send-email may
+    // apply .mailmap transformations to the email From header, causing it to
+    // differ from the original author recorded in the patch body.
+    // (Ported to current main: reads raw body parts because
+    // strip_format_patch_headers() removes the header lines from `body`.)
+    for i in 0..message.text_body_count() {
+        let Some(text) = message.body_text(i) else { continue };
+        let first_line = text
+            .replace("\r\n", "\n")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if first_line.starts_with("From:") {
+            let from_value = first_line.strip_prefix("From:").unwrap_or("").trim();
+            if !from_value.is_empty() {
+                if let Some(start_bracket) = from_value.rfind('<') {
+                    if let Some(end_bracket) = from_value.rfind('>') {
+                        if end_bracket > start_bracket {
+                            let name = from_value[..start_bracket].trim();
+                            let email = from_value[start_bracket + 1..end_bracket].trim();
+                            if !email.is_empty() && email.contains('@') {
+                                author = if name.is_empty() || name.to_lowercase() == "unknown" {
+                                    email.to_string()
+                                } else {
+                                    format_mailbox(name, email)
+                                };
+                            }
+                        }
+                    }
+                } else if from_value.contains('@') {
+                    author = from_value.to_string();
+                }
+            }
+        }
+        break;
+    }
+
     let diff = if has_unquoted_diff(&body) {
         body.clone()
     } else {
