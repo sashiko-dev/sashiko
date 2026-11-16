@@ -14,7 +14,7 @@ filters them out. This feature mentions a pre-existing bug **only when it is cle
 | R4 | Proportionate | Budget based on patch size, hard cap of 2 |
 | R5 | Not security-sensitive, and still present once the patch is applied | Per-candidate **disclosure check** stage, with tools, on the patched tree |
 | R6 | Report once; record when and with which patch | New `preexisting_disclosures` table |
-| R7 | Configurable severity floor, Medium+ by default | `report_preexisting_bugs` policy knob (`true` = `"medium"`, or `"low"`/`"medium"`/`"high"`/`"critical"`) |
+| R7 | Configurable severity floor, High+ by default | `report_preexisting_bugs` policy knob (`true` = `"high"`, or `"low"`/`"medium"`/`"high"`/`"critical"`) |
 
 ## 2. Relevant current-state facts
 
@@ -87,7 +87,7 @@ Per mailing list, at least for now:
 
 ```toml
 [defaults]
-report_preexisting_bugs = true   # true ("medium") | false | "none" | "low" | "medium" | "high" | "critical"
+report_preexisting_bugs = true   # true ("high") | false | "none" | "low" | "medium" | "high" | "critical"
 
 ["linux-mm@kvack.org"]
 report_preexisting_bugs = false

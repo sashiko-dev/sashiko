@@ -121,7 +121,7 @@ pub struct RelatedPreexistingPolicy {
 }
 
 fn default_related_preexisting_min_severity() -> SeverityFloor {
-    SeverityFloor::Medium
+    SeverityFloor::High
 }
 
 impl Default for RelatedPreexistingPolicy {
@@ -731,7 +731,7 @@ mod tests {
         let resolved = config.related_preexisting_for(["Dev <dev@example.org>"]);
         assert_eq!(resolved, RelatedPreexistingPolicy::default());
         assert!(resolved.enabled);
-        assert_eq!(resolved.min_severity, SeverityFloor::Medium);
+        assert_eq!(resolved.min_severity, SeverityFloor::High);
     }
 
     #[test]
@@ -780,7 +780,7 @@ mod tests {
         let config = EmailPolicyConfig::parse_content(
             r#"
             [defaults]
-            report_preexisting_bugs = "high"
+            report_preexisting_bugs = "medium"
 
             ["linux-mm@kvack.org"]
             report_preexisting_bugs = false
@@ -799,7 +799,7 @@ mod tests {
 
         let other = config.related_preexisting_for(["other@example.org"]);
         assert!(other.enabled);
-        assert_eq!(other.min_severity, SeverityFloor::High);
+        assert_eq!(other.min_severity, SeverityFloor::Medium);
 
         let mm = config.related_preexisting_for(["linux-mm@kvack.org"]);
         assert!(!mm.enabled);
@@ -810,7 +810,7 @@ mod tests {
         // `true` enables reporting while preserving the configured default floor.
         let damon = config.related_preexisting_for(["damon@lists.linux.dev"]);
         assert!(damon.enabled);
-        assert_eq!(damon.min_severity, SeverityFloor::High);
+        assert_eq!(damon.min_severity, SeverityFloor::Medium);
 
         let bpf_damon =
             config.related_preexisting_for(["bpf@vger.kernel.org", "damon@lists.linux.dev"]);
@@ -838,7 +838,7 @@ mod tests {
         );
         let bpf_opt_in = opt_in.related_preexisting_for(["bpf@vger.kernel.org"]);
         assert!(bpf_opt_in.enabled);
-        assert_eq!(bpf_opt_in.min_severity, SeverityFloor::Medium);
+        assert_eq!(bpf_opt_in.min_severity, SeverityFloor::High);
     }
 
     #[test]

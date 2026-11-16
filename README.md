@@ -65,7 +65,7 @@ sashiko review HEAD~3..HEAD
 sashiko review --report-preexisting
 
 # Report only the one or two pre-existing bugs closely related to the change
-sashiko review --report-related-preexisting [--related-preexisting-min-severity high]
+sashiko review --report-related-preexisting [--related-preexisting-min-severity medium]
 
 # Review commits in another supported project (gcc, qemu, zephyr, sashiko)
 sashiko review --project gcc
