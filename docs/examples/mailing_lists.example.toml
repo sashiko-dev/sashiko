@@ -38,7 +38,7 @@ ignored_emails = []
 # Mention 1-2 closely related, non-security-sensitive pre-existing bugs on
 # the first non-RFC posting of a series (each bug at most once). Accepts
 # true, false ("none"), or a severity floor ("low".."critical"; true uses
-# "medium").
+# "high").
 report_preexisting_bugs = true
 
 # --- Author-only delivery (inherits defaults when mute_all = false) ---

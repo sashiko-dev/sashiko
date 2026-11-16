@@ -175,7 +175,7 @@ enum Commands {
         #[arg(
             long,
             value_name = "SEVERITY",
-            default_value = "medium",
+            default_value = "high",
             requires = "report_related_preexisting"
         )]
         related_preexisting_min_severity: sashiko::db::SeverityFloor,
@@ -6448,7 +6448,7 @@ mod tests {
         assert!(report_related_preexisting);
         assert_eq!(
             related_preexisting_min_severity,
-            sashiko::db::SeverityFloor::Medium
+            sashiko::db::SeverityFloor::High
         );
 
         let Some(Commands::Review {
@@ -6457,7 +6457,7 @@ mod tests {
         }) = parse(&[
             "--report-related-preexisting",
             "--related-preexisting-min-severity",
-            "high",
+            "medium",
         ])
         .unwrap()
         .command
@@ -6466,7 +6466,7 @@ mod tests {
         };
         assert_eq!(
             related_preexisting_min_severity,
-            sashiko::db::SeverityFloor::High
+            sashiko::db::SeverityFloor::Medium
         );
 
         assert!(parse(&["--report-preexisting", "--report-related-preexisting"]).is_err());
