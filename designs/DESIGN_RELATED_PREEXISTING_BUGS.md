@@ -98,11 +98,10 @@ report_preexisting_bugs = false
 - Resolution across matched lists: any `enabled = false` ⇒ off. The effective `min_severity` is the
   **strictest** (highest) of the explicit values, otherwise the default. If no list matched, the defaults apply.
 
-### 3.3 Step 1: deterministic pre-filter (no LLM, file and symbol level)
+### 3.3 Step 1: deterministic pre-filter (no LLM, file level)
 During the workflow, concern locations are raw LLM output: lines and sides are unverified, because grounding
 runs after the workflow. So the pre-filter only checks facts it can trust:
-- `severity >= min_severity` (or `Medium` when `min_severity == High` and one of the candidate's locations in a
-  surviving touched file names a function or symbol present in that file's diff hunks).
+- `severity >= min_severity`.
 - At least one location is in a file the patch touches, and that file still exists after the patch
   (a deleted file is never reported).
 - The candidate is not a duplicate (same rule as §3.6) of a disclosure the reviewer passed in.
@@ -119,8 +118,7 @@ and tools. The pre-filter is a pure function of the state, recomputed wherever i
   - `Other`: affects the same data structure, lock, resource lifecycle, or paired operation (`init`/`destroy`,
     `register`/`unregister`, `attach`/`detach`, `get`/`set`, `open`/`close`) in the same file.
 - Anti-charity: select a candidate only when one of these concrete connections holds and can be cited.
-- Validator: `len(selected) <= budget`, each item refers to a candidate id from the pre-filter, and any selected
-  candidate whose severity is below `min_severity` (such as `Medium` under a `High` floor) must use `relation == SameCode`.
+- Validator: `len(selected) <= budget`, and each item refers to a candidate id from the pre-filter.
 - Budget is **per patch**: patches changing ≤ 30 lines get 1, larger patches get 2. There is no series-wide cap.
   "Never twice" is guaranteed by §3.6, not by the budget.
 
