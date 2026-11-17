@@ -9,3 +9,4 @@ Conventions and review priorities for GCC RTL optimization passes and target bac
 
 - Reserve standard overflow-trapping optab names (`addv<mode>3`, `subv<mode>3`, `usubv<mode>3`, `mulv<mode>3`, `negv<mode>2`) exclusively for instruction patterns that trap on overflow as required by `-ftrapv`; non-trapping backend patterns must use target-prefixed or non-optab pattern names.
 - Prefer `poly_int`-aware predicates (`known_eq`, `known_lt`, `known_le`, `maybe_eq`, `ordered_p`) over `.to_constant ()` in target-independent RTL and middle-end code so targets with runtime-sized vector modes remain supported.
+- When `gcc/simplify-rtx.cc` or `gcc/combine.cc` changes a canonical RTL form (for example commuting `NOT` across `ROTATE` / `ROTATERT`), check multiple major target backends (`aarch64`, `arm`, `i386`, `riscv`, `avr`) for broken `define_insn` pattern matching and `TARGET_RTX_COSTS` regressions rather than auditing only one target.
