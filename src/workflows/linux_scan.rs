@@ -234,7 +234,8 @@ If you find no Medium, High, or Critical bugs and no dismissed concerns, return 
 - Report distinct defects as separate entries in `'concerns'` (even if two bugs occur in the same function).
 - Each object in `'concerns'` MUST use: `"type"`, `"description"`, `"reasoning"`, `"preexisting"` (`true`), and `"locations"` (non-empty array of `{"file", "function_or_symbol", "line", "code_snippet", "why_this_location_matters"}`).
 - Each object in `'dismissed_concerns'` MUST use: `"type"`, `"description"`, `"reasoning"`, and `"locations"` (quoting the verbatim disproving guard, lock, cleanup path, or caller check in the repository).
-- NO DISMISSAL WITHOUT VERIFIED PROOF: Never dismiss a candidate bug by assuming callers, framework teardown callbacks (such as `->css_free` or `->release`), or surrounding code handle it without inspecting ALL relevant callers and framework entry points and quoting the disproving code in `locations`. If you cannot prove safety from concrete code, report it in `'concerns'`."#;
+- NO DISMISSAL WITHOUT VERIFIED PROOF: Never dismiss a candidate bug by assuming callers, framework teardown callbacks (such as `->css_free` or `->release`), or surrounding code handle it without inspecting ALL relevant callers and framework entry points and quoting the disproving code in `locations`. If you cannot prove safety from concrete code, report it in `'concerns'`.
+- NO HYPOTHETICAL CALLER-ARGUMENT BUGS: Never report a defect predicated on hypothetical internal or out-of-tree (`EXPORT_SYMBOL*`) callers passing invalid, unaligned, `NULL`, zero-sized, or out-of-contract arguments unless either untrusted external input (userspace, network, hardware/DMA/firmware, guest VM, or untrusted filesystem media) reaches the parameter unvalidated or you cite at least one concrete violating in-tree caller in `locations`."#;
 
 pub static SCAN_ANALYSIS_STAGES: &[AnalysisStage] = &[
     AnalysisStage {
@@ -1802,7 +1803,7 @@ Return ONLY a JSON object with 'findings', 'inconclusive_concerns' (MUST be []),
 const STAGE_SCAN_POST_VERIFICATION_INSTRUCTION: &str = r#"# Per-Finding Deep Codebase Post-Verification & Canonical Bug Formatting
 
 You are the lead Linux kernel maintainer performing deep, tool-assisted verification of a speculative or contested candidate issue (`inconclusive_concerns`) against the repository at `Target Revision SHA`.
-1. Use `git_read_files`, `git_grep`, `git_blame`, and `git_show` at the target revision to answer each candidate's `verification_question` and verify ALL callers, callees, lock contexts, and lifecycle paths.
+1. Use `git_read_files`, `git_grep`, `git_blame`, and `git_show` at the target revision to answer each candidate's `verification_question` and verify ALL callers, callees, lock contexts, and lifecycle paths. For any defect predicated on caller-supplied argument properties (such as unaligned addresses, `NULL` or zero sizes, out-of-range values, or violated caller preconditions) rather than untrusted external input, ignore hypothetical future callers and out-of-tree `EXPORT_SYMBOL*` modules: dismiss the candidate in `dismissed_concerns` (citing the verified callers) if `<external_callers>` or `git_grep` across all in-tree callers confirms no in-tree caller passes such an argument, and confirm it in `findings` ONLY if you cite at least one concrete violating in-tree caller or untrusted external boundary path in `locations` and `Call Chain:`.
 2. Every candidate `"I*"` ID in this batch MUST be accounted for in either `findings` or `dismissed_concerns` via a non-empty `"source_ids"` array.
 3. To dismiss a candidate in `dismissed_concerns`, you MUST use the required keys:
    - `"source_ids"`: non-empty array of batch `"I*"` IDs.
@@ -2854,6 +2855,22 @@ F:\tfs/smb/
                 .and_then(Value::as_str)
                 .is_some_and(|s| s.contains("Duplicate tool call blocked")),
             "consecutive identical tool call must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_scan_prompts_require_concrete_caller_or_untrusted_input() {
+        assert!(
+            SCAN_STAGE_JSON_SCHEMA_INSTRUCTIONS.contains("NO HYPOTHETICAL CALLER-ARGUMENT BUGS")
+                && SCAN_STAGE_JSON_SCHEMA_INSTRUCTIONS
+                    .contains("concrete violating in-tree caller"),
+            "scan stage schema instructions must forbid hypothetical internal caller-argument bugs"
+        );
+        assert!(
+            STAGE_SCAN_POST_VERIFICATION_INSTRUCTION.contains("out-of-tree `EXPORT_SYMBOL*`")
+                && STAGE_SCAN_POST_VERIFICATION_INSTRUCTION
+                    .contains("no in-tree caller passes such an argument"),
+            "scan post-verification must enforce all-callers dismissal and concrete caller citation"
         );
     }
 }
