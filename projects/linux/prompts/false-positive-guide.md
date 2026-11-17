@@ -527,6 +527,10 @@ Before reporting ANY regression, verify:
 - Assume the original bug is known/handled
 - Don't re-report the original problem
 
+### Stable Backports (-stable)
+- When reviewing a stable backport patch (for example `[PATCH 5.10 / 6.1.y / 6.6.y / 6.12.y / 6.18.y]` or a commit carrying `commit <sha> upstream`, `[ Upstream commit <sha> ]`, or `(cherry picked from commit <sha>)`), report only backport adaptation defects: missing prerequisite commits, broken surrounding context, API/locking/struct differences in the target stable tree, or bugs newly introduced while adapting the patch
+- Do NOT flag pre-existing limitations, minor stats inaccuracies, or edge cases that behave identically in the upstream mainline commit, because `-stable` backports intentionally preserve upstream commit semantics
+
 ### Subsystem Exclusions
 - fs/bcachefs → Skip all issues
 - Staging drivers → Lower standards apply
