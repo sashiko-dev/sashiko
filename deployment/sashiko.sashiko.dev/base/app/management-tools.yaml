@@ -12,11 +12,12 @@ data:
     echo "--- Environment setup complete ---"
   backup-db.sh: |
     #!/bin/bash
-    set -e
+    set -euo pipefail
     DB_PATH="/data/db/sashiko-self.db"
     BUCKET="${BACKUP_BUCKET:-gs://BACKUP_BUCKET}"
     TIMESTAMP=$(date '+%Y-%m-%d_%Hh-%Mm-%Ss-%Z')
     TEMP_BACKUP="/data/sashiko_self_backup.db"
+    trap 'rm -f "$TEMP_BACKUP"' EXIT
 
     echo "--- Starting Backup at $(date) ---"
 
@@ -35,7 +36,7 @@ data:
     gsutil cp "$TEMP_BACKUP" "${BUCKET}/sashiko_self_${TIMESTAMP}.db"
 
     echo "Cleaning up..."
-    rm "$TEMP_BACKUP"
+    rm -f "$TEMP_BACKUP"
 
     echo "--- Backup Complete: sashiko_self_${TIMESTAMP}.db ---"
 ---
@@ -94,8 +95,8 @@ metadata:
   name: sashiko-self-nightly-backup
   namespace: sashiko-self
 spec:
-  # An hour after the main instance and the bug repository, so the three
-  # backups never contend for the same disk and network at once.
+  # Staggered two hours after the main Linux instance (02:00) and an hour
+  # before gcc.sashiko.dev (05:00) so backups never contend for disk or network.
   schedule: "0 4 * * *"
   timeZone: "America/Los_Angeles"
   concurrencyPolicy: Forbid
@@ -113,6 +114,16 @@ spec:
                 - "/bin/sh"
                 - "-c"
                 - "/usr/local/bin/setup-env.sh && /usr/local/bin/backup-db.sh"
+              # Bounds sequential backup file-cache memory in cgroup v2 so
+              # VACUUM INTO + gsutil cp cannot evict active workload pages on
+              # the shared node.
+              resources:
+                requests:
+                  cpu: "500m"
+                  memory: "2Gi"
+                limits:
+                  cpu: "4"
+                  memory: "8Gi"
               volumeMounts:
                 - name: sashiko-self-storage
                   mountPath: /data
