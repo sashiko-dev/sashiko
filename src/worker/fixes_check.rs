@@ -27,7 +27,10 @@ use tokio::time::timeout;
 use crate::project::ProjectId;
 
 /// Initial Linux root commit (`v2.6.12-rc2`), excluded from blame candidates.
-const INITIAL_KERNEL_ROOT_SHA: &str = "1da177e4c3f415667457b932fe38c6f7471e1a58";
+const INITIAL_KERNEL_ROOT_SHA: &str = "1da177e4c3f41524e886b7f1b8a0c1fc7321cac2";
+const INITIAL_KERNEL_ROOT_ABBREV: &str = "1da177e4c3f4";
+const INITIAL_KERNEL_ROOT_DATE: &str = "2005-04-16";
+const INITIAL_KERNEL_ROOT_SUBJECT: &str = "Linux-2.6.12-rc2";
 
 /// Timeout for individual git inspection subprocesses.
 const GIT_CMD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -89,6 +92,14 @@ static FIXES_FINDING_PROBLEM_RE: LazyLock<Regex> = LazyLock::new(|| {
         r"(?i)(?:\bfixes:\s*|\bfixes\s+trailer\b|\b(?:missing|malformed|invalid|wrong|incorrect|inaccurate|unresolvable|bad|broken|add|suggest|suggested|stale)\s+fixes(?:\s*:|\s+(?:tag|trailer|sha|commit|line|reference)\b)|\bfixes\s+(?:tag|trailer|sha|commit)\s+(?:is|in|missing|malformed|invalid|wrong|incorrect|mismatch|unresolvable|points|cites|references|should)\b)",
     )
     .expect("valid fixes finding problem regex")
+});
+
+static UNRESOLVABLE_FIXES_SHA_CLAIM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // Safety invariant: static regex literal is syntactically valid.
+    Regex::new(
+        r"(?i)\b(?:unresolvable|unknown|cannot\s+be\s+resolved|could\s+not\s+be\s+resolved|unable\s+to\s+resolve|not\s+found|cannot\s+find|does\s+not\s+exist|non-?existent|unfetched|missing\s+(?:from|in)\s+(?:the\s+)?(?:repo|repository|tree|history))\b",
+    )
+    .expect("valid unresolvable fixes SHA claim regex")
 });
 
 static SOB_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -207,6 +218,8 @@ pub struct FixesAnalysis {
     pub series_commit_shas: Vec<String>,
     /// Resolved commits from existing trailers, subject searches, `git blame`, and recent file history.
     pub known_commits: Vec<ResolvedFixesCommit>,
+    /// Whether `worktree` is a shallow git clone (`git rev-parse --is-shallow-repository == true`).
+    pub is_shallow_repo: bool,
 }
 
 impl FixesAnalysis {
@@ -667,6 +680,28 @@ fn run_git_stdout_sync(worktree: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+fn matches_initial_kernel_root_sha(sha_token: &str) -> bool {
+    let lower = sha_token.trim().to_ascii_lowercase();
+    lower.len() >= 7
+        && lower.chars().all(|c| c.is_ascii_hexdigit())
+        && INITIAL_KERNEL_ROOT_SHA.starts_with(&lower)
+}
+
+fn synthesized_initial_kernel_root() -> ResolvedFixesCommit {
+    ResolvedFixesCommit {
+        full_sha: INITIAL_KERNEL_ROOT_SHA.to_string(),
+        abbrev_sha: INITIAL_KERNEL_ROOT_ABBREV.to_string(),
+        commit_date: INITIAL_KERNEL_ROOT_DATE.to_string(),
+        subject: INITIAL_KERNEL_ROOT_SUBJECT.to_string(),
+    }
+}
+
+async fn is_shallow_repository_async(worktree: &Path) -> bool {
+    run_git_stdout(worktree, &["rev-parse", "--is-shallow-repository"])
+        .await
+        .is_some_and(|out| out.trim().eq_ignore_ascii_case("true"))
+}
+
 fn parse_commit_info_output(stdout: &str) -> Option<ResolvedFixesCommit> {
     let mut lines = stdout.lines();
     let full_sha = lines.next()?.trim().to_ascii_lowercase();
@@ -865,6 +900,55 @@ async fn fetch_cited_commit_diff_async(
     Some(truncate_utf8(trimmed, max_bytes))
 }
 
+fn parse_blame_porcelain_scores(
+    stdout: &str,
+    target: &HunkBlameTarget,
+    series_shas: &[String],
+    scores: &mut HashMap<String, usize>,
+    touched: &mut HashMap<String, BTreeMap<String, (usize, usize)>>,
+    same_series_shas: &mut BTreeSet<String>,
+) {
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(sha_tok) = parts.next() else {
+            continue;
+        };
+        let Some(final_line_str) = parts.nth(1) else {
+            continue;
+        };
+        if sha_tok.len() != 40 || !sha_tok.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(line_no) = final_line_str.parse::<usize>() else {
+            continue;
+        };
+        let sha = sha_tok.to_ascii_lowercase();
+        if sha == INITIAL_KERNEL_ROOT_SHA || sha.chars().all(|c| c == '0') {
+            continue;
+        }
+        if series_shas.contains(&sha) {
+            same_series_shas.insert(sha);
+            continue;
+        }
+
+        let weight = if target.deleted_lines.contains(&line_no) {
+            3
+        } else {
+            1
+        };
+        *scores.entry(sha.clone()).or_insert(0) += weight;
+        touched
+            .entry(sha)
+            .or_default()
+            .entry(target.pre_file.clone())
+            .and_modify(|(min_l, max_l)| {
+                *min_l = (*min_l).min(line_no);
+                *max_l = (*max_l).max(line_no);
+            })
+            .or_insert((line_no, line_no));
+    }
+}
+
 async fn collect_blame_candidates_async(
     worktree: &Path,
     parent_rev: &str,
@@ -897,45 +981,14 @@ async fn collect_blame_candidates_async(
             continue;
         };
 
-        for line in stdout.lines() {
-            let mut parts = line.split_whitespace();
-            let Some(sha_tok) = parts.next() else {
-                continue;
-            };
-            let Some(final_line_str) = parts.nth(1) else {
-                continue;
-            };
-            if sha_tok.len() != 40 || !sha_tok.chars().all(|c| c.is_ascii_hexdigit()) {
-                continue;
-            }
-            let Ok(line_no) = final_line_str.parse::<usize>() else {
-                continue;
-            };
-            let sha = sha_tok.to_ascii_lowercase();
-            if sha == INITIAL_KERNEL_ROOT_SHA || sha.chars().all(|c| c == '0') {
-                continue;
-            }
-            if series_shas.contains(&sha) {
-                same_series_shas.insert(sha);
-                continue;
-            }
-
-            let weight = if target.deleted_lines.contains(&line_no) {
-                3
-            } else {
-                1
-            };
-            *scores.entry(sha.clone()).or_insert(0) += weight;
-            touched
-                .entry(sha)
-                .or_default()
-                .entry(target.pre_file.clone())
-                .and_modify(|(min_l, max_l)| {
-                    *min_l = (*min_l).min(line_no);
-                    *max_l = (*max_l).max(line_no);
-                })
-                .or_insert((line_no, line_no));
-        }
+        parse_blame_porcelain_scores(
+            &stdout,
+            target,
+            series_shas,
+            &mut scores,
+            &mut touched,
+            &mut same_series_shas,
+        );
     }
 
     let mut same_series_commits = Vec::new();
@@ -1085,6 +1138,7 @@ async fn evaluate_single_trailer(
             exact_single_space_before_paren,
         } => {
             evaluate_commit_ref_trailer(
+                project,
                 worktree,
                 trailer,
                 sha_token,
@@ -1101,6 +1155,7 @@ async fn evaluate_single_trailer(
 
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_commit_ref_trailer(
+    project: ProjectId,
     worktree: &Path,
     trailer: &ParsedFixesTrailer,
     sha_token: &str,
@@ -1110,7 +1165,15 @@ async fn evaluate_commit_ref_trailer(
     modified_files: &[String],
     analysis: &mut FixesAnalysis,
 ) -> String {
-    if let Some(info) = resolve_commit_info_async(worktree, sha_token).await {
+    let resolved = if let Some(info) = resolve_commit_info_async(worktree, sha_token).await {
+        Some((info, false))
+    } else if project == ProjectId::Linux && matches_initial_kernel_root_sha(sha_token) {
+        Some((synthesized_initial_kernel_root(), true))
+    } else {
+        None
+    };
+
+    if let Some((info, synthesized_root)) = resolved {
         let canonical = info.canonical_trailer();
         let full_sha = info.full_sha.clone();
         let abbrev_sha = info.abbrev_sha.clone();
@@ -1161,15 +1224,14 @@ async fn evaluate_commit_ref_trailer(
             defects.push("missing quoted commit subject `(\"<subject>\")`".to_string());
         }
 
-        let diff_excerpt = fetch_cited_commit_diff_async(
-            worktree,
-            &full_sha,
-            modified_files,
-            MAX_CITED_DIFF_BYTES,
-        )
-        .await
-        .map(|d| format!("\n  Cited commit diff excerpt ({abbrev_sha}):\n{d}"))
-        .unwrap_or_default();
+        let diff_excerpt = if synthesized_root {
+            String::new()
+        } else {
+            fetch_cited_commit_diff_async(worktree, &full_sha, modified_files, MAX_CITED_DIFF_BYTES)
+                .await
+                .map(|d| format!("\n  Cited commit diff excerpt ({abbrev_sha}):\n{d}"))
+                .unwrap_or_default()
+        };
 
         if defects.is_empty() {
             format!(
@@ -1203,6 +1265,11 @@ async fn evaluate_commit_ref_trailer(
         .unwrap_or_default();
         format!(
             "- `{}`\n  Status: UNRESOLVABLE SHA (FOUND MATCHING SUBJECT AT DIFFERENT SHA) — SHA `{sha_token}` does not exist in the repository, but a commit with matching subject exists (commit date: {commit_date}).\n  Canonical replacement: `{canonical}`{diff_excerpt}",
+            trailer.raw
+        )
+    } else if analysis.is_shallow_repo {
+        format!(
+            "- `{}`\n  Status: UNVERIFIABLE IN SHALLOW REPOSITORY — repository history is shallow, so older commit SHAs may precede the shallow boundary; do NOT report SHA {sha_token} as unresolvable.",
             trailer.raw
         )
     } else {
@@ -1414,6 +1481,7 @@ pub async fn analyze_fixes_for_commit(
     analysis.series_commit_shas =
         collect_series_commit_shas(worktree_path, baseline_sha, target_commit_sha, series_range)
             .await;
+    analysis.is_shallow_repo = is_shallow_repository_async(worktree_path).await;
 
     if project == ProjectId::Zephyr {
         if let Some(sob_section) = format_signed_off_by_section(target_commit_diff) {
@@ -1683,14 +1751,14 @@ pub fn render_fixes_block(use_log: bool, analysis: &FixesAnalysis) -> String {
     )
 }
 
-fn rejected_fixes_finding_to_dismissal(finding: &Value) -> Value {
+fn rejected_fixes_finding_to_dismissal_with_reason(finding: &Value, reasoning: &str) -> Value {
     let mut dismissed = json!({
         "type": "Fixes Trailer",
         "description": finding
             .get("problem")
             .and_then(Value::as_str)
             .unwrap_or("Invalid Fixes: trailer suggestion"),
-        "reasoning": "Dismissed by deterministic Fixes guard: the suggested Fixes commit SHA could not be resolved in the repository or belongs to an unmerged patch in the current series.",
+        "reasoning": reasoning,
         "locations": finding.get("locations").cloned().unwrap_or_else(|| json!([])),
     });
     if let Some(map) = dismissed.as_object_mut() {
@@ -1711,6 +1779,76 @@ fn rejected_fixes_finding_to_dismissal(finding: &Value) -> Value {
     dismissed
 }
 
+fn is_shallow_unresolvable_author_fixes_finding(
+    finding: &Value,
+    analysis: &FixesAnalysis,
+    worktree: Option<&Path>,
+) -> bool {
+    if !analysis.is_shallow_repo || analysis.author_fixes_shas.is_empty() {
+        return false;
+    }
+
+    let problem = finding.get("problem").and_then(Value::as_str).unwrap_or("");
+    let explanation = finding
+        .get("severity_explanation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let combined = format!("{problem}\n{explanation}");
+    if !UNRESOLVABLE_FIXES_SHA_CLAIM_RE.is_match(&combined) {
+        return false;
+    }
+
+    // Do not drop legitimate replacement or blame-candidate findings simply
+    // because the finding also notes that the author's original SHA did not
+    // resolve in the shallow repository.
+    let has_resolved_replacement_sha = FINDING_FIXES_RE.captures_iter(&combined).any(|caps| {
+        let matched_str = caps.get(0).map_or("", |m| m.as_str());
+        let tok = caps.get(1).map_or("", |m| m.as_str());
+        !analysis.is_verbatim_author_trailer(matched_str)
+            && !analysis.is_author_fixes_sha(tok)
+            && !analysis.is_same_series_sha(tok)
+            && lookup_commit_for_sanitization(analysis, worktree, tok)
+                .is_some_and(|c| !analysis.series_commit_shas.contains(&c.full_sha))
+    }) || HEX_TOKEN_RE.captures_iter(&combined).any(|caps| {
+        caps.get(1).is_some_and(|m| {
+            let tok = m.as_str();
+            !analysis.is_author_fixes_sha(tok)
+                && !analysis.is_same_series_sha(tok)
+                && analysis
+                    .find_known_commit(tok)
+                    .is_some_and(|c| !analysis.series_commit_shas.contains(&c.full_sha))
+        })
+    });
+    if has_resolved_replacement_sha {
+        return false;
+    }
+
+    let has_unresolved_author_sha = |sha: &str| {
+        !analysis.is_same_series_sha(sha)
+            && lookup_commit_for_sanitization(analysis, worktree, sha).is_none()
+    };
+
+    let mut cited_tokens = Vec::new();
+    for caps in HEX_TOKEN_RE.captures_iter(&combined) {
+        if let Some(tok) = caps.get(1).map(|m| m.as_str())
+            && analysis.is_author_fixes_sha(tok)
+        {
+            cited_tokens.push(tok);
+        }
+    }
+
+    if cited_tokens.is_empty() {
+        analysis
+            .author_fixes_shas
+            .iter()
+            .any(|sha| has_unresolved_author_sha(sha))
+    } else {
+        cited_tokens
+            .iter()
+            .any(|tok| has_unresolved_author_sha(tok))
+    }
+}
+
 /// Validates and canonicalizes `Fixes:` findings in place before recording them in state,
 /// converting any `Fixes:` finding with a hallucinated or same-series SHA into a dismissal
 /// in `dismissed_concerns` so `review_map` lineage remains 100% accounted for.
@@ -1723,6 +1861,14 @@ pub fn sanitize_fixes_findings_with_dismissals(
     let mut retained = Vec::with_capacity(findings.len());
     for mut finding in std::mem::take(findings) {
         if is_fixes_trailer_finding(&finding) {
+            if is_shallow_unresolvable_author_fixes_finding(&finding, analysis, worktree) {
+                dismissed_concerns.push(rejected_fixes_finding_to_dismissal_with_reason(
+                    &finding,
+                    "Dismissed by deterministic Fixes guard: the repository is shallow, so cited author Fixes commit SHAs may precede the shallow boundary and cannot be flagged as unresolvable.",
+                ));
+                continue;
+            }
+
             let mut invalid_suggestion = false;
 
             for field in ["problem", "severity_explanation"] {
@@ -1749,7 +1895,10 @@ pub fn sanitize_fixes_findings_with_dismissals(
             }
 
             if invalid_suggestion {
-                dismissed_concerns.push(rejected_fixes_finding_to_dismissal(&finding));
+                dismissed_concerns.push(rejected_fixes_finding_to_dismissal_with_reason(
+                    &finding,
+                    "Dismissed by deterministic Fixes guard: the suggested Fixes commit SHA could not be resolved in the repository or belongs to an unmerged patch in the current series.",
+                ));
                 continue;
             }
             if let Some(map) = finding.as_object_mut() {
@@ -2051,6 +2200,7 @@ diff --git a/drivers/net/foo.c b/drivers/net/foo.c
                 commit_date: "2024-05-12".to_string(),
                 subject: "bpf: Support stack arguments for bpf functions".to_string(),
             }],
+            is_shallow_repo: false,
         };
 
         let mut findings = vec![
@@ -2188,6 +2338,7 @@ diff --git a/drivers/net/foo.c b/drivers/net/foo.c
             author_fixes_raw: Vec::new(),
             series_commit_shas: vec!["aaaaaaaaaaaa0000000000000000000000000000".to_string()],
             known_commits: Vec::new(),
+            is_shallow_repo: false,
         };
 
         let mut findings = vec![json!({
@@ -2266,6 +2417,7 @@ diff --git a/drivers/net/foo.c b/drivers/net/foo.c
                 commit_date: "2024-05-12".to_string(),
                 subject: "Revert \"bpf: Support stack_arg() for bpf functions\"".to_string(),
             }],
+            is_shallow_repo: false,
         };
 
         let mut findings = vec![
@@ -2464,5 +2616,297 @@ diff --git a/mm/foo.c b/mm/foo.c
         assert_eq!(findings[2]["severity"], "High");
         assert_eq!(findings[2]["preexisting"], false);
         assert_eq!(findings[3]["severity"], "Medium");
+    }
+
+    #[test]
+    fn initial_kernel_root_sha_is_excluded_from_log_and_blame_candidates() {
+        assert_eq!(
+            INITIAL_KERNEL_ROOT_SHA,
+            "1da177e4c3f41524e886b7f1b8a0c1fc7321cac2"
+        );
+
+        let keep_sha = "1234567890abcdef1234567890abcdef12345678";
+        let log_stdout = format!(
+            "{INITIAL_KERNEL_ROOT_SHA}\0{INITIAL_KERNEL_ROOT_ABBREV}\0{INITIAL_KERNEL_ROOT_DATE}\0{INITIAL_KERNEL_ROOT_SUBJECT}\n\
+             {keep_sha}\0{}\02026-01-02\0mm: regular commit\n",
+            &keep_sha[..12]
+        );
+        let parsed = parse_nul_delimited_commits(&log_stdout, &[]);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].full_sha, keep_sha);
+
+        let blame_stdout = format!(
+            "{INITIAL_KERNEL_ROOT_SHA} 1 1 1\n\
+             {keep_sha} 2 2 1\n"
+        );
+        let target = HunkBlameTarget {
+            pre_file: "mm/foo.c".to_string(),
+            start_line: 1,
+            end_line: 2,
+            deleted_lines: HashSet::from([1, 2]),
+        };
+        let mut scores = HashMap::new();
+        let mut touched = HashMap::new();
+        let mut same_series = BTreeSet::new();
+        parse_blame_porcelain_scores(
+            &blame_stdout,
+            &target,
+            &[],
+            &mut scores,
+            &mut touched,
+            &mut same_series,
+        );
+        assert!(!scores.contains_key(INITIAL_KERNEL_ROOT_SHA));
+        assert_eq!(scores.get(keep_sha), Some(&3));
+    }
+
+    #[tokio::test]
+    async fn linux_validates_v2_6_12_rc2_root_fixes_without_history() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path();
+        run_git_test(repo, &["init"]);
+        run_git_test(repo, &["config", "user.name", "Test User"]);
+        run_git_test(repo, &["config", "user.email", "test@example.com"]);
+
+        std::fs::write(repo.join("foo.c"), "int foo(void) { return 0; }\n").expect("write foo.c");
+        run_git_test(repo, &["add", "foo.c"]);
+        run_git_test(repo, &["commit", "-m", "baseline"]);
+        let baseline = run_git_test(repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+
+        std::fs::write(repo.join("foo.c"), "int foo(void) { return 1; }\n").expect("write foo.c");
+        run_git_test(repo, &["add", "foo.c"]);
+        let msg = "net: fix pre-git neighbor bug\n\n\
+                   Fixes: 1da177e4c3f4 (\"Linux-2.6.12-rc2\")\n\
+                   Fixes: 1da177e4 (\"wrong root subject\")\n\
+                   Signed-off-by: Test User <test@example.com>";
+        run_git_test(repo, &["commit", "-m", msg]);
+        let target_sha = run_git_test(repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let show = run_git_test(repo, &["show", &target_sha]);
+        let diff_only = run_git_test(repo, &["show", "--format=", &target_sha]);
+
+        let analysis = analyze_fixes_for_commit(
+            ProjectId::Linux,
+            repo,
+            &baseline,
+            &target_sha,
+            None,
+            &show,
+            &diff_only,
+        )
+        .await;
+
+        assert!(
+            analysis
+                .prompt_context
+                .contains("Status: SYNTAX & SHA VALID (commit date: 2005-04-16)"),
+            "v2.6.12-rc2 trailer should validate cleanly: {}",
+            analysis.prompt_context
+        );
+        assert!(
+            !analysis.prompt_context.contains("UNKNOWN COMMIT SHA"),
+            "v2.6.12-rc2 trailer must not be reported unknown: {}",
+            analysis.prompt_context
+        );
+        assert!(
+            analysis
+                .prompt_context
+                .contains("Canonical replacement: `Fixes: 1da177e4c3f4 (\"Linux-2.6.12-rc2\")`"),
+            "malformed root trailer should suggest canonical root trailer: {}",
+            analysis.prompt_context
+        );
+
+        // Non-Linux projects must not synthesize the Linux root commit.
+        let qemu_analysis = analyze_fixes_for_commit(
+            ProjectId::Qemu,
+            repo,
+            &baseline,
+            &target_sha,
+            None,
+            &show,
+            &diff_only,
+        )
+        .await;
+        assert!(
+            qemu_analysis.prompt_context.contains("UNKNOWN COMMIT SHA"),
+            "QEMU should not synthesize Linux v2.6.12-rc2 root: {}",
+            qemu_analysis.prompt_context
+        );
+    }
+
+    #[tokio::test]
+    async fn shallow_clone_marks_unknown_fixes_sha_unverifiable_and_suppresses_guard_noise() {
+        let tmp = TempDir::new().expect("tempdir");
+        let upstream = tmp.path().join("upstream");
+        let shallow = tmp.path().join("shallow");
+        std::fs::create_dir_all(&upstream).expect("mkdir upstream");
+
+        run_git_test(&upstream, &["init"]);
+        run_git_test(&upstream, &["config", "user.name", "Test User"]);
+        run_git_test(&upstream, &["config", "user.email", "test@example.com"]);
+
+        std::fs::write(upstream.join("drv.c"), "int drv(void) { return 0; }\n").expect("write");
+        run_git_test(&upstream, &["add", "drv.c"]);
+        run_git_test(&upstream, &["commit", "-m", "drv: old historical bug"]);
+        let old_sha = run_git_test(&upstream, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let old_12 = old_sha[..12].to_string();
+
+        std::fs::write(upstream.join("drv.c"), "int drv(void) { return 2; }\n").expect("write");
+        run_git_test(&upstream, &["add", "drv.c"]);
+        run_git_test(&upstream, &["commit", "-m", "drv: newer tip"]);
+
+        let upstream_url = format!("file://{}", upstream.display());
+        run_git_test(
+            tmp.path(),
+            &[
+                "clone",
+                "--depth=1",
+                &upstream_url,
+                shallow.to_str().unwrap(),
+            ],
+        );
+        run_git_test(&shallow, &["config", "user.name", "Test User"]);
+        run_git_test(&shallow, &["config", "user.email", "test@example.com"]);
+        let shallow_baseline = run_git_test(&shallow, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+
+        let shallow_baseline_12 = &shallow_baseline[..12];
+        std::fs::write(shallow.join("drv.c"), "int drv(void) { return 3; }\n").expect("write");
+        run_git_test(&shallow, &["add", "drv.c"]);
+        let msg = format!(
+            "drv: fix old bug\n\nFixes: {old_12} (\"drv: old historical bug\")\nSigned-off-by: Test User <test@example.com>"
+        );
+        run_git_test(&shallow, &["commit", "-m", &msg]);
+        let target_sha = run_git_test(&shallow, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let show = run_git_test(&shallow, &["show", &target_sha]);
+        let diff_only = run_git_test(&shallow, &["show", "--format=", &target_sha]);
+
+        let analysis = analyze_fixes_for_commit(
+            ProjectId::Linux,
+            &shallow,
+            &shallow_baseline,
+            &target_sha,
+            None,
+            &show,
+            &diff_only,
+        )
+        .await;
+
+        assert!(analysis.is_shallow_repo);
+        assert!(
+            analysis.prompt_context.contains(&format!(
+                "Status: UNVERIFIABLE IN SHALLOW REPOSITORY — repository history is shallow, so older commit SHAs may precede the shallow boundary; do NOT report SHA {old_12} as unresolvable."
+            )),
+            "shallow clone prompt_context was: {}",
+            analysis.prompt_context
+        );
+        assert!(!analysis.prompt_context.contains("UNKNOWN COMMIT SHA"));
+
+        let mut findings = vec![
+            json!({
+                "source_ids": ["C1"],
+                "problem": format!("commit_message: unresolvable Fixes SHA {old_12}"),
+                "severity": "Low",
+                "severity_explanation": format!("Fixes: {old_12} was not found in repository history."),
+                "preexisting": false,
+                "locations": [{"file": "commit_message"}]
+            }),
+            json!({
+                "source_ids": ["C2"],
+                "problem": "drv: missing Fixes: trailer",
+                "severity": "Low",
+                "severity_explanation": "Should use Fixes: deadbeef1234 (\"non-existent\").",
+                "preexisting": false,
+                "locations": [{"file": "commit_message"}]
+            }),
+            json!({
+                "source_ids": ["C3"],
+                "problem": format!("commit_message: replace unresolvable Fixes SHA {old_12}"),
+                "severity": "Medium",
+                "severity_explanation": format!(
+                    "Author SHA {old_12} does not exist in the repository; canonical replacement is Fixes: {shallow_baseline_12} (\"wrong subject\")."
+                ),
+                "preexisting": false,
+                "locations": [{"file": "commit_message"}]
+            }),
+        ];
+        let mut dismissed = Vec::new();
+        sanitize_fixes_findings_with_dismissals(
+            &analysis,
+            Some(&shallow),
+            &mut findings,
+            &mut dismissed,
+        );
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected replacement finding retained: {findings:?}"
+        );
+        assert_eq!(findings[0]["source_ids"], json!(["C3"]));
+        assert_eq!(findings[0]["severity"], json!("Low"));
+        assert!(
+            findings[0]["severity_explanation"]
+                .as_str()
+                .unwrap()
+                .contains(&format!(
+                    "Fixes: {shallow_baseline_12} (\"drv: newer tip\")"
+                )),
+            "expected canonical replacement rewrite in {}",
+            findings[0]["severity_explanation"]
+        );
+        assert_eq!(dismissed.len(), 2);
+        assert_eq!(dismissed[0]["source_ids"], json!(["C1"]));
+        assert!(
+            dismissed[0]["reasoning"]
+                .as_str()
+                .unwrap()
+                .contains("shallow")
+        );
+        assert_eq!(dismissed[1]["source_ids"], json!(["C2"]));
+
+        // Also test subject-matched canonical replacement in shallow repo when the replacement SHA
+        // is only recorded in analysis.known_commits and cited as prose in the finding.
+        let mut known_only_analysis = FixesAnalysis {
+            is_shallow_repo: true,
+            author_fixes_shas: vec![old_12.to_string()],
+            ..Default::default()
+        };
+        known_only_analysis.record_known_commit(ResolvedFixesCommit {
+            full_sha: "cafebabe567890abcdef1234567890abcdef1234".to_string(),
+            abbrev_sha: "cafebabe5678".to_string(),
+            commit_date: "2024-05-01".to_string(),
+            subject: "drv: matched historical bug".to_string(),
+        });
+        let mut known_findings = vec![json!({
+            "source_ids": ["C4"],
+            "problem": format!("commit_message: stale Fixes SHA {old_12}"),
+            "severity": "Low",
+            "severity_explanation": format!(
+                "SHA {old_12} does not exist in the repository, but commit cafebabe5678 matches."
+            ),
+            "preexisting": false,
+            "locations": [{"file": "commit_message"}]
+        })];
+        let mut known_dismissed = Vec::new();
+        sanitize_fixes_findings_with_dismissals(
+            &known_only_analysis,
+            None,
+            &mut known_findings,
+            &mut known_dismissed,
+        );
+        assert_eq!(
+            known_findings.len(),
+            1,
+            "expected known-commit replacement retained"
+        );
+        assert!(known_dismissed.is_empty());
     }
 }
