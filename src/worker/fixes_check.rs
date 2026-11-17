@@ -1296,7 +1296,7 @@ fn is_placeholder_or_bot_email(email_lower: &str, domain_lower: &str) -> bool {
         || domain_lower.ends_with(".invalid")
 }
 
-fn evaluate_signed_off_by_line(prefix: &str, value: &str) -> String {
+fn evaluate_signed_off_by_line(project: ProjectId, prefix: &str, value: &str) -> String {
     let raw = format!("{prefix}: {value}");
     let mut issues = Vec::new();
     if prefix != "Signed-off-by" {
@@ -1382,18 +1382,23 @@ fn evaluate_signed_off_by_line(prefix: &str, value: &str) -> String {
         issues.push(format!(
             "AI/bot identity `{name}` is not allowed in `Signed-off-by`"
         ));
-    } else if name.contains('@')
-        || name.contains('_')
-        || name.chars().any(|c| c.is_ascii_digit())
-        || (!name.contains(char::is_whitespace) && name.chars().all(|c| c.is_ascii_lowercase()))
-    {
+    } else if name.contains('@') {
         issues.push(format!(
             "handle/username `{name}` instead of a real human name"
         ));
-    } else if !name.contains(char::is_whitespace) {
-        suspect_notes.push(format!(
-            "single-word name `{name}` (verify whether it is a handle/nickname rather than a real full name; report at High severity if clearly a handle/username)"
-        ));
+    } else if project != ProjectId::Linux {
+        if name.contains('_')
+            || name.chars().any(|c| c.is_ascii_digit())
+            || (!name.contains(char::is_whitespace) && name.chars().all(|c| c.is_ascii_lowercase()))
+        {
+            issues.push(format!(
+                "handle/username `{name}` instead of a real human name"
+            ));
+        } else if !name.contains(char::is_whitespace) {
+            suspect_notes.push(format!(
+                "single-word name `{name}` (verify whether it is a handle/nickname rather than a real full name; report at High severity if clearly a handle/username)"
+            ));
+        }
     }
 
     if !issues.is_empty() {
@@ -1406,12 +1411,16 @@ fn evaluate_signed_off_by_line(prefix: &str, value: &str) -> String {
             "- `{raw}`\n  Status: SUSPECT — {}.",
             suspect_notes.join("; ")
         )
+    } else if project == ProjectId::Linux {
+        format!(
+            "- `{raw}`\n  Status: SYNTAX VALID — known contributor identity and email format valid (single-word human mononyms and single-token contributor identities are accepted under Linux DCO)."
+        )
     } else {
         format!("- `{raw}`\n  Status: SYNTAX VALID — verify real human name and identity.")
     }
 }
 
-fn format_signed_off_by_section(commit_diff: &str) -> Option<String> {
+fn format_signed_off_by_section(project: ProjectId, commit_diff: &str) -> Option<String> {
     let msg_lines = extract_commit_message_lines(commit_diff);
     if msg_lines.is_empty() {
         return None;
@@ -1429,7 +1438,7 @@ fn format_signed_off_by_section(commit_diff: &str) -> Option<String> {
         if let Some(caps) = SOB_LINE_RE.captures(line) {
             let prefix = caps.get(1).map_or("Signed-off-by", |m| m.as_str());
             let value = caps.get(2).map_or("", |m| m.as_str());
-            found.push(evaluate_signed_off_by_line(prefix, value));
+            found.push(evaluate_signed_off_by_line(project, prefix, value));
         }
     }
     if found.is_empty() {
@@ -1484,7 +1493,7 @@ pub async fn analyze_fixes_for_commit(
     analysis.is_shallow_repo = is_shallow_repository_async(worktree_path).await;
 
     if project == ProjectId::Zephyr {
-        if let Some(sob_section) = format_signed_off_by_section(target_commit_diff) {
+        if let Some(sob_section) = format_signed_off_by_section(project, target_commit_diff) {
             analysis.prompt_context = truncate_utf8(&sob_section, MAX_FIXES_CONTEXT_BYTES);
         }
         return analysis;
@@ -1501,7 +1510,7 @@ pub async fn analyze_fixes_for_commit(
 
     let (modified_files, blame_targets) = extract_diff_blame_targets(target_commit_diff_only);
     let mut sections = Vec::new();
-    if let Some(sob_section) = format_signed_off_by_section(target_commit_diff) {
+    if let Some(sob_section) = format_signed_off_by_section(project, target_commit_diff) {
         sections.push(sob_section);
     }
     if trailers.is_empty() {
@@ -2484,7 +2493,8 @@ Author: Jane Doe <jane@kernel.org>
 
 diff --git a/mm/foo.c b/mm/foo.c
 ";
-        let missing_section = format_signed_off_by_section(missing_sob_diff).unwrap();
+        let missing_section =
+            format_signed_off_by_section(ProjectId::Sashiko, missing_sob_diff).unwrap();
         assert!(missing_section.contains("MISSING — report at High severity"));
 
         let broken_sob_diff = "\
@@ -2503,7 +2513,8 @@ Author: jdoe <jdoe@kernel.org>
 
 diff --git a/mm/foo.c b/mm/foo.c
 ";
-        let broken_section = format_signed_off_by_section(broken_sob_diff).unwrap();
+        let broken_section =
+            format_signed_off_by_section(ProjectId::Sashiko, broken_sob_diff).unwrap();
         assert!(broken_section.contains(
             "CLEARLY BROKEN — placeholder, bot, or non-routable email `your.email@example.com`; placeholder name `Your Name`"
         ));
@@ -2526,6 +2537,49 @@ diff --git a/mm/foo.c b/mm/foo.c
                 .contains("`Signed-off-by: Jane Doe <jane@kernel.org>`\n  Status: SYNTAX VALID")
         );
 
+        // On Linux (commit d4563201f33a), known single-token identities and mononyms are accepted,
+        // while placeholders, AI/bot names, `@` handles, and broken emails remain clearly broken.
+        let linux_sob_diff = "\
+commit 3333333333333333333333333333333333333333
+Author: Quchaosheng <quchaosheng000406@163.com>
+
+    net: can: test known identity
+
+    Signed-off-by: Quchaosheng <quchaosheng000406@163.com>
+    Signed-off-by: erebion <mail@erebion.eu>
+    Signed-off-by: Suharto <suharto@kernel.org>
+    Signed-off-by: user@domain <user@kernel.org>
+    Signed-off-by: anonymous <anon@kernel.org>
+    Signed-off-by: Claude Code <noreply@anthropic.com>
+
+diff --git a/drivers/net/can/foo.c b/drivers/net/can/foo.c
+";
+        let linux_section = format_signed_off_by_section(ProjectId::Linux, linux_sob_diff).unwrap();
+        assert!(linux_section.contains(
+            "`Signed-off-by: Quchaosheng <quchaosheng000406@163.com>`\n  Status: SYNTAX VALID"
+        ));
+        assert!(
+            linux_section
+                .contains("`Signed-off-by: erebion <mail@erebion.eu>`\n  Status: SYNTAX VALID")
+        );
+        assert!(
+            linux_section
+                .contains("`Signed-off-by: Suharto <suharto@kernel.org>`\n  Status: SYNTAX VALID")
+        );
+        assert!(!linux_section.contains("SUSPECT"));
+        assert!(
+            linux_section.contains(
+                "`Signed-off-by: user@domain <user@kernel.org>`\n  Status: CLEARLY BROKEN"
+            )
+        );
+        assert!(
+            linux_section
+                .contains("`Signed-off-by: anonymous <anon@kernel.org>`\n  Status: CLEARLY BROKEN")
+        );
+        assert!(linux_section.contains(
+            "`Signed-off-by: Claude Code <noreply@anthropic.com>`\n  Status: CLEARLY BROKEN"
+        ));
+
         // Human names "Claude" and "Ai" must not be misclassified as bots.
         let human_names_diff = "\
 Subject: [PATCH] mm: test
@@ -2535,7 +2589,8 @@ Signed-off-by: Ai Chao <aichao@kylinos.cn>
 
 diff --git a/mm/foo.c b/mm/foo.c
 ";
-        let human_section = format_signed_off_by_section(human_names_diff).unwrap();
+        let human_section =
+            format_signed_off_by_section(ProjectId::Linux, human_names_diff).unwrap();
         assert!(human_section.contains(
             "`Signed-off-by: Claude Shannon <claude@bell-labs.org>`\n  Status: SYNTAX VALID"
         ));
@@ -2553,14 +2608,18 @@ Signed-off-by: Jane Doe <jane@kernel.org>
 ---
 diff --git a/mm/foo.c b/mm/foo.c
 ";
-        let bodyless_section = format_signed_off_by_section(bodyless_diff).unwrap();
+        let bodyless_section =
+            format_signed_off_by_section(ProjectId::Linux, bodyless_diff).unwrap();
         assert!(
             bodyless_section
                 .contains("`Signed-off-by: Jane Doe <jane@kernel.org>`\n  Status: SYNTAX VALID")
         );
 
         // Headerless diff returns None rather than claiming missing SOB.
-        assert!(format_signed_off_by_section("diff --git a/foo.c b/foo.c\n").is_none());
+        assert!(
+            format_signed_off_by_section(ProjectId::Linux, "diff --git a/foo.c b/foo.c\n")
+                .is_none()
+        );
 
         // Sanitization enforces High severity on SOB findings across varied phrasings while keeping
         // Fixes findings (even when mentioning Signed-off-by) at Low and Assisted-by at Medium.

@@ -118,8 +118,11 @@ Evaluate all three dimensions below and state them at the start of
     - Confirmed lock-ordering inversion or sleep-in-atomic bug on a reachable
       runtime path.
     - Missing or clearly broken `Signed-off-by` trailer in the commit message
-      (such as a missing DCO sign-off, missing or placeholder email address, bot
-      identity, or handle/username instead of a real human name).
+      (such as a missing DCO sign-off, missing or placeholder email address,
+      bot identity, anonymous placeholder like `Your Name`/`unknown`/`root`, or
+      an `@` address in the name field; single-word human mononyms and
+      established single-token contributor identities are valid known identities
+      in Linux and must not be flagged).
 - **Never `High`**:
     - Speculative findings resting on unverified assumptions (cap at `Medium`).
     - Bugs requiring both privileged/debug access (`root`, `CAP_SYS_ADMIN`,
