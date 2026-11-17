@@ -6104,6 +6104,7 @@ mod tests {
         // Presenting an invalid or expired Authorization header is rejected
         // with 401 across public and capability-addressed routes rather than
         // silently downgrading to anonymous.
+        let expired_key = jsonwebtoken::EncodingKey::from_secret(SECRET.as_ref()).unwrap();
         let expired = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
             &crate::auth::Claims {
@@ -6114,7 +6115,7 @@ mod tests {
                 typ: Some("session".to_string()),
                 max_bug_access: None,
             },
-            &jsonwebtoken::EncodingKey::from_secret(SECRET.as_ref()),
+            &expired_key,
         )
         .unwrap();
         for bad_bearer in ["nonsense".to_string(), expired] {

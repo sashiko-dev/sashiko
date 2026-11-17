@@ -194,11 +194,8 @@ pub fn create_api_token(
         max_bug_access,
     };
 
-    encode(
-        &Header::new(jsonwebtoken::Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(secret.as_ref()),
-    )
+    let key = EncodingKey::from_secret(secret.as_ref())?;
+    encode(&Header::new(jsonwebtoken::Algorithm::HS256), &claims, &key)
 }
 
 #[cfg(feature = "server")]
@@ -233,22 +230,15 @@ pub fn create_token_with_session(
         max_bug_access: None,
     };
 
-    encode(
-        &Header::new(jsonwebtoken::Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(secret.as_ref()),
-    )
+    let key = EncodingKey::from_secret(secret.as_ref())?;
+    encode(&Header::new(jsonwebtoken::Algorithm::HS256), &claims, &key)
 }
 
 #[cfg(feature = "server")]
 pub fn verify_token(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
     let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
-    decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(secret.as_ref()),
-        &validation,
-    )
-    .map(|data| data.claims)
+    let key = DecodingKey::from_secret(secret.as_ref())?;
+    decode::<Claims>(token, &key, &validation).map(|data| data.claims)
 }
 
 #[cfg(feature = "server")]
@@ -457,15 +447,19 @@ mod tests {
             max_bug_access: None,
         };
         // Encode with HS384 instead of HS256
-        let token = encode(
-            &Header::new(jsonwebtoken::Algorithm::HS384),
-            &claims,
-            &EncodingKey::from_secret(secret.as_ref()),
-        )
-        .unwrap();
+        let key = EncodingKey::from_secret(secret.as_ref()).unwrap();
+        let token = encode(&Header::new(jsonwebtoken::Algorithm::HS384), &claims, &key).unwrap();
 
         let result = verify_token(&token, secret);
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_empty_secret_is_rejected() {
+        assert!(create_token("test@example.com", "", None, 3600).is_err());
+        assert!(create_api_token("test@example.com", "", 3600, None).is_err());
+        assert!(verify_token("not.a.token", "").is_err());
     }
 
     #[cfg(feature = "server")]
