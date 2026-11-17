@@ -286,7 +286,9 @@ impl ClaudeClient {
         let extra_headers = Self::parse_env_headers();
         let client = match client_cert {
             Some(path) => Self::client_with_cert(path)?,
-            None => Client::new(),
+            None => Self::client_builder()
+                .build()
+                .context("Failed to build Claude HTTP client")?,
         };
 
         Ok(Self {
@@ -311,10 +313,21 @@ impl ClaudeClient {
                 path.display()
             )
         })?;
-        Client::builder()
+        Self::client_builder()
             .identity(identity)
             .build()
             .context("Failed to build Claude HTTP client")
+    }
+
+    /// A non-streaming response sends nothing until generation ends, and
+    /// some NAT and VPN relays leave keepalive probes unanswered.  reqwest's
+    /// default keepalive and 30s TCP_USER_TIMEOUT then abort a live request,
+    /// which is resent (and billed) in full.
+    fn client_builder() -> reqwest::ClientBuilder {
+        let builder = Client::builder().tcp_keepalive(None);
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        let builder = builder.tcp_user_timeout(None);
+        builder
     }
 
     pub fn default_base_url() -> String {
