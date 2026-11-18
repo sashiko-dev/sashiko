@@ -445,6 +445,11 @@ impl ForgeWorker {
                                 "Failed to mark forge outbox {} as failed: {}",
                                 entry.id, db_err
                             );
+                        } else {
+                            crate::metrics::inc_outbox_event(
+                                crate::metrics::OutboxChannel::Forge,
+                                crate::metrics::OutboxOutcome::Failed,
+                            );
                         }
                         continue;
                     }
@@ -481,6 +486,10 @@ impl ForgeWorker {
                                 "Posted GitHub PR comment for {}#{} (outbox ID {}, HTTP {})",
                                 entry.repo, entry.pr_number, entry.id, status
                             );
+                            crate::metrics::inc_outbox_event(
+                                crate::metrics::OutboxChannel::Forge,
+                                crate::metrics::OutboxOutcome::Sent,
+                            );
                             if let Err(e) = self.db.mark_forge_outbox_sent(entry.id).await {
                                 error!("Failed to mark forge outbox {} as sent: {}", entry.id, e);
                             }
@@ -513,6 +522,10 @@ impl ForgeWorker {
 
     async fn handle_failure(&self, id: i64, retry_count: i64, err: &str) {
         if Self::is_permanent_failure(err) || retry_count + 1 >= self.max_retries as i64 {
+            crate::metrics::inc_outbox_event(
+                crate::metrics::OutboxChannel::Forge,
+                crate::metrics::OutboxOutcome::Failed,
+            );
             if let Err(db_err) = self.db.mark_forge_outbox_failed(id, err).await {
                 error!("Failed to mark forge outbox {} as failed: {}", id, db_err);
             }

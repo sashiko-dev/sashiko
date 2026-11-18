@@ -2528,6 +2528,10 @@ impl crate::ai::AiProvider for TokenAccountingProvider {
         self.inner.handles_dispatch_gate()
     }
 
+    fn handles_request_telemetry(&self) -> bool {
+        self.inner.handles_request_telemetry()
+    }
+
     fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
         self.inner.get_capabilities()
     }

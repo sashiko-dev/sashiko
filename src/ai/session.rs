@@ -529,6 +529,7 @@ impl<'a> SessionRunner<'a> {
                     });
                 }
                 Result::Err(ValidationError::FormatViolation(violation)) => {
+                    crate::metrics::inc_ai_error(crate::metrics::AiErrorKind::FormatViolation);
                     rejected.push(sent);
                     validation_attempts += 1;
                     if validation_attempts >= self.max_validation_attempts {

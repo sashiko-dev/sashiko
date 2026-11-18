@@ -728,6 +728,14 @@ pub trait AiProvider: Send + Sync {
         false
     }
 
+    /// Returns true if this provider or any inner provider records active AI
+    /// request latency and provider error telemetry at the dispatch boundary
+    /// (after semaphore and quota waits), so outer retry wrappers do not
+    /// double-count or include queueing wait time.
+    fn handles_request_telemetry(&self) -> bool {
+        false
+    }
+
     /// Returns the capabilities and constraints of this provider.
     fn get_capabilities(&self) -> ProviderCapabilities;
 

@@ -526,6 +526,8 @@ impl Ingestor {
     async fn run_nntp_worker(
         &self,
         queue: &tokio::sync::Mutex<std::collections::VecDeque<(String, String)>>,
+        lag_total: &std::sync::atomic::AtomicU64,
+        lag_max: &std::sync::atomic::AtomicU64,
     ) -> Result<()> {
         let mut client: Option<NntpClient> = None;
         let mut consecutive_connect_failures = 0usize;
@@ -621,6 +623,10 @@ impl Ingestor {
                                 .commit_article_mark(&tracker, group_name, committed, handed_off)
                                 .await?;
                             if committed < handed_off {
+                                let group_lag = info.high.saturating_sub(committed);
+                                lag_total
+                                    .fetch_add(group_lag, std::sync::atomic::Ordering::Relaxed);
+                                lag_max.fetch_max(group_lag, std::sync::atomic::Ordering::Relaxed);
                                 // The tracker consumed this batch's loss record.
                                 // Refetch from the saved mark next cycle before
                                 // another batch or final flush can pass the gap.
@@ -655,9 +661,13 @@ impl Ingestor {
             }
 
             if handed_off > committed {
-                self.commit_article_mark(&tracker, group_name, committed, handed_off)
+                committed = self
+                    .commit_article_mark(&tracker, group_name, committed, handed_off)
                     .await?;
             }
+            let group_lag = info.high.saturating_sub(committed);
+            lag_total.fetch_add(group_lag, std::sync::atomic::Ordering::Relaxed);
+            lag_max.fetch_max(group_lag, std::sync::atomic::Ordering::Relaxed);
         }
 
         if let Some(mut active_client) = client
@@ -671,14 +681,18 @@ impl Ingestor {
     async fn process_nntp_cycle(&self) -> Result<()> {
         let groups = self.get_tracked_groups().await?;
         if groups.is_empty() {
+            crate::metrics::set_nntp_lag(0, 0);
             return Ok(());
         }
 
         let worker_count = self.settings.nntp.concurrency.max(1).min(groups.len());
         let queue = tokio::sync::Mutex::new(std::collections::VecDeque::from(groups));
-        let results =
-            futures_util::future::join_all((0..worker_count).map(|_| self.run_nntp_worker(&queue)))
-                .await;
+        let lag_total = std::sync::atomic::AtomicU64::new(0);
+        let lag_max = std::sync::atomic::AtomicU64::new(0);
+        let results = futures_util::future::join_all(
+            (0..worker_count).map(|_| self.run_nntp_worker(&queue, &lag_total, &lag_max)),
+        )
+        .await;
 
         let mut first_err: Option<anyhow::Error> = None;
         for res in results {
@@ -691,6 +705,10 @@ impl Ingestor {
         if let Some(err) = first_err {
             return Err(err);
         }
+        crate::metrics::set_nntp_lag(
+            lag_total.load(std::sync::atomic::Ordering::Relaxed),
+            lag_max.load(std::sync::atomic::Ordering::Relaxed),
+        );
         Ok(())
     }
 

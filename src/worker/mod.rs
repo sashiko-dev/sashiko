@@ -27,6 +27,8 @@ pub mod prompts;
 #[cfg(feature = "server")]
 pub mod repack;
 #[cfg(feature = "server")]
+pub mod stats_backfill;
+#[cfg(feature = "server")]
 pub mod sync;
 
 pub use location_resolver::*;

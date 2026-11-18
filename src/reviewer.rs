@@ -1093,6 +1093,7 @@ impl Reviewer {
         };
 
         // 1. Find a working baseline (apply series)
+        let baseline_started = std::time::Instant::now();
         let baseline_outcome = Self::prepare_baseline_worktree_with_failures(
             &ctx,
             patchset_id,
@@ -1102,6 +1103,10 @@ impl Reviewer {
             body.as_deref(),
         )
         .await;
+        crate::metrics::observe_git_op(
+            crate::metrics::GitOpKind::Baseline,
+            baseline_started.elapsed(),
+        );
         let found_baseline = baseline_outcome.found;
         let patch_commits = baseline_outcome.patch_commits;
         let logs = baseline_outcome.logs_json;
@@ -1546,6 +1551,22 @@ impl Reviewer {
                             "Completed review for patchset {} (status: {})",
                             patchset_id, final_status
                         );
+                        let now_ts = chrono::Utc::now().timestamp();
+                        if let Some(ps_date) = patchset.date.filter(|&d| d > 0) {
+                            let turnaround = now_ts.saturating_sub(ps_date).max(0) as u64;
+                            crate::metrics::observe_patchset_turnaround(
+                                std::time::Duration::from_secs(turnaround),
+                            );
+                        }
+                        if patchset.embargo_until.is_none_or(|u| u <= now_ts)
+                            && let Err(e) =
+                                ctx.db.record_patchset_release_rollups(patchset_id).await
+                        {
+                            warn!(
+                                "Failed to record release rollups for patchset {}: {}",
+                                patchset_id, e
+                            );
+                        }
                         if let Err(e) = Self::queue_forge_pr_comment(&ctx, &patchset, &diffs).await
                         {
                             error!(
@@ -1658,6 +1679,24 @@ impl Reviewer {
                     {
                         error!(
                             "Failed to queue apply-failure notification email for patchset {}: {}",
+                            patchset_id, e
+                        );
+                    }
+                    crate::metrics::inc_review_completed(
+                        crate::metrics::ReviewOutcomeMetric::FailedToApply,
+                    );
+                    let now_ts = chrono::Utc::now().timestamp();
+                    if let Some(ps_date) = patchset.date.filter(|&d| d > 0) {
+                        let turnaround = now_ts.saturating_sub(ps_date).max(0) as u64;
+                        crate::metrics::observe_patchset_turnaround(
+                            std::time::Duration::from_secs(turnaround),
+                        );
+                    }
+                    if patchset.embargo_until.is_none_or(|u| u <= now_ts)
+                        && let Err(e) = ctx.db.record_patchset_release_rollups(patchset_id).await
+                    {
+                        warn!(
+                            "Failed to record FailedToApply rollups for patchset {}: {}",
                             patchset_id, e
                         );
                     }
@@ -3103,6 +3142,7 @@ impl Reviewer {
                 return Err(e);
             }
             ctx.db.update_patch_status(patch_id, "Skipped").await?;
+            crate::metrics::inc_review_completed(crate::metrics::ReviewOutcomeMetric::SkippedOther);
 
             return Ok(PatchResult::Success);
         }
@@ -3186,6 +3226,21 @@ impl Reviewer {
                 .await?;
             ctx.db.update_patch_status(patch_id, "Skipped").await?;
             crate::metrics::inc_reviews_skipped_unchanged();
+            let _ = ctx
+                .db
+                .record_completed_review_telemetry(
+                    review_id,
+                    patchset_id,
+                    &ctx.settings.ai.provider,
+                    &ctx.settings.ai.model,
+                    ReviewStatus::Skipped.as_str(),
+                    true,
+                    0,
+                    0,
+                    0,
+                    None,
+                )
+                .await;
 
             return Ok(PatchResult::Success);
         }
@@ -3451,8 +3506,22 @@ impl Reviewer {
                         None
                     };
 
+                    if let Some(fv) = json_output["format_violations"].as_u64() {
+                        crate::metrics::add_ai_errors(
+                            crate::metrics::AiErrorKind::FormatViolation,
+                            fv,
+                        );
+                    }
                     let interaction_id = if let Some(tokens_in) = json_output["tokens_in"].as_u64()
                     {
+                        let t_out = json_output["tokens_out"].as_u64().unwrap_or(0);
+                        let t_cached = json_output["tokens_cached"].as_u64().unwrap_or(0);
+                        crate::metrics::add_ai_tokens(
+                            crate::metrics::AiWorkload::Review,
+                            tokens_in.saturating_sub(t_cached),
+                            t_cached,
+                            t_out,
+                        );
                         let i_id = generate_interaction_id();
                         let input_ctx = json_output["input_context"].as_str().unwrap_or("");
                         let output_raw = if let Some(r) = json_output.get("review") {
@@ -3530,6 +3599,13 @@ impl Reviewer {
                                 return Err(e);
                             }
                             ctx.db.update_patch_status(patch_id, "Failed").await?;
+                            Self::record_failed_review_metrics(
+                                ctx,
+                                review_id,
+                                patchset_id,
+                                Some(&json_output),
+                            )
+                            .await;
                             return Ok(PatchResult::ReviewFailed);
                         } else if let Some(review_content) = json_output.get("review") {
                             if !review_content.is_null() {
@@ -3671,6 +3747,32 @@ impl Reviewer {
                                         "Failed to save review completion for patch {}/{} (ID: {})",
                                         patchset_id, index, patch_id
                                     )));
+                                }
+                                crate::metrics::inc_review_completed(
+                                    crate::metrics::ReviewOutcomeMetric::Reviewed,
+                                );
+                                let t_in = json_output["tokens_in"].as_u64().unwrap_or(0);
+                                let t_out = json_output["tokens_out"].as_u64().unwrap_or(0);
+                                let t_cached = json_output["tokens_cached"].as_u64().unwrap_or(0);
+                                if let Ok(dur_secs) = ctx
+                                    .db
+                                    .record_completed_review_telemetry(
+                                        review_id,
+                                        patchset_id,
+                                        &ctx.settings.ai.provider,
+                                        &ctx.settings.ai.model,
+                                        ReviewStatus::Reviewed.as_str(),
+                                        false,
+                                        t_in as i64,
+                                        t_out as i64,
+                                        t_cached as i64,
+                                        Some(review_content),
+                                    )
+                                    .await
+                                {
+                                    crate::metrics::observe_review_duration(
+                                        std::time::Duration::from_secs(dur_secs),
+                                    );
                                 }
 
                                 if ctx.settings.linux_bug.enabled
@@ -3896,6 +3998,9 @@ impl Reviewer {
                                     return Err(e);
                                 }
                                 ctx.db.update_patch_status(patch_id, "Skipped").await?;
+                                crate::metrics::inc_review_completed(
+                                    crate::metrics::ReviewOutcomeMetric::SkippedOther,
+                                );
                                 return Ok(PatchResult::Success);
                             } else {
                                 if retries < max_retries {
@@ -3932,6 +4037,13 @@ impl Reviewer {
                                     return Err(e);
                                 }
                                 ctx.db.update_patch_status(patch_id, "Failed").await?;
+                                Self::record_failed_review_metrics(
+                                    ctx,
+                                    review_id,
+                                    patchset_id,
+                                    Some(&json_output),
+                                )
+                                .await;
                                 return Ok(PatchResult::ReviewFailed);
                             }
                         } else {
@@ -3972,6 +4084,13 @@ impl Reviewer {
                                 return Err(e);
                             }
                             ctx.db.update_patch_status(patch_id, "Failed").await?;
+                            Self::record_failed_review_metrics(
+                                ctx,
+                                review_id,
+                                patchset_id,
+                                Some(&json_output),
+                            )
+                            .await;
                             return Ok(PatchResult::ReviewFailed);
                         }
                     } else {
@@ -4013,6 +4132,13 @@ impl Reviewer {
                             return Err(e);
                         }
                         ctx.db.update_patch_status(patch_id, "Failed").await?;
+                        Self::record_failed_review_metrics(
+                            ctx,
+                            review_id,
+                            patchset_id,
+                            Some(&json_output),
+                        )
+                        .await;
                         return Ok(PatchResult::ReviewFailed);
                     }
                 }
@@ -4087,10 +4213,42 @@ impl Reviewer {
                         return Err(err);
                     }
                     ctx.db.update_patch_status(patch_id, "Failed").await?;
+                    Self::record_failed_review_metrics(ctx, review_id, patchset_id, None).await;
                     return Ok(PatchResult::ReviewFailed);
                 }
             }
         }
+    }
+
+    async fn record_failed_review_metrics(
+        ctx: &ReviewContext,
+        review_id: i64,
+        patchset_id: i64,
+        json_output: Option<&serde_json::Value>,
+    ) {
+        crate::metrics::inc_review_completed(crate::metrics::ReviewOutcomeMetric::Failed);
+        let (t_in, t_out, t_cached) = json_output.map_or((0, 0, 0), |v| {
+            (
+                v["tokens_in"].as_u64().unwrap_or(0),
+                v["tokens_out"].as_u64().unwrap_or(0),
+                v["tokens_cached"].as_u64().unwrap_or(0),
+            )
+        });
+        let _ = ctx
+            .db
+            .record_completed_review_telemetry(
+                review_id,
+                patchset_id,
+                &ctx.settings.ai.provider,
+                &ctx.settings.ai.model,
+                ReviewStatus::Failed.as_str(),
+                false,
+                t_in as i64,
+                t_out as i64,
+                t_cached as i64,
+                None,
+            )
+            .await;
     }
 }
 
