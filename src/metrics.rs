@@ -67,7 +67,7 @@ pub static METRIC_CATALOG: &[MetricDef] = &[
     MetricDef {
         name: "sashiko_patchsets_stored",
         metric_type: MetricType::Gauge,
-        help: "Total patchsets stored in the database.",
+        help: "Current patchsets stored in the database grouped by status.",
         unit: "",
     },
     MetricDef {
@@ -1547,6 +1547,12 @@ pub fn unflushed_runtime_deltas() -> Vec<RollupSample> {
     let prev = read_flush_watermark();
     let curr = RuntimeCounterSnapshot::capture_current();
     curr.diff_from(&prev)
+}
+
+/// Returns current process-lifetime runtime counter and histogram samples for
+/// instant PromQL queries.
+pub fn current_runtime_counter_samples() -> Vec<RollupSample> {
+    RuntimeCounterSnapshot::capture_current().diff_from(&RuntimeCounterSnapshot::zero())
 }
 
 // ============================================================================

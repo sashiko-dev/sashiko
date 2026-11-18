@@ -262,6 +262,18 @@ pub struct AppState {
     patchsets_homepage_cache: AsyncCache<Vec<crate::db::PatchsetRow>>,
     messages_homepage_cache: AsyncCache<Vec<crate::db::MessageRow>>,
     bug_subsystems_cache: AsyncMapCache<Option<String>, Vec<serde_json::Value>>,
+    pipeline_stats_cache: AsyncCache<crate::db::PipelineMultiWindowStats>,
+}
+
+impl AppState {
+    pub async fn get_cached_pipeline_stats(
+        &self,
+        now_ts: i64,
+    ) -> anyhow::Result<crate::db::PipelineMultiWindowStats> {
+        self.pipeline_stats_cache
+            .get_or_fetch(|| async { self.db.get_pipeline_multi_window_stats(now_ts).await })
+            .await
+    }
 }
 
 async fn redirect_www(req: Request, next: Next) -> impl IntoResponse {
@@ -315,11 +327,30 @@ pub fn build_router(
         patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
         messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
         bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+        pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
     });
 
     Router::new()
         .route("/health", get(health_check))
         .route("/api/health", get(health_check))
+        .route("/metrics", get(crate::prom_api::prometheus_metrics))
+        .route(
+            "/api/v1/query",
+            get(crate::prom_api::prom_query).post(crate::prom_api::prom_query),
+        )
+        .route(
+            "/api/v1/query_range",
+            get(crate::prom_api::prom_query_range).post(crate::prom_api::prom_query_range),
+        )
+        .route(
+            "/api/v1/labels",
+            get(crate::prom_api::prom_labels).post(crate::prom_api::prom_labels),
+        )
+        .route(
+            "/api/v1/label/{name}/values",
+            get(crate::prom_api::prom_label_values),
+        )
+        .route("/api/v1/metadata", get(crate::prom_api::prom_metadata))
         .route("/api/config", get(get_config))
         .route("/api/lists", get(list_mailing_lists))
         .route("/api/patchsets", get(list_patchsets))
@@ -391,8 +422,11 @@ async fn reject_invalid_authorization(
     next: middleware::Next,
 ) -> Result<axum::response::Response, (StatusCode, &'static str)> {
     let headers = request.headers();
+    let is_metrics_scrape = request.uri().path() == "/metrics"
+        && crate::prom_api::presents_metrics_token(headers, &state);
     if headers.contains_key(axum::http::header::AUTHORIZATION)
         && !presents_local_token(headers, &state)
+        && !is_metrics_scrape
     {
         crate::auth::authenticate_bearer_header(headers, &state)?;
     }
@@ -4888,6 +4922,7 @@ mod tests {
             patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+            pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
         });
 
         let blocked_user = crate::auth::AuthUser::new("blocked@example.com");
@@ -5458,6 +5493,7 @@ mod tests {
                 patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
                 messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
                 bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+                pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
             })
         };
 
@@ -5525,6 +5561,7 @@ mod tests {
                 patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
                 messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
                 bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+                pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
             })
         };
 
@@ -5696,6 +5733,7 @@ mod tests {
             patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+            pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
             local_token: None,
             email_worker_heartbeat: None,
         });
@@ -6912,6 +6950,7 @@ F:	*
             stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
             stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(60)),
+            pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
             sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
         });
 
@@ -7289,6 +7328,7 @@ F:	*
             patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+            pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
         });
 
         let payload = serde_json::json!({
@@ -7916,6 +7956,287 @@ F:	net/
             .await
             .unwrap();
         assert_eq!(close_ok.status(), StatusCode::OK);
+
+        crate::maintainers::clear_global_maintainers();
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_endpoints_metrics_token_and_bug_subsystem_acl() {
+        let _guard = crate::maintainers::GLOBAL_INDEX_TEST_LOCK.lock().await;
+        crate::maintainers::clear_global_maintainers();
+        let maint = "Maintainers List\n===================\n\nBTRFS FILE SYSTEM\nM:\tbtrfs-maint@example.org\nS:\tMaintained\nF:\tfs/btrfs/\n\nNETWORKING [GENERAL]\nM:\tnet-maint@example.org\nS:\tMaintained\nF:\tnet/\n";
+        let index =
+            Arc::new(crate::maintainers::MaintainersIndex::from_reader(maint.as_bytes()).unwrap());
+        crate::maintainers::init_global_maintainers(index.clone());
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.database.url = ":memory:".to_string();
+        settings.server.testing_mode = false;
+        settings.server.jwt_secret = Some("test-prom-jwt-secret".to_string());
+        settings.server.metrics_token = Some("prom-scrape-secret-token".to_string());
+        settings.server.acl.admins = vec!["admin@example.org".to_string()];
+        settings.linux_bug.enabled = true;
+
+        let db = Arc::new(Database::new(&settings.database).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        db.ensure_subsystem("netdev", "netdev@vger.kernel.org")
+            .await
+            .unwrap();
+        db.flush_rollup_samples(
+            now,
+            &[crate::metrics::RollupSample {
+                metric: "sashiko_messages_ingested_total",
+                labels: vec![("source", "nntp")],
+                delta: 42.0,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let mut btrfs_bug: crate::db::NewBug = serde_json::from_value(serde_json::json!({
+            "bugid": "linux-prom-btrfs",
+            "title": "btrfs: deadlock"
+        }))
+        .unwrap();
+        btrfs_bug.subsystems = index.attribute_files(["fs/btrfs/inode.c"]);
+        let btrfs_id = db
+            .create_bug_with_enrichment(&btrfs_bug, None)
+            .await
+            .unwrap();
+        db.execute(
+            "UPDATE bugs SET lifecycle_status = 'open', severity_int = 3 WHERE id = ?",
+            libsql::params![btrfs_id],
+        )
+        .await
+        .unwrap();
+
+        let mut net_bug: crate::db::NewBug = serde_json::from_value(serde_json::json!({
+            "bugid": "linux-prom-net",
+            "title": "net: skb leak"
+        }))
+        .unwrap();
+        net_bug.subsystems = index.attribute_files(["net/core/skbuff.c"]);
+        let net_id = db.create_bug_with_enrichment(&net_bug, None).await.unwrap();
+        db.execute(
+            "UPDATE bugs SET lifecycle_status = 'open', severity_int = 4 WHERE id = ?",
+            libsql::params![net_id],
+        )
+        .await
+        .unwrap();
+
+        let local_tok = crate::auth::LocalToken::generate().unwrap();
+        let local_secret = local_tok.secret().to_string();
+        let (tx, _rx) = mpsc::channel(4);
+        let (ftx, _frx) = mpsc::channel(4);
+        let app = build_router(
+            Arc::new(settings),
+            db.clone(),
+            tx,
+            ftx,
+            ServerOptions {
+                local_token: Some(local_tok),
+                ..ServerOptions::default()
+            },
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+
+        let client = reqwest::Client::new();
+
+        // 1. GET /metrics requires metrics_token when configured, and metrics_token
+        //    is rejected on non-/metrics API routes.
+        let unauth_m = client
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth_m.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_m = client
+            .get(format!("http://{addr}/metrics"))
+            .header("Authorization", "Bearer wrong-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_m.status(), StatusCode::UNAUTHORIZED);
+
+        let ok_m = client
+            .get(format!("http://{addr}/metrics"))
+            .header("Authorization", "Bearer prom-scrape-secret-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_m.status(), StatusCode::OK);
+        let m_body = ok_m.text().await.unwrap();
+        assert!(m_body.contains("sashiko_bugs_total"));
+        assert!(!m_body.contains("BTRFS FILE SYSTEM"));
+
+        let rejected_on_api = client
+            .get(format!("http://{addr}/api/bugs"))
+            .header("Authorization", "Bearer prom-scrape-secret-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected_on_api.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. Anonymous and LocalToken callers see global bug totals & rollups,
+        //    but zero sashiko_bugs_by_subsystem rows and no restricted section names.
+        let q_tot: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/api/v1/query?query=sum(sashiko_bugs_total{{status=\"open\"}})"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(q_tot["status"], "success");
+        assert_eq!(q_tot["data"]["result"][0]["value"][1], "2");
+
+        for hdr in [None, Some(format!("Bearer {local_secret}"))] {
+            let mut req = client.get(format!(
+                "http://{addr}/api/v1/query?query=sashiko_bugs_by_subsystem"
+            ));
+            if let Some(ref h) = hdr {
+                req = req.header("Authorization", h);
+            }
+            let body: serde_json::Value = req.send().await.unwrap().json().await.unwrap();
+            assert_eq!(body["data"]["result"].as_array().unwrap().len(), 0);
+        }
+
+        let anon_subs: serde_json::Value = client
+            .get(format!("http://{addr}/api/v1/label/subsystem/values"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let anon_list: Vec<String> = serde_json::from_value(anon_subs["data"].clone()).unwrap();
+        assert_eq!(anon_list, vec!["netdev".to_string()]);
+
+        // 3. BTRFS maintainer sees only BTRFS FILE SYSTEM; admin sees both.
+        let btrfs_jwt = crate::auth::create_token(
+            "btrfs-maint@example.org",
+            "test-prom-jwt-secret",
+            Some("session".into()),
+            3600,
+        )
+        .unwrap();
+        let btrfs_q: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/api/v1/query?query=sashiko_bugs_by_subsystem{{facet=\"open\"}}"
+            ))
+            .header("Authorization", format!("Bearer {btrfs_jwt}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let btrfs_res = btrfs_q["data"]["result"].as_array().unwrap();
+        assert_eq!(btrfs_res.len(), 1);
+        assert_eq!(btrfs_res[0]["metric"]["subsystem"], "BTRFS FILE SYSTEM");
+        assert_eq!(btrfs_res[0]["value"][1], "1");
+
+        let admin_jwt = crate::auth::create_token(
+            "admin@example.org",
+            "test-prom-jwt-secret",
+            Some("session".into()),
+            3600,
+        )
+        .unwrap();
+        let admin_q: serde_json::Value = client
+            .post(format!("http://{addr}/api/v1/query"))
+            .header("Authorization", format!("Bearer {admin_jwt}"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body("query=sashiko_bugs_by_subsystem%7Bfacet%3D%22open%22%7D")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(admin_q["data"]["result"].as_array().unwrap().len(), 2);
+
+        // 4. query_range and metadata succeed in O(1).
+        let qr: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/api/v1/query_range?query=sum(increase(sashiko_messages_ingested_total[1h]))&start={}&end={}&step=300s",
+                now - 600,
+                now
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(qr["status"], "success");
+        assert_eq!(qr["data"]["resultType"], "matrix");
+
+        // Historical instant query older than 48h falls back to the 1h tier after 5m reaping.
+        let three_days_ago = ((now - 3 * 86_400) / 3600) * 3600 + 1800;
+        db.flush_rollup_samples(
+            three_days_ago,
+            &[crate::metrics::RollupSample {
+                metric: "sashiko_messages_ingested_total",
+                labels: vec![("source", "nntp")],
+                delta: 17.0,
+            }],
+        )
+        .await
+        .unwrap();
+        db.reap_expired_rollups(now, 500).await.unwrap();
+        let hist_q: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/api/v1/query?query=sum(increase(sashiko_messages_ingested_total[1h]))&time={}",
+                three_days_ago + 1800
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(hist_q["status"], "success");
+        assert_eq!(hist_q["data"]["result"][0]["value"][1], "17");
+
+        let meta_resp: serde_json::Value = client
+            .get(format!("http://{addr}/api/v1/metadata"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(meta_resp["status"], "success");
+        assert!(meta_resp["data"]["sashiko_messages_ingested_total"].is_array());
+
+        // 5. EXPLAIN QUERY PLAN on stats_series + stats_rollups proves index seeks only.
+        for sql in [
+            "EXPLAIN QUERY PLAN SELECT id, metric, labels_json FROM stats_series WHERE metric IN ('sashiko_messages_ingested_total')",
+            "EXPLAIN QUERY PLAN SELECT series_id, bucket_ts, value FROM stats_rollups WHERE series_id IN (1) AND resolution_secs = 300 AND bucket_ts >= 0 AND bucket_ts <= 9999999999",
+        ] {
+            let mut eqp = db.read_conn().query(sql, ()).await.unwrap();
+            while let Some(r) = eqp.next().await.unwrap() {
+                let detail: String = r.get(3).unwrap();
+                assert!(
+                    !detail.starts_with("SCAN "),
+                    "unexpected full scan in rollup query plan: {detail}"
+                );
+            }
+        }
 
         crate::maintainers::clear_global_maintainers();
     }

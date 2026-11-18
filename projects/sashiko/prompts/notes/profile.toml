@@ -13,6 +13,8 @@ source = "component_map"
 "db" = ["src/db.rs", "src/db/", "src/migrations/"]
 "api-server" = [
     "src/server.rs",
+    "src/prom_api.rs",
+    "src/promql.rs",
     "src/api.rs",
     "src/auth.rs",
     "src/access.rs",

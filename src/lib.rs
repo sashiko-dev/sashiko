@@ -60,8 +60,11 @@ pub mod patchwork;
 pub mod prerequisites;
 pub mod prior_context;
 pub mod project;
+#[cfg(feature = "server")]
+pub mod prom_api;
 pub mod prompt_bundle;
 pub mod prompt_namespaces;
+pub mod promql;
 pub mod related_preexisting;
 pub mod repo_sync;
 #[cfg(feature = "server")]

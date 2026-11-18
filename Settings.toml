@@ -89,6 +89,9 @@ port = 8080
 # Signs sign-in links and sessions; sign-in is unavailable without it.
 # Prefer SASHIKO__SERVER__JWT_SECRET to writing it here.
 # jwt_secret = ""
+# Optional bearer token required to scrape GET /metrics (prefer
+# SASHIKO__SERVER__METRICS_TOKEN). When unset, GET /metrics is open.
+# metrics_token = ""
 
 # Capabilities of signed-in (JWT) identities. Empty lists grant nothing
 # (fail-closed). Do NOT list arbitrary users here. Each list also accepts

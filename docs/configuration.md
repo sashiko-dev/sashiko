@@ -315,6 +315,7 @@ Settings for the goose provider (`provider = "goose"`).
 | `read_only` | bool | `false` | When true, disables write API endpoints. Set automatically by `--no-api`. |
 | `public_base_url` | string | -- | The URL the service is reachable at from outside, with no trailing slash. Required whenever `[smtp]` is configured: sign-in links and bug links are mailed, and the bind address names no host a recipient can open. The server refuses to start without it. |
 | `jwt_secret` | string | -- | Signs sign-in links and session tokens. Without it, sign-in returns `501` and no identity can be established. Keep it stable: replacing it invalidates every session and every unopened link. Prefer `SASHIKO__SERVER__JWT_SECRET` over writing it to disk. |
+| `metrics_token` | string | -- | Optional bearer token required on `GET /metrics` (`Authorization: Bearer <token>`). Prefer `SASHIKO__SERVER__METRICS_TOKEN` over writing it to disk. When unset, `GET /metrics` is readable without authentication (and never includes restricted per-subsystem bug counts). Accepted exclusively on `/metrics`; never grants API or bug access. |
 | `log_sign_in_links` | bool | `false` | Writes sign-in links to the log. For a developer machine with no real users; a link in a log is a credential anyone reading the log can spend. |
 | `testing_mode` | bool | `false` | **Never enable on a reachable server.** Grants every caller operator capabilities and full bug access without signing in. For automated tests only. |
 

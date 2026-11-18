@@ -58,6 +58,18 @@ pub struct BugSubsystemFacetSummary {
     pub sec_medium: u64,
     pub sec_low: u64,
     pub sec_hardening: u64,
+    pub open_sev_critical: u64,
+    pub open_sev_high: u64,
+    pub open_sec_critical: u64,
+    pub open_sec_high: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RollupBucketRow {
+    pub metric: String,
+    pub labels: BTreeMap<String, String>,
+    pub bucket_ts: i64,
+    pub value: f64,
 }
 
 /// Encodes label pairs as compact JSON with keys sorted alphabetically,
@@ -1315,6 +1327,339 @@ impl Database {
         Ok(v.max(0) as usize)
     }
 
+    /// Reads all positive rows in `stats_state_gauges` (~300 bounded facets).
+    pub async fn get_all_state_gauges(
+        &self,
+    ) -> Result<Vec<(String, BTreeMap<String, String>, i64)>> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT metric, labels_json, value FROM stats_state_gauges WHERE value > 0",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            let m: String = r.get(0)?;
+            let lj: String = r.get(1)?;
+            let v: i64 = r.get(2)?;
+            out.push((m, decode_labels_json(&lj), v));
+        }
+        Ok(out)
+    }
+
+    /// Returns `true` once `stats_backfill:v1:done` is `'1'` in `meta`.
+    pub async fn is_stats_backfill_done(&self) -> Result<bool> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT value FROM meta WHERE key = 'stats_backfill:v1:done'",
+                (),
+            )
+            .await?;
+        let done = match rows.next().await? {
+            Some(r) => r.get::<String>(0)? == "1",
+            None => false,
+        };
+        Ok(done)
+    }
+
+    /// Queries bounded multi-resolution `stats_rollups` buckets for `metrics`,
+    /// resolving matching `stats_series` rows first via `UNIQUE(metric, labels_json)`
+    /// and then seeking `stats_rollups` directly by `(series_id, resolution_secs, bucket_ts)`.
+    pub async fn query_rollup_buckets(
+        &self,
+        metrics: &[String],
+        resolution_secs: i64,
+        min_bucket_ts: i64,
+        max_bucket_ts: i64,
+    ) -> Result<Vec<RollupBucketRow>> {
+        self.query_rollup_buckets_filtered(
+            metrics,
+            resolution_secs,
+            min_bucket_ts,
+            max_bucket_ts,
+            |_, _| true,
+        )
+        .await
+    }
+
+    /// Queries `stats_rollups` after pre-filtering `stats_series` in memory so
+    /// selective label filters (e.g. `{subsystem="netdev"}`) only seek matching
+    /// `series_id` ranges in `stats_rollups` and decode `labels_json` once per series.
+    pub async fn query_rollup_buckets_filtered<F>(
+        &self,
+        metrics: &[String],
+        resolution_secs: i64,
+        min_bucket_ts: i64,
+        max_bucket_ts: i64,
+        accept_series: F,
+    ) -> Result<Vec<RollupBucketRow>>
+    where
+        F: Fn(&str, &BTreeMap<String, String>) -> bool,
+    {
+        if metrics.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut series_meta: std::collections::HashMap<i64, (String, BTreeMap<String, String>)> =
+            std::collections::HashMap::new();
+        let mut series_ids: Vec<i64> = Vec::new();
+        for chunk in metrics.chunks(SUB_BATCH_SIZE) {
+            let ph = vec!["?"; chunk.len()].join(", ");
+            let params: Vec<libsql::Value> = chunk
+                .iter()
+                .map(|m| libsql::Value::Text(m.clone()))
+                .collect();
+            let sql =
+                format!("SELECT id, metric, labels_json FROM stats_series WHERE metric IN ({ph})");
+            let mut rows = self.read_conn().query(&sql, params).await?;
+            while let Some(r) = rows.next().await? {
+                let id: i64 = r.get(0)?;
+                let metric: String = r.get(1)?;
+                let lj: String = r.get(2)?;
+                let labels = decode_labels_json(&lj);
+                if accept_series(&metric, &labels) {
+                    series_ids.push(id);
+                    series_meta.insert(id, (metric, labels));
+                }
+            }
+        }
+        if series_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        for chunk in series_ids.chunks(SUB_BATCH_SIZE) {
+            let ph = vec!["?"; chunk.len()].join(", ");
+            let mut params: Vec<libsql::Value> =
+                chunk.iter().map(|&id| libsql::Value::Integer(id)).collect();
+            params.push(libsql::Value::Integer(resolution_secs));
+            params.push(libsql::Value::Integer(min_bucket_ts));
+            params.push(libsql::Value::Integer(max_bucket_ts));
+
+            let sql = format!(
+                "SELECT series_id, bucket_ts, value
+                 FROM stats_rollups
+                 WHERE series_id IN ({ph})
+                   AND resolution_secs = ?
+                   AND bucket_ts >= ?
+                   AND bucket_ts <= ?"
+            );
+            let mut rows = self.read_conn().query(&sql, params).await?;
+            while let Some(r) = rows.next().await? {
+                let sid: i64 = r.get(0)?;
+                let bucket_ts: i64 = r.get(1)?;
+                let value: f64 = r.get(2)?;
+                if let Some((metric, labels)) = series_meta.get(&sid) {
+                    out.push(RollupBucketRow {
+                        metric: metric.clone(),
+                        labels: labels.clone(),
+                        bucket_ts,
+                        value,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Lists public mailing-list subsystem names from `subsystems` (bounded by `limit`).
+    pub async fn list_public_subsystem_names(&self, limit: usize) -> Result<Vec<String>> {
+        let cap = limit.clamp(1, 500) as i64;
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT name FROM subsystems ORDER BY name ASC LIMIT ?",
+                libsql::params![cap],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(r.get::<String>(0)?);
+        }
+        Ok(out)
+    }
+
+    /// Lists distinct values for a non-restricted label key across `stats_series`
+    /// (`subsystem` is deliberately handled separately with ACL checks).
+    pub async fn list_series_label_values(
+        &self,
+        label_name: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if label_name == "subsystem" || label_name.is_empty() || label_name.len() > 64 {
+            return Ok(Vec::new());
+        }
+        let cap = limit.clamp(1, 500);
+        let mut rows = self
+            .read_conn()
+            .query("SELECT labels_json FROM stats_series LIMIT 2000", ())
+            .await?;
+        let mut vals = std::collections::BTreeSet::new();
+        while let Some(r) = rows.next().await? {
+            let lj: String = r.get(0)?;
+            let map = decode_labels_json(&lj);
+            if let Some(v) = map.get(label_name) {
+                vals.insert(v.clone());
+                if vals.len() >= cap {
+                    break;
+                }
+            }
+        }
+        Ok(vals.into_iter().collect())
+    }
+
+    /// Serves legacy `/api/stats/timeline` in O(1) from 1-day (`86400`s) rollups
+    /// without scanning `messages`, `patchsets`, `patches`, `reviews`, or `findings`.
+    pub async fn get_timeline_stats_o1(
+        &self,
+        subsystem_id: Option<i64>,
+    ) -> Result<serde_json::Value> {
+        let now_ts = chrono::Utc::now().timestamp();
+        let min_ts = now_ts.saturating_sub(365 * 86_400);
+        let sub_name: Option<String> = if let Some(sid) = subsystem_id {
+            let mut r = self
+                .read_conn()
+                .query(
+                    "SELECT name FROM subsystems WHERE id = ?",
+                    libsql::params![sid],
+                )
+                .await?;
+            match r.next().await? {
+                Some(row) => Some(row.get::<String>(0)?),
+                None => {
+                    return Ok(serde_json::json!({
+                        "messages": [],
+                        "patchsets": [],
+                        "patches": [],
+                        "reviews": [],
+                        "findings": [],
+                    }));
+                }
+            }
+        } else {
+            None
+        };
+
+        let metrics: Vec<String> = if sub_name.is_some() {
+            vec![
+                "sashiko_subsystem_patchsets_total".into(),
+                "sashiko_subsystem_patches_total".into(),
+                "sashiko_subsystem_findings_total".into(),
+            ]
+        } else {
+            vec![
+                "sashiko_messages_ingested_total".into(),
+                "sashiko_patchsets_completed_total".into(),
+                "sashiko_patches_ingested_total".into(),
+                "sashiko_reviews_completed_total".into(),
+                "sashiko_findings_discovered_total".into(),
+            ]
+        };
+        let rows = self
+            .query_rollup_buckets_filtered(&metrics, 86_400, min_ts, now_ts, |_, labels| {
+                sub_name
+                    .as_ref()
+                    .is_none_or(|target| labels.get("subsystem") == Some(target))
+            })
+            .await?;
+
+        let fmt_day = |ts: i64| -> String {
+            chrono::DateTime::from_timestamp(ts, 0)
+                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .unwrap_or_default()
+        };
+
+        let mut msg_by_day: BTreeMap<String, i64> = BTreeMap::new();
+        let mut ps_by_day: BTreeMap<(String, String), i64> = BTreeMap::new();
+        let mut patch_by_day: BTreeMap<String, i64> = BTreeMap::new();
+        let mut rev_by_day: BTreeMap<(String, String), i64> = BTreeMap::new();
+        let mut find_by_day: BTreeMap<(String, String), i64> = BTreeMap::new();
+
+        for r in rows {
+            if let Some(ref target_sub) = sub_name
+                && r.labels.get("subsystem") != Some(target_sub)
+            {
+                continue;
+            }
+            let day = fmt_day(r.bucket_ts);
+            if day.is_empty() {
+                continue;
+            }
+            let cnt = r.value.round() as i64;
+            if cnt <= 0 {
+                continue;
+            }
+            match r.metric.as_str() {
+                "sashiko_messages_ingested_total" => {
+                    *msg_by_day.entry(day).or_insert(0) += cnt;
+                }
+                "sashiko_patchsets_completed_total" => {
+                    let st = r.labels.get("status").cloned().unwrap_or_default();
+                    *ps_by_day.entry((day, st)).or_insert(0) += cnt;
+                }
+                "sashiko_subsystem_patchsets_total" => {
+                    *ps_by_day.entry((day, "Reviewed".to_string())).or_insert(0) += cnt;
+                }
+                "sashiko_patches_ingested_total" | "sashiko_subsystem_patches_total" => {
+                    *patch_by_day.entry(day).or_insert(0) += cnt;
+                }
+                "sashiko_reviews_completed_total" => {
+                    let st = r
+                        .labels
+                        .get("status")
+                        .cloned()
+                        .unwrap_or_else(|| "Reviewed".to_string());
+                    *rev_by_day.entry((day, st)).or_insert(0) += cnt;
+                }
+                "sashiko_findings_discovered_total" | "sashiko_subsystem_findings_total" => {
+                    let sev = r
+                        .labels
+                        .get("severity")
+                        .cloned()
+                        .unwrap_or_else(|| "low".to_string());
+                    *find_by_day.entry((day, sev)).or_insert(0) += cnt;
+                }
+                _ => {}
+            }
+        }
+
+        let messages_data: Vec<_> = msg_by_day
+            .into_iter()
+            .map(|(day, count)| serde_json::json!({"day": day, "count": count}))
+            .collect();
+        let patchsets_data: Vec<_> = ps_by_day
+            .into_iter()
+            .map(|((day, status), count)| {
+                serde_json::json!({"day": day, "status": status, "count": count})
+            })
+            .collect();
+        let patches_data: Vec<_> = patch_by_day
+            .into_iter()
+            .map(|(day, count)| serde_json::json!({"day": day, "count": count}))
+            .collect();
+        let reviews_data: Vec<_> = rev_by_day
+            .into_iter()
+            .map(|((day, status), count)| {
+                serde_json::json!({"day": day, "status": status, "count": count})
+            })
+            .collect();
+        let findings_data: Vec<_> = find_by_day
+            .into_iter()
+            .map(|((day, severity), count)| {
+                serde_json::json!({"day": day, "severity": severity, "count": count})
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "messages": messages_data,
+            "patchsets": patchsets_data,
+            "patches": patches_data,
+            "reviews": reviews_data,
+            "findings": findings_data,
+        }))
+    }
+
     /// Reads `BugAccess`-enforced per-subsystem bug summaries in O(1) from
     /// `stats_bug_subsystem_facets` without joining `bugs`.
     ///
@@ -2363,6 +2708,18 @@ fn fold_subsystem_facet_row(
         "hardening" => entry.sec_hardening += cnt,
         _ => {}
     }
+    if status == "open" {
+        match sev_int {
+            4 => entry.open_sev_critical += cnt,
+            3 => entry.open_sev_high += cnt,
+            _ => {}
+        }
+        match sec_rating.as_str() {
+            "critical" => entry.open_sec_critical += cnt,
+            "high" => entry.open_sec_high += cnt,
+            _ => {}
+        }
+    }
     Ok(())
 }
 
@@ -2915,6 +3272,42 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_subsystem_open_severity_facets_exclude_non_open_bugs() -> Result<()> {
+        let db = setup_migrated_db().await;
+        let now = chrono::Utc::now().timestamp();
+        db.execute(
+            "INSERT INTO bugs (id, bugid, title, lifecycle_status, pipeline_state, reporter, reported_at, severity_int, security_score_tenths, security_class, created_at, updated_at)
+             VALUES
+             (1, 'linux-o1', 'open crit', 'open', 'succeeded', 'bot', ?, 4, 95, 'vulnerability', ?, ?),
+             (2, 'linux-f1', 'fixed crit', 'fixed', 'succeeded', 'bot', ?, 4, 95, 'vulnerability', ?, ?),
+             (3, 'linux-d1', 'dismissed high', 'dismissed', 'succeeded', 'bot', ?, 3, 75, 'vulnerability', ?, ?)",
+            libsql::params![now, now, now, now, now, now, now, now, now],
+        )
+        .await?;
+        db.execute(
+            "INSERT INTO bug_subsystems (bug_id, subsystem, source) VALUES
+             (1, 'NET', 'maintainers_section'),
+             (2, 'NET', 'maintainers_section'),
+             (3, 'NET', 'maintainers_section')",
+            (),
+        )
+        .await?;
+
+        let facets = db
+            .get_bug_subsystem_facets_o1(None, BugVisibility::Unrestricted, 50)
+            .await?;
+        assert_eq!(facets.len(), 1);
+        assert_eq!(facets[0].open, 1);
+        assert_eq!(facets[0].open_sev_critical, 1);
+        assert_eq!(facets[0].open_sev_high, 0);
+        assert_eq!(facets[0].open_sec_critical, 1);
+        assert_eq!(facets[0].open_sec_high, 0);
+        assert_eq!(facets[0].sev_critical, 2);
+        assert_eq!(facets[0].sec_high, 1);
         Ok(())
     }
 
