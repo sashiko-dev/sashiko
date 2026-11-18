@@ -131,7 +131,21 @@ impl AiProvider for ConcurrencyLimitedProvider {
             b.on_request_start();
             crate::ai::backoff_provider::RequestActiveGuard(b.as_ref())
         });
-        self.inner.generate_content(request).await
+        struct AiInflightGuard;
+        impl Drop for AiInflightGuard {
+            fn drop(&mut self) {
+                crate::metrics::dec_ai_inflight_requests();
+            }
+        }
+        crate::metrics::inc_ai_inflight_requests();
+        let _inflight_guard = AiInflightGuard;
+        let call_started = std::time::Instant::now();
+        let res = self.inner.generate_content(request).await;
+        crate::metrics::observe_ai_request_duration(call_started.elapsed());
+        if let Err(ref err) = res {
+            crate::ai::backoff_provider::record_ai_error_metric(err);
+        }
+        res
     }
 
     fn handles_active_budget(&self) -> bool {
@@ -140,6 +154,10 @@ impl AiProvider for ConcurrencyLimitedProvider {
 
     fn handles_dispatch_gate(&self) -> bool {
         self.quota.is_some() || self.inner.handles_dispatch_gate()
+    }
+
+    fn handles_request_telemetry(&self) -> bool {
+        true
     }
 
     fn map_cached_inner(

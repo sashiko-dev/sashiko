@@ -191,6 +191,7 @@ impl QuotaManager {
         }
 
         if slept_any {
+            crate::metrics::set_ai_quota_cooldown_secs(0);
             wait_start.elapsed()
         } else {
             Duration::ZERO
@@ -299,6 +300,7 @@ impl QuotaManager {
         let mut guard = self.blocked_until.lock().await;
         if guard.is_some() {
             *guard = None;
+            crate::metrics::set_ai_quota_cooldown_secs(0);
             info!("AI request succeeded, resetting quota backoff.");
         }
     }
@@ -320,6 +322,10 @@ impl QuotaManager {
         } else {
             *guard = Some(resume_time);
         }
+        let rem_secs = guard
+            .and_then(|u| u.checked_duration_since(Instant::now()))
+            .map_or(0, |d| d.as_secs());
+        crate::metrics::set_ai_quota_cooldown_secs(rem_secs);
 
         match detail {
             Some(detail) => warn!(

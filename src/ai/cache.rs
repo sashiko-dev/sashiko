@@ -336,10 +336,12 @@ impl AiProvider for CachingAiProvider {
                     // recorded with the response covers this same prompt.
                     usage.cached_tokens = Some(usage.prompt_tokens);
                 }
+                crate::metrics::inc_ai_cache_request(crate::metrics::CacheOutcome::Hit);
                 return Ok(resp);
             }
         }
 
+        crate::metrics::inc_ai_cache_request(crate::metrics::CacheOutcome::Miss);
         debug!("Cache miss [{}]", hash_prefix);
 
         let resp = self.inner.generate_content(request.clone()).await?;

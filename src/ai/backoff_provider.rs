@@ -345,11 +345,31 @@ impl BackoffProvider {
     }
 }
 
+pub(crate) fn record_ai_error_class_metric(err_class: &AiErrorClass) {
+    match err_class {
+        AiErrorClass::RateLimit { .. } => {
+            crate::metrics::inc_ai_error(crate::metrics::AiErrorKind::RateLimit);
+        }
+        AiErrorClass::Transient { .. } => {
+            crate::metrics::inc_ai_error(crate::metrics::AiErrorKind::Transient);
+        }
+        AiErrorClass::Fatal => {
+            crate::metrics::inc_ai_error(crate::metrics::AiErrorKind::Fatal);
+        }
+    }
+}
+
+pub(crate) fn record_ai_error_metric(err: &anyhow::Error) {
+    let err_class = classify_ai_error(err);
+    record_ai_error_class_metric(&err_class);
+}
+
 #[async_trait]
 impl AiProvider for BackoffProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         let mut attempt: u32 = 0;
         let mut transient_streak: i32 = 0;
+        let record_telemetry = !self.inner.handles_request_telemetry();
         loop {
             // Honour any active global rate-limit window before trying. The
             // wait is reported so a caller can keep it off its own deadline.
@@ -369,6 +389,7 @@ impl AiProvider for BackoffProvider {
                 budget.check()?;
             }
 
+            let call_started = record_telemetry.then(std::time::Instant::now);
             let response_res = {
                 let _active_guard = (!self.inner.handles_active_budget())
                     .then(|| {
@@ -380,6 +401,9 @@ impl AiProvider for BackoffProvider {
                     .flatten();
                 self.inner.generate_content(request.clone()).await
             };
+            if let Some(started) = call_started {
+                crate::metrics::observe_ai_request_duration(started.elapsed());
+            }
 
             match response_res {
                 Ok(response) => {
@@ -390,12 +414,16 @@ impl AiProvider for BackoffProvider {
                 }
                 Err(e) => {
                     attempt += 1;
+                    let err_class = classify_ai_error(&e);
+                    if record_telemetry {
+                        record_ai_error_class_metric(&err_class);
+                    }
                     if let Some(max) = self.max_attempts
                         && attempt >= max
                     {
                         return Err(e);
                     }
-                    match classify_ai_error(&e) {
+                    match err_class {
                         AiErrorClass::RateLimit { retry_after } => {
                             // Account-wide: block every concurrent request
                             // until it clears. The next iteration's

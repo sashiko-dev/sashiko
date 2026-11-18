@@ -939,7 +939,15 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
                 .await;
 
                 match result {
-                    Ok(val) => {
+                    Ok(mut val) => {
+                        let fv = sashiko::metrics::get_ai_errors(
+                            sashiko::metrics::AiErrorKind::FormatViolation,
+                        );
+                        if fv > 0
+                            && let Some(obj) = val.as_object_mut()
+                        {
+                            obj.insert("format_violations".to_string(), serde_json::json!(fv));
+                        }
                         print_worker_json(&val).map_err(Box::<dyn std::error::Error>::from)?;
                         return Ok(());
                     }
@@ -1547,6 +1555,20 @@ async fn run_daemon(
                     }
                 };
                 let mut receipt = article.receipt.take();
+                let ingest_src = if article.mr_url.is_some() {
+                    sashiko::metrics::IngestSource::Forge
+                } else {
+                    match article.source {
+                        MessageSource::Nntp => sashiko::metrics::IngestSource::Nntp,
+                        MessageSource::ApiInject | MessageSource::ApiFetchThread => {
+                            sashiko::metrics::IngestSource::Api
+                        }
+                        MessageSource::GitFetch
+                        | MessageSource::GitImport
+                        | MessageSource::GitArchive => sashiko::metrics::IngestSource::Git,
+                    }
+                };
+                let was_failed_event = article.failed_error.is_some();
                 match process_parsed_article(
                     &worker_db,
                     article,
@@ -1563,11 +1585,19 @@ async fn run_daemon(
                         if let Some(receipt) = receipt.as_mut() {
                             receipt.settle();
                         }
+                        if was_failed_event {
+                            sashiko::metrics::inc_ingest_error(ingest_src);
+                        } else {
+                            sashiko::metrics::inc_messages_ingested(ingest_src, 1);
+                        }
                         total_ingested += 1;
                     }
                     // The receipt is dropped unsettled, which reports the
                     // article as lost and keeps the mark below it.
-                    ProcessStatus::Error => total_errors += 1,
+                    ProcessStatus::Error => {
+                        sashiko::metrics::inc_ingest_error(ingest_src);
+                        total_errors += 1;
+                    }
                 }
                 total_processed += 1;
 
@@ -1687,8 +1717,8 @@ async fn run_daemon(
             smtp_settings,
             settings.server.log_sign_in_links,
         );
-        if let Some(hb) = email_worker_heartbeat {
-            email_worker = email_worker.with_heartbeat(hb);
+        if let Some(ref hb) = email_worker_heartbeat {
+            email_worker = email_worker.with_heartbeat(Arc::clone(hb));
         }
         let email_worker = Arc::new(email_worker);
 
@@ -1879,12 +1909,23 @@ async fn run_daemon(
         }
     });
 
+    let stats_backfill_db = db.clone();
+    let stats_backfill_handle = tokio::spawn(async move {
+        sashiko::worker::stats_backfill::run_stats_backfill_loop(stats_backfill_db).await;
+    });
+
     let metrics_db = db.clone();
     let metrics_repo_path = repo_path.clone();
+    let metrics_email_hb = email_worker_heartbeat.clone();
+    let metrics_flush_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let worker_flush_lock = Arc::clone(&metrics_flush_lock);
     let metrics_handle = spawn_supervised_worker("MetricsWorker", move || {
         let metrics_db = Arc::clone(&metrics_db);
         let metrics_repo_path = metrics_repo_path.clone();
+        let metrics_email_hb = metrics_email_hb.clone();
+        let worker_flush_lock = Arc::clone(&worker_flush_lock);
         async move {
+            let mut tick: u64 = 0;
             loop {
                 if let Ok(pending) = metrics_db.count_pending_patches().await {
                     sashiko::metrics::set_pending_patches(pending);
@@ -1902,6 +1943,37 @@ async fn run_daemon(
                     Ok((packs, bytes)) => sashiko::metrics::set_repo_packs(packs, bytes),
                     Err(e) => warn!("Failed to count packs in the review repository: {}", e),
                 }
+                sashiko::git_ops::refresh_remote_freshness_metrics(&metrics_repo_path).await;
+                let now_ts = chrono::Utc::now().timestamp();
+                if let Some(ref hb) = metrics_email_hb {
+                    let last = hb.load(std::sync::atomic::Ordering::Relaxed);
+                    sashiko::metrics::set_email_worker_heartbeat_age_secs(
+                        now_ts.saturating_sub(last).max(0),
+                    );
+                } else {
+                    sashiko::metrics::set_email_worker_heartbeat_age_secs(-1);
+                }
+
+                {
+                    let _flush_guard = worker_flush_lock.lock().await;
+                    let pending = sashiko::metrics::prepare_runtime_flush();
+                    if !pending.is_empty() {
+                        match metrics_db
+                            .flush_rollup_samples(now_ts, pending.samples())
+                            .await
+                        {
+                            Ok(()) => sashiko::metrics::commit_runtime_flush(&pending),
+                            Err(e) => warn!("Failed to flush runtime metrics rollups: {}", e),
+                        }
+                    }
+                }
+
+                if tick.is_multiple_of(60)
+                    && let Err(e) = metrics_db.reap_expired_rollups(now_ts, 5_000).await
+                {
+                    warn!("Failed to reap expired stats rollups: {}", e);
+                }
+                tick = tick.wrapping_add(1);
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             }
         }
@@ -1943,10 +2015,25 @@ async fn run_daemon(
         h.abort();
     }
     commit_graph_handle.abort();
+    stats_backfill_handle.abort();
     sync_handle.abort();
     repack_handle.abort();
     reviewer_handle.abort();
+    // Serialize with any in-flight MetricsWorker flush before aborting it so
+    // an already-committed DB write always updates FLUSH_WATERMARK before the
+    // final shutdown flush reads it.
+    let _metrics_flush_guard = metrics_flush_lock.lock().await;
     metrics_handle.abort();
+    let _ = metrics_handle.await;
+
+    let final_flush = sashiko::metrics::prepare_runtime_flush();
+    if !final_flush.is_empty()
+        && let Ok(()) = db
+            .flush_rollup_samples(chrono::Utc::now().timestamp(), final_flush.samples())
+            .await
+    {
+        sashiko::metrics::commit_runtime_flush(&final_flush);
+    }
 
     // A token from a dead server authenticates nothing, since the next one
     // draws a new secret, but leaving the file behind invites a local tool to
@@ -5165,6 +5252,9 @@ async fn process_parsed_article(
                         patchset_id, e
                     );
                 }
+                if let Ok(true) = worker_db.record_patchset_ingested_rollup(patchset_id).await {
+                    sashiko::metrics::inc_patchsets_ingested(1);
+                }
 
                 if let Some(patch) = patch_opt {
                     match worker_db
@@ -5184,6 +5274,10 @@ async fn process_parsed_article(
                                 {
                                     error!("Failed to link patch to subsystem: {}", e);
                                 }
+                            }
+                            if let Ok(true) = worker_db.record_patch_ingested_rollup(patch_id).await
+                            {
+                                sashiko::metrics::inc_patches_ingested(1);
                             }
                         }
                         Err(e) => {

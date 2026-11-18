@@ -118,6 +118,10 @@ impl PatchworkWorker {
                     {
                         Ok(()) => {
                             info!("Successfully posted patchwork check ID {}", entry.id);
+                            crate::metrics::inc_outbox_event(
+                                crate::metrics::OutboxChannel::Patchwork,
+                                crate::metrics::OutboxOutcome::Sent,
+                            );
                             if let Err(e) = self.db.mark_patchwork_sent(entry.id).await {
                                 error!("Failed to mark patchwork {} as sent: {}", entry.id, e);
                             }
@@ -132,6 +136,10 @@ impl PatchworkWorker {
                                 }
                             }
                             if entry.retry_count + 1 >= self.max_retries as i64 {
+                                crate::metrics::inc_outbox_event(
+                                    crate::metrics::OutboxChannel::Patchwork,
+                                    crate::metrics::OutboxOutcome::Failed,
+                                );
                                 if let Err(db_err) = self
                                     .db
                                     .mark_patchwork_failed(entry.id, &e.to_string())

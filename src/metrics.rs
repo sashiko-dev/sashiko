@@ -849,7 +849,7 @@ static GIT_REMOTE_MAX_AGE_SECS: AtomicU64 = AtomicU64::new(0);
 static NNTP_LAG_TOTAL: AtomicU64 = AtomicU64::new(0);
 static NNTP_LAG_MAX: AtomicU64 = AtomicU64::new(0);
 static AI_INFLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
-static AI_QUOTA_COOLDOWN_SECS: AtomicU64 = AtomicU64::new(0);
+static AI_QUOTA_COOLDOWN_UNTIL_UNIX: AtomicI64 = AtomicI64::new(0);
 static EMAIL_WORKER_HEARTBEAT_AGE_SECS: AtomicI64 = AtomicI64::new(-1);
 
 static LOG_EVENTS: [[AtomicU64; LogComponent::COUNT]; LogLevelMetric::COUNT] = [
@@ -1032,6 +1032,12 @@ pub fn inc_review_completed(outcome: ReviewOutcomeMetric) {
     REVIEWS_COMPLETED[outcome as usize].fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn add_reviews_completed(outcome: ReviewOutcomeMetric, count: u64) {
+    if count > 0 {
+        REVIEWS_COMPLETED[outcome as usize].fetch_add(count, Ordering::Relaxed);
+    }
+}
+
 pub fn observe_review_duration(duration: Duration) {
     REVIEW_DURATION.observe(duration);
 }
@@ -1062,6 +1068,16 @@ pub fn inc_ai_error(kind: AiErrorKind) {
     AI_ERRORS[kind as usize].fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn add_ai_errors(kind: AiErrorKind, count: u64) {
+    if count > 0 {
+        AI_ERRORS[kind as usize].fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+pub fn get_ai_errors(kind: AiErrorKind) -> u64 {
+    AI_ERRORS[kind as usize].load(Ordering::Relaxed)
+}
+
 pub fn inc_ai_cache_request(outcome: CacheOutcome) {
     AI_CACHE_REQUESTS[outcome as usize].fetch_add(1, Ordering::Relaxed);
 }
@@ -1070,16 +1086,43 @@ pub fn set_ai_inflight_requests(inflight: u64) {
     AI_INFLIGHT_REQUESTS.store(inflight, Ordering::Relaxed);
 }
 
+pub fn inc_ai_inflight_requests() {
+    AI_INFLIGHT_REQUESTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn dec_ai_inflight_requests() {
+    let _ = AI_INFLIGHT_REQUESTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        Some(cur.saturating_sub(1))
+    });
+}
+
 pub fn get_ai_inflight_requests() -> u64 {
     AI_INFLIGHT_REQUESTS.load(Ordering::Relaxed)
 }
 
+fn unix_secs_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 pub fn set_ai_quota_cooldown_secs(secs: u64) {
-    AI_QUOTA_COOLDOWN_SECS.store(secs, Ordering::Relaxed);
+    let until = if secs == 0 {
+        0
+    } else {
+        unix_secs_now().saturating_add(secs as i64)
+    };
+    AI_QUOTA_COOLDOWN_UNTIL_UNIX.store(until, Ordering::Relaxed);
 }
 
 pub fn get_ai_quota_cooldown_secs() -> u64 {
-    AI_QUOTA_COOLDOWN_SECS.load(Ordering::Relaxed)
+    let until = AI_QUOTA_COOLDOWN_UNTIL_UNIX.load(Ordering::Relaxed);
+    if until <= 0 {
+        0
+    } else {
+        until.saturating_sub(unix_secs_now()).max(0) as u64
+    }
 }
 
 pub fn inc_outbox_event(channel: OutboxChannel, outcome: OutboxOutcome) {

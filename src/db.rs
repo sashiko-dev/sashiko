@@ -36,6 +36,14 @@ use tracing::{debug, info, warn};
 #[cfg(feature = "server")]
 mod patch_lineage;
 #[cfg(feature = "server")]
+mod pipeline_stats;
+#[cfg(feature = "server")]
+pub use pipeline_stats::{
+    CompactPriorStat, CompactStageStat, ExtractSummaryInput, PipelineMultiWindowStats,
+    PipelineWindowAggregate, ReviewPipelineSummary, extract_review_pipeline_summary,
+    normalize_stage_name,
+};
+#[cfg(feature = "server")]
 mod preexisting_disclosures;
 #[cfg(feature = "server")]
 pub use preexisting_disclosures::{NewPreexistingDisclosure, PreexistingDisclosure};
@@ -4729,6 +4737,15 @@ impl Database {
             || enrichment.tokens_out.is_some()
             || enrichment.tokens_cached.is_some()
         {
+            let ti = enrichment.tokens_in.unwrap_or(0) as u64;
+            let to = enrichment.tokens_out.unwrap_or(0) as u64;
+            let tc = enrichment.tokens_cached.unwrap_or(0) as u64;
+            crate::metrics::add_ai_tokens(
+                crate::metrics::AiWorkload::Bug,
+                ti.saturating_sub(tc),
+                tc,
+                to,
+            );
             let interaction_id = format!("bug_enrichment:{id}");
             self.execute(
                 "INSERT OR REPLACE INTO ai_interactions (
@@ -8605,12 +8622,20 @@ impl Database {
     }
 
     pub async fn add_subsystem_to_patch(&self, patch_id: i64, subsystem_id: i64) -> Result<()> {
-        self.execute(
-            "INSERT OR IGNORE INTO patches_subsystems (patch_id, subsystem_id) VALUES (?, ?)",
-            libsql::params![patch_id, subsystem_id],
+        if self.in_transaction {
+            self.execute(
+                "INSERT OR IGNORE INTO patches_subsystems (patch_id, subsystem_id) VALUES (?, ?)",
+                libsql::params![patch_id, subsystem_id],
+            )
+            .await?;
+            return Ok(());
+        }
+        self.add_subsystem_link_with_rollup(
+            stats_queries::SubsystemLinkTarget::Patch,
+            patch_id,
+            subsystem_id,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     pub async fn add_subsystem_to_patchset(
@@ -8618,12 +8643,20 @@ impl Database {
         patchset_id: i64,
         subsystem_id: i64,
     ) -> Result<()> {
-        self.execute(
-            "INSERT OR IGNORE INTO patchsets_subsystems (patchset_id, subsystem_id) VALUES (?, ?)",
-            libsql::params![patchset_id, subsystem_id],
+        if self.in_transaction {
+            self.execute(
+                "INSERT OR IGNORE INTO patchsets_subsystems (patchset_id, subsystem_id) VALUES (?, ?)",
+                libsql::params![patchset_id, subsystem_id],
+            )
+            .await?;
+            return Ok(());
+        }
+        self.add_subsystem_link_with_rollup(
+            stats_queries::SubsystemLinkTarget::Patchset,
+            patchset_id,
+            subsystem_id,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     pub async fn get_message_id_by_msg_id(&self, msg_id: &str) -> Result<Option<i64>> {
@@ -11182,13 +11215,23 @@ impl Database {
     }
 
     pub async fn clear_patchset_embargo(&self, id: i64) -> Result<()> {
-        self.execute(
-            "UPDATE patchsets
+        let updated = self
+            .execute(
+                "UPDATE patchsets
                  SET embargo_until = NULL, embargo_release_started_at = NULL
                  WHERE id = ?",
-            libsql::params![id],
-        )
-        .await?;
+                libsql::params![id],
+            )
+            .await?;
+        if updated > 0
+            && !self.in_transaction
+            && let Err(e) = self.record_patchset_release_rollups(id).await
+        {
+            warn!(
+                "Failed to record post-embargo rollup telemetry for patchset {}: {}",
+                id, e
+            );
+        }
         Ok(())
     }
 
@@ -12960,7 +13003,7 @@ impl Database {
         let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until, p.slug, p.mr_url, p.mr_title, p.mr_number, p.priority
              FROM patchsets p
-             WHERE (p.status = 'Reviewed' OR (p.status = 'Failed' AND p.mr_url IS NOT NULL))
+             WHERE p.status IN ('Reviewed', 'Failed', 'Failed To Apply')
              AND p.embargo_until IS NOT NULL
              AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
              AND (
@@ -13241,7 +13284,7 @@ impl Database {
         let sql = format!(
             "UPDATE patchsets AS p SET embargo_release_started_at = ?
              WHERE p.id = ?
-               AND (p.status = 'Reviewed' OR (p.status = 'Failed' AND p.mr_url IS NOT NULL))
+               AND p.status IN ('Reviewed', 'Failed', 'Failed To Apply')
                AND p.embargo_until IS NOT NULL
                AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
                AND (p.embargo_until <= ? OR (p.status = 'Reviewed' AND ({CLEAN_PATCHSET_PREDICATE})))"
@@ -13910,7 +13953,7 @@ impl Database {
                 )
                 .await?;
         }
-        tx_db
+        let cancelled_reviews = tx_db
             .execute(
                 "UPDATE reviews
                     SET status = 'Cancelled', interaction_id = NULL
@@ -13918,6 +13961,10 @@ impl Database {
                 libsql::params![id],
             )
             .await?;
+        crate::metrics::add_reviews_completed(
+            crate::metrics::ReviewOutcomeMetric::Cancelled,
+            cancelled_reviews,
+        );
         tx_db
             .execute(
                 "UPDATE patches
@@ -15472,23 +15519,42 @@ impl Database {
                 libsql::params![review_id],
             )
             .await?;
+        let mut transitioned = 0u64;
         if id_opt.is_some() {
             tx_db
                 .delete_aborted_review_children_in_tx(review_id)
                 .await?;
-            tx_db
+            transitioned = tx_db
                 .execute(
                     "UPDATE reviews
                         SET status = 'Cancelled',
                             result_description = ?,
                             interaction_id = NULL
                       WHERE id = ?
-                        AND status IN ('Pending', 'In Review', 'Cancelled')",
+                        AND status IN ('Pending', 'In Review')",
                     libsql::params![reason, review_id],
                 )
                 .await?;
+            if transitioned == 0 {
+                // Row was already marked Cancelled (e.g. by cancel_patchset());
+                // still record the abort reason without double-counting the metric.
+                tx_db
+                    .execute(
+                        "UPDATE reviews
+                            SET result_description = ?,
+                                interaction_id = NULL
+                          WHERE id = ?
+                            AND status = 'Cancelled'",
+                        libsql::params![reason, review_id],
+                    )
+                    .await?;
+            }
         }
         tx.commit().await?;
+        crate::metrics::add_reviews_completed(
+            crate::metrics::ReviewOutcomeMetric::Cancelled,
+            transitioned,
+        );
         Ok(())
     }
 
@@ -15518,11 +15584,12 @@ impl Database {
                 libsql::params![patchset_id, patch_id],
             )
             .await?;
+        let mut transitioned = 0u64;
         if let Some(review_id) = id_opt {
             tx_db
                 .delete_aborted_review_children_in_tx(review_id)
                 .await?;
-            tx_db
+            transitioned = tx_db
                 .execute(
                     "UPDATE reviews
                         SET status = 'Cancelled',
@@ -15534,6 +15601,10 @@ impl Database {
                 .await?;
         }
         tx.commit().await?;
+        crate::metrics::add_reviews_completed(
+            crate::metrics::ReviewOutcomeMetric::Cancelled,
+            transitioned,
+        );
         Ok(())
     }
 
@@ -16457,6 +16528,12 @@ impl Database {
                 .await?;
                 Self::stamp_disclosures_in(&tx, status, disclose_for).await?;
                 tx.commit().await?;
+                if existing_status != status {
+                    Self::record_initial_outbox_outcome(
+                        crate::metrics::OutboxChannel::Email,
+                        status,
+                    );
+                }
                 return Ok(true);
             }
             tracing::debug!(
@@ -16487,6 +16564,7 @@ impl Database {
         .await?;
         Self::stamp_disclosures_in(&tx, status, disclose_for).await?;
         tx.commit().await?;
+        Self::record_initial_outbox_outcome(crate::metrics::OutboxChannel::Email, status);
         Ok(true)
     }
 
@@ -16631,6 +16709,12 @@ impl Database {
                 )
                 .await?;
                 tx.commit().await?;
+                if existing_status != status {
+                    Self::record_initial_outbox_outcome(
+                        crate::metrics::OutboxChannel::Email,
+                        status,
+                    );
+                }
                 return Ok(true);
             }
             tracing::debug!(
@@ -16661,7 +16745,21 @@ impl Database {
         )
         .await?;
         tx.commit().await?;
+        Self::record_initial_outbox_outcome(crate::metrics::OutboxChannel::Email, status);
         Ok(true)
+    }
+
+    fn record_initial_outbox_outcome(channel: crate::metrics::OutboxChannel, status: &str) {
+        let outcome = match status {
+            "Muted" => Some(crate::metrics::OutboxOutcome::Muted),
+            "Skipped" | "Disabled" => Some(crate::metrics::OutboxOutcome::Skipped),
+            "Dry-Run" => Some(crate::metrics::OutboxOutcome::DryRun),
+            "Embargoed" => Some(crate::metrics::OutboxOutcome::Embargoed),
+            _ => None,
+        };
+        if let Some(out) = outcome {
+            crate::metrics::inc_outbox_event(channel, out);
+        }
     }
 
     /// Stamps the live reservations of `disclose_for` as mailed inside the
@@ -17118,6 +17216,12 @@ impl Database {
                 )
                 .await?;
                 tx.commit().await?;
+                if existing_status != status {
+                    Self::record_initial_outbox_outcome(
+                        crate::metrics::OutboxChannel::Forge,
+                        status,
+                    );
+                }
                 return Ok(());
             }
             tx.commit().await?;
@@ -17146,6 +17250,7 @@ impl Database {
         )
         .await?;
         tx.commit().await?;
+        Self::record_initial_outbox_outcome(crate::metrics::OutboxChannel::Forge, status);
         Ok(())
     }
 

@@ -132,6 +132,15 @@ impl GitSyncWorker {
         // That cycle has no failure to quote and the network may have
         // recovered since, so it logs at warn.
         let tried = fetched + stale + failed;
+        crate::metrics::add_git_sync_runs(crate::metrics::GitSyncOutcome::Fetched, fetched as u64);
+        crate::metrics::add_git_sync_runs(crate::metrics::GitSyncOutcome::Skipped, skipped as u64);
+        crate::metrics::add_git_sync_runs(
+            crate::metrics::GitSyncOutcome::BackedOff,
+            backed_off as u64,
+        );
+        crate::metrics::add_git_sync_runs(crate::metrics::GitSyncOutcome::Stale, stale as u64);
+        crate::metrics::add_git_sync_runs(crate::metrics::GitSyncOutcome::Failed, failed as u64);
+        crate::git_ops::refresh_remote_freshness_metrics(&self.repo_path).await;
         if fetched == 0 && tried > 0 {
             error!(
                 "GitSyncWorker: Sync cycle fetched nothing: {} skipped, {} backing off, {} stale, {} failed. First failure: {}",

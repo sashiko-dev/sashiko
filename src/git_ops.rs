@@ -1051,12 +1051,88 @@ pub async fn repack_repository(repo_path: &Path) -> Result<()> {
 
     write_commit_graph_locked(repo_path).await?;
 
-    info!(
-        "Repacked {:?} in {:.1}s",
-        repo_path,
-        started.elapsed().as_secs_f64()
-    );
+    let elapsed = started.elapsed();
+    crate::metrics::observe_git_op(crate::metrics::GitOpKind::Repack, elapsed);
+    info!("Repacked {:?} in {:.1}s", repo_path, elapsed.as_secs_f64());
     Ok(())
+}
+
+/// Inspects `.sashiko/fetch_timestamps/` across all configured non-ephemeral
+/// git remotes without network I/O and publishes live remote freshness gauges
+/// (`fresh`, `stale`, `backed_off`, `failed`, and `max_age_secs`).
+pub async fn refresh_remote_freshness_metrics(repo_path: &Path) {
+    let Ok(output) = crate::git_cmd::in_dir_async(repo_path)
+        .args(["remote", "-v"])
+        .output()
+        .await
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let ts_dir = repo_path.join(".sashiko/fetch_timestamps");
+
+    let Ok(counts) = tokio::task::spawn_blocking(move || {
+        let mut remotes: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for line in stdout.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(name), Some(url)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if !name.is_empty() && !name.starts_with("fetcher-") {
+                remotes
+                    .entry(name.to_string())
+                    .or_insert_with(|| url.to_string());
+            }
+        }
+        let now = std::time::SystemTime::now();
+        let mut fresh = 0u64;
+        let mut stale = 0u64;
+        let mut backed_off = 0u64;
+        let mut failed = 0u64;
+        let mut max_age_secs = 0u64;
+
+        for (name, url) in remotes {
+            let ts_file = ts_dir.join(&name);
+            let fail_file = ts_dir.join(format!("{name}.fail"));
+            let age = std::fs::metadata(&ts_file)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok());
+            let fail_age = std::fs::metadata(&fail_file)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok());
+
+            if let Some(a) = age {
+                max_age_secs = max_age_secs.max(a.as_secs());
+            }
+            let interval_secs = if url.contains("akpm/mm") || url.contains("linux-next") {
+                300u64
+            } else {
+                3600u64
+            };
+            let failed_recently = fail_age.is_some_and(|fa| fa.as_secs() < 3600);
+            match age {
+                Some(a) if a.as_secs() >= 86_400 && fail_age.is_some() => failed += 1,
+                Some(_) if failed_recently => backed_off += 1,
+                Some(a) if a.as_secs() > interval_secs => stale += 1,
+                Some(_) => fresh += 1,
+                None if failed_recently => failed += 1,
+                None if name == "origin" => fresh += 1,
+                None => stale += 1,
+            }
+        }
+        (fresh, stale, backed_off, failed, max_age_secs)
+    })
+    .await
+    else {
+        return;
+    };
+    crate::metrics::set_git_remotes(counts.0, counts.1, counts.2, counts.3, counts.4);
 }
 
 #[allow(dead_code)]
@@ -1870,6 +1946,7 @@ pub async fn refresh_remote_with_policy(
             }
         }
 
+        crate::metrics::observe_git_op(crate::metrics::GitOpKind::Fetch, started.elapsed());
         match attempt {
             Ok(()) => fetch_ok = true,
             Err(message) => error_msg = message,

@@ -136,12 +136,25 @@ impl EmailWorker {
                     match send_result {
                         Ok(_) => {
                             info!("Successfully sent email ID {}", email.id);
+                            let outcome = if self.settings.dry_run {
+                                crate::metrics::OutboxOutcome::DryRun
+                            } else {
+                                crate::metrics::OutboxOutcome::Sent
+                            };
+                            crate::metrics::inc_outbox_event(
+                                crate::metrics::OutboxChannel::Email,
+                                outcome,
+                            );
                             if let Err(e) = self.db.mark_email_sent(email.id).await {
                                 error!("Failed to mark email {} as sent: {}", email.id, e);
                             }
                         }
                         Err(e) => {
                             error!("Failed to send email ID {}: {}", email.id, e);
+                            crate::metrics::inc_outbox_event(
+                                crate::metrics::OutboxChannel::Email,
+                                crate::metrics::OutboxOutcome::Failed,
+                            );
                             if let Err(db_err) =
                                 self.db.mark_email_failed(email.id, &e.to_string()).await
                             {
