@@ -502,6 +502,32 @@
         .switch input:focus + .slider { box-shadow: 0 0 1px var(--status-reviewed); }
         .switch input:checked + .slider:before { transform: translateX(20px); }
         .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px; background-color: white; transition: .4s; border-radius: 50%; }
+
+        /* Reworked 4-Tab Statistics Dashboard */
+        .stats-header-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+        .stats-header-bar h1 { margin: 0; padding: 0; border: none; font-size: 1.75em; }
+        .stats-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; border-bottom: 1px solid var(--border-light); padding-bottom: 8px; align-items: center; }
+        .stats-tab-btn { padding: 6px 14px; border-radius: 4px; border: 1px solid var(--border); background: var(--btn-bg); color: var(--text-muted); font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; transition: all 0.12s ease; }
+        .stats-tab-btn:hover { background: var(--hover); color: var(--text); text-decoration: none; }
+        .stats-tab-btn.active { background: var(--selected); color: var(--text); border-color: var(--link); box-shadow: inset 0 -2px 0 var(--link); }
+        .stats-toolbar { display: flex; gap: 8px; align-items: center; margin-left: auto; flex-wrap: wrap; }
+        .stats-seg { display: inline-flex; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+        .stats-seg button { border: none; border-right: 1px solid var(--border-light); border-radius: 0; padding: 4px 10px; font-size: 12px; background: var(--btn-bg); color: var(--text-muted); }
+        .stats-seg button:last-child { border-right: none; }
+        .stats-seg button.active { background: var(--selected); color: var(--text); font-weight: 700; }
+        .stats-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 18px; margin-bottom: 20px; }
+        @media (max-width: 600px) { .stats-grid-2 { grid-template-columns: 1fr; } }
+        .stat-card .sub-deltas { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; font-size: 11px; color: var(--text-muted); }
+        .delta-pill { display: inline-block; padding: 1px 6px; border-radius: 10px; font-weight: 600; border: 1px solid var(--border-light); background: var(--code-bg); }
+        .delta-good { color: var(--status-reviewed); }
+        .delta-bad { color: var(--status-failed); }
+        .delta-warn { color: var(--status-inreview); }
+        .stats-banner-note { padding: 8px 12px; border-radius: 4px; border: 1px solid var(--warn-border); background: var(--warn-bg); color: var(--warn-text); margin-bottom: 14px; font-size: 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+        .stats-table-wrap { overflow-x: auto; }
+        .stats-table th, .stats-table td { font-variant-numeric: tabular-nums; cursor: default; }
+        .stats-table tr { cursor: default; }
+        .chart-title-sm { font-size: 0.95em; font-weight: 600; margin: 0 0 10px 0; color: var(--text); display: flex; justify-content: space-between; align-items: baseline; }
+        .chart-subtitle { font-size: 11px; font-weight: normal; color: var(--text-muted); }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
 </head>
@@ -685,7 +711,9 @@
             selectedList: '', bugSubsystem: '', bugSubsystemsList: [], selectedSubsystems: null,
             bugMinSeverity: '', bugSecurityFilter: '', bugLifecycleStatus: 'open', bugAssignee: '', bugSortBy: 'severity', bugSortOrder: 'desc',
             patchsetId: null, patchsetPage: 1, patchsetTotalPages: 1, patchsetLimit: 50,
-            settings: { theme: 'auto', colorblind: false }, statsData: null, activeCharts: []
+            settings: { theme: 'auto', colorblind: false },
+            statsTab: 'ops', statsOpsWin: '24h', statsMaintWin: '12w', statsMaintSub: '', statsPipeWin: '100',
+            activeCharts: []
         };
 
         // =====================================================================
@@ -1031,9 +1059,9 @@
             const cbToggle = document.getElementById('colorblindToggle');
             if (cbToggle) cbToggle.checked = state.settings.colorblind;
 
-            if (state.view === 'stats' && state.statsData) {
+            if (state.view === 'stats') {
                 clearActiveCharts();
-                renderStatsView();
+                renderStatsView(state.statsTab);
             }
         }
 
@@ -1077,7 +1105,7 @@
             [/^#\/log\/baseline\/(.+)\/(\d+)$/, m => ({ view: 'baseline_log', id: safeDecodeURI(m[1]), idx: parseInt(m[2], 10) })],
             [/^#\/log\/(\d+)$/, m => ({ view: 'log', id: m[1] })],
             [/^#\/map\/(\d+)$/, m => ({ view: 'map', id: m[1] })],
-            [/^#\/stats$/, () => ({ view: 'stats' })]
+            [/^#\/stats(?:\/([a-z]+))?$/, m => ({ view: 'stats', tab: m[1] || 'ops' })]
         ];
 
         function parseHash() {
@@ -1158,8 +1186,20 @@
             state.view = route.view;
             state.selectedIndex = -1;
 
-            if (route.query && typeof route.query.list !== 'undefined') state.selectedList = route.query.list;
-            if (oldView !== 'stats' && state.view === 'stats') state.statsData = null;
+            if (route.query) {
+                if (typeof route.query.list !== 'undefined') state.selectedList = route.query.list;
+                if (route.query.mode === 'bugs' || route.query.mode === 'patchsets' || route.query.mode === 'messages') {
+                    state.listMode = route.query.mode;
+                    state.currentPage = 1;
+                }
+                if (typeof route.query.subsystem === 'string' && route.query.subsystem.trim()) {
+                    const targetSub = route.query.subsystem.trim();
+                    state.selectedSubsystems = new Set([targetSub]);
+                    state.bugSubsystem = targetSub;
+                    state.currentPage = 1;
+                }
+            }
+            if (oldView === 'stats' && state.view !== 'stats') statsRenderSeq++;
             clearActiveCharts();
 
             const app = document.getElementById('app');
@@ -1176,7 +1216,7 @@
                     case 'log': await renderLogView(route.id); break;
                     case 'map': await renderReviewMapView(route.id); break;
                     case 'baseline_log': await renderBaselineLogView(route.id, route.idx); break;
-                    case 'stats': await renderStatsView(); break;
+                    case 'stats': await renderStatsView(route.tab); break;
                     default: await renderListView();
                 }
             } catch (e) {
@@ -1981,7 +2021,10 @@
                         updatePagination(0);
                         return;
                     }
-                    if (state.selectedSubsystems.size < state.bugSubsystemsList.length) {
+                    const allSelected = state.bugSubsystemsList.length > 0 &&
+                        state.selectedSubsystems.size === state.bugSubsystemsList.length &&
+                        state.bugSubsystemsList.every(s => state.selectedSubsystems.has(s.name));
+                    if (!allSelected) {
                         url += `&subsystems=${encodeURIComponent(Array.from(state.selectedSubsystems).join(','))}`;
                     }
                 } else if (state.bugSubsystem) {
@@ -4404,178 +4447,1118 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         }
 
         // =====================================================================
-        // STATS VIEW
+        // STATS VIEW (4-TAB PROMETHEUS-BACKED DASHBOARD)
         // =====================================================================
-        async function renderStatsView() {
+        const VALID_STATS_TABS = ['ops', 'bugs', 'maintainers', 'pipeline'];
+
+        async function promQuery(expr) {
+            const res = await fetch('/api/v1/query?query=' + encodeURIComponent(expr));
+            if (!res.ok) throw new Error('PromQL query failed (' + res.status + ')');
+            const body = await res.json();
+            if (body.status !== 'success') throw new Error(body.error || 'PromQL error');
+            return (body.data && body.data.result) || [];
+        }
+
+        async function promQueryRange(expr, startSec, endSec, stepSec) {
+            const url = `/api/v1/query_range?query=${encodeURIComponent(expr)}&start=${startSec}&end=${endSec}&step=${stepSec}s`;
+            const res = await fetch(url);
+            if (!res.ok) throw new Error('PromQL range failed (' + res.status + ')');
+            const body = await res.json();
+            if (body.status !== 'success') throw new Error(body.error || 'PromQL range error');
+            return (body.data && body.data.result) || [];
+        }
+
+        function promScalar(vec, fallback = 0) {
+            if (!Array.isArray(vec) || !vec.length) return fallback;
+            const raw = Array.isArray(vec[0].value) ? vec[0].value[1] : vec[0];
+            const n = Number(raw);
+            return Number.isFinite(n) ? n : fallback;
+        }
+
+        function promMapBy(vec, labelKey) {
+            const out = {};
+            if (!Array.isArray(vec)) return out;
+            for (const item of vec) {
+                const k = (item.metric && item.metric[labelKey]) || 'unknown';
+                const n = Number(item.value && item.value[1]);
+                out[k] = (out[k] || 0) + (Number.isFinite(n) ? n : 0);
+            }
+            return out;
+        }
+
+        function fmtNum(n, digits = 0) {
+            if (!Number.isFinite(n)) return '—';
+            if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+            if (Math.abs(n) >= 1e4 && digits === 0) return (n / 1e3).toFixed(1) + 'k';
+            return digits > 0 ? n.toFixed(digits) : String(Math.round(n));
+        }
+
+        function fmtSecs(s) {
+            if (!Number.isFinite(s) || s < 0) return '—';
+            if (s < 1) return Math.round(s * 1000) + 'ms';
+            if (s < 60) return s.toFixed(1) + 's';
+            if (s < 3600) return (s / 60).toFixed(1) + 'm';
+            if (s < 86400) return (s / 3600).toFixed(1) + 'h';
+            return (s / 86400).toFixed(1) + 'd';
+        }
+
+        function fmtBytes(b) {
+            if (!Number.isFinite(b) || b <= 0) return '0 B';
+            if (b >= 1073741824) return (b / 1073741824).toFixed(2) + ' GiB';
+            if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MiB';
+            if (b >= 1024) return (b / 1024).toFixed(1) + ' KiB';
+            return Math.round(b) + ' B';
+        }
+
+        function renderDeltaPill(curr, baseline, label, lowerIsBetter = false) {
+            if (!Number.isFinite(curr) || !Number.isFinite(baseline) || baseline <= 0) {
+                return `<span class="delta-pill">${escapeHtml(label)}: —</span>`;
+            }
+            const pct = ((curr - baseline) / baseline) * 100;
+            const sign = pct > 0 ? '+' : '';
+            let cls = '';
+            if (Math.abs(pct) >= 10) {
+                if (lowerIsBetter) cls = pct > 25 ? 'delta-bad' : (pct < -10 ? 'delta-good' : 'delta-warn');
+                else cls = pct < -30 ? 'delta-warn' : '';
+            }
+            return `<span class="delta-pill ${cls}">${escapeHtml(sign + Math.round(pct) + '% ' + label)}</span>`;
+        }
+
+        function renderRichCard(title, value, subHtml = '') {
+            return `<div class="stat-card"><h3>${escapeHtml(title)}</h3><div class="value">${escapeHtml(String(value))}</div>${subHtml ? `<div class="sub-deltas">${subHtml}</div>` : ''}</div>`;
+        }
+
+        function getStatsPalette() {
+            const isDark = isDarkThemeActive();
+            const cs = getComputedStyle(document.body);
+            const v = (name, fb) => cs.getPropertyValue(name).trim() || fb;
+            return {
+                isDark,
+                bg: isDark ? 'rgba(22, 27, 34, 0.94)' : 'rgba(255, 255, 255, 0.95)',
+                border: v('--border', isDark ? '#30363d' : '#ccc'),
+                text: v('--text', isDark ? '#c9d1d9' : '#24292f'),
+                muted: v('--text-muted', isDark ? '#8b949e' : '#666'),
+                ok: v('--status-reviewed', '#22863a'),
+                pending: v('--status-pending', '#0366d6'),
+                warn: v('--status-inreview', '#d67f05'),
+                fail: v('--status-failed', '#d73a49'),
+                embargo: v('--status-embargoed', '#6f42c1'),
+                sev: {
+                    critical: v('--sev-critical', '#B71C1C'),
+                    high: v('--sev-high', '#FF5722'),
+                    medium: v('--sev-medium', '#FF9800'),
+                    low: v('--sev-low', '#FBC02D'),
+                }
+            };
+        }
+
+        function mountStatsChart(elId, option) {
+            const el = document.getElementById(elId);
+            if (!el) return;
+            const pal = getStatsPalette();
+            const chart = echarts.init(el, pal.isDark ? 'dark' : null);
+            const merged = Object.assign({
+                backgroundColor: 'transparent',
+                tooltip: {
+                    trigger: 'axis',
+                    backgroundColor: pal.bg,
+                    borderColor: pal.border,
+                    borderWidth: 1,
+                    textStyle: { color: pal.text, fontSize: 12 }
+                }
+            }, option);
+            chart.setOption(merged);
+            state.activeCharts.push(chart);
+        }
+
+        function formatMatrixBuckets(matrix, stepSec, spanSec) {
+            const tsSet = new Set();
+            for (const s of matrix) {
+                for (const pt of (s.values || [])) tsSet.add(Number(pt[0]));
+            }
+            const sorted = Array.from(tsSet).sort((a, b) => a - b);
+            const labels = sorted.map(ts => {
+                const d = new Date(ts * 1000);
+                if (spanSec <= 86400 * 2) {
+                    return d.toISOString().slice(11, 16);
+                }
+                return d.toISOString().slice(5, 10);
+            });
+            return { sorted, labels };
+        }
+
+        function seriesValuesAt(seriesObj, sortedTs) {
+            const map = new Map();
+            if (seriesObj && Array.isArray(seriesObj.values)) {
+                for (const [ts, val] of seriesObj.values) map.set(Number(ts), Number(val) || 0);
+            }
+            return sortedTs.map(t => map.get(t) || 0);
+        }
+
+        function promEscapeStringLiteral(s) {
+            return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\t/g, '\\t');
+        }
+
+        let statsRenderSeq = 0;
+
+        async function renderStatsView(requestedTab) {
+            const renderSeq = ++statsRenderSeq;
             clearActiveCharts();
+            const tab = VALID_STATS_TABS.includes(requestedTab)
+                ? requestedTab
+                : (VALID_STATS_TABS.includes(state.statsTab) ? state.statsTab : 'ops');
+            state.statsTab = tab;
+            if (!state.statsOpsWin) state.statsOpsWin = '24h';
+            if (!state.statsMaintWin) state.statsMaintWin = '12w';
+            if (!state.statsPipeWin) state.statsPipeWin = '100';
+            if (typeof state.statsMaintSub === 'undefined') state.statsMaintSub = '';
+
+            const toolbarHtml = renderStatsToolbar(tab);
             document.getElementById('app').innerHTML = `
-                <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
-                <h1>Statistics</h1>
-                <div id="stats-content" class="loading">Loading stats...</div>
+                <div class="nav" style="justify-content: space-between;">
+                    <a href="#/" id="statsBackLink">← Back</a>
+                    <a href="/metrics" target="_blank" rel="noopener" class="text-muted-sm" title="Prometheus text 0.0.4 scrape endpoint">Prometheus /metrics ↗</a>
+                </div>
+                <div class="stats-header-bar">
+                    <h1>Statistics</h1>
+                </div>
+                <div class="stats-tabs" id="statsTabBar">
+                    <a href="#/stats/ops" class="stats-tab-btn ${tab === 'ops' ? 'active' : ''}" data-stats-tab="ops">1. Operational</a>
+                    <a href="#/stats/bugs" class="stats-tab-btn ${tab === 'bugs' ? 'active' : ''}" data-stats-tab="bugs">2. Bugs Database</a>
+                    <a href="#/stats/maintainers" class="stats-tab-btn ${tab === 'maintainers' ? 'active' : ''}" data-stats-tab="maintainers">3. Maintainers</a>
+                    <a href="#/stats/pipeline" class="stats-tab-btn ${tab === 'pipeline' ? 'active' : ''}" data-stats-tab="pipeline">4. Pipeline</a>
+                    <div class="stats-toolbar">${toolbarHtml}</div>
+                </div>
+                <div id="stats-backfill-banner"></div>
+                <div id="stats-content" class="loading">Loading statistics...</div>
             `;
 
+            const backEl = document.getElementById('statsBackLink');
+            if (backEl) backEl.addEventListener('click', ev => { ev.preventDefault(); goBack(); });
+            bindStatsToolbarEvents(tab);
+
             try {
-                if (!state.statsData) {
-                    const fetchJson = r => { if (!r.ok) throw new Error(`${r.status} ${r.statusText}`); return r.json(); };
-                    const [timeline, reviewsData, tools] = await Promise.all([
-                        fetch('/api/stats/timeline').then(fetchJson),
-                        fetch('/api/stats/reviews').then(fetchJson),
-                        fetch('/api/stats/tools').then(fetchJson)
-                    ]);
-                    state.statsData = { timeline, reviewsData, tools };
+                const bfVec = await promQuery('sashiko_stats_backfill_complete');
+                if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
+                if (bfVec.length && promScalar(bfVec, 1) < 1) {
+                    const bEl = document.getElementById('stats-backfill-banner');
+                    if (bEl) {
+                        bEl.innerHTML = `<div class="stats-banner-note"><span>Historical time-series rollup backfill is running in the background; live gauges are already current.</span></div>`;
+                    }
                 }
 
-                const { timeline, reviewsData, tools } = state.statsData;
-                const reviews = reviewsData.reviews;
-                const isDark = isDarkThemeActive();
-                const themeBg = isDark ? 'rgba(22, 27, 34, 0.9)' : 'rgba(255, 255, 255, 0.9)';
-                const themeBorder = isDark ? '#30363d' : '#eee';
-                const themeText = isDark ? '#c9d1d9' : '#333';
-                const themeAxis = isDark ? '#444' : '#ccc';
-                const colors = { primary: '#5470c6', secondary: '#91cc75', patchset: '#fac858', individual_patches: '#5ab1ef', failure: '#ee6666', text: themeText };
-
-                const completedReviews = reviews.filter(r => !['Pending', 'In Review'].includes(r.status));
-                const totalReviewsLast1k = completedReviews.reduce((acc, r) => acc + r.count, 0);
-                const successfulLast1k = completedReviews.filter(r => r.status === 'Reviewed').reduce((acc, r) => acc + r.count, 0);
-                const successRateLast1k = totalReviewsLast1k ? Math.round(successfulLast1k / totalReviewsLast1k * 100) + '%' : '-';
-
-                const tokenReviews = reviews.filter(r => {
-                    const s = r.status.toLowerCase().replace(/ /g, '');
-                    return !['pending', 'inreview'].includes(s) && !s.includes('failedtoapply');
-                });
-                const totalTokensIn = tokenReviews.reduce((acc, r) => acc + Math.max(0, (r.tokens_in || 0) - (r.tokens_cached || 0)), 0);
-                const totalTokensOut = tokenReviews.reduce((acc, r) => acc + (r.tokens_out || 0), 0);
-                const totalTokensCached = tokenReviews.reduce((acc, r) => acc + (r.tokens_cached || 0), 0);
-                const tokenReviewCount = tokenReviews.reduce((acc, r) => acc + r.count, 0);
-                const avgTokens = total => tokenReviewCount ? Math.round(total / tokenReviewCount) : 0;
-
-                let html = '<h2>Activity Timeline</h2><div class="chart-section"><div id="chart-timeline" class="chart-container"></div></div>';
-                html += '<h2>AI Reviews</h2><div class="stat-card-grid">' +
-                    renderStatCard('Total Reviews', reviewsData.total_reviews) +
-                    renderStatCard('Total Failures', reviewsData.total_failures) +
-                    renderStatCard('Success Rate (last 1k reviews)', successRateLast1k) + '</div>';
-                html += '<h3>Review Outcomes</h3><div class="chart-section"><div id="chart-review-outcomes" class="chart-container"></div></div>';
-                html += '<h3>Findings Severity</h3><div class="chart-section"><div id="chart-findings" class="chart-container"></div></div>';
-                html += '<h3>Token Usage (last 1k reviews)</h3><div class="stat-card-grid">' +
-                    renderStatCard('Input tokens/patch', formatTokenCount(avgTokens(totalTokensIn))) +
-                    renderStatCard('Cached tokens/patch', formatTokenCount(avgTokens(totalTokensCached))) +
-                    renderStatCard('Out tokens/patch', formatTokenCount(avgTokens(totalTokensOut))) + '</div>';
-
-                const bugTokens = reviewsData.bug_tokens;
-                if (bugTokens && bugTokens.bugs_analyzed > 0) {
-                    const bugUncachedIn = Math.max(0, (bugTokens.tokens_in || 0) - (bugTokens.tokens_cached || 0));
-                    html += '<h3>Bug Pipeline Token Usage (last 1k bugs)</h3><div class="stat-card-grid">' +
-                        renderStatCard('Input tokens/bug', formatTokenCount(Math.round(bugUncachedIn / bugTokens.bugs_analyzed))) +
-                        renderStatCard('Cached tokens/bug', formatTokenCount(Math.round((bugTokens.tokens_cached || 0) / bugTokens.bugs_analyzed))) +
-                        renderStatCard('Out tokens/bug', formatTokenCount(Math.round((bugTokens.tokens_out || 0) / bugTokens.bugs_analyzed))) + '</div>';
-                }
-                html += '<h2>Tool Usage (last 1k reviews)</h2><div class="chart-section"><div id="chart-tools" class="chart-container-lg"></div></div>';
-
-                const container = document.getElementById('stats-content');
-                if (!container) return;
-                container.innerHTML = html;
-                container.classList.remove('loading');
-
-                const mountChart = (elId, option) => {
-                    const chart = echarts.init(document.getElementById(elId), isDark ? 'dark' : null);
-                    chart.setOption(option);
-                    state.activeCharts.push(chart);
-                };
-
-                if (timeline.messages && timeline.messages.length) {
-                    const dates = [...new Set([...timeline.messages.map(m => m.day), ...timeline.patchsets.map(p => p.day), ...(timeline.patches || []).map(p => p.day)])].sort();
-                    const msgData = dates.map(d => timeline.messages.find(m => m.day === d)?.count || 0);
-                    const patchsetData = dates.map(d => timeline.patchsets.filter(p => p.day === d).reduce((a, b) => a + b.count, 0));
-                    const patchesData = dates.map(d => timeline.patches?.find(p => p.day === d)?.count || 0);
-                    mountChart('chart-timeline', {
-                        backgroundColor: 'transparent',
-                        color: [colors.primary, colors.individual_patches, colors.patchset],
-                        tooltip: { trigger: 'axis', backgroundColor: themeBg, borderColor: themeBorder, borderWidth: 1, textStyle: { color: themeText } },
-                        legend: { data: ['Messages', 'Patches', 'Patchsets'], bottom: 0 },
-                        grid: { left: '3%', right: '4%', bottom: '10%', top: '10%', containLabel: true, show: true, borderColor: themeBorder },
-                        xAxis: { type: 'category', data: dates, splitLine: { show: false }, axisLine: { lineStyle: { color: themeAxis } } },
-                        yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                        series: [
-                            { name: 'Messages', type: 'line', smooth: true, showSymbol: false, lineStyle: { width: 3 }, data: msgData, itemStyle: { color: colors.primary } },
-                            { name: 'Patches', type: 'line', smooth: true, showSymbol: false, lineStyle: { width: 3 }, data: patchesData, itemStyle: { color: colors.individual_patches } },
-                            { name: 'Patchsets', type: 'line', smooth: true, showSymbol: false, lineStyle: { width: 3 }, data: patchsetData, itemStyle: { color: colors.patchset } }
-                        ]
-                    });
-                } else {
-                    document.getElementById('chart-timeline').innerHTML = '<p class="loading">No timeline data available.</p>';
-                }
-
-                if (timeline.reviews && timeline.reviews.length) {
-                    const dates = [...new Set(timeline.reviews.map(r => r.day))].sort();
-                    const statuses = [...new Set(timeline.reviews.map(r => r.status))];
-                    const getColor = s => s === 'Reviewed' ? colors.secondary : s === 'Pending' ? colors.primary
-                        : s === 'In Review' ? (getComputedStyle(document.body).getPropertyValue('--status-inreview').trim() || '#d67f05')
-                        : s.toLowerCase().includes('failed') ? colors.failure : null;
-                    mountChart('chart-review-outcomes', {
-                        backgroundColor: 'transparent', tooltip: { trigger: 'axis' },
-                        legend: { data: statuses, bottom: 0 },
-                        grid: { left: '3%', right: '4%', bottom: '10%', top: '10%', containLabel: true },
-                        xAxis: { type: 'category', data: dates, splitLine: { show: false }, axisLine: { lineStyle: { color: themeAxis } } },
-                        yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                        series: statuses.map(s => {
-                            const c = getColor(s);
-                            return { name: s, type: 'line', smooth: true, showSymbol: false, itemStyle: c ? { color: c } : {}, data: dates.map(d => timeline.reviews.find(r => r.day === d && r.status === s)?.count || 0) };
-                        })
-                    });
-                } else {
-                    document.getElementById('chart-review-outcomes').innerHTML = '<p class="loading">No review history available.</p>';
-                }
-
-                if (tools && tools.length) {
-                    const toolStats = {};
-                    tools.forEach(t => { toolStats[t.tool] = (toolStats[t.tool] || 0) + t.count; });
-                    const toolNames = Object.keys(toolStats).sort((a, b) => toolStats[a] - toolStats[b]);
-                    mountChart('chart-tools', {
-                        backgroundColor: 'transparent', tooltip: { trigger: 'axis' },
-                        grid: { left: '3%', right: '4%', bottom: '5%', top: '5%', containLabel: true },
-                        xAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                        yAxis: { type: 'category', data: toolNames, axisLabel: { color: colors.text } },
-                        series: [{
-                            name: 'Count', type: 'bar', data: toolNames.map(t => toolStats[t]),
-                            itemStyle: {
-                                color: new echarts.graphic.LinearGradient(0, 0, 1, 0, [{ offset: 0, color: '#83bff6' }, { offset: 0.5, color: '#188df0' }, { offset: 1, color: '#188df0' }]),
-                                borderRadius: [0, 4, 4, 0]
-                            }
-                        }]
-                    });
-                } else {
-                    document.getElementById('chart-tools').innerHTML = '<p class="loading">No tool usage data available.</p>';
-                }
-
-                if (timeline.findings && timeline.findings.length) {
-                    const dates = [...new Set(timeline.findings.map(f => f.day))].sort();
-                    const severities = ['low', 'medium', 'high', 'critical'];
-                    const computedStyle = getComputedStyle(document.body);
-                    const severityColors = {
-                        low: computedStyle.getPropertyValue('--sev-low').trim() || '#FBC02D',
-                        medium: computedStyle.getPropertyValue('--sev-medium').trim() || '#FF9800',
-                        high: computedStyle.getPropertyValue('--sev-high').trim() || '#FF5722',
-                        critical: computedStyle.getPropertyValue('--sev-critical').trim() || '#B71C1C'
-                    };
-                    mountChart('chart-findings', {
-                        backgroundColor: 'transparent', tooltip: { trigger: 'axis' },
-                        legend: { data: severities.map(s => s.charAt(0).toUpperCase() + s.slice(1)), bottom: 0 },
-                        grid: { left: '3%', right: '4%', bottom: '15%', top: '10%', containLabel: true },
-                        xAxis: { type: 'category', data: dates, splitLine: { show: false }, axisLine: { lineStyle: { color: themeAxis } } },
-                        yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                        series: severities.map(sev => ({
-                            name: sev.charAt(0).toUpperCase() + sev.slice(1),
-                            type: 'line', smooth: true, showSymbol: false, itemStyle: { color: severityColors[sev] },
-                            data: dates.map(d => timeline.findings.find(f => f.day === d && f.severity === sev)?.count || 0)
-                        }))
-                    });
-                } else {
-                    document.getElementById('chart-findings').innerHTML = '<p class="loading">No findings data available.</p>';
-                }
+                if (tab === 'ops') await renderOpsStatsTab(renderSeq);
+                else if (tab === 'bugs') await renderBugsStatsTab(renderSeq);
+                else if (tab === 'maintainers') await renderMaintainersStatsTab(renderSeq);
+                else await renderPipelineStatsTab(renderSeq);
             } catch (e) {
+                if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
                 console.error(e);
                 const container = document.getElementById('stats-content');
-                if (container) container.innerHTML = `<div class="error">Error loading stats: ${escapeHtml(e.message)}</div>`;
+                if (container) {
+                    container.classList.remove('loading');
+                    container.innerHTML = `<div class="error">Error loading statistics: ${escapeHtml(e.message)}</div>`;
+                }
+            }
+        }
+
+        function renderStatsToolbar(tab) {
+            if (tab === 'ops') {
+                const w = state.statsOpsWin;
+                return `<span class="bug-filter-label">Window:</span>
+                    <div class="stats-seg">
+                        <button type="button" data-ops-win="1h" class="${w === '1h' ? 'active' : ''}">Last 1h</button>
+                        <button type="button" data-ops-win="24h" class="${w === '24h' ? 'active' : ''}">Last 24h</button>
+                    </div>`;
+            }
+            if (tab === 'maintainers') {
+                const w = state.statsMaintWin;
+                return `<span class="bug-filter-label">Subsystem:</span>
+                    <select id="maintSubsystemSelect"><option value="">All Subsystems</option></select>
+                    <span class="bug-filter-label">Window:</span>
+                    <div class="stats-seg">
+                        <button type="button" data-maint-win="4w" class="${w === '4w' ? 'active' : ''}">4w</button>
+                        <button type="button" data-maint-win="12w" class="${w === '12w' ? 'active' : ''}">12w</button>
+                        <button type="button" data-maint-win="26w" class="${w === '26w' ? 'active' : ''}">26w</button>
+                    </div>`;
+            }
+            if (tab === 'pipeline') {
+                const w = state.statsPipeWin;
+                return `<span class="bug-filter-label">Sample:</span>
+                    <div class="stats-seg">
+                        <button type="button" data-pipe-win="100" class="${w === '100' ? 'active' : ''}">Last 100</button>
+                        <button type="button" data-pipe-win="500" class="${w === '500' ? 'active' : ''}">Last 500</button>
+                        <button type="button" data-pipe-win="1000" class="${w === '1000' ? 'active' : ''}">Last 1000</button>
+                    </div>`;
+            }
+            return '';
+        }
+
+        function bindStatsToolbarEvents(tab) {
+            document.querySelectorAll('[data-ops-win]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    state.statsOpsWin = btn.dataset.opsWin;
+                    renderStatsView('ops');
+                });
+            });
+            document.querySelectorAll('[data-maint-win]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    state.statsMaintWin = btn.dataset.maintWin;
+                    renderStatsView('maintainers');
+                });
+            });
+            document.querySelectorAll('[data-pipe-win]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    state.statsPipeWin = btn.dataset.pipeWin;
+                    renderStatsView('pipeline');
+                });
+            });
+            if (tab === 'maintainers') {
+                const sel = document.getElementById('maintSubsystemSelect');
+                if (sel) {
+                    sel.addEventListener('change', () => {
+                        state.statsMaintSub = sel.value || '';
+                        renderStatsView('maintainers');
+                    });
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // TAB 1: OPERATIONAL / SRE (#/stats/ops)
+        // ---------------------------------------------------------------------
+        async function renderOpsStatsTab(renderSeq) {
+            const win = state.statsOpsWin === '1h' ? '1h' : '24h';
+            const winHours = win === '1h' ? 1 : 24;
+            const scale7d = (7 * 24) / winHours;
+            const scale30d = (30 * 24) / winHours;
+            const nowSec = Math.floor(Date.now() / 1000);
+            const spanSec = winHours * 3600;
+            const stepSec = win === '1h' ? 300 : 1800;
+            const startSec = nowSec - spanSec;
+
+            const [
+                ingCurr, ing7d, ing30d, ingOff7d,
+                revBySt, rev7d, rev30d,
+                logByLvl, log7dErr,
+                tokByDir, tok7d, tok30d,
+                cacheByOut, aiErrByCls, workerRestarts,
+                outboxByOut, gitRemotes, gitMaxAge, nntpLag,
+                queueDepth, outboxDepth, fetchDepth,
+                inflight, cooldown, hbAge, packCnt, packBytes,
+                aiP50, aiP90, aiP99, revP50, revP90, gitOpP90,
+                rngIng, rngIngOff, rngRev, rngLogs, rngTok
+            ] = await Promise.all([
+                promQuery(`sum by (source) (increase(sashiko_messages_ingested_total[${win}]))`),
+                promQuery(`sum(increase(sashiko_messages_ingested_total[7d]))`),
+                promQuery(`sum(increase(sashiko_messages_ingested_total[30d]))`),
+                promQuery(`sum(increase(sashiko_messages_ingested_total[${win}] offset 7d))`),
+                promQuery(`sum by (status) (increase(sashiko_reviews_completed_total[${win}]))`),
+                promQuery(`sum(increase(sashiko_reviews_completed_total[7d]))`),
+                promQuery(`sum(increase(sashiko_reviews_completed_total[30d]))`),
+                promQuery(`sum by (level) (increase(sashiko_log_events_total[${win}]))`),
+                promQuery(`sum(increase(sashiko_log_events_total{level="error"}[7d]))`),
+                promQuery(`sum by (direction) (increase(sashiko_ai_tokens_total[${win}]))`),
+                promQuery(`sum(increase(sashiko_ai_tokens_total[7d]))`),
+                promQuery(`sum(increase(sashiko_ai_tokens_total[30d]))`),
+                promQuery(`sum by (outcome) (increase(sashiko_ai_cache_requests_total[${win}]))`),
+                promQuery(`sum by (class) (increase(sashiko_ai_errors_total[${win}]))`),
+                promQuery(`sum by (reason) (increase(sashiko_worker_restarts_total[${win}]))`),
+                promQuery(`sum by (channel, outcome) (increase(sashiko_outbox_events_total[${win}]))`),
+                promQuery(`sashiko_git_remotes`),
+                promQuery(`sashiko_git_remote_max_age_seconds`),
+                promQuery(`sashiko_nntp_lag_articles`),
+                promQuery(`sashiko_queue_depth`),
+                promQuery(`sum by (channel) (sashiko_outbox_depth{status="Pending"})`),
+                promQuery(`sashiko_fetch_queue_depth{status="Pending"}`),
+                promQuery(`sashiko_ai_inflight_requests`),
+                promQuery(`sashiko_ai_quota_cooldown_seconds`),
+                promQuery(`sashiko_email_worker_heartbeat_age_seconds`),
+                promQuery(`sashiko_repo_packs`),
+                promQuery(`sashiko_repo_pack_bytes`),
+                promQuery(`histogram_quantile(0.5, sum by (le) (increase(sashiko_ai_request_duration_seconds_bucket[${win}])))`),
+                promQuery(`histogram_quantile(0.9, sum by (le) (increase(sashiko_ai_request_duration_seconds_bucket[${win}])))`),
+                promQuery(`histogram_quantile(0.99, sum by (le) (increase(sashiko_ai_request_duration_seconds_bucket[${win}])))`),
+                promQuery(`histogram_quantile(0.5, sum by (le) (increase(sashiko_review_duration_seconds_bucket[${win}])))`),
+                promQuery(`histogram_quantile(0.9, sum by (le) (increase(sashiko_review_duration_seconds_bucket[${win}])))`),
+                promQuery(`histogram_quantile(0.9, sum by (op, le) (increase(sashiko_git_op_duration_seconds_bucket[${win}])))`),
+                promQueryRange(`sum(increase(sashiko_messages_ingested_total[${stepSec}s]))`, startSec, nowSec, stepSec),
+                promQueryRange(`sum(increase(sashiko_messages_ingested_total[${stepSec}s] offset 7d))`, startSec, nowSec, stepSec),
+                promQueryRange(`sum by (status) (increase(sashiko_reviews_completed_total[${stepSec}s]))`, startSec, nowSec, stepSec),
+                promQueryRange(`sum by (level) (increase(sashiko_log_events_total[${stepSec}s]))`, startSec, nowSec, stepSec),
+                promQueryRange(`sum by (direction) (increase(sashiko_ai_tokens_total[${stepSec}s]))`, startSec, nowSec, stepSec)
+            ]);
+            if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
+
+            const ingMap = promMapBy(ingCurr, 'source');
+            const ingTot = Object.values(ingMap).reduce((a, b) => a + b, 0);
+            const revMap = promMapBy(revBySt, 'status');
+            const revTot = Object.values(revMap).reduce((a, b) => a + b, 0);
+            const revFail = (revMap['Failed'] || 0) + (revMap['Failed To Apply'] || 0);
+            const logMap = promMapBy(logByLvl, 'level');
+            const errCnt = logMap['error'] || 0;
+            const warnCnt = logMap['warn'] || 0;
+            const tokMap = promMapBy(tokByDir, 'direction');
+            const tokTot = Object.values(tokMap).reduce((a, b) => a + b, 0);
+            const tokInAll = (tokMap['uncached_in'] || 0) + (tokMap['cached_in'] || 0);
+            const promptCachePct = tokInAll > 0 ? Math.round(((tokMap['cached_in'] || 0) / tokInAll) * 100) + '%' : '—';
+            const respCache = promMapBy(cacheByOut, 'outcome');
+            const respCacheTot = (respCache['hit'] || 0) + (respCache['miss'] || 0);
+            const respCachePct = respCacheTot > 0 ? Math.round(((respCache['hit'] || 0) / respCacheTot) * 100) + '%' : '—';
+
+            const remMap = promMapBy(gitRemotes, 'state');
+            const staleCnt = (remMap['stale'] || 0) + (remMap['failed'] || 0) + (remMap['backed_off'] || 0);
+            const lagMap = promMapBy(nntpLag, 'agg');
+            const qMap = promMapBy(queueDepth, 'queue');
+            const obPendMap = promMapBy(outboxDepth, 'channel');
+            const obPendTot = Object.values(obPendMap).reduce((a, b) => a + b, 0);
+
+            let sentEmail = 0, sentForge = 0, sentPw = 0, obFailed = 0;
+            for (const item of outboxByOut) {
+                const ch = item.metric?.channel;
+                const oc = item.metric?.outcome;
+                const v = Number(item.value?.[1]) || 0;
+                if (oc === 'sent') {
+                    if (ch === 'email') sentEmail += v;
+                    else if (ch === 'forge') sentForge += v;
+                    else if (ch === 'patchwork') sentPw += v;
+                } else if (oc === 'failed') obFailed += v;
+            }
+            const restartsMap = promMapBy(workerRestarts, 'reason');
+            const aiErrMap = promMapBy(aiErrByCls, 'class');
+            const gitOpMap = promMapBy(gitOpP90, 'op');
+
+            let html = `<div class="stat-card-grid">
+                ${renderRichCard(`Ingested Messages (${win})`, fmtNum(ingTot),
+                    renderDeltaPill(ingTot, promScalar(ing7d) / scale7d, 'vs 7d avg') +
+                    renderDeltaPill(ingTot, promScalar(ing30d) / scale30d, 'vs 30d avg') +
+                    renderDeltaPill(ingTot, promScalar(ingOff7d), 'vs 7d ago'))}
+                ${renderRichCard(`Reviews Completed (${win})`, fmtNum(revTot),
+                    renderDeltaPill(revTot, promScalar(rev7d) / scale7d, 'vs 7d avg') +
+                    renderDeltaPill(revTot, promScalar(rev30d) / scale30d, 'vs 30d avg') +
+                    `<span class="delta-pill ${revFail > 0 ? 'delta-bad' : 'delta-good'}">Failures: ${fmtNum(revFail)}</span>`)}
+                ${renderRichCard(`Errors / Warnings (${win})`, `${fmtNum(errCnt)} / ${fmtNum(warnCnt)}`,
+                    renderDeltaPill(errCnt, promScalar(log7dErr) / scale7d, 'err vs 7d avg', true) +
+                    `<span class="delta-pill ${(restartsMap['panic'] || 0) > 0 ? 'delta-bad' : ''}">Panics: ${fmtNum(restartsMap['panic'] || 0)}</span>`)}
+                ${renderRichCard(`Git Trees (Stale / Fresh)`, `${fmtNum(staleCnt)} / ${fmtNum(remMap['fresh'] || 0)}`,
+                    `<span class="delta-pill ${staleCnt > 0 ? 'delta-warn' : 'delta-good'}">Max age: ${fmtSecs(promScalar(gitMaxAge))}</span>` +
+                    `<span class="delta-pill">Packs: ${fmtNum(promScalar(packCnt))} (${fmtBytes(promScalar(packBytes))})</span>`)}
+                ${renderRichCard(`Queues & NNTP Lag`, `${fmtNum(qMap['patches_pending'] || 0)} pend / ${fmtNum(qMap['patches_reviewing'] || 0)} active`,
+                    `<span class="delta-pill">NNTP lag: ${fmtNum(lagMap['total'] || 0)}</span>` +
+                    `<span class="delta-pill">Fetch Q: ${fmtNum(promScalar(fetchDepth))} | Outbox Q: ${fmtNum(obPendTot)}</span>`)}
+                ${renderRichCard(`LLM Tokens (${win})`, fmtNum(tokTot),
+                    renderDeltaPill(tokTot, promScalar(tok7d) / scale7d, 'vs 7d avg', true) +
+                    renderDeltaPill(tokTot, promScalar(tok30d) / scale30d, 'vs 30d avg', true) +
+                    `<span class="delta-pill">Prompt cache: ${promptCachePct} | Resp cache: ${respCachePct}</span>`)}
+                ${renderRichCard(`AI Latency p50 / p90 / p99`, `${fmtSecs(promScalar(aiP50, NaN))} / ${fmtSecs(promScalar(aiP90, NaN))} / ${fmtSecs(promScalar(aiP99, NaN))}`,
+                    `<span class="delta-pill">Review p50/p90: ${fmtSecs(promScalar(revP50, NaN))} / ${fmtSecs(promScalar(revP90, NaN))}</span>` +
+                    `<span class="delta-pill ${promScalar(cooldown) > 0 ? 'delta-warn' : ''}">Inflight: ${fmtNum(promScalar(inflight))} | Cooldown: ${fmtSecs(promScalar(cooldown))}</span>`)}
+                ${renderRichCard(`Outbox Sent (Mail / Forge / PW)`, `${fmtNum(sentEmail)} / ${fmtNum(sentForge)} / ${fmtNum(sentPw)}`,
+                    `<span class="delta-pill ${obFailed > 0 ? 'delta-bad' : 'delta-good'}">Delivery fails: ${fmtNum(obFailed)}</span>` +
+                    `<span class="delta-pill">SMTP heartbeat: ${hbAge.length ? fmtSecs(promScalar(hbAge)) : 'off'}</span>`)}
+            </div>`;
+
+            html += `<div class="stats-grid-2">
+                <div class="chart-section"><div class="chart-title-sm"><span>Message Ingestion vs 7d Baseline</span><span class="chart-subtitle">Step: ${stepSec / 60}m</span></div><div id="ops-chart-ingest" class="chart-container"></div></div>
+                <div class="chart-section"><div class="chart-title-sm"><span>Review Outcomes (${win})</span><span class="chart-subtitle">Reviewed / Skipped / Failed</span></div><div id="ops-chart-reviews" class="chart-container"></div></div>
+                <div class="chart-section"><div class="chart-title-sm"><span>Warnings & Errors (${win})</span><span class="chart-subtitle">429s: ${fmtNum(aiErrMap['rate_limit'] || 0)} | Timeouts: ${fmtNum(aiErrMap['timeout'] || 0)} | Format: ${fmtNum(aiErrMap['format_violation'] || 0)}</span></div><div id="ops-chart-logs" class="chart-container"></div></div>
+                <div class="chart-section"><div class="chart-title-sm"><span>LLM Token Throughput (${win})</span><span class="chart-subtitle">Git p90 — baseline: ${fmtSecs(gitOpMap['baseline'] ?? NaN)}, fetch: ${fmtSecs(gitOpMap['fetch'] ?? NaN)}</span></div><div id="ops-chart-tokens" class="chart-container"></div></div>
+            </div>`;
+
+            const container = document.getElementById('stats-content');
+            if (!container) return;
+            container.classList.remove('loading');
+            container.innerHTML = html;
+
+            const pal = getStatsPalette();
+            const ingAxis = formatMatrixBuckets([...rngIng, ...rngIngOff], stepSec, spanSec);
+            mountStatsChart('ops-chart-ingest', {
+                legend: { data: ['Current', '7d Ago'], bottom: 0 },
+                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: ingAxis.labels },
+                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                series: [
+                    { name: 'Current', type: 'line', smooth: true, showSymbol: false, itemStyle: { color: pal.pending }, areaStyle: { opacity: 0.12 }, data: seriesValuesAt(rngIng[0], ingAxis.sorted) },
+                    { name: '7d Ago', type: 'line', smooth: true, showSymbol: false, lineStyle: { type: 'dashed', width: 1.5 }, itemStyle: { color: pal.muted }, data: seriesValuesAt(rngIngOff[0], ingAxis.sorted) }
+                ]
+            });
+
+            const revAxis = formatMatrixBuckets(rngRev, stepSec, spanSec);
+            const revColor = st => st === 'Reviewed' ? pal.ok : st.includes('Failed') ? pal.fail : st.includes('Skipped') ? pal.embargo : pal.warn;
+            mountStatsChart('ops-chart-reviews', {
+                legend: { bottom: 0 },
+                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: revAxis.labels },
+                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                series: rngRev.map(s => {
+                    const st = s.metric?.status || 'Other';
+                    return { name: st, type: 'bar', stack: 'rev', itemStyle: { color: revColor(st) }, data: seriesValuesAt(s, revAxis.sorted) };
+                })
+            });
+
+            const logAxis = formatMatrixBuckets(rngLogs, stepSec, spanSec);
+            mountStatsChart('ops-chart-logs', {
+                legend: { bottom: 0 },
+                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: logAxis.labels },
+                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                series: ['error', 'warn'].map(lvl => {
+                    const found = rngLogs.find(s => s.metric?.level === lvl);
+                    return { name: lvl.toUpperCase(), type: 'bar', stack: 'logs', itemStyle: { color: lvl === 'error' ? pal.fail : pal.warn }, data: seriesValuesAt(found, logAxis.sorted) };
+                })
+            });
+
+            const tokAxis = formatMatrixBuckets(rngTok, stepSec, spanSec);
+            const dirColors = { uncached_in: pal.pending, cached_in: pal.ok, out: pal.warn };
+            mountStatsChart('ops-chart-tokens', {
+                legend: { bottom: 0 },
+                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: tokAxis.labels },
+                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                series: ['uncached_in', 'cached_in', 'out'].map(dir => {
+                    const found = rngTok.find(s => s.metric?.direction === dir);
+                    return { name: dir, type: 'bar', stack: 'tok', itemStyle: { color: dirColors[dir] }, data: seriesValuesAt(found, tokAxis.sorted) };
+                })
+            });
+        }
+
+        // ---------------------------------------------------------------------
+        // TAB 2: BUGS DATABASE (#/stats/bugs)
+        // ---------------------------------------------------------------------
+        async function renderBugsStatsTab(renderSeq) {
+            const nowSec = Math.floor(Date.now() / 1000);
+            const span12w = 84 * 86400;
+            const stepWeek = 7 * 86400;
+
+            const [
+                byStatus, openBySev, secRatingOpen, secRatingFixed,
+                secClassOpen, attachOpen, subFacets, rngEvents
+            ] = await Promise.all([
+                promQuery(`sum by (status) (sashiko_bugs_total)`),
+                promQuery(`sum by (severity) (sashiko_bugs_total{status="open"})`),
+                promQuery(`sum by (security_rating) (sashiko_bugs_total{status="open"})`),
+                promQuery(`sum by (security_rating) (sashiko_bugs_total{status="fixed"})`),
+                promQuery(`sum by (security_class) (sashiko_bugs_total{status="open"})`),
+                promQuery(`sashiko_bugs_with_attachment{status="open"}`),
+                promQuery(`sashiko_bugs_by_subsystem`),
+                promQueryRange(`sum by (event) (increase(sashiko_bugs_events_total[7d]))`, nowSec - span12w, nowSec, stepWeek)
+            ]);
+            if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
+
+            const stMap = promMapBy(byStatus, 'status');
+            const openCnt = stMap['open'] || 0;
+            const fixedCnt = stMap['fixed'] || 0;
+            const dupCnt = stMap['duplicate'] || 0;
+            const dismCnt = stMap['dismissed'] || 0;
+            const newCnt = stMap['new'] || 0;
+            const sevMap = promMapBy(openBySev, 'severity');
+            const secOpenMap = promMapBy(secRatingOpen, 'security_rating');
+            const secFixedMap = promMapBy(secRatingFixed, 'security_rating');
+            const secClsMap = promMapBy(secClassOpen, 'security_class');
+            const attMap = promMapBy(attachOpen, 'attachment');
+            const secHighCrit = (secOpenMap['critical'] || 0) + (secOpenMap['high'] || 0);
+            const reproCnt = attMap['reproducer'] || 0;
+            const fixCnt = attMap['proposed_fix'] || 0;
+            const pctOfOpen = c => openCnt > 0 ? Math.round((c / openCnt) * 100) + '% of open' : '0% of open';
+
+            // Group per-subsystem facets
+            const subs = {};
+            for (const item of subFacets) {
+                const name = item.metric?.subsystem;
+                const facet = item.metric?.facet;
+                if (!name || !facet) continue;
+                if (!subs[name]) subs[name] = { open: 0, fixed: 0, duplicate: 0, dismissed: 0, total: 0, high_crit_open: 0, sec_high_crit_open: 0 };
+                subs[name][facet] = Number(item.value?.[1]) || 0;
+            }
+            const subRows = Object.entries(subs)
+                .sort((a, b) => (b[1].open - a[1].open) || (b[1].total - a[1].total) || a[0].localeCompare(b[0]));
+
+            let html = `<div class="stat-card-grid">
+                ${renderRichCard('Open Bugs', fmtNum(openCnt), `<span class="delta-pill">Triaging (new): ${fmtNum(newCnt)}</span>`)}
+                ${renderRichCard('Fixed Upstream', fmtNum(fixedCnt), `<span class="delta-pill delta-good">Closed: ${fmtNum(stMap['closed'] || 0)}</span>`)}
+                ${renderRichCard('Duplicates / Dismissed', `${fmtNum(dupCnt)} / ${fmtNum(dismCnt)}`, `<span class="delta-pill">Dedup + FP triage</span>`)}
+                ${renderRichCard('CVSS High / Critical Open', fmtNum(secHighCrit), `<span class="delta-pill ${secHighCrit > 0 ? 'delta-bad' : 'delta-good'}">Vulns open: ${fmtNum(secClsMap['vulnerability'] || 0)}</span>`)}
+                ${renderRichCard('Open w/ Reproducer (r)', fmtNum(reproCnt), `<span class="delta-pill">${escapeHtml(pctOfOpen(reproCnt))}</span>`)}
+                ${renderRichCard('Open w/ Proposed Fix (f)', fmtNum(fixCnt), `<span class="delta-pill">${escapeHtml(pctOfOpen(fixCnt))}</span>`)}
+            </div>`;
+
+            html += `<div class="stats-grid-2">
+                <div class="chart-section"><div class="chart-title-sm"><span>Weekly Bug Lifecycle Velocity (12w)</span><span class="chart-subtitle">Discovered vs Fixed vs Duplicate/Dismissed</span></div><div id="bugs-chart-velocity" class="chart-container"></div></div>
+                <div class="chart-section"><div class="chart-title-sm"><span>CVSS v4.0 Security Rating (Open vs Fixed)</span><span class="chart-subtitle">Hardening open: ${fmtNum(secClsMap['hardening'] || 0)}</span></div><div id="bugs-chart-security" class="chart-container"></div></div>
+                <div class="chart-section"><div class="chart-title-sm"><span>Open Bugs by Engineering Severity</span><span class="chart-subtitle">Critical / High / Medium / Low</span></div><div id="bugs-chart-severity" class="chart-container"></div></div>
+                <div class="chart-section"><div class="chart-title-sm"><span>Top Authorized Subsystems (Open Bugs)</span><span class="chart-subtitle">${subRows.length ? subRows.length + ' visible sections' : 'Sign-in scoped'}</span></div><div id="bugs-chart-subsystems" class="chart-container"></div></div>
+            </div>`;
+
+            if (subRows.length > 0) {
+                html += `<div class="chart-section">
+                    <div class="chart-title-sm"><span>Bugs by MAINTAINERS Subsystem</span><span class="chart-subtitle">Scoped to your authorized sections</span></div>
+                    <div class="stats-table-wrap"><table class="stats-table">
+                        <thead><tr><th>Subsystem</th><th>Open</th><th>Eng High/Crit</th><th>CVSS High/Crit</th><th>Fixed</th><th>Duplicate</th><th>Dismissed</th><th>Total</th></tr></thead>
+                        <tbody>${subRows.slice(0, 50).map(([name, f]) => `<tr>
+                            <td><a href="#/?mode=bugs&subsystem=${encodeURIComponent(name)}">${escapeHtml(name)}</a></td>
+                            <td><strong>${fmtNum(f.open)}</strong></td>
+                            <td>${fmtNum(f.high_crit_open)}</td>
+                            <td>${fmtNum(f.sec_high_crit_open)}</td>
+                            <td>${fmtNum(f.fixed)}</td>
+                            <td>${fmtNum(f.duplicate)}</td>
+                            <td>${fmtNum(f.dismissed)}</td>
+                            <td>${fmtNum(f.total)}</td>
+                        </tr>`).join('')}</tbody>
+                    </table></div>
+                </div>`;
+            } else if (!isAuthenticatedUser()) {
+                html += `<div class="stats-banner-note">
+                    <span>Per-subsystem bug breakdowns follow MAINTAINERS and embargo visibility rules. Sign in to view subsystem counts within your scope.</span>
+                    <button type="button" id="statsSignInBtn">Sign In</button>
+                </div>`;
+            }
+
+            const container = document.getElementById('stats-content');
+            if (!container) return;
+            container.classList.remove('loading');
+            container.innerHTML = html;
+
+            const signBtn = document.getElementById('statsSignInBtn');
+            if (signBtn) signBtn.addEventListener('click', () => openAuthModal());
+
+            const pal = getStatsPalette();
+            const velAxis = formatMatrixBuckets(rngEvents, stepWeek, span12w);
+            const evMeta = [
+                ['discovered', 'Discovered', pal.pending],
+                ['fixed', 'Fixed', pal.ok],
+                ['duplicate', 'Duplicate', pal.muted],
+                ['dismissed', 'Dismissed', pal.warn]
+            ];
+            mountStatsChart('bugs-chart-velocity', {
+                legend: { bottom: 0 },
+                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: velAxis.labels },
+                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                series: evMeta.map(([ev, title, col]) => {
+                    const found = rngEvents.find(s => s.metric?.event === ev);
+                    return { name: title, type: 'bar', itemStyle: { color: col }, data: seriesValuesAt(found, velAxis.sorted) };
+                })
+            });
+
+            const ratings = ['critical', 'high', 'medium', 'low', 'hardening', 'none', 'pending'];
+            mountStatsChart('bugs-chart-security', {
+                legend: { data: ['Open', 'Fixed'], bottom: 0 },
+                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: ratings.map(r => r.toUpperCase()) },
+                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                series: [
+                    { name: 'Open', type: 'bar', stack: 'sec', itemStyle: { color: pal.fail }, data: ratings.map(r => secOpenMap[r] || 0) },
+                    { name: 'Fixed', type: 'bar', stack: 'sec', itemStyle: { color: pal.ok }, data: ratings.map(r => secFixedMap[r] || 0) }
+                ]
+            });
+
+            const sevs = ['critical', 'high', 'medium', 'low'];
+            mountStatsChart('bugs-chart-severity', {
+                tooltip: { trigger: 'axis' },
+                grid: { left: '3%', right: '4%', bottom: '10%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: sevs.map(s => s.toUpperCase()) },
+                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                series: [{
+                    name: 'Open Bugs',
+                    type: 'bar',
+                    data: sevs.map(s => ({ value: sevMap[s] || 0, itemStyle: { color: pal.sev[s] } }))
+                }]
+            });
+
+            if (subRows.length > 0) {
+                const top12 = subRows.slice(0, 12).reverse();
+                mountStatsChart('bugs-chart-subsystems', {
+                    grid: { left: '3%', right: '6%', bottom: '8%', top: '6%', containLabel: true },
+                    xAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                    yAxis: { type: 'category', data: top12.map(r => r[0]) },
+                    series: [
+                        { name: 'Open', type: 'bar', stack: 's', itemStyle: { color: pal.pending }, data: top12.map(r => r[1].open) },
+                        { name: 'Fixed', type: 'bar', stack: 's', itemStyle: { color: pal.ok }, data: top12.map(r => r[1].fixed) }
+                    ]
+                });
+            } else {
+                const subEl = document.getElementById('bugs-chart-subsystems');
+                if (subEl) subEl.innerHTML = `<p class="loading">${isAuthenticatedUser() ? 'No subsystem bug records in scope.' : 'Sign in to view per-subsystem bug counts.'}</p>`;
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // TAB 3: PROJECT LEADERS / MAINTAINERS (#/stats/maintainers)
+        // ---------------------------------------------------------------------
+        async function renderMaintainersStatsTab(renderSeq) {
+            const win = ['4w', '12w', '26w'].includes(state.statsMaintWin) ? state.statsMaintWin : '12w';
+            const weeks = parseInt(win, 10) || 12;
+            const spanSec = weeks * 7 * 86400;
+            const stepWeek = 7 * 86400;
+            const nowSec = Math.floor(Date.now() / 1000);
+            const selectedSub = state.statsMaintSub || '';
+            const subFilter = selectedSub ? `{subsystem="${promEscapeStringLiteral(selectedSub)}"}` : '';
+
+            const [
+                subPsAll, subPatchesAll, subFindingsAll,
+                psByVer, patchesTot, psCompleted, findingsBySev,
+                priorByOrigin, skippedUnchanged, turnP50, turnP90,
+                rngPsVer, rngPatches, rngFindings, rngFixups
+            ] = await Promise.all([
+                promQuery(`sum by (subsystem) (increase(sashiko_subsystem_patchsets_total[${win}]))`),
+                promQuery(`sum by (subsystem) (increase(sashiko_subsystem_patches_total[${win}]))`),
+                promQuery(`sum by (subsystem, severity) (increase(sashiko_subsystem_findings_total[${win}]))`),
+                selectedSub
+                    ? promQuery(`sum(increase(sashiko_subsystem_patchsets_total${subFilter}[${win}]))`)
+                    : promQuery(`sum by (version_bucket) (increase(sashiko_patchsets_ingested_by_version_total[${win}]))`),
+                selectedSub
+                    ? promQuery(`sum(increase(sashiko_subsystem_patches_total${subFilter}[${win}]))`)
+                    : promQuery(`sum(increase(sashiko_patches_ingested_total[${win}]))`),
+                promQuery(`sum by (status, clean) (increase(sashiko_patchsets_completed_total[${win}]))`),
+                selectedSub
+                    ? promQuery(`sum by (severity) (increase(sashiko_subsystem_findings_total${subFilter}[${win}]))`)
+                    : promQuery(`sum by (severity) (increase(sashiko_findings_discovered_total{preexisting="false"}[${win}]))`),
+                promQuery(`sum by (origin_kind, outcome) (increase(sashiko_prior_feedback_total[${win}]))`),
+                promQuery(`sum(increase(sashiko_reviews_skipped_unchanged_total[${win}]))`),
+                promQuery(`histogram_quantile(0.5, sum by (le) (increase(sashiko_patchset_turnaround_seconds_bucket[${win}])))`),
+                promQuery(`histogram_quantile(0.9, sum by (le) (increase(sashiko_patchset_turnaround_seconds_bucket[${win}])))`),
+                selectedSub
+                    ? promQueryRange(`sum(increase(sashiko_subsystem_patchsets_total${subFilter}[7d]))`, nowSec - spanSec, nowSec, stepWeek)
+                    : promQueryRange(`sum by (version_bucket) (increase(sashiko_patchsets_ingested_by_version_total[7d]))`, nowSec - spanSec, nowSec, stepWeek),
+                selectedSub
+                    ? promQueryRange(`sum(increase(sashiko_subsystem_patches_total${subFilter}[7d]))`, nowSec - spanSec, nowSec, stepWeek)
+                    : promQueryRange(`sum(increase(sashiko_patches_ingested_total[7d]))`, nowSec - spanSec, nowSec, stepWeek),
+                selectedSub
+                    ? promQueryRange(`sum by (severity) (increase(sashiko_subsystem_findings_total${subFilter}[7d]))`, nowSec - spanSec, nowSec, stepWeek)
+                    : promQueryRange(`sum by (severity) (increase(sashiko_findings_discovered_total{preexisting="false"}[7d]))`, nowSec - spanSec, nowSec, stepWeek),
+                promQueryRange(`sum by (outcome) (increase(sashiko_prior_feedback_total[7d]))`, nowSec - spanSec, nowSec, stepWeek)
+            ]);
+            if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
+
+            // Populate public subsystem dropdown
+            const subPsMap = promMapBy(subPsAll, 'subsystem');
+            const subNameSet = new Set(Object.keys(subPsMap));
+            if (selectedSub) subNameSet.add(selectedSub);
+            const subNames = Array.from(subNameSet).sort();
+            const selEl = document.getElementById('maintSubsystemSelect');
+            if (selEl) {
+                selEl.innerHTML = `<option value="">All Subsystems</option>` +
+                    subNames.map(n => `<option value="${escapeHtml(n)}" ${n === selectedSub ? 'selected' : ''}>${escapeHtml(n)}</option>`).join('');
+            }
+
+            let psTotal = 0, v1Cnt = 0, v2PlusCnt = 0;
+            if (selectedSub) {
+                psTotal = promScalar(psByVer);
+            } else {
+                const verMap = promMapBy(psByVer, 'version_bucket');
+                v1Cnt = verMap['v1'] || 0;
+                v2PlusCnt = (verMap['v2'] || 0) + (verMap['v3'] || 0) + (verMap['v4_plus'] || 0);
+                psTotal = v1Cnt + v2PlusCnt;
+            }
+            const patchesCount = promScalar(patchesTot);
+
+            let compReviewed = 0, compClean = 0, compFta = 0, compFailed = 0;
+            for (const item of psCompleted) {
+                const st = item.metric?.status;
+                const cl = item.metric?.clean;
+                const v = Number(item.value?.[1]) || 0;
+                if (st === 'Reviewed') {
+                    compReviewed += v;
+                    if (cl === 'true') compClean += v;
+                } else if (st === 'Failed To Apply') compFta += v;
+                else if (st === 'Failed') compFailed += v;
+            }
+            const compAll = compReviewed + compFta + compFailed;
+            const cleanPct = compReviewed > 0 ? Math.round((compClean / compReviewed) * 100) + '%' : '—';
+            const ftaPct = compAll > 0 ? Math.round((compFta / compAll) * 100) + '%' : '—';
+
+            const fSevMap = promMapBy(findingsBySev, 'severity');
+            const fTotal = Object.values(fSevMap).reduce((a, b) => a + b, 0);
+            const denomPs = selectedSub ? psTotal : compReviewed;
+            const issuesPerPs = denomPs > 0 ? (fTotal / denomPs).toFixed(2) : '—';
+            const issuesPerPatch = patchesCount > 0 ? (fTotal / patchesCount).toFixed(2) : '—';
+
+            // Prior feedback fixups by origin
+            const prior = { sashiko_review: { addressed: 0, confirmed_finding: 0, other: 0 }, human_reviewer: { addressed: 0, confirmed_finding: 0, other: 0 } };
+            for (const item of priorByOrigin) {
+                const orig = item.metric?.origin_kind === 'human_reviewer' ? 'human_reviewer' : 'sashiko_review';
+                const oc = item.metric?.outcome || 'other';
+                const v = Number(item.value?.[1]) || 0;
+                if (oc === 'addressed') prior[orig].addressed += v;
+                else if (oc === 'confirmed_finding') prior[orig].confirmed_finding += v;
+                else prior[orig].other += v;
+            }
+            const totAddressed = prior.sashiko_review.addressed + prior.human_reviewer.addressed;
+            const totUnaddr = prior.sashiko_review.confirmed_finding + prior.human_reviewer.confirmed_finding;
+            const fixupRate = (totAddressed + totUnaddr) > 0
+                ? Math.round((totAddressed / (totAddressed + totUnaddr)) * 100) + '%'
+                : '—';
+
+            let html = `<div class="stat-card-grid">
+                ${renderRichCard(`Patchsets / Week (${win})`, fmtNum(psTotal / weeks, 1),
+                    `<span class="delta-pill">Total: ${fmtNum(psTotal)}</span>` +
+                    (!selectedSub && psTotal > 0 ? `<span class="delta-pill">v2+ revisions: ${Math.round((v2PlusCnt / psTotal) * 100)}%</span>` : ''))}
+                ${renderRichCard(`Patches / Week (${win})`, fmtNum(patchesCount / weeks, 1),
+                    `<span class="delta-pill">Total patches: ${fmtNum(patchesCount)}</span>` +
+                    `<span class="delta-pill">Avg series len: ${psTotal > 0 ? (patchesCount / psTotal).toFixed(1) : '—'}</span>`)}
+                ${renderRichCard('Issues / Patchset', issuesPerPs,
+                    `<span class="delta-pill">Issues / patch: ${escapeHtml(String(issuesPerPatch))}</span>` +
+                    `<span class="delta-pill">High+Crit: ${fmtNum((fSevMap['critical'] || 0) + (fSevMap['high'] || 0))}</span>`)}
+                ${renderRichCard('Clean Patchsets %', cleanPct,
+                    `<span class="delta-pill delta-good">${fmtNum(compClean)} clean of ${fmtNum(compReviewed)} reviewed</span>`)}
+                ${renderRichCard('Author vN Fixup Rate', fixupRate,
+                    `<span class="delta-pill delta-good">Sashiko fixed: ${fmtNum(prior.sashiko_review.addressed)}</span>` +
+                    `<span class="delta-pill">Human fixed: ${fmtNum(prior.human_reviewer.addressed)}</span>`)}
+                ${renderRichCard('Skipped Unchanged Patches', fmtNum(promScalar(skippedUnchanged)),
+                    `<span class="delta-pill">Inherited clean verdicts</span>`)}
+                ${renderRichCard('Failed To Apply %', ftaPct,
+                    `<span class="delta-pill ${compFta > 0 ? 'delta-warn' : ''}">${fmtNum(compFta)} baseline misses</span>`)}
+                ${renderRichCard('Review Turnaround p50 / p90', `${fmtSecs(promScalar(turnP50, NaN))} / ${fmtSecs(promScalar(turnP90, NaN))}`,
+                    `<span class="delta-pill">Arrival → review complete</span>`)}
+            </div>`;
+
+            html += `<div class="stats-grid-2">
+                <div class="chart-section"><div class="chart-title-sm"><span>Weekly Patchset & Patch Volume (${win})</span><span class="chart-subtitle">${selectedSub ? escapeHtml(selectedSub) : 'v1 vs v2+ & patches'}</span></div><div id="maint-chart-volume" class="chart-container"></div></div>
+                <div class="chart-section"><div class="chart-title-sm"><span>Discovered Issues by Severity / Week</span><span class="chart-subtitle">Patch-introduced findings</span></div><div id="maint-chart-findings" class="chart-container"></div></div>
+                <div class="chart-section"><div class="chart-title-sm"><span>Prior-Version Feedback Fixups (${win})</span><span class="chart-subtitle">Addressed in vN vs Still Unaddressed</span></div><div id="maint-chart-fixups" class="chart-container"></div></div>
+                <div class="chart-section"><div class="chart-title-sm"><span>Author Fixups by Reviewer Origin</span><span class="chart-subtitle">Sashiko vs Human Reviewers</span></div><div id="maint-chart-origin" class="chart-container"></div></div>
+            </div>`;
+
+            const subPatchMap = promMapBy(subPatchesAll, 'subsystem');
+            const subFindMap = {};
+            for (const item of subFindingsAll) {
+                const s = item.metric?.subsystem;
+                if (!s) continue;
+                subFindMap[s] = (subFindMap[s] || 0) + (Number(item.value?.[1]) || 0);
+            }
+            const leaderRows = Object.keys(subPsMap)
+                .map(name => ({
+                    name,
+                    ps: subPsMap[name] || 0,
+                    patches: subPatchMap[name] || 0,
+                    findings: subFindMap[name] || 0
+                }))
+                .sort((a, b) => b.ps - a.ps);
+
+            if (leaderRows.length > 0) {
+                html += `<div class="chart-section">
+                    <div class="chart-title-sm"><span>Subsystem Activity & Issue Density (${win})</span><span class="chart-subtitle">Public mailing-list subsystems</span></div>
+                    <div class="stats-table-wrap"><table class="stats-table">
+                        <thead><tr><th>Subsystem</th><th>Patchsets</th><th>Patches</th><th>Findings</th><th>Findings / Patchset</th><th>Findings / Patch</th></tr></thead>
+                        <tbody>${leaderRows.slice(0, 30).map(r => `<tr>
+                            <td>${escapeHtml(r.name)}</td>
+                            <td>${fmtNum(r.ps)}</td>
+                            <td>${fmtNum(r.patches)}</td>
+                            <td>${fmtNum(r.findings)}</td>
+                            <td>${r.ps > 0 ? (r.findings / r.ps).toFixed(2) : '—'}</td>
+                            <td>${r.patches > 0 ? (r.findings / r.patches).toFixed(2) : '—'}</td>
+                        </tr>`).join('')}</tbody>
+                    </table></div>
+                </div>`;
+            }
+
+            const container = document.getElementById('stats-content');
+            if (!container) return;
+            container.classList.remove('loading');
+            container.innerHTML = html;
+
+            const pal = getStatsPalette();
+            const volAxis = formatMatrixBuckets([...rngPsVer, ...rngPatches], stepWeek, spanSec);
+            const volSeries = selectedSub
+                ? [{ name: 'Patchsets', type: 'bar', itemStyle: { color: pal.pending }, data: seriesValuesAt(rngPsVer[0], volAxis.sorted) }]
+                : ['v1', 'v2', 'v3', 'v4_plus'].map((vb, idx) => {
+                    const f = rngPsVer.find(s => s.metric?.version_bucket === vb);
+                    const cols = [pal.pending, pal.ok, pal.warn, pal.embargo];
+                    return { name: vb, type: 'bar', stack: 'ps', itemStyle: { color: cols[idx] }, data: seriesValuesAt(f, volAxis.sorted) };
+                });
+            volSeries.push({ name: 'Patches', type: 'line', smooth: true, yAxisIndex: 1, itemStyle: { color: pal.fail }, data: seriesValuesAt(rngPatches[0], volAxis.sorted) });
+
+            mountStatsChart('maint-chart-volume', {
+                legend: { bottom: 0 },
+                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: volAxis.labels },
+                yAxis: [
+                    { type: 'value', name: 'Patchsets', splitLine: { lineStyle: { type: 'dashed' } } },
+                    { type: 'value', name: 'Patches', splitLine: { show: false } }
+                ],
+                series: volSeries
+            });
+
+            const fAxis = formatMatrixBuckets(rngFindings, stepWeek, spanSec);
+            mountStatsChart('maint-chart-findings', {
+                legend: { bottom: 0 },
+                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: fAxis.labels },
+                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                series: ['critical', 'high', 'medium', 'low'].map(sev => {
+                    const f = rngFindings.find(s => s.metric?.severity === sev);
+                    return { name: sev.toUpperCase(), type: 'bar', stack: 'f', itemStyle: { color: pal.sev[sev] }, data: seriesValuesAt(f, fAxis.sorted) };
+                })
+            });
+
+            const fxAxis = formatMatrixBuckets(rngFixups, stepWeek, spanSec);
+            mountStatsChart('maint-chart-fixups', {
+                legend: { bottom: 0 },
+                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: fxAxis.labels },
+                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                series: [
+                    { name: 'Addressed in vN', type: 'bar', stack: 'fx', itemStyle: { color: pal.ok }, data: seriesValuesAt(rngFixups.find(s => s.metric?.outcome === 'addressed'), fxAxis.sorted) },
+                    { name: 'Still Unaddressed', type: 'bar', stack: 'fx', itemStyle: { color: pal.fail }, data: seriesValuesAt(rngFixups.find(s => s.metric?.outcome === 'confirmed_finding'), fxAxis.sorted) }
+                ]
+            });
+
+            mountStatsChart('maint-chart-origin', {
+                legend: { bottom: 0 },
+                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: ['Sashiko Prior Reviews', 'Human Mailing-List / PR Reviews'] },
+                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                series: [
+                    { name: 'Addressed in vN', type: 'bar', stack: 'or', itemStyle: { color: pal.ok }, data: [prior.sashiko_review.addressed, prior.human_reviewer.addressed] },
+                    { name: 'Still Unaddressed', type: 'bar', stack: 'or', itemStyle: { color: pal.fail }, data: [prior.sashiko_review.confirmed_finding, prior.human_reviewer.confirmed_finding] },
+                    { name: 'Settled / Disproven', type: 'bar', stack: 'or', itemStyle: { color: pal.muted }, data: [prior.sashiko_review.other, prior.human_reviewer.other] }
+                ]
+            });
+        }
+
+        // ---------------------------------------------------------------------
+        // TAB 4: SASHIKO PIPELINE (#/stats/pipeline)
+        // ---------------------------------------------------------------------
+        async function renderPipelineStatsTab(renderSeq) {
+            const win = ['100', '500', '1000'].includes(state.statsPipeWin) ? state.statsPipeWin : '100';
+            const wf = `{window="${win}"}`;
+
+            const [
+                winReviews, durSum, tokSum, funnelVec,
+                stageRunsVec, stageTurnsVec, stageTokVec, stageItemsVec,
+                overlapVec, toolCallsVec, toolBytesVec, priorAlignVec
+            ] = await Promise.all([
+                promQuery(`sashiko_pipeline_window_reviews${wf}`),
+                promQuery(`sashiko_pipeline_duration_seconds_sum${wf}`),
+                promQuery(`sashiko_pipeline_tokens_sum${wf}`),
+                promQuery(`sashiko_pipeline_funnel_items${wf}`),
+                promQuery(`sashiko_pipeline_stage_runs${wf}`),
+                promQuery(`sashiko_pipeline_stage_turns_sum${wf}`),
+                promQuery(`sashiko_pipeline_stage_tokens_sum${wf}`),
+                promQuery(`sashiko_pipeline_stage_items${wf}`),
+                promQuery(`sashiko_pipeline_stage_overlap${wf}`),
+                promQuery(`sashiko_pipeline_tool_calls${wf}`),
+                promQuery(`sashiko_pipeline_tool_output_bytes_sum${wf}`),
+                promQuery(`sashiko_pipeline_prior_alignment${wf}`)
+            ]);
+            if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
+
+            const nRev = promScalar(winReviews);
+            const avgDur = nRev > 0 ? promScalar(durSum) / nRev : NaN;
+            const tokMap = promMapBy(tokSum, 'direction');
+            const totTok = Object.values(tokMap).reduce((a, b) => a + b, 0);
+            const funnel = promMapBy(funnelVec, 'step');
+            const priorAl = promMapBy(priorAlignVec, 'metric');
+
+            const rawConcerns = funnel['raw_concerns'] || 0;
+            const finalReported = (funnel['findings_patch'] || 0) + (funnel['findings_preexisting'] || 0);
+            const dismissPct = rawConcerns > 0 ? Math.round((1 - Math.min(1, finalReported / rawConcerns)) * 100) + '%' : '—';
+
+            // Build stage map
+            const stages = {};
+            const ensureStage = s => {
+                if (!stages[s]) {
+                    stages[s] = { executed: 0, skipped: 0, turns: 0, tokens: 0, raw_concerns: 0, stage1_dismissed: 0, confirmed_findings: 0, exclusive_findings: 0, dismissed_in_verify: 0 };
+                }
+                return stages[s];
+            };
+            for (const it of stageRunsVec) {
+                const st = ensureStage(it.metric?.stage || 'unknown');
+                st[it.metric?.outcome === 'skipped' ? 'skipped' : 'executed'] += Number(it.value?.[1]) || 0;
+            }
+            for (const it of stageTurnsVec) {
+                ensureStage(it.metric?.stage || 'unknown').turns += Number(it.value?.[1]) || 0;
+            }
+            for (const it of stageTokVec) {
+                ensureStage(it.metric?.stage || 'unknown').tokens += Number(it.value?.[1]) || 0;
+            }
+            for (const it of stageItemsVec) {
+                const st = ensureStage(it.metric?.stage || 'unknown');
+                const k = it.metric?.kind;
+                if (k && k in st) st[k] += Number(it.value?.[1]) || 0;
+            }
+
+            const stageList = Object.entries(stages)
+                .sort((a, b) => (b[1].confirmed_findings - a[1].confirmed_findings) || (b[1].executed - a[1].executed));
+            const totalExclusive = stageList.reduce((acc, [, s]) => acc + s.exclusive_findings, 0);
+            const totalStageConfirmed = stageList.reduce((acc, [, s]) => acc + s.confirmed_findings, 0);
+            const hmUnaddr = priorAl['hm_unaddressed'] || 0;
+            const hmRecall = hmUnaddr > 0 ? Math.round(((priorAl['hm_also_found'] || 0) / hmUnaddr) * 100) + '%' : '—';
+
+            let html = `<div class="stat-card-grid">
+                ${renderRichCard(`Analyzed Reviews (N=${win})`, fmtNum(nRev), `<span class="delta-pill">Excludes inherited skips & embargoes</span>`)}
+                ${renderRichCard('Concern Dismissal %', dismissPct,
+                    `<span class="delta-pill">${fmtNum(rawConcerns)} raw → ${fmtNum(finalReported)} final</span>`)}
+                ${renderRichCard('Avg Review Latency', fmtSecs(avgDur),
+                    `<span class="delta-pill">Wall-clock / patch review</span>`)}
+                ${renderRichCard('Avg Tokens / Review', nRev > 0 ? fmtNum(totTok / nRev) : '—',
+                    `<span class="delta-pill">Uncached: ${nRev > 0 ? fmtNum((tokMap['uncached_in'] || 0) / nRev) : '—'} | Out: ${nRev > 0 ? fmtNum((tokMap['out'] || 0) / nRev) : '—'}</span>`)}
+                ${renderRichCard('Exclusive Stage Catches', fmtNum(totalExclusive),
+                    `<span class="delta-pill delta-good">${totalStageConfirmed > 0 ? Math.round((totalExclusive / totalStageConfirmed) * 100) + '% single-stage unique' : '—'}</span>`)}
+                ${renderRichCard('Human Issue Recall', hmRecall,
+                    `<span class="delta-pill">${fmtNum(priorAl['hm_also_found'] || 0)} of ${fmtNum(hmUnaddr)} unaddressed caught</span>`)}
+            </div>`;
+
+            html += `<div class="stats-grid-2">
+                <div class="chart-section"><div class="chart-title-sm"><span>Verification & Dismissal Funnel (Last ${win})</span><span class="chart-subtitle">Stage 1 → Dedup → Verify → Post-Verify → Reported</span></div><div id="pipe-chart-funnel" class="chart-container"></div></div>
+                <div class="chart-section"><div class="chart-title-sm"><span>Bugs Discovered by Stage</span><span class="chart-subtitle">Confirmed vs Exclusive vs Dismissed in Verify</span></div><div id="pipe-chart-stages" class="chart-container"></div></div>
+                <div class="chart-section"><div class="chart-title-sm"><span>Stage × Stage Co-Discovery Overlap</span><span class="chart-subtitle">Diagonal = exclusive catches; off-diagonal = co-discovered</span></div><div id="pipe-chart-overlap" class="chart-container-lg"></div></div>
+                <div class="chart-section"><div class="chart-title-sm"><span>Agent Tool Invocations (Last ${win})</span><span class="chart-subtitle">Calls & output volume by tool</span></div><div id="pipe-chart-tools" class="chart-container-lg"></div></div>
+            </div>`;
+
+            if (stageList.length > 0) {
+                html += `<div class="chart-section">
+                    <div class="chart-title-sm"><span>Stage Precision & Token ROI (Last ${win} Reviews)</span><span class="chart-subtitle">Normalized across sharded stages</span></div>
+                    <div class="stats-table-wrap"><table class="stats-table">
+                        <thead><tr><th>Stage</th><th>Executed</th><th>Skipped</th><th>Avg Turns</th><th>Tokens / Run</th><th>Raw Concerns</th><th>Stage-1 Self-Dismiss</th><th>Confirmed</th><th>Exclusive</th><th>Verify Dismissed</th><th>Precision %</th><th>Tokens / Confirmed</th></tr></thead>
+                        <tbody>${stageList.map(([name, s]) => {
+                            const denom = s.confirmed_findings + s.dismissed_in_verify;
+                            const prec = denom > 0 ? Math.round((s.confirmed_findings / denom) * 100) + '%' : '—';
+                            const roi = s.confirmed_findings > 0 ? fmtNum(s.tokens / s.confirmed_findings) : '—';
+                            return `<tr>
+                                <td><strong>${escapeHtml(name)}</strong></td>
+                                <td>${fmtNum(s.executed)}</td>
+                                <td>${fmtNum(s.skipped)}</td>
+                                <td>${s.executed > 0 ? (s.turns / s.executed).toFixed(1) : '—'}</td>
+                                <td>${s.executed > 0 ? fmtNum(s.tokens / s.executed) : '—'}</td>
+                                <td>${fmtNum(s.raw_concerns)}</td>
+                                <td>${fmtNum(s.stage1_dismissed)}</td>
+                                <td><strong>${fmtNum(s.confirmed_findings)}</strong></td>
+                                <td>${fmtNum(s.exclusive_findings)}</td>
+                                <td>${fmtNum(s.dismissed_in_verify)}</td>
+                                <td>${prec}</td>
+                                <td>${roi}</td>
+                            </tr>`;
+                        }).join('')}</tbody>
+                    </table></div>
+                </div>`;
+            }
+
+            const container = document.getElementById('stats-content');
+            if (!container) return;
+            container.classList.remove('loading');
+            container.innerHTML = html;
+
+            const pal = getStatsPalette();
+            const funnelSteps = [
+                ['Raw Concerns', rawConcerns, pal.pending],
+                ['Stage-1 Self-Dismissed', funnel['stage1_dismissed'] || 0, pal.muted],
+                ['Deduped Clusters', funnel['deduplicated_clusters'] || 0, pal.pending],
+                ['Verified (1a)', funnel['verified_1a'] || 0, pal.ok],
+                ['Dismissed (1b)', funnel['dismissed_1b'] || 0, pal.fail],
+                ['Post-Verify Passed', funnel['verified_pv'] || 0, pal.ok],
+                ['Patch Findings', funnel['findings_patch'] || 0, pal.ok],
+                ['Pre-existing Bugs', funnel['findings_preexisting'] || 0, pal.embargo]
+            ];
+            mountStatsChart('pipe-chart-funnel', {
+                grid: { left: '3%', right: '5%', bottom: '8%', top: '6%', containLabel: true },
+                xAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                yAxis: { type: 'category', data: funnelSteps.map(s => s[0]).reverse() },
+                series: [{
+                    name: 'Items',
+                    type: 'bar',
+                    data: funnelSteps.slice().reverse().map(s => ({ value: s[1], itemStyle: { color: s[2] } }))
+                }]
+            });
+
+            if (stageList.length > 0) {
+                const topSt = stageList.slice(0, 14).reverse();
+                mountStatsChart('pipe-chart-stages', {
+                    legend: { bottom: 0 },
+                    grid: { left: '3%', right: '5%', bottom: '14%', top: '6%', containLabel: true },
+                    xAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                    yAxis: { type: 'category', data: topSt.map(s => s[0]) },
+                    series: [
+                        { name: 'Exclusive', type: 'bar', stack: 'c', itemStyle: { color: pal.ok }, data: topSt.map(s => s[1].exclusive_findings) },
+                        { name: 'Shared Confirmed', type: 'bar', stack: 'c', itemStyle: { color: pal.pending }, data: topSt.map(s => Math.max(0, s[1].confirmed_findings - s[1].exclusive_findings)) },
+                        { name: 'Dismissed in Verify', type: 'bar', itemStyle: { color: pal.fail }, data: topSt.map(s => s[1].dismissed_in_verify) }
+                    ]
+                });
+            } else {
+                document.getElementById('pipe-chart-stages').innerHTML = '<p class="loading">No completed reviews in window yet.</p>';
+            }
+
+            // Heatmap for pairwise stage overlap
+            if (overlapVec.length > 0) {
+                const ovStagesSet = new Set();
+                const pairMap = new Map();
+                let maxOv = 1;
+                for (const it of overlapVec) {
+                    const a = it.metric?.stage_a;
+                    const b = it.metric?.stage_b;
+                    const v = Number(it.value?.[1]) || 0;
+                    if (!a || !b || v <= 0) continue;
+                    ovStagesSet.add(a);
+                    ovStagesSet.add(b);
+                    pairMap.set(`${a}|${b}`, v);
+                    pairMap.set(`${b}|${a}`, v);
+                    if (v > maxOv) maxOv = v;
+                }
+                const axes = Array.from(ovStagesSet).sort();
+                const heatData = [];
+                axes.forEach((a, i) => {
+                    axes.forEach((b, j) => {
+                        const v = pairMap.get(`${a}|${b}`) || 0;
+                        heatData.push([i, j, v]);
+                    });
+                });
+                mountStatsChart('pipe-chart-overlap', {
+                    tooltip: {
+                        position: 'top',
+                        formatter: p => {
+                            const a = axes[p.value[0]];
+                            const b = axes[p.value[1]];
+                            return a === b
+                                ? `${escapeHtml(a)} (exclusive): <strong>${p.value[2]}</strong>`
+                                : `${escapeHtml(a)} × ${escapeHtml(b)}: <strong>${p.value[2]}</strong>`;
+                        }
+                    },
+                    grid: { left: '4%', right: '6%', bottom: '18%', top: '6%', containLabel: true },
+                    xAxis: { type: 'category', data: axes, axisLabel: { rotate: 35 } },
+                    yAxis: { type: 'category', data: axes },
+                    visualMap: {
+                        min: 0, max: maxOv, calculable: true, orient: 'horizontal', left: 'center', bottom: 0,
+                        inRange: { color: pal.isDark ? ['#161b22', '#1f6feb', '#58a6ff'] : ['#f1f5f9', '#60a5fa', '#1d4ed8'] }
+                    },
+                    series: [{
+                        name: 'Overlap',
+                        type: 'heatmap',
+                        data: heatData,
+                        label: { show: axes.length <= 12, formatter: p => p.value[2] > 0 ? String(p.value[2]) : '' }
+                    }]
+                });
+            } else {
+                document.getElementById('pipe-chart-overlap').innerHTML = '<p class="loading">No multi-stage finding overlap recorded in window yet.</p>';
+            }
+
+            const callMap = promMapBy(toolCallsVec, 'tool');
+            const byteMap = promMapBy(toolBytesVec, 'tool');
+            const toolNames = Object.keys(callMap).sort((a, b) => callMap[a] - callMap[b]);
+            if (toolNames.length > 0) {
+                mountStatsChart('pipe-chart-tools', {
+                    tooltip: {
+                        trigger: 'axis',
+                        formatter: params => {
+                            const p = Array.isArray(params) ? params[0] : params;
+                            if (!p) return '';
+                            const t = p.name;
+                            const calls = callMap[t] || 0;
+                            const avgB = calls > 0 ? fmtBytes((byteMap[t] || 0) / calls) : '0 B';
+                            return `${escapeHtml(t)}<br/>Calls: <strong>${fmtNum(calls)}</strong><br/>Avg output: <strong>${escapeHtml(avgB)}</strong>`;
+                        }
+                    },
+                    grid: { left: '3%', right: '6%', bottom: '8%', top: '6%', containLabel: true },
+                    xAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                    yAxis: { type: 'category', data: toolNames },
+                    series: [{
+                        name: 'Calls',
+                        type: 'bar',
+                        itemStyle: { color: pal.pending },
+                        data: toolNames.map(t => callMap[t])
+                    }]
+                });
+            } else {
+                document.getElementById('pipe-chart-tools').innerHTML = '<p class="loading">No tool usage recorded in window yet.</p>';
             }
         }
 
