@@ -1892,10 +1892,10 @@ async fn run_daemon(
                 if let Ok(reviewing) = metrics_db.count_reviewing_patches().await {
                     sashiko::metrics::set_reviewing_patches(reviewing);
                 }
-                if let Ok(messages) = metrics_db.count_messages(None, None).await {
+                if let Ok(messages) = metrics_db.count_messages_stored_o1().await {
                     sashiko::metrics::set_messages(messages);
                 }
-                if let Ok(patchsets) = metrics_db.count_patchsets(None, None).await {
+                if let Ok(patchsets) = metrics_db.count_patchsets_stored_o1().await {
                     sashiko::metrics::set_patchsets(patchsets);
                 }
                 match sashiko::git_ops::pack_stats(&metrics_repo_path).await {

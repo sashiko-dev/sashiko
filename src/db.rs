@@ -43,6 +43,12 @@ pub use preexisting_disclosures::{NewPreexistingDisclosure, PreexistingDisclosur
 mod prior_context_queries;
 #[cfg(feature = "server")]
 pub use prior_context_queries::PriorContextOptions;
+#[cfg(feature = "server")]
+mod stats_queries;
+#[cfg(feature = "server")]
+pub use stats_queries::{
+    BugSubsystemFacetSummary, ROLLUP_RESOLUTIONS, canonical_labels_json, decode_labels_json,
+};
 
 /// The SQL form of [`Database::is_closed_to_new_parts`], for the statements
 /// that have to ask the question of a row they are updating. The two must
@@ -3555,6 +3561,31 @@ impl Database {
                     }
                 }
                 tx.execute("PRAGMA user_version = 23", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        if current_version < 24 {
+            info!("Applying database migration version 24 (O(1) statistics rollups and gauges)...");
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 24 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 24.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                tx.execute_batch(include_str!("migrations/024_stats_rollups.sql"))
+                    .await?;
+                stats_queries::apply_migration_24_seeds_and_triggers(&tx).await?;
+                tx.execute("PRAGMA user_version = 24", ()).await?;
                 tx.commit().await?;
             }
         }
@@ -10342,6 +10373,11 @@ impl Database {
                     .await?;
                     tx.execute(
                         "UPDATE prior_feedback_resolutions SET patchset_id = ? WHERE patchset_id = ?",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE review_pipeline_stats SET patchset_id = ? WHERE patchset_id = ?",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
@@ -17878,7 +17914,7 @@ mod tests {
             .await?
             .expect("user_version row")
             .get(0)?;
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
 
         let mut columns = db.conn.query("PRAGMA table_info(reviews)", ()).await?;
         let mut names = std::collections::BTreeSet::new();
@@ -32143,7 +32179,7 @@ mod tests {
         let db = setup_db().await;
         let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
         let version: u32 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
 
         for (table, expected_cols) in [
             (
