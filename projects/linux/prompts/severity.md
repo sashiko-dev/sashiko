@@ -154,9 +154,11 @@ Evaluate all three dimensions below and state them at the start of
       to unprivileged userspace (`copy_to_user` padding leak).
     - `kselftests`, `perf`, or in-tree userspace tool bugs that cause silent
       false passes or break building/running the suite on supported targets.
-    - Meaningful mismatch between code behavior and commit message, or
-      speculative kernel bugs whose consequence would otherwise be `High` or
-      `Critical`.
+    - Meaningful mismatch between code behavior and commit message, defeated or
+      incomplete optimization in a commit claiming a performance improvement,
+      contained performance/scalability degradation on a warm runtime or
+      multi-instance teardown path, or speculative kernel bugs whose consequence
+      would otherwise be `High` or `Critical`.
 
 ## Low
 

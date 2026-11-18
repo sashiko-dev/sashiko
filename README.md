@@ -109,6 +109,7 @@ Sashiko evaluates patches through specialized parallel analysis stages followed 
 - **`resources`:** Memory leaks, use-after-free (UAF), double frees, and object lifecycles across queues, timers, and workqueues.
 - **`locking`:** Concurrency issues, deadlocks, RCU rule violations, and thread-safety.
 - **`security`:** Buffer overflows, OOB reads/writes, TOCTOU races, and uninitialized memory leaks.
+- **`performance`:** Unintended latency/throughput regressions, $O(N)$/$O(N^2)$ scaling, cacheline false sharing, unbatched flushes/IPIs, and defeated optimizations.
 - **`hardware`:** Register accesses, DMA mapping, memory barriers, and state machine constraints.
 
 **Consolidation stages** (run in sequence):
