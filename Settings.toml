@@ -128,6 +128,10 @@ concurrency = 16
 worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
+# Preparation has a separate per-attempt deadline and retry budget.
+# Each cleanup pauses that deadline and has its own 120-second budget.
+# preparation_timeout_seconds = 1800
+# preparation_max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
 # Reasoning effort on Gemini models: "low", "mid" (default on Gemini 4+),
 # "high", or "dynamic". Ignored on non-Gemini providers.

@@ -1,0 +1,9 @@
+# Merge these keys into your existing [review] table in Settings.toml.
+# This fragment is not a complete daemon configuration.
+[review]
+# Positive per-attempt preparation deadline, independent of AI execution.
+# Each cleanup pauses that deadline and has its own 120-second budget.
+preparation_timeout_seconds = 1800
+# Additional fresh-worktree attempts after timeouts; 0 disables retries.
+# Three retries matches the AI retry default, but is configured independently.
+preparation_max_retries = 3

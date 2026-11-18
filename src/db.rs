@@ -15814,6 +15814,27 @@ impl Database {
         Ok(count)
     }
 
+    /// Publish preparation progress without replacing a forced baseline or
+    /// model metadata. A superseded attempt cannot overwrite the current run.
+    pub async fn update_patchset_preparation_logs(&self, id: i64, logs: &str) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
+        let compressed = crate::compression::compress_opt_string_async(Some(logs)).await;
+        self.execute(
+            "UPDATE patchsets SET baseline_logs = ?
+             WHERE id = ? AND status = 'In Review'
+               AND (? IS NULL OR (
+                   patchsets.id = ? AND EXISTS (
+                       SELECT 1 FROM meta m
+                       WHERE m.key = 'patchset_active_gen:' || CAST(patchsets.id AS TEXT)
+                         AND CAST(m.value AS INTEGER) = ?
+                   )
+               ))",
+            libsql::params![compressed, id, claim_ps_id, claim_ps_id, claim_gen],
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn update_patchset_baseline_info(
         &self,
         id: i64,
