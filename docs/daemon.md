@@ -98,6 +98,25 @@ By default (`log_level = "info"`), the daemon logs concise lifecycle milestones,
 
 Once the daemon is running, it prints the local URL (default `http://localhost:8080`) where you can access the Web UI to browse patchsets, review statuses, inline findings, and bug tracking.
 
+## Monitoring, Statistics UI & Prometheus API
+
+Sashiko exposes an O(1) Prometheus-compatible telemetry surface backed by live SQLite state gauges, multi-resolution rollups (`5m`, `1h`, `1d`), bounded per-review pipeline summaries, and lock-free runtime atomics.
+
+### 4-Tab Statistics Dashboard (`#/stats`)
+
+The built-in Web UI consumes Sashiko's Prometheus HTTP API directly across four persona-focused views:
+
+1. **Operational (`#/stats/ops`)**: Last `1h` and `24h` SRE telemetry compared against `7d` / `30d` averages and `7d`-offset baselines, covering message ingestion, NNTP lag, git remote freshness, `tracing` warnings/errors by component, worker restarts/panics, `p50`/`p90`/`p99` AI and review latencies, LLM token burn, prompt/response cache hit rates, quota cooldowns, and outbox delivery outcomes.
+2. **Bugs Database (`#/stats/bugs`)**: Open, fixed, duplicate, and dismissed counts, 12-week discovery/fix velocity, CVSS v4.0 security rating and `security_class` breakdowns, engineering severity, reproducer (`r`) / proposed-fix (`f`) coverage, and `BugAccess`-scoped per-subsystem bug facets.
+3. **Maintainers (`#/stats/maintainers`)**: `4w` / `12w` / `26w` weekly patchset and patch throughput (`v1` vs `v2+` revision mix), clean series rate, discovered issues per patchset and per patch by severity, prior-feedback author fixups split by Sashiko vs human reviewers, skipped unchanged patches, `Failed To Apply` rate, review turnaround `p50`/`p90`, and public mailing-list subsystem filtering.
+4. **Pipeline (`#/stats/pipeline`)**: Last `100` / `500` / `1000` non-inherited review summaries with the concern-to-finding verification dismissal funnel, total vs exclusive stage discoveries, a 2D stage × stage co-discovery overlap heatmap, stage precision and token ROI, agent tool invocations, and human-reviewer recall alignment.
+
+### Prometheus Scrape & HTTP Query Endpoints
+
+- **`GET /metrics`**: Prometheus text `0.0.4` exposition endpoint for external Prometheus or VictoriaMetrics scrapers. Public by default; set `metrics_token` under `[server]` in `Settings.toml` (or `SASHIKO__SERVER__METRICS_TOKEN`) to require `Authorization: Bearer <metrics_token>` exclusively on `GET /metrics` without affecting Web UI or API routes.
+- **`GET|POST /api/v1/query` & `/api/v1/query_range`**: Bounded PromQL instant and range evaluation (`increase`, `rate`, `sum_over_time`, `avg_over_time`, `max_over_time`, `sum`/`avg`/`min`/`max`/`count` with `by`/`without`, `topk`, `clamp_min`, `histogram_quantile`, `offset`, regex label matchers, and binary arithmetic).
+- **`GET|POST /api/v1/labels`, `GET /api/v1/label/{name}/values`, `GET /api/v1/metadata`**: Label and metric discovery endpoints. `sashiko_bugs_by_subsystem` and `subsystem` bug facets enforce `MAINTAINERS` and `[server.acl]` visibility (`OptionalPrincipal`), returning only sections authorized for the caller.
+
 ## Interacting with the Daemon (`sashiko-cli`)
 
 Use `sashiko-cli` to submit patches or query review status on a running daemon:
