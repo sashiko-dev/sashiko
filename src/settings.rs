@@ -972,7 +972,7 @@ impl AclSettings {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ServerSettings {
@@ -992,6 +992,9 @@ pub struct ServerSettings {
     #[serde(default)]
     pub testing_mode: bool,
     pub jwt_secret: Option<String>,
+    /// Optional bearer token required to scrape `GET /metrics`.
+    #[serde(default)]
+    pub metrics_token: Option<String>,
     /// Prints sign-in links in full to the log.
     ///
     /// A sign-in link is a bearer credential, and the log is the one place it
@@ -1004,6 +1007,22 @@ pub struct ServerSettings {
 
     #[serde(default)]
     pub acl: AclSettings,
+}
+
+impl std::fmt::Debug for ServerSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerSettings")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("public_base_url", &self.public_base_url)
+            .field("read_only", &self.read_only)
+            .field("testing_mode", &self.testing_mode)
+            .field("jwt_secret", &self.jwt_secret.as_ref().map(|_| "***"))
+            .field("metrics_token", &self.metrics_token.as_ref().map(|_| "***"))
+            .field("log_sign_in_links", &self.log_sign_in_links)
+            .field("acl", &self.acl)
+            .finish()
+    }
 }
 
 fn default_server_host() -> String {
@@ -1025,6 +1044,7 @@ impl Default for ServerSettings {
             read_only: false,
             testing_mode: false,
             jwt_secret: None,
+            metrics_token: None,
             log_sign_in_links: false,
             acl: AclSettings::default(),
         }
@@ -2520,6 +2540,7 @@ mod tests {
             read_only: false,
             testing_mode: false,
             jwt_secret: None,
+            metrics_token: None,
             log_sign_in_links: false,
             acl: AclSettings::default(),
         };
@@ -2540,6 +2561,7 @@ mod tests {
             read_only: false,
             testing_mode: false,
             jwt_secret: None,
+            metrics_token: None,
             log_sign_in_links: false,
             acl: AclSettings::default(),
         };
@@ -2567,6 +2589,17 @@ mod tests {
         let opted_in: ServerSettings =
             toml::from_str("host = \"::\"\nport = 8080\nlog_sign_in_links = true").unwrap();
         assert!(opted_in.log_sign_in_links);
+        assert!(opted_in.metrics_token.is_none());
+
+        let with_secrets = ServerSettings {
+            jwt_secret: Some("super-secret-jwt".to_string()),
+            metrics_token: Some("super-secret-metrics".to_string()),
+            ..ServerSettings::default()
+        };
+        let dbg = format!("{with_secrets:?}");
+        assert!(!dbg.contains("super-secret-jwt"));
+        assert!(!dbg.contains("super-secret-metrics"));
+        assert!(dbg.contains("***"));
     }
 
     #[test]
