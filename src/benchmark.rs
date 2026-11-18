@@ -65,6 +65,7 @@ pub enum BenchmarkExpectedBehavior {
     DetectWithAttribution,
     DetectRegression,
     SuppressFalsePositive,
+    ExpectClean,
 }
 
 impl BenchmarkExpectedBehavior {
@@ -74,11 +75,16 @@ impl BenchmarkExpectedBehavior {
             Self::DetectWithAttribution => "detect_with_attribution",
             Self::DetectRegression => "detect_regression",
             Self::SuppressFalsePositive => "suppress_false_positive",
+            Self::ExpectClean => "expect_clean",
         }
     }
 
     pub fn is_suppression(&self) -> bool {
-        matches!(self, Self::SuppressFalsePositive)
+        matches!(self, Self::SuppressFalsePositive | Self::ExpectClean)
+    }
+
+    pub fn is_expect_clean(&self) -> bool {
+        matches!(self, Self::ExpectClean)
     }
 
     pub fn expects_attribution(&self) -> bool {
@@ -287,6 +293,16 @@ impl BenchmarkEntry {
                 {
                     bail!(
                         "case {label}: detect_bug expects no prior credit; expected_reviewer, expected_prior_version and expected_prior_message_ids must be empty"
+                    );
+                }
+            }
+            BenchmarkExpectedBehavior::ExpectClean => {
+                if has_reviewer
+                    || self.expected_prior_version.is_some()
+                    || !self.expected_prior_message_ids.is_empty()
+                {
+                    bail!(
+                        "case {label}: expect_clean expects no prior credit; expected_reviewer, expected_prior_version and expected_prior_message_ids must be empty"
                     );
                 }
             }
@@ -754,6 +770,8 @@ pub struct BenchmarkSummaryStats {
     pub concern_to_finding_conversion_pct: f64,
     pub detections_by_stage: BTreeMap<String, usize>,
     pub false_dismissals_by_stage: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub false_positives_by_stage: BTreeMap<String, usize>,
     pub by_subsystem: Vec<SubsystemBenchmarkSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub by_category: Vec<CategoryBenchmarkSummary>,
@@ -2989,19 +3007,29 @@ pub(crate) async fn evaluate_single_entry(
     entry: BenchmarkEntry,
     commit_data: Option<CommitReviewData>,
 ) -> BenchmarkEntryResult {
-    let Some(problem_description) = entry
-        .problem_description
-        .as_ref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    else {
-        return empty_entry_result(
-            &entry,
-            "",
-            "SKIPPED",
-            "No problem description provided",
-            None,
-        );
+    let problem_description = if entry.expected_behavior.is_expect_clean() {
+        entry
+            .problem_description
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        let Some(desc) = entry
+            .problem_description
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            return empty_entry_result(
+                &entry,
+                "",
+                "SKIPPED",
+                "No problem description provided",
+                None,
+            );
+        };
+        desc
     };
 
     let Some(data) = commit_data else {
@@ -3022,7 +3050,7 @@ pub(crate) async fn evaluate_single_entry(
             "Patch not found in database.",
             Some("review_failed"),
         );
-    }
+    };
 
     if !data.is_completed_review() {
         return build_entry_result_from_data(
@@ -3039,6 +3067,10 @@ pub(crate) async fn evaluate_single_entry(
             Some("review_failed".to_string()),
             None,
         );
+    }
+
+    if entry.expected_behavior.is_expect_clean() {
+        return evaluate_expect_clean_entry(&entry, &problem_description, &data);
     }
 
     if entry.expected_behavior.is_suppression() && data.findings.is_empty() {
@@ -3150,6 +3182,80 @@ pub(crate) async fn evaluate_single_entry(
             None,
         ),
     }
+}
+
+fn record_finding_stages(
+    counts: &mut BTreeMap<String, usize>,
+    stages: &[String],
+    origin: Option<&str>,
+) {
+    if stages.is_empty() {
+        let key = origin.unwrap_or("unspecified").to_string();
+        *counts.entry(key).or_insert(0) += 1;
+    } else {
+        for stage in stages {
+            *counts.entry(stage.clone()).or_insert(0) += 1;
+        }
+    }
+}
+
+fn evaluate_expect_clean_entry(
+    entry: &BenchmarkEntry,
+    problem_description: &str,
+    data: &CommitReviewData,
+) -> BenchmarkEntryResult {
+    let patch_findings: Vec<&BenchmarkFindingRecord> =
+        data.findings.iter().filter(|f| !f.preexisting).collect();
+    if patch_findings.is_empty() {
+        return build_entry_result_from_data(
+            entry,
+            problem_description,
+            data,
+            "SUPPRESSED".to_string(),
+            None,
+            "Clean commit produced zero patch findings.".to_string(),
+            None,
+            None,
+            None,
+        );
+    }
+    let first = patch_findings[0];
+    let matched = MatchedFindingSummary {
+        index: first.index,
+        severity: first.severity.clone(),
+        problem: first.problem.clone(),
+        preexisting: first.preexisting,
+        origin: first.origin.clone(),
+        stages: first.stages.clone(),
+        prompts: first.prompts.clone(),
+    };
+    let listed: Vec<String> = patch_findings
+        .iter()
+        .map(|f| {
+            let stages = if f.stages.is_empty() {
+                "unspecified".to_string()
+            } else {
+                f.stages.join("+")
+            };
+            format!("[{}] ({}) {}", f.severity, stages, f.problem)
+        })
+        .collect();
+    let explanation = format!(
+        "Clean commit reported {} false-positive patch finding(s): {}",
+        patch_findings.len(),
+        listed.join("; ")
+    );
+    build_entry_result_from_data(
+        entry,
+        problem_description,
+        data,
+        "FALSE_POSITIVE".to_string(),
+        None,
+        explanation,
+        Some(matched),
+        None,
+        None,
+    )
 }
 
 fn empty_entry_result(
@@ -3614,6 +3720,7 @@ pub(crate) fn build_benchmark_summary(
 
     let mut detections_by_stage: BTreeMap<String, usize> = BTreeMap::new();
     let mut false_dismissals_by_stage: BTreeMap<String, usize> = BTreeMap::new();
+    let mut false_positives_by_stage: BTreeMap<String, usize> = BTreeMap::new();
     let mut subsystem_buckets: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
     let mut category_buckets: BTreeMap<String, CategoryBenchmarkSummary> = BTreeMap::new();
     let mut matched_findings_by_commit: HashMap<String, BTreeSet<usize>> = HashMap::new();
@@ -3628,11 +3735,11 @@ pub(crate) fn build_benchmark_summary(
             .unwrap_or("unspecified")
             .to_string();
 
-        // Versioned entries: every entry that was not skipped for lacking a
-        // description is scored, and unreviewed entries and failed judge
-        // evaluations count as failures. Classic entries keep the original
-        // semantics, which only score judged outcomes.
-        let strict = res.versioned;
+        // Versioned and expect_clean entries: every entry that was not skipped
+        // for lacking a description is scored, and unreviewed entries and
+        // failed judge evaluations count as failures. Classic detection entries
+        // keep the original semantics, which only score judged outcomes.
+        let strict = res.versioned || res.expected_behavior.is_expect_clean();
         let is_scored = if strict {
             res.status != "SKIPPED"
         } else {
@@ -3765,6 +3872,21 @@ pub(crate) fn build_benchmark_summary(
             }
             "FALSE_POSITIVE" => {
                 false_positives += 1;
+                if res.expected_behavior.is_expect_clean() {
+                    for f in res.findings.iter().filter(|f| !f.preexisting) {
+                        record_finding_stages(
+                            &mut false_positives_by_stage,
+                            &f.stages,
+                            f.origin.as_deref(),
+                        );
+                    }
+                } else if let Some(ref mf) = res.matched_finding {
+                    record_finding_stages(
+                        &mut false_positives_by_stage,
+                        &mf.stages,
+                        mf.origin.as_deref(),
+                    );
+                }
             }
             "NOT_REVIEWED" | "NOT_FOUND_IN_DB" => {
                 not_reviewed += 1;
@@ -3793,19 +3915,7 @@ pub(crate) fn build_benchmark_summary(
                     .or_default()
                     .insert(mf.index);
             }
-            if mf.stages.is_empty() {
-                if let Some(ref origin) = mf.origin {
-                    *detections_by_stage.entry(origin.clone()).or_insert(0) += 1;
-                } else {
-                    *detections_by_stage
-                        .entry("unspecified".to_string())
-                        .or_insert(0) += 1;
-                }
-            } else {
-                for stage in &mf.stages {
-                    *detections_by_stage.entry(stage.clone()).or_insert(0) += 1;
-                }
-            }
+            record_finding_stages(&mut detections_by_stage, &mf.stages, mf.origin.as_deref());
         }
     }
 
@@ -4001,6 +4111,7 @@ pub(crate) fn build_benchmark_summary(
         concern_to_finding_conversion_pct,
         detections_by_stage,
         false_dismissals_by_stage,
+        false_positives_by_stage,
         by_subsystem,
         by_category,
         tokens_in,
@@ -4097,7 +4208,7 @@ pub fn format_benchmark_summary_markdown(report: &BenchmarkRunReport) -> String 
         s.skipped
     ));
 
-    if s.suppression_evaluated_entries > 0 || s.attribution_expected_entries > 0 {
+    if any_versioned || s.attribution_expected_entries > 0 {
         out.push_str("## Versioned Feedback Metrics\n\n");
         out.push_str("| Metric | Count | Rate |\n|---|---:|---:|\n");
         if s.attribution_expected_entries > 0 {
@@ -4149,6 +4260,18 @@ pub fn format_benchmark_summary_markdown(report: &BenchmarkRunReport) -> String 
             ));
         }
         out.push('\n');
+    } else if s.suppression_evaluated_entries > 0 {
+        out.push_str("## Neutral / Suppression Metrics\n\n");
+        out.push_str("| Metric | Count | Rate |\n|---|---:|---:|\n");
+        out.push_str(&format!(
+            "| **Clean / Suppressed** | **{} / {}** | **{:.1}%** |\n",
+            s.suppressed, s.suppression_evaluated_entries, s.false_positive_suppression_rate_pct
+        ));
+        out.push_str(&format!(
+            "| False Positives Reported | {} | {:.1}% |\n\n",
+            s.false_positives,
+            (s.false_positives as f64 * 100.0) / s.suppression_evaluated_entries as f64
+        ));
     }
 
     if !s.by_category.is_empty() {
@@ -4216,9 +4339,32 @@ pub fn format_benchmark_summary_markdown(report: &BenchmarkRunReport) -> String 
         s.findings_by_severity.low
     ));
     out.push_str(&format!(
-        "- **Concerns Raised / Dismissed**: {} raised, {} dismissed ({:.1}% concern-to-finding conversion)\n\n",
+        "- **Concerns Raised / Dismissed**: {} raised, {} dismissed ({:.1}% concern-to-finding conversion)\n",
         s.total_concerns_raised, s.total_concerns_dismissed, s.concern_to_finding_conversion_pct
     ));
+    if !s.detections_by_stage.is_empty() {
+        let formatted: Vec<String> = s
+            .detections_by_stage
+            .iter()
+            .map(|(st, cnt)| format!("`{st}`: {cnt}"))
+            .collect();
+        out.push_str(&format!(
+            "- **Detections by Stage**: {}\n",
+            formatted.join(", ")
+        ));
+    }
+    if !s.false_positives_by_stage.is_empty() {
+        let formatted: Vec<String> = s
+            .false_positives_by_stage
+            .iter()
+            .map(|(st, cnt)| format!("`{st}`: {cnt}"))
+            .collect();
+        out.push_str(&format!(
+            "- **False Positives by Stage**: {}\n",
+            formatted.join(", ")
+        ));
+    }
+    out.push('\n');
 
     out.push_str("## Resource & Latency Distributions (Per Unique Reviewed Commit)\n\n");
     out.push_str("| Metric | Total | Mean | P50 | P90 | Max |\n|---|---:|---:|---:|---:|---:|\n");
@@ -6472,5 +6618,132 @@ mod tests {
             failures.join("\n")
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_expect_clean_scores_without_description_and_tracks_stage_false_positives() {
+        struct NoJudgeProvider;
+
+        #[async_trait]
+        impl AiProvider for NoJudgeProvider {
+            async fn generate_content(
+                &self,
+                _request: crate::ai::AiRequest,
+            ) -> Result<crate::ai::AiResponse> {
+                bail!("expect_clean must never invoke the AI judge")
+            }
+
+            fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+                crate::ai::ProviderCapabilities {
+                    model_name: "no-judge".to_string(),
+                    context_window_size: 100_000,
+                }
+            }
+        }
+
+        let clean_entry = BenchmarkEntry {
+            commit: "clean111".to_string(),
+            subsystem: Some("mm".to_string()),
+            category: Some("neutral_hot_path_change".to_string()),
+            expected_behavior: BenchmarkExpectedBehavior::ExpectClean,
+            ..Default::default()
+        };
+        assert!(clean_entry.validate_attribution_labels().is_ok());
+
+        let invalid_attr = BenchmarkEntry {
+            expected_reviewer: Some("Dev <dev@example.org>".to_string()),
+            ..clean_entry.clone()
+        };
+        assert!(invalid_attr.validate_attribution_labels().is_err());
+
+        let fp_entry = BenchmarkEntry {
+            commit: "noisy222".to_string(),
+            subsystem: Some("net".to_string()),
+            category: Some("neutral_lookalike_cold_or_bounded".to_string()),
+            expected_behavior: BenchmarkExpectedBehavior::ExpectClean,
+            ..Default::default()
+        };
+
+        let clean_data = CommitReviewData {
+            review_id: Some(1),
+            patch_id: Some(1),
+            review_status: Some("Reviewed".to_string()),
+            findings: vec![BenchmarkFindingRecord {
+                index: 1,
+                severity: "High".to_string(),
+                problem: "pre-existing bug".to_string(),
+                explanation: None,
+                preexisting: true,
+                origin: None,
+                prior_attribution: None,
+                stages: vec!["resources".to_string()],
+                prompts: vec![],
+            }],
+            ..Default::default()
+        };
+
+        let noisy_data = CommitReviewData {
+            review_id: Some(2),
+            patch_id: Some(2),
+            review_status: Some("Reviewed".to_string()),
+            findings: vec![
+                BenchmarkFindingRecord {
+                    index: 1,
+                    severity: "Medium".to_string(),
+                    problem: "mm: speculative lock contention".to_string(),
+                    explanation: Some("Adds lock".to_string()),
+                    preexisting: false,
+                    origin: None,
+                    prior_attribution: None,
+                    stages: vec!["performance".to_string(), "locking".to_string()],
+                    prompts: vec![],
+                },
+                BenchmarkFindingRecord {
+                    index: 2,
+                    severity: "Low".to_string(),
+                    problem: "net: minor loop".to_string(),
+                    explanation: None,
+                    preexisting: false,
+                    origin: None,
+                    prior_attribution: None,
+                    stages: vec!["performance".to_string()],
+                    prompts: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+
+        let dummy_provider: Arc<dyn AiProvider> = Arc::new(NoJudgeProvider);
+        let res_clean = evaluate_single_entry(
+            Arc::clone(&dummy_provider),
+            clean_entry.clone(),
+            Some(clean_data.clone()),
+        )
+        .await;
+        assert_eq!(res_clean.status, "SUPPRESSED");
+        assert!(res_clean.found);
+        assert!(!res_clean.suppressed_with_no_findings);
+
+        let res_noisy =
+            evaluate_single_entry(dummy_provider, fp_entry.clone(), Some(noisy_data.clone())).await;
+        assert_eq!(res_noisy.status, "FALSE_POSITIVE");
+        assert!(!res_noisy.found);
+
+        let mut commit_map = HashMap::new();
+        commit_map.insert("clean111".to_string(), clean_data);
+        commit_map.insert("noisy222".to_string(), noisy_data);
+        let entries = vec![clean_entry, fp_entry];
+        let results = vec![res_clean, res_noisy];
+        let summary = build_benchmark_summary(&entries, &results, &commit_map);
+        assert_eq!(summary.suppression_evaluated_entries, 2);
+        assert_eq!(summary.suppressed, 1);
+        assert_eq!(summary.false_positives, 1);
+        assert_eq!(summary.false_positive_suppression_rate_pct, 50.0);
+        assert_eq!(
+            summary.false_positives_by_stage.get("performance"),
+            Some(&2)
+        );
+        assert_eq!(summary.false_positives_by_stage.get("locking"), Some(&1));
+        assert_eq!(summary.unmatched_extra_findings, 2);
     }
 }

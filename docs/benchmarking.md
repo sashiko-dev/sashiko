@@ -60,7 +60,7 @@ Versioned benchmark entries may additionally specify `mbox_archive` (a
 `.jsonl.gz` fixture bundle), `ancestor_mboxes` (`v1..v(N-1)` mbox threads with
 optional `patchset_status` and seeded `prior_findings`), `target_mbox` (`vN`),
 `baseline_commit`, `expected_behavior` (`detect_bug`, `detect_with_attribution`,
-`detect_regression`, or `suppress_false_positive`), `expected_reviewer`,
+`detect_regression`, `suppress_false_positive`, or `expect_clean`), `expected_reviewer`,
 `expected_prior_version`, `expected_prior_message_ids`,
 `expected_co_reviewers`, and `acceptable_attributions`.
 
