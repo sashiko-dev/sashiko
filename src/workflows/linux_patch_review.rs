@@ -378,6 +378,14 @@ For every concern you raise, explicitly state in `reasoning`: (1) the concrete a
 
 CRITICAL NON-DISMISSAL RULE: Never dismiss or omit a genuine memory-safety, bounds, integer-overflow, race, or information-leak bug merely because the threat model classifies it as a regular bug rather than a security vulnerability (for example, on a `CAP_SYS_ADMIN`, `debugfs`, staging, or mounted-image path). Report every real bug in `concerns` with accurate privilege and boundary details so downstream verification calibrates its severity properly."#;
 
+const STAGE_PERFORMANCE_INSTRUCTION: &str = r#"# Performance and scalability review
+
+You are a Linux kernel performance and scalability engineer auditing a proposed commit for unintended performance regressions, latency/boot/teardown stalls, cacheline false sharing, silent fast-path or offload demotion, and defeated or asymmetric optimization claims.
+
+Follow every investigation step, anti-charity rule, and anti-noise exclusion in `performance.md` below. Remember that severe performance regressions are usually unexpected second-order side effects of ordinary bug fixes, cleanups, `#ifdef` / struct changes, or refactorings: use `git_grep` and `git_read_files` to trace callers (both hot runtime paths and multi-instance O(N) or global-barrier fan-out paths during boot, probe, unmap, or teardown) and outer structs that embed modified structures by value.
+
+ANTI-CHARITY RULE: Never self-dismiss a newly introduced broadcast IPI, hot-path spinlock/atomic, unconditional `vfs_fsync`, hardirq-to-threaded-IRQ conversion, VMA readahead/large-folio/tag-depth/TPA clamp, global all-cache barrier on single-object destroy, duplicate `delayed_work_pending` wakeup, or shared-struct dirty field into `dismissed_concerns` by arguing that the critical section is short, teardown is rare, extra wakeups are benign, or the commit message stated the correctness mechanism. Emit such regressions in `concerns` with concrete Baseline vs. Target Commit evidence while still omitting speculative micro-optimizations and zero-delta lock cleanups (`guard(mutex)`)."#;
+
 const STAGE_HARDWARE_INSTRUCTION: &str = r#"# Hardware engineer's review
 
 You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing dma_wmb()/dma_rmb() barriers, incorrect endianness conversions (cpu_to_le32), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are actually initialized in the current hardware state before being unconditionally accessed. When 32-bit code (such as RV32 or 32-bit ARM) writes a 64-bit hardware timer/comparator register pair (High/Low CSRs or MMIO registers such as `stimecmp`/`stimecmph` or `vstimecmp`/`vstimecmph`) or reads a two-part hardware counter/timestamp, verify that the two-step write sequence cannot trigger a spurious intermediate comparator match (e.g., writing Low before High when the old High equals the new High, or writing `ULONG_MAX` to only the low 32-bit register when masking/clearing the timer on `vcpu_put`) and that two-part timestamp reconstruction handles rollover/carry between parts cleanly. Cross-check register offsets, bitmasks, clock parents, and DT properties against in-tree headers, DT bindings, and sibling SoC drivers rather than assuming magic numbers are unverifiable without an external datasheet. If the patch is purely generic software logic (e.g., VFS, core networking), return {"concerns": [], "dismissed_concerns": []}."#;
@@ -408,14 +416,14 @@ Classify every consolidated item using these strict signal rules. **Repetition i
      - **Single-caller or happy-path-only proofs:** A dismissal that proves an invariant (such as non-NULL pointers, prior ring/vector mapping, packet length bounds, or external serialization) in only one caller or normal init/open/default mode without verifying ALL callers and modes in the tree (including suspend/resume, rebuild, reset, default-mapping flags, sysfs/debugfs, and external-module `W=`/`M=` build paths), or cites an upstream validator (`*_size_ok` or pre-decode check) without verifying that every branch and flag condition covers the consumer's access, or assumes hardware init/MTU registers bound a fixed-size software array (`MAX_SKB_FRAGS`) in a loop, is INVALID.
      - **Asymmetry or cleared-state rationalizations:** A dismissal that rationalizes an unpaired init/patch/fini call, an unpatched hardware packet field, clearing/consuming an error or status field (e.g., via `xchg`) before downstream event/notification consumers read it, or a remaining bug in modified code because the patch is a "partial improvement / better than before" or "cannot be verified without an external hardware datasheet" (when in-tree code/headers/bindings show an inconsistency) without concrete code proving that exact value or omission is safely handled is INVALID.
      - **Build or compile-time assertion failures are bugs, not mitigations:** A dismissal that argues a type, size, alignment, or Kconfig mismatch is safe because a compile-time assertion, compiler error, or build/test failure will prevent runtime execution is INVALID—breaking the build under any valid configuration or host/target architecture is itself a real bug.
-     - **Indirect state checks or unstated "simplicity trade-off" rationalizations:** A dismissal that relies on an indirect state check (such as checking interrupt disablement inside a non-raw spinlock critical section that does not disable hardware interrupts on `PREEMPT_RT`) or rationalizes an unintended state advancement, range expansion, operation on unmodified state/ranges, or narrowing of an existing Kconfig/UAPI feature as "harmless", "benign", or an unstated "deliberate simplicity trade-off" (not explicitly stated in the commit message or code comments) is INVALID.
+     - **Indirect state checks or unstated "simplicity trade-off" rationalizations:** A dismissal that relies on an indirect state check (such as checking interrupt disablement inside a non-raw spinlock critical section that does not disable hardware interrupts on `PREEMPT_RT`) or rationalizes an unintended state advancement, range expansion, operation on unmodified state/ranges, or narrowing of an existing Kconfig/UAPI feature as "harmless", "benign", or an unstated "deliberate simplicity trade-off" (not explicitly stated in the commit message or code comments), or rationalizes away a newly added broadcast IPI, hot-path spinlock/atomic, unconditional `vfs_fsync`, hardirq-to-threaded-IRQ conversion, VMA readahead/large-folio/tag-depth/`wake_batch`/TPA clamp, global all-cache barrier on single-object destroy, duplicate `delayed_work_pending` wakeup, or shared-struct dirty field as "short-held", "benign", "cold teardown", or "intentional correctness design" is INVALID.
    - **Action:** Place in `dismissed_concerns` (dropped from further verification).
    - **CRITICAL INVARIANT:** Never place any item that was raised as a `concern` into `dismissed_concerns` in this stage. If a raised `concern` is contested by a `dismissed_concern` or appears questionable, it MUST be placed in `inconclusive_concerns` for tool-based `post-verification`.
 
 3. **Category 2 — Inconclusive: Speculative or Contested (`inconclusive_concerns` array — sent to parallel `post-verification`):**
    - **Strong signals:**
      - **Mixed signals (`"mixed_signals"`):** Similar or overlapping `concerns` and `dismissed_concerns` exist for the same root cause, function, or code path.
-     - **Speculative or assumption-based dismissal (`"speculative_dismissal"`):** Even when NO stage raised a `concern` (and especially when multiple stages emitted overlapping `dismissed_concerns`), inspect every standalone dismissal critically! Multiple overlapping dismissals are NOT enough if they are not justified by specific local disproving code. If one or more `dismissed_concerns` identified a plausible bug (such as a missing cleanup on an error path, NULL dereference when a field is unmapped on resume/rebuild, unlocked shared state access, race with teardown or truncation, unpaired init/patch call, cleared error field before event reporting, sleeping/rescheduling under a lock, unintended state or range advancement, missing software array bounds check in a loop, parser/validator branch mismatch, or type/width/config/build mismatch) and dismissed it using a single-caller proof, an upstream validator without proving all flag branches, an assumption that hardware init/MTU settings bound a software array, an unstated "simplicity trade-off" or "partial improvement over old code", a rationalization that an unpatched `0` or cleared error is "harmless" or "intentional", a claim that a compile-time assertion/build failure prevents runtime corruption, or an indirect predicate check that fails under `PREEMPT_RT` or other valid configurations, you MUST classify the item into `inconclusive_concerns` with `"signal_reason": "speculative_dismissal"`.
+     - **Speculative or assumption-based dismissal (`"speculative_dismissal"`):** Even when NO stage raised a `concern` (and especially when multiple stages emitted overlapping `dismissed_concerns`), inspect every standalone dismissal critically! Multiple overlapping dismissals are NOT enough if they are not justified by specific local disproving code. If one or more `dismissed_concerns` identified a plausible bug (such as a missing cleanup on an error path, NULL dereference when a field is unmapped on resume/rebuild, unlocked shared state access, race with teardown or truncation, unpaired init/patch call, cleared error field before event reporting, sleeping/rescheduling under a lock, unintended state or range advancement, missing software array bounds check in a loop, parser/validator branch mismatch, type/width/config/build mismatch, or a newly added broadcast IPI, hot-path spinlock/atomic, unconditional `vfs_fsync`, threaded-IRQ conversion, readahead/large-folio/tag-depth/TPA clamp, global barrier on single-object destroy, duplicate `delayed_work_pending` wakeup, or shared-struct cacheline shift/dirty field) and dismissed it using a single-caller proof, an upstream validator without proving all flag branches, an assumption that hardware init/MTU settings bound a software array, an unstated "simplicity trade-off" or "partial improvement over old code", a rationalization that an unpatched `0`, cleared error, short-held spinlock, extra workqueue wakeup, cold teardown, or stated correctness mechanism (`vfs_fsync`, IPI, threaded IRQ) is "harmless", "benign", or "intentional", a claim that a compile-time assertion/build failure prevents runtime corruption, or an indirect predicate check that fails under `PREEMPT_RT` or other valid configurations, you MUST classify the item into `inconclusive_concerns` with `"signal_reason": "speculative_dismissal"`.
      - **Speculative or incomplete concern (`"speculative_concern"`):** One or more overlapping `concerns` whose argument is vague, relies on assumptions not based on specific code in the diff/locations (requiring tool inspection of callers, callees, struct definitions, or lock contexts — even if multiple stages repeated the concern), asserts a caller-argument bug (including `"preexisting": true` or `EXPORT_SYMBOL*` exports, such as unaligned addresses, `NULL`/`0` counts, or violated caller preconditions) without citing a concrete violating in-tree caller or untrusted external boundary in `locations`, or mixes a partially inaccurate premise with a potentially real underlying bug in the same code path.
      - **Series interaction (`"series_interaction"`):** Any concern that could plausibly be resolved, wired up, or rewritten by a subsequent patch listed in `=== Follow-Up Patches in Series ===`.
      - **Prior-version feedback (`PC*` / `PD*`):** Input items with `PC*` IDs are unaddressed concerns from earlier versions (`v1..v(N-1)`), and `PD*` IDs are authoritative/code explanations from earlier versions (carrying `prior_discussion_context` with verbatim quotes and programmatic `ContributorAuthority`). Route any cluster mixing `C*` with `PD*`, mixing `PC*` with `D*`, or containing a `PC*` whose validity depends on `ContributorAuthority` rather than self-contained local code proof into `inconclusive_concerns` (`"signal_reason": "mixed_signals"` or `"other"`). Uncontested `PC*` items backed by clear, self-contained local code proof on `vN` may be validated directly in `findings`. A `PD*` that settles a question by authority carries `authority_evidence` (the cited message ref and a verbatim quote). Never dismiss a raised `C*`/`PC*` concern in this stage because of a `PD*`: route the cluster to `inconclusive_concerns` and put the `PD*` explanation, including its `authority_evidence` ref and quote, into `dismissal_arguments` so `post-verification` can audit it.
@@ -1644,6 +1652,21 @@ pub fn extract_item_stages_and_prompts(
     (stages, prompts)
 }
 
+fn is_any_stage_exclusive_guide(name: &str) -> bool {
+    [
+        ANALYSIS_STAGES,
+        crate::workflows::sashiko_patch_review::ANALYSIS_STAGES,
+        crate::workflows::gcc_patch_review::ANALYSIS_STAGES,
+        crate::workflows::qemu_patch_review::ANALYSIS_STAGES,
+        crate::workflows::zephyr_patch_review::ANALYSIS_STAGES,
+        crate::workflows::e2fsprogs_patch_review::ANALYSIS_STAGES,
+    ]
+    .into_iter()
+    .flat_map(|stages| stages.iter())
+    .flat_map(|def| def.guides)
+    .any(|guide| guide.rsplit('/').next() == Some(name))
+}
+
 pub fn extra_prompt_paths_for_items(
     selected_guides: &[String],
     items: &[Value],
@@ -1678,12 +1701,7 @@ pub fn extra_prompt_paths_for_items(
         {
             continue;
         }
-        if p.contains('/')
-            || matches!(
-                p.as_str(),
-                "callstack.md" | "locking.md" | "prompt-injection.md"
-            )
-        {
+        if p.contains('/') || is_any_stage_exclusive_guide(&p) {
             push_path(PathBuf::from(&p));
         } else {
             push_path(PathBuf::from(&p));
@@ -2299,27 +2317,29 @@ pub fn planning_stage_with_effort(
 - resources: Resource management (memory lifecycles, leaks, UAF, refcounts, devm, cleanup)
 - locking: Locking and synchronization (spinlocks, mutexes, RCU, atomics, concurrency, caller serialization)
 - security: Security audit (user input boundaries, bounds checks, integer overflows, privilege checks)
+- performance: Performance and scalability review (unexpected hot-path or O(N) fan-out regressions, cacheline false sharing, lock/RCU stalls, offload/fast-path demotion, defeated optimizations)
 - hardware: Hardware engineer's review (device registers, DMA, IRQs, MMIO, clocks/GPIO/pinctrl, DT bindings, hardware state machines)
 
 CRITICAL BIAS RULE: Always err on the side of running more stages. If you are not absolutely sure, include the stage.
 - Include "hardware" whenever the patch touches drivers/, sound/, arch/, device-tree (.dts/.dtsi/bindings), or any register, IRQ, DMA, clock, GPIO/pinctrl, PHY, timer, or bus/device code.
-- Include "resources" and "locking" on any non-trivial C or Rust code change (even small helper refactorings frequently alter error-path cleanup, object lifetimes, or caller locking assumptions).
-- Omit an optional stage ONLY when it is unmistakably irrelevant (for example, omit "hardware" for pure core-kernel software logic with no device/arch interaction, or omit stages for a trivial comment/typo fix). Core stages (goal, implementation, execution-flow) always run and should not be listed in relevant_stages.
+- Include "resources", "locking", and "performance" on any non-trivial C, Rust, or struct/header change (even small bug fixes, cleanups, and struct or helper refactorings frequently introduce unexpected cleanup, locking, or performance/scalability side effects).
+- Omit an optional stage ONLY when it is unmistakably irrelevant (for example, omit "hardware" for pure core-kernel software logic with no device/arch interaction, or omit stages for a trivial comment/typo/documentation/device-ID-only patch). Core stages (goal, implementation, execution-flow) always run and should not be listed in relevant_stages.
 
 2. The reasoning effort ("medium" or "high") in stage_efforts for each stage that will run (goal, implementation, execution-flow, plus each stage selected in relevant_stages):
-- Default to "high" for active technical stages (implementation, execution-flow, resources, locking, security, hardware) whenever the patch modifies executable C, Rust, Kbuild/Makefile, or device-tree logic. Small diffs (< 50 lines) that refactor helpers, error paths, or state transitions require "high" effort to trace callers and callees.
+- Default to "high" for active technical stages (implementation, execution-flow, resources, locking, security, performance, hardware) whenever the patch modifies executable C, Rust, Kbuild/Makefile, or device-tree logic. Small diffs (< 50 lines) that refactor helpers, error paths, or state transitions require "high" effort to trace callers and callees.
 - Use "medium" only for routine checks on straightforward, purely mechanical aspects (such as "goal" on a localized bug fix, or all stages on a trivial comment/documentation/spelling patch).
 
 You MUST respond with ONLY a JSON object, no other text. Example:
 ```json
 {
-  "relevant_stages": ["resources", "locking", "hardware"],
+  "relevant_stages": ["resources", "locking", "performance", "hardware"],
   "stage_efforts": {
     "goal": "medium",
     "implementation": "high",
     "execution-flow": "high",
     "resources": "high",
     "locking": "high",
+    "performance": "high",
     "hardware": "high"
   }
 }
@@ -2347,13 +2367,14 @@ You MUST respond with ONLY a JSON object, no other text. Example:
 - resources: Resource management
 - locking: Locking and synchronization
 - security: Security audit
+- performance: Performance and scalability review
 - hardware: Hardware engineer's review
 
-CRITICAL: Always err on the side of running more stages. If you are not absolutely sure, include the stage. If the patch is a trivial typo fix, you may omit some stages. Stages not listed above always run and should not be included in your answer.
+CRITICAL: Always err on the side of running more stages. If you are not absolutely sure, include the stage. Include "resources", "locking", and "performance" on any non-trivial C, Rust, or struct/header change, as ordinary bug fixes and cleanups frequently introduce unexpected side effects. If the patch is a trivial typo/comment/doc/ID-table change, you may omit stages. Stages not listed above always run and should not be included in your answer.
 
 You MUST respond with ONLY a JSON object, no other text. Use the names exactly as given above. Example:
 ```json
-{"relevant_stages": ["resources", "locking", "security", "hardware"]}
+{"relevant_stages": ["resources", "locking", "security", "performance", "hardware"]}
 ```"#,
             OutputFormat::json_with_schema(json!({
                 "type": "object",
@@ -2476,6 +2497,15 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         instruction: STAGE_SECURITY_INSTRUCTION,
         guides: &[],
         uses_commit_log: false,
+        optional: true,
+        wants_series_context: false,
+    },
+    AnalysisStage {
+        name: "performance",
+        short: "Performance",
+        instruction: STAGE_PERFORMANCE_INSTRUCTION,
+        guides: &["performance.md"],
+        uses_commit_log: true,
         optional: true,
         wants_series_context: false,
     },
@@ -4348,7 +4378,7 @@ mod tests {
     fn test_each_stage_declares_whether_it_needs_the_commit_message() {
         // This was a numeric range in a free function, which kept compiling
         // while meaning something else whenever the stages moved.
-        for name in ["goal", "implementation", "hardware"] {
+        for name in ["goal", "implementation", "performance", "hardware"] {
             assert!(
                 analysis_stage_by_name(name).unwrap().uses_commit_log,
                 "{name} judges the change against its stated intent"
@@ -4414,6 +4444,7 @@ mod tests {
         // Claimed by a stage, so the pre-screen must not also broadcast them.
         assert!(is_stage_exclusive_guide("locking.md"));
         assert!(is_stage_exclusive_guide("callstack.md"));
+        assert!(is_stage_exclusive_guide("performance.md"));
 
         // Not claimed by any stage: the pre-screen's to offer.
         assert!(!is_stage_exclusive_guide("mm-vma.md"));
@@ -4454,7 +4485,16 @@ mod tests {
             .filter(|d| d.optional)
             .map(|d| d.name)
             .collect();
-        assert_eq!(optional, ["resources", "locking", "security", "hardware"]);
+        assert_eq!(
+            optional,
+            [
+                "resources",
+                "locking",
+                "security",
+                "performance",
+                "hardware"
+            ]
+        );
 
         let required: Vec<&str> = ANALYSIS_STAGES
             .iter()
@@ -6650,6 +6690,7 @@ mod tests {
             "execution-flow",
             "resources",
             "locking",
+            "performance",
             "hardware",
         ] {
             let def = analysis_stage_by_name(other_name).expect(other_name);
@@ -6662,6 +6703,12 @@ mod tests {
                 "{other_name} must not receive <kernel_threat_model>"
             );
             assert!(!other_rendered.contains("{{kernel_threat_model_section}}"));
+            if other_name == "performance" {
+                assert!(
+                    other_rendered.contains("Performance & Scalability Review Guide"),
+                    "performance stage must embed performance.md"
+                );
+            }
         }
     }
 
@@ -6791,5 +6838,49 @@ mod tests {
         let extra_guides = extra_prompt_paths_for_state(&state, analysis_stage_by_name);
         assert!(extra_guides.contains(&std::path::PathBuf::from("callstack.md")));
         assert!(extra_guides.contains(&std::path::PathBuf::from("locking.md")));
+        assert!(extra_guides.contains(&std::path::PathBuf::from("performance.md")));
+        assert!(!extra_guides.contains(&std::path::PathBuf::from("subsystem/performance.md")));
+        assert!(!extra_guides.contains(&std::path::PathBuf::from("patterns/performance.md")));
+    }
+
+    #[test]
+    fn test_performance_stage_integrates_across_local_and_daemon_modes() {
+        assert_eq!(
+            crate::workflows::stage_short_label(crate::project::ProjectId::Linux, "performance"),
+            Some("Performance")
+        );
+        assert!(crate::workflows::is_counted_stage(
+            crate::project::ProjectId::Linux,
+            "performance"
+        ));
+        assert_eq!(
+            crate::workflows::planned_stages_from(
+                crate::project::ProjectId::Linux,
+                &["performance"]
+            ),
+            vec![
+                "performance",
+                "deduplication",
+                "verification",
+                "post-verification",
+                "report",
+            ]
+        );
+
+        let manual_state = LinuxPatchReviewState {
+            project: "linux".to_string(),
+            manual_stages: Some(vec!["performance".to_string()]),
+            ..Default::default()
+        };
+        let stages = resolve_analysis_stages_with_options(&manual_state, 10, 0.0);
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].name(), "performance");
+
+        let perf_items = vec![json!({
+            "stage": "performance",
+            "description": "cacheline false sharing"
+        })];
+        let extra = extra_prompt_paths_for_items(&[], &perf_items, analysis_stage_by_name);
+        assert_eq!(extra, vec![std::path::PathBuf::from("performance.md")]);
     }
 }

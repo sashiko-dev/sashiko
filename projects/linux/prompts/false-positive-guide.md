@@ -220,10 +220,9 @@ already produced one, check it against the code again rather than copying it.
 
 ### 9. Performance Tradeoffs
 **Not a regression if**:
-- Lower performance was an intentional tradeoff explicitly documented in the commit message or code comments
-- Commit message explains the performance impact
-- Simplicity/maintainability was explicitly prioritized by the author in the commit message or comments (never invent an unstated "simplicity tradeoff" to excuse operating on unmodified ranges/entries when the code tracks modified sub-ranges, or to excuse narrowing an existing Kconfig/UAPI feature)
-- It's optimizing for a different use case
+- The commit message or code comments explicitly acknowledge and accept the specific workload performance degradation as a deliberate tradeoff (IMPORTANT: merely describing the correctness mechanism added by the patch—such as adding `vfs_fsync()`, `tlb_remove_table_sync_one()` broadcast IPIs, a hot-path `spin_lock_irqsave`, delegating a high-IOPS completion ISR to a threaded IRQ, clamping `filemap_fault` readahead to VMA boundaries, or flushing all global slab caches on a single `kmem_cache_destroy()`—is **NOT** an accepted performance tradeoff when the author did not recognize the severe throughput, latency, or IPI cliff on real workloads; report such regressions!)
+- Simplicity/maintainability was explicitly prioritized by the author in the commit message or comments for a genuinely cold path (never invent an unstated "simplicity", "short critical section", "benign extra workqueue wakeup", or "cold teardown" rationalization to excuse operating on unmodified ranges/all global caches, shifting hot embedding-struct cachelines such as `struct mem_cgroup` or `struct netns_*`, reducing block `wake_batch`/async depth, or narrowing large-folio/readahead/offload support)
+- **No speculative micro-optimizations or zero-delta lock nitpicks**: Never report `likely()`/`unlikely()`, manual `inline`, extra function parameters, static-key plumbing, small fixed-bound loops ($\le 16$ entries), converting an existing lock to `guard(mutex)` / `scoped_guard`, or taking a local `mutex` on a one-shot control, `probe`, `resume`, `open`, or sensor mode-switch path that has no hot runtime caller, no $O(N)$ multi-instance fan-out, and no `synchronize_rcu*` / `fsync` / broadcast-IPI stall. Confirming a performance finding requires concrete code proof of hot-path execution frequency, $O(N)$/$O(N^2)$ scaling, hot-struct cacheline false sharing, asymmetric unbatched high-order page teardown, or silent fast-path/offload/readahead/priority demotion.
 
 ### 9.1 Documented API Guarantees
 **Never report** that an API fails to provide something its own documentation
