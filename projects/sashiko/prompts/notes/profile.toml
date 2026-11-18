@@ -10,7 +10,7 @@ source = "component_map"
 "notes" = ["src/notes/"]
 "ai" = ["src/ai/"]
 "toolbox" = ["src/toolbox/"]
-"db" = ["src/db.rs", "src/migrations/"]
+"db" = ["src/db.rs", "src/db/", "src/migrations/"]
 "api-server" = [
     "src/server.rs",
     "src/api.rs",
