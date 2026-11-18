@@ -1,6 +1,74 @@
 use std::io::{self, Write};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
+
+/// Lock-free `tracing` layer counting `WARN` and `ERROR` events by bounded
+/// [`crate::metrics::LogComponent`] without heap allocation.
+pub struct MetricsLayer;
+
+impl<S> Layer<S> for MetricsLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let meta = event.metadata();
+        match *meta.level() {
+            tracing::Level::ERROR => crate::metrics::inc_log_event(
+                crate::metrics::LogLevelMetric::Error,
+                crate::metrics::LogComponent::from_target(meta.target()),
+            ),
+            tracing::Level::WARN => crate::metrics::inc_log_event(
+                crate::metrics::LogLevelMetric::Warn,
+                crate::metrics::LogComponent::from_target(meta.target()),
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// Initializes the global `tracing` subscriber with `env_filter`, stderr output
+/// tolerant of broken pipes, and [`MetricsLayer`] warning/error telemetry.
+pub fn init_subscriber(
+    env_filter: EnvFilter,
+    plain_logs: bool,
+    level_only_logs: bool,
+    use_ansi: bool,
+) {
+    let base = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(MetricsLayer);
+    let writer = IgnoreBrokenPipe(std::io::stderr);
+    if plain_logs {
+        base.with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(use_ansi)
+                .with_level(false)
+                .with_target(false)
+                .without_time(),
+        )
+        .init();
+    } else if level_only_logs {
+        base.with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(use_ansi)
+                .with_target(false)
+                .without_time(),
+        )
+        .init();
+    } else {
+        base.with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(use_ansi),
+        )
+        .init();
+    }
+}
 
 /// Command execution mode for selecting default log verbosity when `RUST_LOG`
 /// and `--debug` are not explicitly set.
@@ -234,5 +302,44 @@ mod tests {
         assert!(bad_env_warn.is_some());
         let (_, bad_cfg_warn) = build_env_filter(None, "=invalid[");
         assert!(bad_cfg_warn.is_some());
+    }
+
+    #[test]
+    fn test_metrics_layer_counts_warnings_and_errors_by_component() {
+        use crate::metrics::{LogComponent, LogLevelMetric, get_log_events};
+
+        let (filter, _) = build_env_filter(None, "warn,sashiko=info");
+        let buf = TestBuf::default();
+        let sub = tracing_subscriber::registry()
+            .with(filter)
+            .with(MetricsLayer)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(buf)
+                    .with_ansi(false),
+            );
+
+        let before_warn = get_log_events(LogLevelMetric::Warn, LogComponent::Nntp);
+        let before_err = get_log_events(LogLevelMetric::Error, LogComponent::Email);
+        let before_other = get_log_events(LogLevelMetric::Warn, LogComponent::Reviewer);
+
+        tracing::subscriber::with_default(sub, || {
+            tracing::info!(target: "sashiko::nntp", "routine poll");
+            tracing::warn!(target: "sashiko::nntp", "connection reset");
+            tracing::error!(target: "sashiko::worker::email", "smtp rejected");
+        });
+
+        assert_eq!(
+            get_log_events(LogLevelMetric::Warn, LogComponent::Nntp),
+            before_warn + 1
+        );
+        assert_eq!(
+            get_log_events(LogLevelMetric::Error, LogComponent::Email),
+            before_err + 1
+        );
+        assert_eq!(
+            get_log_events(LogLevelMetric::Warn, LogComponent::Reviewer),
+            before_other
+        );
     }
 }

@@ -45,7 +45,6 @@ use tokio::sync::{Semaphore, mpsc};
 #[cfg(feature = "server")]
 use tracing::error;
 use tracing::{debug, info, warn};
-use tracing_subscriber::fmt;
 
 const DEFAULT_SETTINGS: &str = include_str!("../docs/examples/Settings.example.toml");
 
@@ -747,22 +746,7 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     let level_only_logs = std::env::var("SASHIKO_LOG_LEVEL_ONLY").is_ok();
     let use_ansi = std::env::var("NO_COLOR").is_err() && std::io::stderr().is_terminal();
 
-    let builder = fmt()
-        .with_env_filter(env_filter)
-        .with_writer(sashiko::logging::IgnoreBrokenPipe(std::io::stderr))
-        .with_ansi(use_ansi);
-
-    if plain_logs {
-        builder
-            .with_level(false)
-            .with_target(false)
-            .without_time()
-            .init();
-    } else if level_only_logs {
-        builder.with_target(false).without_time().init();
-    } else {
-        builder.init();
-    }
+    sashiko::logging::init_subscriber(env_filter, plain_logs, level_only_logs, use_ansi);
 
     if let Some(warning) = filter_warning {
         warn!("{warning}");
@@ -2019,6 +2003,10 @@ where
             let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {
+                    sashiko::metrics::inc_worker_restart(
+                        sashiko::metrics::WorkerKind::from_name(name),
+                        false,
+                    );
                     warn!(
                         "{name} exited unexpectedly; restarting in {}ms...",
                         backoff.as_millis()
@@ -2028,6 +2016,10 @@ where
                     break;
                 }
                 Err(join_err) => {
+                    sashiko::metrics::inc_worker_restart(
+                        sashiko::metrics::WorkerKind::from_name(name),
+                        true,
+                    );
                     error!(
                         "{name} panicked ({join_err}); restarting in {}ms...",
                         backoff.as_millis()
