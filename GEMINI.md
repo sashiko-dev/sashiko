@@ -107,6 +107,7 @@ See `docs/benchmarking.md` for full setup and CLI options (`sashiko [--project <
 - `benchmark_missed.json` (upstream fixes for bugs missed by Sashiko after public launch)
 - `benchmark_kvm_arm64.json` (97 checked KVM/arm64 bugs fixed in 2026)
 - `benchmark_arm64.json` (62 checked arm64 core bugs fixed in 2026)
+- `benchmark_performance.json` (40 entries: 20 Linux performance regressions + 20 soak-verified `expect_clean` neutral commits)
 - `benchmark_preexisting.json` (known Linux bugs for testing the pre-existing bug pipeline)
 - `benchmark_versioned.json` (53 multi-version LKML patchset stories testing prior-version feedback verification, attribution, and suppression)
 

@@ -40,6 +40,7 @@ cargo run --bin sashiko -- benchmark projects/linux/benchmarks/benchmark_tiny.js
 | `projects/linux/benchmarks/benchmark_missed.json` | Upstream fixes for bugs missed by Sashiko after public launch. |
 | `projects/linux/benchmarks/benchmark_kvm_arm64.json` | KVM/arm64 bugs fixed in 2026, each checked to be a real defect visible in the buggy commit's own diff (97 entries). |
 | `projects/linux/benchmarks/benchmark_arm64.json` | arm64 core (non-KVM) bugs fixed in 2026, checked the same way (62 entries). |
+| `projects/linux/benchmarks/benchmark_performance.json` | Balanced Linux performance regression and soak-verified `expect_clean` neutral suite (40 entries: 20 positive + 20 neutral). |
 | `projects/linux/benchmarks/benchmark_preexisting.json` | Tests detection of pre-existing bugs. |
 | `projects/linux/benchmarks/benchmark_versioned.json` | Multi-version LKML patchset stories (`v1..vN`) testing prior-feedback verification, reviewer attribution, and false-positive suppression. |
 
