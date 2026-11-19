@@ -1057,24 +1057,55 @@ pub async fn repack_repository(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Inspects `.sashiko/fetch_timestamps/` across all configured non-ephemeral
-/// git remotes without network I/O and publishes live remote freshness gauges
-/// (`fresh`, `stale`, `backed_off`, `failed`, and `max_age_secs`).
-pub async fn refresh_remote_freshness_metrics(repo_path: &Path) {
-    let Ok(output) = crate::git_cmd::in_dir_async(repo_path)
+/// Returns a public-safe display string for a git remote URL by stripping
+/// credentials, query parameters, fragments, and local filesystem paths.
+pub fn sanitize_git_remote_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let no_frag = trimmed.split('#').next().unwrap_or(trimmed);
+    let no_query = no_frag.split('?').next().unwrap_or(no_frag);
+    if let Some((scheme, rest)) = no_query.split_once("://") {
+        if scheme.eq_ignore_ascii_case("file") {
+            return "(local)".to_string();
+        }
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        let (authority, path) = rest.split_at(authority_end);
+        let host = authority
+            .rsplit_once('@')
+            .map(|(_, h)| h)
+            .unwrap_or(authority);
+        return crate::utils::redact_secret(&format!("{scheme}://{host}{path}"));
+    }
+    if let Some((before_colon, after_colon)) = no_query.split_once(':')
+        && !before_colon.is_empty()
+        && !before_colon.contains('/')
+    {
+        let host = before_colon
+            .rsplit_once('@')
+            .map(|(_, h)| h)
+            .unwrap_or(before_colon);
+        return crate::utils::redact_secret(&format!("{host}:{after_colon}"));
+    }
+    "(local)".to_string()
+}
+
+async fn inspect_remote_freshness(
+    repo_path: &Path,
+) -> Option<(u64, u64, u64, u64, u64, Vec<crate::metrics::StaleGitRemote>)> {
+    let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["remote", "-v"])
         .output()
         .await
-    else {
-        return;
-    };
+        .ok()?;
     if !output.status.success() {
-        return;
+        return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let ts_dir = repo_path.join(".sashiko/fetch_timestamps");
 
-    let Ok(counts) = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let mut remotes: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
         for line in stdout.lines() {
@@ -1094,6 +1125,7 @@ pub async fn refresh_remote_freshness_metrics(repo_path: &Path) {
         let mut backed_off = 0u64;
         let mut failed = 0u64;
         let mut max_age_secs = 0u64;
+        let mut stale_remotes: Vec<crate::metrics::StaleGitRemote> = Vec::new();
 
         for (name, url) in remotes {
             let ts_file = ts_dir.join(&name);
@@ -1116,23 +1148,92 @@ pub async fn refresh_remote_freshness_metrics(repo_path: &Path) {
                 3600u64
             };
             let failed_recently = fail_age.is_some_and(|fa| fa.as_secs() < 3600);
-            match age {
-                Some(a) if a.as_secs() >= 86_400 && fail_age.is_some() => failed += 1,
-                Some(_) if failed_recently => backed_off += 1,
-                Some(a) if a.as_secs() > interval_secs => stale += 1,
-                Some(_) => fresh += 1,
-                None if failed_recently => failed += 1,
-                None if name == "origin" => fresh += 1,
-                None => stale += 1,
+            let state = match age {
+                Some(a) if a.as_secs() >= 86_400 && fail_age.is_some() => {
+                    failed += 1;
+                    crate::metrics::GitRemoteState::Failed
+                }
+                Some(_) if failed_recently => {
+                    backed_off += 1;
+                    crate::metrics::GitRemoteState::BackedOff
+                }
+                Some(a) if a.as_secs() > interval_secs => {
+                    stale += 1;
+                    crate::metrics::GitRemoteState::Stale
+                }
+                Some(_) => {
+                    fresh += 1;
+                    crate::metrics::GitRemoteState::Fresh
+                }
+                None if failed_recently => {
+                    failed += 1;
+                    crate::metrics::GitRemoteState::Failed
+                }
+                None if name == "origin" => {
+                    fresh += 1;
+                    crate::metrics::GitRemoteState::Fresh
+                }
+                None => {
+                    stale += 1;
+                    crate::metrics::GitRemoteState::Stale
+                }
+            };
+            if state != crate::metrics::GitRemoteState::Fresh {
+                stale_remotes.push(crate::metrics::StaleGitRemote {
+                    remote: name,
+                    url: sanitize_git_remote_url(&url),
+                    state,
+                    age_secs: age.map(|a| a.as_secs()),
+                });
             }
         }
-        (fresh, stale, backed_off, failed, max_age_secs)
+        stale_remotes.sort_by(|a, b| {
+            let rank = |s: crate::metrics::GitRemoteState| match s {
+                crate::metrics::GitRemoteState::Failed => 0u8,
+                crate::metrics::GitRemoteState::BackedOff => 1u8,
+                crate::metrics::GitRemoteState::Stale => 2u8,
+                crate::metrics::GitRemoteState::Fresh => 3u8,
+            };
+            rank(a.state)
+                .cmp(&rank(b.state))
+                .then_with(|| {
+                    b.age_secs
+                        .unwrap_or(u64::MAX)
+                        .cmp(&a.age_secs.unwrap_or(u64::MAX))
+                })
+                .then_with(|| a.remote.cmp(&b.remote))
+        });
+        (
+            fresh,
+            stale,
+            backed_off,
+            failed,
+            max_age_secs,
+            stale_remotes,
+        )
     })
     .await
+    .ok()
+}
+
+/// Inspects `.sashiko/fetch_timestamps/` across all configured non-ephemeral
+/// git remotes without network I/O and publishes live remote freshness gauges
+/// (`fresh`, `stale`, `backed_off`, `failed`, `max_age_secs`, and per-remote
+/// details for every non-fresh tree).
+pub async fn refresh_remote_freshness_metrics(repo_path: &Path) {
+    let Some((fresh, stale, backed_off, failed, max_age_secs, stale_remotes)) =
+        inspect_remote_freshness(repo_path).await
     else {
         return;
     };
-    crate::metrics::set_git_remotes(counts.0, counts.1, counts.2, counts.3, counts.4);
+    crate::metrics::set_git_remotes_with_details(
+        fresh,
+        stale,
+        backed_off,
+        failed,
+        max_age_secs,
+        stale_remotes,
+    );
 }
 
 #[allow(dead_code)]
@@ -3829,6 +3930,76 @@ mod tests {
             "git commit-graph verify failed: {}",
             String::from_utf8_lossy(&verify.stderr)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_sanitize_git_remote_url_strips_secrets_and_local_paths() {
+        assert_eq!(
+            sanitize_git_remote_url(
+                "https://user:pass@git.kernel.org/pub/scm/linux.git?token=abc#frag"
+            ),
+            "https://git.kernel.org/pub/scm/linux.git"
+        );
+        assert_eq!(
+            sanitize_git_remote_url("git://git.kernel.org/pub/scm/linux/kernel/git/akpm/mm"),
+            "git://git.kernel.org/pub/scm/linux/kernel/git/akpm/mm"
+        );
+        assert_eq!(
+            sanitize_git_remote_url("git@github.com:torvalds/linux.git"),
+            "github.com:torvalds/linux.git"
+        );
+        assert_eq!(
+            sanitize_git_remote_url("file:///srv/repos/linux.git"),
+            "(local)"
+        );
+        assert_eq!(sanitize_git_remote_url("/tmp/local-repo"), "(local)");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_remote_freshness_metrics_records_stale_details() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo_path = dir.path().to_path_buf();
+        let init = crate::git_cmd::in_dir_async(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+        assert!(init.status.success());
+
+        for (name, url) in [
+            ("origin", "https://git.kernel.org/pub/scm/linux.git"),
+            (
+                "net-next",
+                "https://user:secret@git.kernel.org/net-next.git?token=xyz",
+            ),
+            ("broken", "https://example.com/broken.git"),
+        ] {
+            let out = crate::git_cmd::in_dir_async(&repo_path)
+                .args(["remote", "add", name, url])
+                .output()
+                .await?;
+            assert!(out.status.success());
+        }
+
+        let ts_dir = repo_path.join(".sashiko/fetch_timestamps");
+        std::fs::create_dir_all(&ts_dir)?;
+        // Mark `broken` as recently failed with no prior clean fetch -> Failed.
+        // Leave `net-next` with no timestamp -> Stale.
+        // Leave `origin` -> Fresh by rule.
+        std::fs::write(ts_dir.join("broken.fail"), "failed")?;
+
+        let (fresh, stale_cnt, backed_off, failed, _max_age, stale) =
+            inspect_remote_freshness(&repo_path)
+                .await
+                .expect("inspect_remote_freshness should succeed");
+        assert_eq!((fresh, stale_cnt, backed_off, failed), (1, 1, 0, 1));
+        assert_eq!(stale.len(), 2);
+        assert_eq!(stale[0].remote, "broken");
+        assert_eq!(stale[0].state, crate::metrics::GitRemoteState::Failed);
+        assert_eq!(stale[0].age_secs, None);
+        assert_eq!(stale[1].remote, "net-next");
+        assert_eq!(stale[1].state, crate::metrics::GitRemoteState::Stale);
+        assert_eq!(stale[1].url, "https://git.kernel.org/net-next.git");
         Ok(())
     }
 }

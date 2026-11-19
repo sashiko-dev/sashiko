@@ -951,6 +951,7 @@ pub async fn prom_labels() -> Json<Value> {
         "preexisting",
         "queue",
         "reason",
+        "remote",
         "security_class",
         "security_rating",
         "severity",
@@ -964,6 +965,7 @@ pub async fn prom_labels() -> Json<Value> {
         "subsystem",
         "tag",
         "tool",
+        "url",
         "version",
         "version_bucket",
         "window",
@@ -1549,6 +1551,22 @@ fn populate_runtime_instant_metrics(
                 value: crate::metrics::get_git_remote_max_age_secs() as f64,
             }],
         );
+    }
+    if needed.contains("sashiko_git_remote_stale_age_seconds") {
+        let samples = crate::metrics::get_stale_git_remotes()
+            .into_iter()
+            .map(|item| {
+                let mut labels = Labels::new();
+                labels.insert("remote".to_string(), item.remote);
+                labels.insert("state".to_string(), item.state.as_str().to_string());
+                labels.insert("url".to_string(), item.url);
+                EvalSample {
+                    labels,
+                    value: item.age_secs.map(|s| s as f64).unwrap_or(-1.0),
+                }
+            })
+            .collect();
+        out.insert("sashiko_git_remote_stale_age_seconds".to_string(), samples);
     }
     if needed.contains("sashiko_nntp_lag_articles") {
         let (tot, max_g) = crate::metrics::get_nntp_lag();

@@ -90,26 +90,35 @@ pub async fn run_stats_backfill_loop(db: Arc<Database>) {
 /// Executes one complete pass of all backfill phases (also callable directly in
 /// deterministic integration tests).
 pub async fn run_stats_backfill_once(db: &Database) -> Result<()> {
-    if read_meta_str(db, DONE_KEY).await?.as_deref() == Some("1") {
+    let main_done = read_meta_str(db, DONE_KEY).await?.as_deref() == Some("1");
+    let email_cursor = read_phase_cursor(db, "email_outbox").await?;
+    if main_done && email_cursor <= 0 {
         debug!("StatsBackfill already completed; exiting.");
         return Ok(());
     }
 
-    info!("StatsBackfill: starting bounded historical statistics backfill...");
-    backfill_pipeline_summaries(db).await?;
-    backfill_messages(db).await?;
-    backfill_patchsets(db).await?;
-    backfill_patches(db).await?;
-    backfill_reviews(db).await?;
-    backfill_bugs(db).await?;
+    if !main_done {
+        info!("StatsBackfill: starting bounded historical statistics backfill...");
+        backfill_pipeline_summaries(db).await?;
+        backfill_messages(db).await?;
+        backfill_patchsets(db).await?;
+        backfill_patches(db).await?;
+        backfill_reviews(db).await?;
+        backfill_bugs(db).await?;
+        backfill_email_outbox(db).await?;
 
-    db.execute(
-        "INSERT INTO meta (key, value) VALUES (?, '1')
-         ON CONFLICT(key) DO UPDATE SET value = '1'",
-        libsql::params![DONE_KEY],
-    )
-    .await?;
-    info!("StatsBackfill: historical statistics backfill completed.");
+        db.execute(
+            "INSERT INTO meta (key, value) VALUES (?, '1')
+             ON CONFLICT(key) DO UPDATE SET value = '1'",
+            libsql::params![DONE_KEY],
+        )
+        .await?;
+        info!("StatsBackfill: historical statistics backfill completed.");
+    } else {
+        info!("StatsBackfill: running incremental email_outbox rollup backfill...");
+        backfill_email_outbox(db).await?;
+        info!("StatsBackfill: email_outbox rollup backfill completed.");
+    }
     Ok(())
 }
 
@@ -495,6 +504,53 @@ async fn backfill_bugs(db: &Database) -> Result<()> {
     Ok(())
 }
 
+async fn backfill_email_outbox(db: &Database) -> Result<()> {
+    let mut cursor = read_phase_cursor(db, "email_outbox").await?;
+    while cursor > 0 {
+        let low = (cursor - TABLE_CHUNK).max(0);
+        let now = now_unix();
+        let mut acc = RollupBatchAccumulator::new(now);
+        let mut rows = db
+            .read_conn()
+            .query(
+                "SELECT COALESCE(e.created_at, 0), COALESCE(e.status, 'Pending')
+                 FROM email_outbox e
+                 WHERE e.id > ? AND e.id <= ?
+                   AND e.created_at IS NOT NULL AND e.created_at > 0
+                   AND NOT EXISTS (
+                       SELECT 1 FROM meta m
+                       WHERE m.key = 'stats_backfill:skip_email_outbox:' || e.id
+                   )",
+                libsql::params![low, cursor],
+            )
+            .await?;
+        while let Some(r) = rows.next().await? {
+            let ts: i64 = r.get(0)?;
+            let status: String = r.get(1)?;
+            let outcome = match status.as_str() {
+                "Sent" => "sent",
+                "Failed" => "failed",
+                "Muted" => "muted",
+                "Skipped" | "Disabled" => "skipped",
+                "Dry-Run" => "dry_run",
+                _ => continue,
+            };
+            acc.add(
+                ts,
+                "sashiko_outbox_events_total",
+                &[("channel", "email"), ("outcome", outcome)],
+                1.0,
+            );
+        }
+        drop(rows);
+        db.commit_backfill_chunk("email_outbox", low, &acc.buckets)
+            .await?;
+        cursor = low;
+        sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,6 +730,18 @@ mod tests {
             libsql::params![now, now, now, now, now, now],
         )
         .await?;
+        // Pre-upgrade email_outbox rows: id=1 Sent, id=2 Pending (skipped by backfill),
+        // id=3 Failed, id=4 Disabled (-> skipped), id=5 Dry-Run (-> dry_run).
+        db.execute(
+            "INSERT INTO email_outbox (id, status, created_at) VALUES
+             (1, 'Sent', ?),
+             (2, 'Pending', ?),
+             (3, 'Failed', ?),
+             (4, 'Disabled', ?),
+             (5, 'Dry-Run', ?)",
+            libsql::params![now, now, now, now, now],
+        )
+        .await?;
 
         db.migrate().await?;
 
@@ -688,8 +756,41 @@ mod tests {
             libsql::params![now + 10],
         )
         .await?;
+        // Transition email 2 Pending->Sent BEFORE backfill runs; skip_email_outbox guard prevents backfill double-count.
+        db.execute("UPDATE email_outbox SET status = 'Sent' WHERE id = 2", ())
+            .await?;
 
         run_stats_backfill_once(&db).await?;
+
+        // Only pre-upgrade terminal Sent (id=1) and Failed (id=3) are backfilled; id=2 was Pending at upgrade.
+        let email_sent = sum_rollup_86400(
+            &db,
+            "sashiko_outbox_events_total",
+            r#"{"channel":"email","outcome":"sent"}"#,
+        )
+        .await?;
+        let email_failed = sum_rollup_86400(
+            &db,
+            "sashiko_outbox_events_total",
+            r#"{"channel":"email","outcome":"failed"}"#,
+        )
+        .await?;
+        let email_skipped = sum_rollup_86400(
+            &db,
+            "sashiko_outbox_events_total",
+            r#"{"channel":"email","outcome":"skipped"}"#,
+        )
+        .await?;
+        let email_dry_run = sum_rollup_86400(
+            &db,
+            "sashiko_outbox_events_total",
+            r#"{"channel":"email","outcome":"dry_run"}"#,
+        )
+        .await?;
+        assert!((email_sent - 1.0).abs() < f64::EPSILON);
+        assert!((email_failed - 1.0).abs() < f64::EPSILON);
+        assert!((email_skipped - 1.0).abs() < f64::EPSILON);
+        assert!((email_dry_run - 1.0).abs() < f64::EPSILON);
 
         // Patchset 1 completion must be counted ONCE (not twice).
         let ps1_done = sum_rollup_86400(
