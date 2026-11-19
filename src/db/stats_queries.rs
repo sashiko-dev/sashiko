@@ -1463,6 +1463,132 @@ impl Database {
         Ok(out)
     }
 
+    /// Queries `stats_rollups` for a single instant window `[query_start, query_end]`
+    /// by pushing interior-bucket aggregation (`full_start..=full_end`) into SQLite
+    /// `SUM(value) GROUP BY series_id` while returning boundary buckets verbatim for
+    /// exact fractional edge weighting.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_rollup_sums_filtered<F>(
+        &self,
+        metrics: &[String],
+        resolution_secs: i64,
+        query_start: i64,
+        full_start: i64,
+        full_end: i64,
+        query_end: i64,
+        accept_series: F,
+    ) -> Result<Vec<RollupBucketRow>>
+    where
+        F: Fn(&str, &BTreeMap<String, String>) -> bool,
+    {
+        if metrics.is_empty() {
+            return Ok(Vec::new());
+        }
+        if full_start > full_end {
+            return self
+                .query_rollup_buckets_filtered(
+                    metrics,
+                    resolution_secs,
+                    query_start,
+                    query_end,
+                    accept_series,
+                )
+                .await;
+        }
+        let mut series_meta: std::collections::HashMap<i64, (String, BTreeMap<String, String>)> =
+            std::collections::HashMap::new();
+        let mut series_ids: Vec<i64> = Vec::new();
+        for chunk in metrics.chunks(SUB_BATCH_SIZE) {
+            let ph = vec!["?"; chunk.len()].join(", ");
+            let params: Vec<libsql::Value> = chunk
+                .iter()
+                .map(|m| libsql::Value::Text(m.clone()))
+                .collect();
+            let sql =
+                format!("SELECT id, metric, labels_json FROM stats_series WHERE metric IN ({ph})");
+            let mut rows = self.read_conn().query(&sql, params).await?;
+            while let Some(r) = rows.next().await? {
+                let id: i64 = r.get(0)?;
+                let metric: String = r.get(1)?;
+                let lj: String = r.get(2)?;
+                let labels = decode_labels_json(&lj);
+                if accept_series(&metric, &labels) {
+                    series_ids.push(id);
+                    series_meta.insert(id, (metric, labels));
+                }
+            }
+        }
+        if series_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        for chunk in series_ids.chunks(SUB_BATCH_SIZE) {
+            let ph = vec!["?"; chunk.len()].join(", ");
+
+            // 1. Interior buckets summed in SQLite (1 row per series_id).
+            let mut sum_params: Vec<libsql::Value> =
+                chunk.iter().map(|&id| libsql::Value::Integer(id)).collect();
+            sum_params.push(libsql::Value::Integer(resolution_secs));
+            sum_params.push(libsql::Value::Integer(full_start));
+            sum_params.push(libsql::Value::Integer(full_end));
+            let sum_sql = format!(
+                "SELECT series_id, SUM(value)
+                 FROM stats_rollups
+                 WHERE series_id IN ({ph})
+                   AND resolution_secs = ?
+                   AND bucket_ts >= ?
+                   AND bucket_ts <= ?
+                 GROUP BY series_id"
+            );
+            let mut sum_rows = self.read_conn().query(&sum_sql, sum_params).await?;
+            while let Some(r) = sum_rows.next().await? {
+                let sid: i64 = r.get(0)?;
+                let value: f64 = r.get(1)?;
+                if let Some((metric, labels)) = series_meta.get(&sid) {
+                    out.push(RollupBucketRow {
+                        metric: metric.clone(),
+                        labels: labels.clone(),
+                        bucket_ts: full_start,
+                        value,
+                    });
+                }
+            }
+            drop(sum_rows);
+
+            // 2. Boundary buckets (left/right edges outside full_start..=full_end).
+            let mut edge_params: Vec<libsql::Value> =
+                chunk.iter().map(|&id| libsql::Value::Integer(id)).collect();
+            edge_params.push(libsql::Value::Integer(resolution_secs));
+            edge_params.push(libsql::Value::Integer(query_start));
+            edge_params.push(libsql::Value::Integer(full_start));
+            edge_params.push(libsql::Value::Integer(full_end));
+            edge_params.push(libsql::Value::Integer(query_end));
+            let edge_sql = format!(
+                "SELECT series_id, bucket_ts, value
+                 FROM stats_rollups
+                 WHERE series_id IN ({ph})
+                   AND resolution_secs = ?
+                   AND ((bucket_ts >= ? AND bucket_ts < ?) OR (bucket_ts > ? AND bucket_ts <= ?))"
+            );
+            let mut edge_rows = self.read_conn().query(&edge_sql, edge_params).await?;
+            while let Some(r) = edge_rows.next().await? {
+                let sid: i64 = r.get(0)?;
+                let bucket_ts: i64 = r.get(1)?;
+                let value: f64 = r.get(2)?;
+                if let Some((metric, labels)) = series_meta.get(&sid) {
+                    out.push(RollupBucketRow {
+                        metric: metric.clone(),
+                        labels: labels.clone(),
+                        bucket_ts,
+                        value,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Lists public mailing-list subsystem names from `subsystems` (bounded by `limit`).
     pub async fn list_public_subsystem_names(&self, limit: usize) -> Result<Vec<String>> {
         let cap = limit.clamp(1, 500) as i64;
