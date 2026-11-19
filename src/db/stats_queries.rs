@@ -250,6 +250,16 @@ pub(super) async fn apply_migration_24_seeds_and_triggers(tx: &DatabaseTransacti
             )
             .await?;
         }
+        if has_email_outbox {
+            tx.execute(
+                "INSERT OR IGNORE INTO meta (key, value)
+                 SELECT 'stats_backfill:skip_email_outbox:' || id, '1'
+                 FROM email_outbox
+                 WHERE status IN ('Pending', 'Sending')",
+                (),
+            )
+            .await?;
+        }
     }
 
     install_core_triggers(

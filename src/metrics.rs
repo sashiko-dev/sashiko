@@ -16,8 +16,8 @@
 //! rollup delta snapshotting, and Prometheus text `0.0.4` exposition helpers.
 
 use std::fmt::Write as _;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 // ============================================================================
@@ -98,6 +98,12 @@ pub static METRIC_CATALOG: &[MetricDef] = &[
         name: "sashiko_git_remote_max_age_seconds",
         metric_type: MetricType::Gauge,
         help: "Maximum time in seconds since the oldest tracked git remote synced cleanly.",
+        unit: "seconds",
+    },
+    MetricDef {
+        name: "sashiko_git_remote_stale_age_seconds",
+        metric_type: MetricType::Gauge,
+        help: "Age in seconds since last clean sync for each non-fresh git remote (-1 if never fetched).",
         unit: "seconds",
     },
     MetricDef {
@@ -846,6 +852,16 @@ pub static REVIEWS_SKIPPED_UNCHANGED: AtomicUsize = AtomicUsize::new(0);
 static GIT_REMOTES: [AtomicU64; GitRemoteState::COUNT] =
     [const { AtomicU64::new(0) }; GitRemoteState::COUNT];
 static GIT_REMOTE_MAX_AGE_SECS: AtomicU64 = AtomicU64::new(0);
+static STALE_GIT_REMOTES: RwLock<Vec<StaleGitRemote>> = RwLock::new(Vec::new());
+
+/// Snapshot of a single non-fresh git remote published for health monitoring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleGitRemote {
+    pub remote: String,
+    pub url: String,
+    pub state: GitRemoteState,
+    pub age_secs: Option<u64>,
+}
 static NNTP_LAG_TOTAL: AtomicU64 = AtomicU64::new(0);
 static NNTP_LAG_MAX: AtomicU64 = AtomicU64::new(0);
 static AI_INFLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -991,11 +1007,30 @@ pub fn inc_ingest_error(source: IngestSource) {
 }
 
 pub fn set_git_remotes(fresh: u64, stale: u64, backed_off: u64, failed: u64, max_age_secs: u64) {
+    set_git_remotes_with_details(fresh, stale, backed_off, failed, max_age_secs, Vec::new());
+}
+
+pub fn set_git_remotes_with_details(
+    fresh: u64,
+    stale: u64,
+    backed_off: u64,
+    failed: u64,
+    max_age_secs: u64,
+    stale_remotes: Vec<StaleGitRemote>,
+) {
     GIT_REMOTES[GitRemoteState::Fresh as usize].store(fresh, Ordering::Relaxed);
     GIT_REMOTES[GitRemoteState::Stale as usize].store(stale, Ordering::Relaxed);
     GIT_REMOTES[GitRemoteState::BackedOff as usize].store(backed_off, Ordering::Relaxed);
     GIT_REMOTES[GitRemoteState::Failed as usize].store(failed, Ordering::Relaxed);
     GIT_REMOTE_MAX_AGE_SECS.store(max_age_secs, Ordering::Relaxed);
+    *STALE_GIT_REMOTES.write().unwrap_or_else(|e| e.into_inner()) = stale_remotes;
+}
+
+pub fn get_stale_git_remotes() -> Vec<StaleGitRemote> {
+    STALE_GIT_REMOTES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 pub fn get_git_remotes(state: GitRemoteState) -> u64 {
@@ -1705,6 +1740,27 @@ fn write_runtime_gauges(buf: &mut String) {
         &[],
         get_git_remote_max_age_secs() as f64,
     );
+
+    let stale_remotes = get_stale_git_remotes();
+    write_prometheus_header(
+        buf,
+        "sashiko_git_remote_stale_age_seconds",
+        MetricType::Gauge,
+        "Age in seconds since last clean sync for each non-fresh git remote (-1 if never fetched).",
+    );
+    for item in &stale_remotes {
+        let age = item.age_secs.map(|s| s as f64).unwrap_or(-1.0);
+        write_prometheus_sample(
+            buf,
+            "sashiko_git_remote_stale_age_seconds",
+            &[
+                ("remote", item.remote.as_str()),
+                ("state", item.state.as_str()),
+                ("url", item.url.as_str()),
+            ],
+            age,
+        );
+    }
 
     let (lag_total, lag_max) = get_nntp_lag();
     write_prometheus_header(
