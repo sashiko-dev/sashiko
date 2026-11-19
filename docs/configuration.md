@@ -500,6 +500,7 @@ Controls which mailing lists Sashiko tracks via NNTP, embargo delays, how Sashik
 | `defaults.embargo_hours` | integer | `0` | Hours to wait before publishing a review with findings. Clean reviews are released immediately after the complete patchset review succeeds. |
 | `defaults.reply_to` | list | `[]` | Recipient targets when findings are present: `"author"`, `"list"`, `"recipients"`. |
 | `defaults.positive_review` | string | `"none"` | Who receives a review email when patches review clean: `"none"`, `"author"`, or `"all"`. Single-patch submissions receive a reply on the patch; multi-patch series receive a single consolidated summary email replying to the cover letter (or patch 1) whenever at least one patch is clean, while patches with findings still receive individual inline replies. |
+| `defaults.failed_review` | string | `"none"` | Opt-in notification when a patchset fails to apply or fails review after exhausting all retries: `"none"` (default), `"author"`, or `"all"`. |
 | `defaults.mute_all` | bool | `false` | Suppress all email sending for this scope. |
 | `defaults.cc` | list | `[]` | Static CC addresses always included on review emails. |
 | `defaults.ignored_emails` | list | `[]` | Author addresses whose patches are skipped at ingestion, so they are never reviewed or mailed. Matched as case-insensitive substrings of the author address. |
@@ -516,6 +517,7 @@ Each mailing list is configured as a `["<list-email>"]` table (e.g. `["bpf@vger.
 | `subject_prefixes` | list | `[]` | Subject prefix tags (e.g. `["net", "net-next"]`) used to disambiguate `embargo_hours` on cross-posted series. Only considered on a list that sets `embargo_hours` itself. |
 | `reply_to` | list | `defaults.reply_to` | Recipient targets for this list (`"author"`, `"list"`, `"recipients"`). |
 | `positive_review` | string | `defaults.positive_review` | Positive review delivery mode (`"none"`, `"author"`, `"all"`). |
+| `failed_review` | string | `defaults.failed_review` | Opt-in failure notification mode (`"none"`, `"author"`, `"all"`) for patchsets that fail to apply or fail review after retries. Cross-posted lists that do not opt in never receive failure emails. |
 | `mute_all` | bool | `defaults.mute_all` | Suppress all email sending for patches matching this list. |
 | `cc` | list | `[]` | Additional static CC addresses for this list (merged with `defaults.cc`). |
 | `ignored_emails` | list | `[]` | Additional ignored author addresses, with the same meaning as `defaults.ignored_emails`. They apply to patches on every list, not only this one. |

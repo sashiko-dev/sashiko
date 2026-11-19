@@ -1047,7 +1047,7 @@ impl Reviewer {
         };
 
         // 1. Find a working baseline (apply series)
-        let (found_baseline, patch_commits, logs) = Self::prepare_baseline_worktree(
+        let baseline_outcome = Self::prepare_baseline_worktree_with_failures(
             &ctx,
             patchset_id,
             &candidates,
@@ -1056,6 +1056,10 @@ impl Reviewer {
             body.as_deref(),
         )
         .await;
+        let found_baseline = baseline_outcome.found;
+        let patch_commits = baseline_outcome.patch_commits;
+        let logs = baseline_outcome.logs_json;
+        let apply_failure_summaries = baseline_outcome.failure_summaries;
 
         let prompts_hash = Some(env!("GIT_HASH"));
 
@@ -1272,6 +1276,7 @@ impl Reviewer {
             // 2. Run Reviews
             let mut review_success = true; // Optimistic
             let mut patch_failures: Vec<String> = Vec::new();
+            let mut failed_patch_indices: Vec<i64> = Vec::new();
 
             let mut valid_jobs = Vec::new();
 
@@ -1404,25 +1409,36 @@ impl Reviewer {
             }
 
             // Main worker loop uses the existing worktree
-            patch_failures.extend(
-                Self::drain_review_queue(
-                    &ctx,
-                    &valid_jobs_queue,
-                    &aborted,
-                    patchset_id,
-                    &baseline_ref_str,
-                    Some(baseline_id),
-                    &input_payload,
-                    prompts_hash,
-                    &worktree.path,
-                    patchset.embargo_until,
-                )
-                .await,
-            );
+            for (idx_opt, msg) in Self::drain_review_queue(
+                &ctx,
+                &valid_jobs_queue,
+                &aborted,
+                patchset_id,
+                &baseline_ref_str,
+                Some(baseline_id),
+                &input_payload,
+                prompts_hash,
+                &worktree.path,
+                patchset.embargo_until,
+            )
+            .await
+            {
+                if let Some(idx) = idx_opt {
+                    failed_patch_indices.push(idx);
+                }
+                patch_failures.push(msg);
+            }
 
             for handle in handles {
                 match handle.await {
-                    Ok(failures) => patch_failures.extend(failures),
+                    Ok(failures) => {
+                        for (idx_opt, msg) in failures {
+                            if let Some(idx) = idx_opt {
+                                failed_patch_indices.push(idx);
+                            }
+                            patch_failures.push(msg);
+                        }
+                    }
                     Err(e) => {
                         error!("Review worker tokio task crashed/panicked: {}", e);
                         patch_failures.push(format!("review worker crashed: {e}"));
@@ -1519,6 +1535,20 @@ impl Reviewer {
                                     patchset_id, e
                                 );
                             }
+                        } else if let Err(e) = Self::queue_patchset_failure_email(
+                            &ctx,
+                            &completed,
+                            PatchsetFailureNotice::ReviewFailed {
+                                total_patches: diffs.len(),
+                                failed_patch_indices: &failed_patch_indices,
+                            },
+                        )
+                        .await
+                        {
+                            error!(
+                                "Failed to queue failure notification email for patchset {}: {}",
+                                patchset_id, e
+                            );
                         }
                     }
                     Ok(false) => {
@@ -1565,7 +1595,27 @@ impl Reviewer {
             )
             .await
             {
-                Ok(crate::db::FailedToApplyOutcome::MarkedFailedToApply) => {}
+                Ok(crate::db::FailedToApplyOutcome::MarkedFailedToApply) => {
+                    let failed_ps = PatchsetRow {
+                        status: Some(ReviewStatus::FailedToApply.as_str().to_string()),
+                        ..patchset.clone()
+                    };
+                    if let Err(e) = Self::queue_patchset_failure_email(
+                        &ctx,
+                        &failed_ps,
+                        PatchsetFailureNotice::ApplyFailed {
+                            total_patches: diffs.len(),
+                            attempts: &apply_failure_summaries,
+                        },
+                    )
+                    .await
+                    {
+                        error!(
+                            "Failed to queue apply-failure notification email for patchset {}: {}",
+                            patchset_id, e
+                        );
+                    }
+                }
                 Ok(crate::db::FailedToApplyOutcome::RequeuedForLateCover) => {
                     info!(
                         "Patchset {} received a late cover letter with baseline/prerequisite metadata during apply; requeued to Pending",
@@ -1773,6 +1823,7 @@ impl Reviewer {
         .await;
     }
 
+    #[cfg(test)]
     async fn prepare_baseline_worktree(
         ctx: &ReviewContext,
         patchset_id: i64,
@@ -1785,7 +1836,29 @@ impl Reviewer {
         HashMap<i64, String>,
         String,
     ) {
+        let out = Self::prepare_baseline_worktree_with_failures(
+            ctx,
+            patchset_id,
+            candidates,
+            diffs,
+            target_message_id,
+            prerequisite_metadata,
+        )
+        .await;
+        (out.found, out.patch_commits, out.logs_json)
+    }
+
+    async fn prepare_baseline_worktree_with_failures(
+        ctx: &ReviewContext,
+        patchset_id: i64,
+        candidates: &[BaselineResolution],
+        diffs: &[(i64, i64, String, String, String, i64, String)],
+        target_message_id: Option<&str>,
+        prerequisite_metadata: Option<&str>,
+    ) -> BaselineWorktreeOutcome {
         let mut attempts: Vec<BaselineAttempt> = Vec::new();
+        let mut failure_summaries: Vec<crate::email_text::ApplyFailureSummary> = Vec::new();
+        let total_parts = diffs.len();
         let prerequisites = match resolve_prerequisites_from_lore(
             &ctx.db,
             patchset_id,
@@ -1838,6 +1911,10 @@ impl Reviewer {
                     status: current_status,
                     log: current_log,
                 });
+                failure_summaries.push(crate::email_text::ApplyFailureSummary {
+                    baseline: baseline_ref,
+                    outcome: crate::email_text::ApplyAttemptOutcome::BaselineUnavailable,
+                });
                 continue;
             }
 
@@ -1861,6 +1938,10 @@ impl Reviewer {
                         baseline: baseline_ref.clone(),
                         status: current_status,
                         log: current_log,
+                    });
+                    failure_summaries.push(crate::email_text::ApplyFailureSummary {
+                        baseline: baseline_ref,
+                        outcome: crate::email_text::ApplyAttemptOutcome::BaselineUnavailable,
                     });
                     continue;
                 }
@@ -1921,6 +2002,7 @@ impl Reviewer {
             let mut application_failed = false;
             let mut apply_logs = String::new();
             let mut review_baseline_sha = baseline_sha.clone();
+            let mut attempt_outcome: Option<crate::email_text::ApplyAttemptOutcome> = None;
 
             match Self::apply_prerequisites(
                 &worktree,
@@ -1933,6 +2015,8 @@ impl Reviewer {
                 Ok(sha) => review_baseline_sha = sha,
                 Err(e) => {
                     apply_logs.push_str(&format!("{e}\n"));
+                    attempt_outcome =
+                        Some(crate::email_text::ApplyAttemptOutcome::PrerequisitesFailed);
                     application_failed = true;
                 }
             }
@@ -1988,6 +2072,11 @@ impl Reviewer {
                                 "Patch {}/{} (ID: {}) has an invalid date: {}\n",
                                 patchset_id, index, patch_id, e
                             ));
+                            attempt_outcome =
+                                Some(crate::email_text::ApplyAttemptOutcome::InvalidPatchDate {
+                                    part_index: *index,
+                                    total_parts,
+                                });
                             application_failed = true;
                             break;
                         }
@@ -1997,10 +2086,14 @@ impl Reviewer {
                     match worktree.apply_patch(&mbox).await {
                         Ok(()) => applied = true,
                         Err(e) => {
-                            apply_logs.push_str(&format!(
-                                "Patch application error: {}\n",
-                                PatchApplyFailure::from_error(&e).public_message()
-                            ));
+                            let reason = PatchApplyFailure::from_error(&e).public_message();
+                            apply_logs.push_str(&format!("Patch application error: {}\n", reason));
+                            attempt_outcome =
+                                Some(crate::email_text::ApplyAttemptOutcome::PatchFailed {
+                                    part_index: *index,
+                                    total_parts,
+                                    reason,
+                                });
                         }
                     }
                 }
@@ -2057,11 +2150,12 @@ impl Reviewer {
                         candidate.as_str(),
                         attempts.len()
                     );
-                    return (
-                        Some((bid, worktree, review_baseline_sha)),
+                    return BaselineWorktreeOutcome {
+                        found: Some((bid, worktree, review_baseline_sha)),
                         patch_commits,
                         logs_json,
-                    );
+                        failure_summaries,
+                    };
                 }
                 // Fallback if DB insert fails, though unlikely
                 // We still return success but maybe log error.
@@ -2088,6 +2182,11 @@ impl Reviewer {
                     status: current_status,
                     log: current_log,
                 });
+                failure_summaries.push(crate::email_text::ApplyFailureSummary {
+                    baseline: baseline_ref,
+                    outcome: attempt_outcome
+                        .unwrap_or(crate::email_text::ApplyAttemptOutcome::BaselineUnavailable),
+                });
             }
 
             // Clean up failed worktree
@@ -2095,7 +2194,12 @@ impl Reviewer {
         }
 
         let logs_json = serde_json::to_string(&attempts).unwrap_or_default();
-        (None, HashMap::new(), logs_json)
+        BaselineWorktreeOutcome {
+            found: None,
+            patch_commits: HashMap::new(),
+            logs_json,
+            failure_summaries,
+        }
     }
 
     /// How many times a review completion or notification write is attempted
@@ -2585,7 +2689,7 @@ impl Reviewer {
         prompts_hash: Option<&str>,
         worktree_path: &Path,
         embargo_until: Option<i64>,
-    ) -> Vec<String> {
+    ) -> Vec<(Option<i64>, String)> {
         let mut failures = Vec::new();
         loop {
             let Some(job) = queue.lock().await.pop() else {
@@ -2603,10 +2707,16 @@ impl Reviewer {
                         "Failed to verify active claim before reviewing patch {}/{}: {}",
                         patchset_id, job.index, e
                     );
-                    failures.push(format!("patch {}: claim check failed: {e:#}", job.index));
+                    failures.push((
+                        Some(job.index),
+                        format!("patch {}: claim check failed: {e:#}", job.index),
+                    ));
                     let skipped: Vec<ValidJob> = queue.lock().await.drain(..).collect();
                     failures.extend(skipped.iter().rev().map(|j| {
-                        format!("patch {}: not reviewed after a failed claim check", j.index)
+                        (
+                            Some(j.index),
+                            format!("patch {}: not reviewed after a failed claim check", j.index),
+                        )
                     }));
                     break;
                 }
@@ -2633,16 +2743,16 @@ impl Reviewer {
                     queue.lock().await.clear();
                     break;
                 }
-                Ok(PatchResult::ReviewFailed) => failures.push(format!(
-                    "patch {}: review failed, see its review log",
-                    job.index
+                Ok(PatchResult::ReviewFailed) => failures.push((
+                    Some(job.index),
+                    format!("patch {}: review failed, see its review log", job.index),
                 )),
                 Err(e) => {
                     error!(
                         "Failed to process review for patch {}/{}: {}",
                         patchset_id, job.index, e
                     );
-                    failures.push(format!("patch {}: {e:#}", job.index));
+                    failures.push((Some(job.index), format!("patch {}: {e:#}", job.index)));
                 }
             }
         }
@@ -5486,6 +5596,92 @@ impl Reviewer {
         );
         Ok(())
     }
+
+    async fn queue_patchset_failure_email(
+        ctx: &ReviewContext,
+        patchset: &PatchsetRow,
+        notice: PatchsetFailureNotice<'_>,
+    ) -> Result<()> {
+        let Some(reply_ctx) = Self::resolve_patchset_reply_context(ctx, patchset).await? else {
+            return Ok(());
+        };
+        if Self::is_bot_loop_author(
+            &reply_ctx.policy,
+            &reply_ctx.author,
+            &reply_ctx.sender_address,
+        ) {
+            return Ok(());
+        }
+
+        let Some((fail_to, fail_cc)) = EmailRouter::resolve_failure_recipients(
+            &reply_ctx.policy,
+            &reply_ctx.to_list,
+            &reply_ctx.cc_list,
+            &reply_ctx.author,
+            &reply_ctx.sender_address,
+        ) else {
+            return Ok(());
+        };
+
+        let body = match notice {
+            PatchsetFailureNotice::ApplyFailed {
+                total_patches,
+                attempts,
+            } => crate::email_text::compose_apply_failure_email(
+                total_patches,
+                attempts,
+                &reply_ctx.target_url,
+            ),
+            PatchsetFailureNotice::ReviewFailed {
+                total_patches,
+                failed_patch_indices,
+            } => crate::email_text::compose_review_failure_email(
+                total_patches,
+                failed_patch_indices,
+                &reply_ctx.target_url,
+            ),
+        };
+
+        let to_json = serde_json::to_string(&fail_to)?;
+        let cc_json = serde_json::to_string(&fail_cc)?;
+        ctx.db
+            .insert_patchset_email_outbox(
+                patchset.id,
+                crate::db::EmailKind::PatchsetFailure,
+                reply_ctx.outbox_status,
+                &to_json,
+                &cc_json,
+                &reply_ctx.reply_subject,
+                &reply_ctx.in_reply_to,
+                &reply_ctx.references_hdr,
+                &body,
+            )
+            .await?;
+
+        debug!(
+            "Queued opt-in failure notification email for patchset {}",
+            patchset.id
+        );
+        Ok(())
+    }
+}
+
+struct BaselineWorktreeOutcome {
+    found: Option<(i64, GitWorktree, String)>,
+    patch_commits: HashMap<i64, String>,
+    logs_json: String,
+    failure_summaries: Vec<crate::email_text::ApplyFailureSummary>,
+}
+
+enum PatchsetFailureNotice<'a> {
+    ApplyFailed {
+        total_patches: usize,
+        attempts: &'a [crate::email_text::ApplyFailureSummary],
+    },
+    ReviewFailed {
+        total_patches: usize,
+        failed_patch_indices: &'a [i64],
+    },
 }
 
 struct PatchsetReplyContext {
@@ -10131,6 +10327,330 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             summary_count, 0,
             "all-issues series must not queue summary email"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_opt_in_patchset_failure_notification_emails() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let policy_path = temp_dir.path().join("mailing_lists.toml");
+        std::fs::write(
+            &policy_path,
+            r#"
+            [defaults]
+            reply_to = []
+            failed_review = "none"
+
+            ["opt-in-author@vger.kernel.org"]
+            reply_to = ["author", "list"]
+            failed_review = "author"
+
+            ["opt-in-all@vger.kernel.org"]
+            reply_to = ["author", "list"]
+            cc = ["maint@example.org"]
+            failed_review = "all"
+
+            ["opt-out@vger.kernel.org"]
+            reply_to = ["author", "list"]
+            "#,
+        )?;
+
+        let mut settings = Settings::new().unwrap();
+        settings.database.url = ":memory:".to_string();
+        settings.review.email_policy_path = policy_path.to_str().unwrap().to_string();
+        settings.smtp = Some(crate::settings::SmtpSettings {
+            transport: crate::settings::MailTransport::Smtp,
+            server: Some("smtp.example.org".to_string()),
+            port: Some(465),
+            username: None,
+            password: None,
+            sendmail_path: None,
+            sender_address: "sashiko@sashiko.dev".to_string(),
+            reply_to: None,
+            dry_run: false,
+        });
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(1)),
+            db: db.clone(),
+            settings: settings.clone(),
+            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None, None)?),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+            worker_overrides: WorkerSubprocessOverrides::default(),
+        };
+
+        let make_ps = |id: i64, mid: &str, subj: &str, mr_url: Option<&str>| PatchsetRow {
+            id,
+            subject: Some(subj.to_string()),
+            status: Some("Failed To Apply".to_string()),
+            thread_id: None,
+            author: Some("Dev <dev@example.org>".to_string()),
+            date: Some(1000),
+            message_id: Some(mid.to_string()),
+            total_parts: Some(3),
+            received_parts: Some(3),
+            mailing_lists: vec![],
+            subsystems: vec![],
+            findings_low: None,
+            findings_medium: None,
+            findings_high: None,
+            findings_critical: None,
+            baseline_id: None,
+            slug: None,
+            failed_reason: None,
+            skip_filters: None,
+            only_filters: None,
+            target_review_count: Some(1),
+            model_name: None,
+            prompts_git_hash: None,
+            baseline_logs: None,
+            provider: None,
+            embargo_until: None,
+            mr_url: mr_url.map(str::to_string),
+            mr_title: None,
+            mr_number: None,
+            priority: None,
+        };
+
+        // 1. FailedToApply on opt-in-author list -> 1 PatchsetFailure email to author only.
+        let t1 = db
+            .create_thread("cover-f1@example.org", "[PATCH 0/3] fail1", 100)
+            .await?;
+        db.create_message(
+            "cover-f1@example.org",
+            t1,
+            None,
+            "Dev <dev@example.org>",
+            "[PATCH 0/3] fail1",
+            100,
+            "Cover\n",
+            "opt-in-author@vger.kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps1 = db
+            .create_patchset(
+                t1,
+                Some("cover-f1@example.org"),
+                "cover-f1@example.org",
+                "[PATCH 0/3] fail1",
+                "Dev <dev@example.org>",
+                100,
+                3,
+                0,
+                "opt-in-author@vger.kernel.org",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let attempts = vec![crate::email_text::ApplyFailureSummary {
+            baseline: "bpf-next/master".to_string(),
+            outcome: crate::email_text::ApplyAttemptOutcome::PatchFailed {
+                part_index: 2,
+                total_parts: 3,
+                reason: "context does not match",
+            },
+        }];
+        Reviewer::queue_patchset_failure_email(
+            &ctx,
+            &make_ps(ps1, "cover-f1@example.org", "[PATCH 0/3] fail1", None),
+            PatchsetFailureNotice::ApplyFailed {
+                total_patches: 3,
+                attempts: &attempts,
+            },
+        )
+        .await?;
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, to_addresses, cc_addresses, in_reply_to, body
+                   FROM email_outbox
+                  WHERE patchset_id = ? AND kind = 'patchset_failure'",
+                libsql::params![ps1],
+            )
+            .await?;
+        let row = rows.next().await?.expect("apply failure email queued");
+        assert_eq!(row.get::<String>(0)?, "Pending");
+        assert_eq!(row.get::<String>(1)?, "[\"Dev <dev@example.org>\"]");
+        assert_eq!(row.get::<String>(2)?, "[]");
+        assert_eq!(row.get::<String>(3)?, "cover-f1@example.org");
+        let body: String = row.get(4)?;
+        assert!(
+            body.contains("bpf-next/master: patch 2/3 failed to apply (context does not match)"),
+            "{body}"
+        );
+
+        // 2. FailedToApply on opt-out list -> 0 emails.
+        let t2 = db
+            .create_thread("cover-f2@example.org", "[PATCH 0/3] fail2", 200)
+            .await?;
+        db.create_message(
+            "cover-f2@example.org",
+            t2,
+            None,
+            "Dev <dev@example.org>",
+            "[PATCH 0/3] fail2",
+            200,
+            "Cover\n",
+            "opt-out@vger.kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps2 = db
+            .create_patchset(
+                t2,
+                Some("cover-f2@example.org"),
+                "cover-f2@example.org",
+                "[PATCH 0/3] fail2",
+                "Dev <dev@example.org>",
+                200,
+                3,
+                0,
+                "opt-out@vger.kernel.org",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        Reviewer::queue_patchset_failure_email(
+            &ctx,
+            &make_ps(ps2, "cover-f2@example.org", "[PATCH 0/3] fail2", None),
+            PatchsetFailureNotice::ApplyFailed {
+                total_patches: 3,
+                attempts: &attempts,
+            },
+        )
+        .await?;
+        let count2: i64 = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM email_outbox WHERE patchset_id = ?",
+                libsql::params![ps2],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get(0)?;
+        assert_eq!(count2, 0, "opt-out list must not receive failure email");
+
+        // 3. ReviewFailed on opt-in-all list -> 1 PatchsetFailure email to author + list + cc.
+        let t3 = db
+            .create_thread("cover-f3@example.org", "[PATCH 0/4] fail3", 300)
+            .await?;
+        db.create_message(
+            "cover-f3@example.org",
+            t3,
+            None,
+            "Dev <dev@example.org>",
+            "[PATCH 0/4] fail3",
+            300,
+            "Cover\n",
+            "opt-in-all@vger.kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps3 = db
+            .create_patchset(
+                t3,
+                Some("cover-f3@example.org"),
+                "cover-f3@example.org",
+                "[PATCH 0/4] fail3",
+                "Dev <dev@example.org>",
+                300,
+                4,
+                0,
+                "opt-in-all@vger.kernel.org",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        Reviewer::queue_patchset_failure_email(
+            &ctx,
+            &make_ps(ps3, "cover-f3@example.org", "[PATCH 0/4] fail3", None),
+            PatchsetFailureNotice::ReviewFailed {
+                total_patches: 4,
+                failed_patch_indices: &[2, 4],
+            },
+        )
+        .await?;
+        let mut rows3 = db
+            .conn
+            .query(
+                "SELECT to_addresses, cc_addresses, body FROM email_outbox WHERE patchset_id = ? AND kind = 'patchset_failure'",
+                libsql::params![ps3],
+            )
+            .await?;
+        let row3 = rows3.next().await?.expect("review failure email queued");
+        let to3: Vec<String> = serde_json::from_str(&row3.get::<String>(0)?)?;
+        let cc3: Vec<String> = serde_json::from_str(&row3.get::<String>(1)?)?;
+        let body3: String = row3.get(2)?;
+        assert!(to3.contains(&"Dev <dev@example.org>".to_string()));
+        assert!(to3.contains(&"opt-in-all@vger.kernel.org".to_string()));
+        assert_eq!(cc3, vec!["maint@example.org".to_string()]);
+        assert!(
+            body3.contains("Patches that could not be reviewed: 2 and 4."),
+            "{body3}"
+        );
+
+        // 4. Forge PR never queues mailing-list failure email.
+        Reviewer::queue_patchset_failure_email(
+            &ctx,
+            &make_ps(
+                ps2,
+                "cover-f2@example.org",
+                "[PATCH 0/3] pr",
+                Some("https://github.com/org/repo/pull/1"),
+            ),
+            PatchsetFailureNotice::ReviewFailed {
+                total_patches: 3,
+                failed_patch_indices: &[1],
+            },
+        )
+        .await?;
+        let count_pr: i64 = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM email_outbox WHERE patchset_id = ?",
+                libsql::params![ps2],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get(0)?;
+        assert_eq!(count_pr, 0);
 
         Ok(())
     }
