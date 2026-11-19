@@ -362,6 +362,152 @@ pub fn compose_patchset_summary_email(
     Some(body)
 }
 
+/// Finite, public-safe classification of why a candidate baseline could not
+/// apply a patchset. Contains only static reason strings — never raw git
+/// output, stderr, filenames, or internal error messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyAttemptOutcome {
+    PatchFailed {
+        part_index: i64,
+        total_parts: usize,
+        reason: &'static str,
+    },
+    InvalidPatchDate {
+        part_index: i64,
+        total_parts: usize,
+    },
+    PrerequisitesFailed,
+    BaselineUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyFailureSummary {
+    pub baseline: String,
+    pub outcome: ApplyAttemptOutcome,
+}
+
+const MAX_FAILURE_BASELINES_IN_EMAIL: usize = 6;
+
+/// Composes a plain-text email explaining that a patch or series could not be
+/// applied to any candidate baseline.
+pub fn compose_apply_failure_email(
+    total_patches: usize,
+    attempts: &[ApplyFailureSummary],
+    target_url: &str,
+) -> String {
+    let subject_noun = if total_patches <= 1 {
+        "this patch"
+    } else {
+        "this patch series"
+    };
+    let mut body = wrap(
+        &format!(
+            "Sashiko was unable to apply {subject_noun} cleanly to any candidate baseline, so it could not be reviewed."
+        ),
+        "",
+        "",
+    );
+
+    if !attempts.is_empty() {
+        body.push_str("\nBaselines tried:\n");
+        let shown = attempts.len().min(MAX_FAILURE_BASELINES_IN_EMAIL);
+        for attempt in &attempts[..shown] {
+            let baseline = crate::patch::clean_display_name(&attempt.baseline);
+            let detail = match &attempt.outcome {
+                ApplyAttemptOutcome::PatchFailed {
+                    part_index,
+                    total_parts,
+                    reason,
+                } => {
+                    if *total_parts <= 1 {
+                        format!("failed to apply ({reason})")
+                    } else {
+                        format!("patch {part_index}/{total_parts} failed to apply ({reason})")
+                    }
+                }
+                ApplyAttemptOutcome::InvalidPatchDate {
+                    part_index,
+                    total_parts,
+                } => {
+                    if *total_parts <= 1 {
+                        "invalid patch date header".to_string()
+                    } else {
+                        format!("patch {part_index}/{total_parts} has an invalid date header")
+                    }
+                }
+                ApplyAttemptOutcome::PrerequisitesFailed => {
+                    "prerequisite patches failed to apply".to_string()
+                }
+                ApplyAttemptOutcome::BaselineUnavailable => "baseline ref unavailable".to_string(),
+            };
+            body.push_str(&wrap(&format!("{baseline}: {detail}"), "- ", "  "));
+        }
+        if attempts.len() > shown {
+            let extra = attempts.len() - shown;
+            body.push_str(&wrap(&format!("... and {extra} more."), "- ", "  "));
+        }
+    }
+
+    body.push('\n');
+    body.push_str(&wrap(
+        "Tip: sending patches with git format-patch --base=<commit> (adding a base-commit: trailer) or targeting the expected subsystem tree helps Sashiko select the right baseline.",
+        "",
+        "",
+    ));
+    body.push_str(&format!("\n-- \nSashiko AI review · {target_url}\n"));
+    body
+}
+
+/// Composes a plain-text email explaining that Sashiko could not complete the
+/// review after exhausting retries. Never interpolates internal error strings
+/// or findings from sibling patches.
+pub fn compose_review_failure_email(
+    total_patches: usize,
+    failed_patch_indices: &[i64],
+    target_url: &str,
+) -> String {
+    let subject_noun = if total_patches <= 1 {
+        "this patch".to_string()
+    } else {
+        format!("this {total_patches}-patch series")
+    };
+    let mut body = wrap(
+        &format!(
+            "Sashiko could not complete the review of {subject_noun} after multiple attempts."
+        ),
+        "",
+        "",
+    );
+
+    if total_patches > 1 && !failed_patch_indices.is_empty() {
+        let mut unique = failed_patch_indices.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let label = if unique.len() == 1 {
+            format!(
+                "Patch that could not be reviewed: {}.",
+                format_patch_ranges(&unique)
+            )
+        } else {
+            format!(
+                "Patches that could not be reviewed: {}.",
+                format_patch_ranges(&unique)
+            )
+        };
+        body.push('\n');
+        body.push_str(&wrap(&label, "", ""));
+    }
+
+    body.push('\n');
+    body.push_str(&wrap(
+        "You can check the review status at the link below.",
+        "",
+        "",
+    ));
+    body.push_str(&format!("\n-- \nSashiko AI review · {target_url}\n"));
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +677,59 @@ mod tests {
                 assert!(line.len() <= WRAP_WIDTH, "line exceeded 72 cols: {line:?}");
             }
         }
+    }
+
+    #[test]
+    fn test_compose_apply_and_review_failure_emails() {
+        let url = "https://sashiko.dev/#/patchset/fail@example.org";
+        let attempts: Vec<ApplyFailureSummary> = (1..=8)
+            .map(|i| ApplyFailureSummary {
+                baseline: format!("tree-{i}/master"),
+                outcome: if i == 1 {
+                    ApplyAttemptOutcome::PatchFailed {
+                        part_index: 2,
+                        total_parts: 3,
+                        reason: "context does not match",
+                    }
+                } else {
+                    ApplyAttemptOutcome::BaselineUnavailable
+                },
+            })
+            .collect();
+
+        let apply_body = compose_apply_failure_email(3, &attempts, url);
+        assert!(apply_body.contains("unable to apply this patch series cleanly"));
+        assert!(
+            apply_body
+                .contains("- tree-1/master: patch 2/3 failed to apply (context does not match)")
+        );
+        assert!(apply_body.contains("- ... and 2 more."));
+        assert!(apply_body.contains("git format-patch --base=<commit>"));
+        for line in apply_body.lines() {
+            if !line.contains("https://") {
+                assert!(line.len() <= WRAP_WIDTH, "line exceeded 72 cols: {line:?}");
+            }
+        }
+
+        let review_body = compose_review_failure_email(5, &[3, 5], url);
+        let review_flat = review_body.replace('\n', " ");
+        assert!(
+            review_flat.contains("5-patch series after multiple attempts."),
+            "{review_body}"
+        );
+        assert!(review_body.contains("Patches that could not be reviewed: 3 and 5."));
+        for line in review_body.lines() {
+            if !line.contains("https://") {
+                assert!(line.len() <= WRAP_WIDTH, "line exceeded 72 cols: {line:?}");
+            }
+        }
+
+        let single_body = compose_review_failure_email(1, &[1], url);
+        let single_flat = single_body.replace('\n', " ");
+        assert!(
+            single_flat.contains("this patch after multiple attempts."),
+            "{single_body}"
+        );
+        assert!(!single_body.contains("Patches that could not be reviewed"));
     }
 }

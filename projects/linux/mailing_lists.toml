@@ -22,6 +22,13 @@ reply_to = []
 # - "all": send positive review to the full resolved recipient set
 positive_review = "none"
 
+# When a patchset fails to apply or fails review after all retries, who
+# receives the failure notification email (strictly opt-in):
+# - "none": do not send failure emails (default)
+# - "author": send failure notice only to the patchset author
+# - "all": send failure notice to opted-in lists/CCs and author
+failed_review = "none"
+
 # If true, completely mutes (suppresses) outbound emails for this scope.
 mute_all = false
 

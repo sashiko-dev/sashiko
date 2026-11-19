@@ -103,6 +103,11 @@ pub enum PositiveReviewPolicy {
     All,
 }
 
+/// Who receives an opt-in notification email when a patchset fails to apply
+/// or fails review after exhausting all retries. Shares the same scopes as
+/// [`PositiveReviewPolicy`]: `"none"` (default), `"author"`, or `"all"`.
+pub type FailedReviewPolicy = PositiveReviewPolicy;
+
 fn default_true() -> bool {
     true
 }
@@ -225,6 +230,8 @@ pub struct DefaultListPolicy {
     #[serde(default)]
     pub positive_review: PositiveReviewPolicy,
     #[serde(default)]
+    pub failed_review: FailedReviewPolicy,
+    #[serde(default)]
     pub mute_all: bool,
     #[serde(default)]
     pub cc: Vec<String>,
@@ -244,6 +251,7 @@ impl Default for DefaultListPolicy {
             track: true,
             reply_to: Vec::new(),
             positive_review: PositiveReviewPolicy::None,
+            failed_review: FailedReviewPolicy::None,
             mute_all: false,
             cc: Vec::new(),
             ignored_emails: Vec::new(),
@@ -360,6 +368,7 @@ pub struct MailingListPolicy {
     pub nntp_group: Option<String>,
     pub reply_to: Option<Vec<ReplyTarget>>,
     pub positive_review: Option<PositiveReviewPolicy>,
+    pub failed_review: Option<FailedReviewPolicy>,
     pub mute_all: Option<bool>,
     #[serde(default)]
     pub cc: Vec<String>,
@@ -1230,5 +1239,33 @@ mod tests {
             allowed_paths = [""]
         "#;
         assert!(EmailPolicyConfig::parse_content(invalid).is_err());
+    }
+    #[test]
+    fn test_failed_review_policy_defaults_and_overrides() {
+        let default_cfg = EmailPolicyConfig::parse_content("").unwrap();
+        assert_eq!(default_cfg.defaults.failed_review, FailedReviewPolicy::None);
+
+        let cfg = EmailPolicyConfig::parse_content(
+            r#"
+            [defaults]
+            failed_review = "author"
+
+            ["bpf@vger.kernel.org"]
+            failed_review = "all"
+
+            ["netdev@vger.kernel.org"]
+            failed_review = "none"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.defaults.failed_review, FailedReviewPolicy::Author);
+        assert_eq!(
+            cfg.lists["bpf@vger.kernel.org"].failed_review,
+            Some(FailedReviewPolicy::All)
+        );
+        assert_eq!(
+            cfg.lists["netdev@vger.kernel.org"].failed_review,
+            Some(FailedReviewPolicy::None)
+        );
     }
 }
