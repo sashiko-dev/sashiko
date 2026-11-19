@@ -4478,6 +4478,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
         function fmtNum(n, digits = 0) {
             if (!Number.isFinite(n)) return '-';
+            if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(1) + 'B';
             if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M';
             if (Math.abs(n) >= 1e4 && digits === 0) return (n / 1e3).toFixed(1) + 'k';
             return digits > 0 ? n.toFixed(digits) : Math.round(n).toLocaleString('en-US');
@@ -4691,7 +4692,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             }
             if (tab === 'project') {
                 const w = state.statsProjectWin;
-                return `<select id="projectSubsystemSelect"><option value="">All Subsystems</option></select>
+                return `<select id="projectSubsystemSelect"><option value="">All Mailing Lists</option></select>
                     <button type="button" data-project-win="4w" class="${w === '4w' ? 'active' : ''}">4w</button>
                     <button type="button" data-project-win="12w" class="${w === '12w' ? 'active' : ''}">12w</button>
                     <button type="button" data-project-win="26w" class="${w === '26w' ? 'active' : ''}">26w</button>`;
@@ -4784,15 +4785,21 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 { id: 'workerRestarts', query: `sum(increase(sashiko_worker_restarts_total[${win}]))` },
                 { id: 'gitRemotes', query: 'sashiko_git_remotes' },
                 { id: 'gitMaxAge', query: 'sashiko_git_remote_max_age_seconds' },
+                { id: 'staleRemotes', query: 'sashiko_git_remote_stale_age_seconds' },
                 { id: 'nntpLag', query: 'sashiko_nntp_lag_articles{agg="total"}' },
                 { id: 'queueDepth', query: 'sashiko_queue_depth' },
                 { id: 'outboxDepth', query: 'sum(sashiko_outbox_depth{status="Pending"})' },
+                { id: 'emailOutboxDepth', query: 'sashiko_outbox_depth{channel="email"}' },
+                { id: 'emailEvCurr', query: `sum by (outcome) (increase(sashiko_outbox_events_total{channel="email"}[${win}]))` },
+                { id: 'emailSent7d', query: 'sum(increase(sashiko_outbox_events_total{channel="email",outcome="sent"}[7d]))' },
+                { id: 'emailSent30d', query: 'sum(increase(sashiko_outbox_events_total{channel="email",outcome="sent"}[30d]))' },
                 { id: 'fetchDepth', query: 'sashiko_fetch_queue_depth{status="Pending"}' },
                 { id: 'cooldown', query: 'sashiko_ai_quota_cooldown_seconds' },
                 { id: 'aiP90', query: `histogram_quantile(0.9, sum by (le) (increase(sashiko_ai_request_duration_seconds_bucket[${win}])))` },
                 { id: 'rngIng', query: `sum(increase(sashiko_messages_ingested_total[${stepStr}]))`, start: startStr, end: endStr, step: stepStr },
                 { id: 'rngIngOff', query: `sum(increase(sashiko_messages_ingested_total[${stepStr}] offset 7d))`, start: startStr, end: endStr, step: stepStr },
                 { id: 'rngRev', query: `sum by (status) (increase(sashiko_reviews_completed_total[${stepStr}]))`, start: startStr, end: endStr, step: stepStr },
+                { id: 'rngEmail', query: `sum by (outcome) (increase(sashiko_outbox_events_total{channel="email"}[${stepStr}]))`, start: startStr, end: endStr, step: stepStr },
                 { id: 'rngTok', query: `sum by (direction) (increase(sashiko_ai_tokens_total[${stepStr}]))`, start: startStr, end: endStr, step: stepStr },
                 { id: 'rngLogs', query: `sum by (level) (increase(sashiko_log_events_total[${stepStr}]))`, start: startStr, end: endStr, step: stepStr }
             ]);
@@ -4808,6 +4815,16 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const revFail = Math.round((revMap['Failed'] || 0) + (revMap['Failed To Apply'] || 0));
             const revAvg7 = promScalar(r.rev7d) / scale7d;
             const revAvg30 = promScalar(r.rev30d) / scale30d;
+
+            const emailDepthMap = promMapBy(r.emailOutboxDepth, 'status');
+            const emailPending = Math.round(emailDepthMap['Pending'] || 0);
+            const emailSending = Math.round(emailDepthMap['Sending'] || 0);
+            const emailSentAllTime = Math.round(emailDepthMap['Sent'] || 0);
+            const emailEvMap = promMapBy(r.emailEvCurr, 'outcome');
+            const emailSentCurr = Math.round(emailEvMap['sent'] || 0);
+            const emailFailCurr = Math.round(emailEvMap['failed'] || 0);
+            const emailSentAvg7 = promScalar(r.emailSent7d) / scale7d;
+            const emailSentAvg30 = promScalar(r.emailSent30d) / scale30d;
 
             const logMap = promMapBy(r.logByLvl, 'level');
             const errCnt = Math.round(logMap['error'] || 0);
@@ -4828,6 +4845,21 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const nntpLagVal = Math.round(promScalar(r.nntpLag));
             const cdSecs = promScalar(r.cooldown);
             const aiP90Val = promScalar(r.aiP90, NaN);
+
+            const staleStateRank = st => st === 'failed' ? 0 : st === 'backed_off' ? 1 : 2;
+            const staleList = (r.staleRemotes || [])
+                .map(s => ({
+                    remote: s.metric?.remote || '',
+                    state: s.metric?.state || 'stale',
+                    url: s.metric?.url || '',
+                    age: Number(s.value?.[1])
+                }))
+                .filter(s => s.remote)
+                .sort((a, b) => (staleStateRank(a.state) - staleStateRank(b.state))
+                    || ((a.age < 0 ? 1 : 0) - (b.age < 0 ? 1 : 0) === 0
+                        ? ((b.age || 0) - (a.age || 0))
+                        : (a.age < 0 ? -1 : 1))
+                    || a.remote.localeCompare(b.remote));
 
             const rows = [
                 [
@@ -4850,6 +4882,21 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     fmtBaseline(revAvg7),
                     fmtBaseline(revAvg30),
                     [revTot > 0 ? `${Math.round((revFail / revTot) * 100)}% failed` : '0 failed', fmtPctDelta(revTot, revAvg7)].filter(Boolean).join(' · ')
+                ],
+                [
+                    'Outgoing Emails',
+                    `${fmtNum(emailSentCurr)} sent`,
+                    fmtBaseline(emailSentAvg7),
+                    fmtBaseline(emailSentAvg30),
+                    {
+                        html: [
+                            `<strong class="${emailPending > 0 ? 'text-error-bold' : ''}">${escapeHtml(fmtNum(emailPending))} pending</strong>`,
+                            emailSending > 0 ? `${escapeHtml(fmtNum(emailSending))} sending` : '',
+                            emailFailCurr > 0 ? `<strong class="text-error-bold">${escapeHtml(fmtNum(emailFailCurr))} failed</strong>` : '0 failed',
+                            `${escapeHtml(fmtNum(emailSentAllTime))} total sent`,
+                            escapeHtml(fmtPctDelta(emailSentCurr, emailSentAvg7))
+                        ].filter(Boolean).join(' · ')
+                    }
                 ],
                 [
                     'Errors',
@@ -4880,9 +4927,24 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             html += `<h2>Ingestion vs 7d Ago</h2><div class="stats-chart-wrap"><div id="health-chart-ingest" class="chart-container"></div></div>`;
             html += `<h2>Review Outcomes</h2><div class="stats-chart-wrap"><div id="health-chart-reviews" class="chart-container"></div></div>`;
+            html += `<h2>Outgoing Emails</h2><div class="stats-chart-wrap"><div id="health-chart-emails" class="chart-container"></div></div>`;
             html += `<h2>Token Burn</h2><div class="stats-chart-wrap"><div id="health-chart-tokens" class="chart-container"></div></div>`;
             if (errCnt > 0 || warnCnt > 0) {
                 html += `<h2>Errors &amp; Warnings</h2><div class="stats-chart-wrap"><div id="health-chart-logs" class="chart-container"></div></div>`;
+            }
+            html += `<h2>Stale Git Trees</h2>`;
+            if (staleList.length > 0) {
+                html += `<div class="stats-table-wrap"><table class="stats-table">
+                    <thead><tr><th>Remote</th><th>State</th><th>Last Sync</th><th>URL</th></tr></thead>
+                    <tbody>${staleList.map(item => `<tr>
+                        <td><strong>${escapeHtml(item.remote)}</strong></td>
+                        <td><span class="${item.state === 'failed' ? 'text-error-bold' : ''}">${escapeHtml(item.state.replace('_', ' '))}</span></td>
+                        <td>${item.age >= 0 && Number.isFinite(item.age) ? `${escapeHtml(fmtSecs(item.age))} ago` : 'never'}</td>
+                        <td>${escapeHtml(item.url || '-')}</td>
+                    </tr>`).join('')}</tbody>
+                </table></div>`;
+            } else {
+                html += `<p class="text-muted-sm">All ${fmtNum(freshCnt)} configured git trees are fresh.</p>`;
             }
 
             const container = document.getElementById('stats-content');
@@ -4913,6 +4975,21 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 series: r.rngRev.map(s => {
                     const st = s.metric?.status || 'Other';
                     return { name: st, type: 'bar', stack: 'rev', itemStyle: { color: revColor(st) }, data: seriesIntsAt(s, axis.sorted) };
+                })
+            });
+
+            mountStatsChart('health-chart-emails', {
+                legend: { bottom: 0 },
+                grid: { left: '3%', right: '4%', bottom: '12%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: axis.labels },
+                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                series: [
+                    { name: 'Sent', outcome: 'sent', color: pal.ok },
+                    { name: 'Failed', outcome: 'failed', color: pal.fail },
+                    { name: 'Dry Run', outcome: 'dry_run', color: pal.muted }
+                ].map(cfg => {
+                    const found = (r.rngEmail || []).find(s => s.metric?.outcome === cfg.outcome);
+                    return { name: cfg.name, type: 'bar', stack: 'email', itemStyle: { color: cfg.color }, data: seriesIntsAt(found, axis.sorted) };
                 })
             });
 
@@ -4982,7 +5059,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 const name = item.metric?.subsystem;
                 const facet = item.metric?.facet;
                 if (!name || !facet) continue;
-                if (!subs[name]) subs[name] = { open: 0, fixed: 0, total: 0, high_crit_open: 0, sec_high_crit_open: 0 };
+                if (!subs[name]) subs[name] = { open: 0, fixed: 0, fixed_60d: 0, total: 0, high_crit_open: 0, sec_high_crit_open: 0 };
                 subs[name][facet] = Math.round(Number(item.value?.[1]) || 0);
             }
             const subRows = Object.entries(subs)
@@ -5000,14 +5077,15 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             html += `<h2>Open Bugs by Severity: Engineering vs CVSS v4.0 <span class="text-muted-sm">non-security: ${fmtNum(secOpenMap['none'] || 0)} · hardening: ${fmtNum(secClsMap['hardening'] || 0)}</span></h2><div class="stats-chart-wrap"><div id="bugs-chart-severity" class="chart-container"></div></div>`;
 
             if (subRows.length > 0) {
-                html += `<h2>Subsystems with Most Open Bugs</h2><div class="stats-chart-wrap"><div id="bugs-chart-subsystems" class="chart-container"></div></div>`;
+                html += `<h2>Subsystems with Most Open Bugs <span class="text-muted-sm">open vs fixed in last 60d</span></h2><div class="stats-chart-wrap"><div id="bugs-chart-subsystems" class="chart-container"></div></div>`;
                 html += `<h2>Bugs by MAINTAINERS Subsystem</h2><div class="stats-table-wrap"><table class="stats-table">
-                    <thead><tr><th>Subsystem</th><th>Open</th><th>Eng High/Crit</th><th>CVSS High/Crit</th><th>Fixed</th><th>Total</th></tr></thead>
+                    <thead><tr><th>Subsystem</th><th>Open</th><th>Eng High/Crit</th><th>CVSS High/Crit</th><th>Fixed (60d)</th><th>Fixed (All)</th><th>Total</th></tr></thead>
                     <tbody>${subRows.slice(0, 50).map(([name, f]) => `<tr>
                         <td><a href="#/?mode=bugs&subsystem=${encodeURIComponent(name)}">${escapeHtml(name)}</a></td>
                         <td><strong>${fmtNum(f.open)}</strong></td>
                         <td>${fmtNum(f.high_crit_open)}</td>
                         <td>${fmtNum(f.sec_high_crit_open)}</td>
+                        <td>${fmtNum(f.fixed_60d)}</td>
                         <td>${fmtNum(f.fixed)}</td>
                         <td>${fmtNum(f.total)}</td>
                     </tr>`).join('')}</tbody>
@@ -5028,9 +5106,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const velAxis = buildFixedAxis(startSec, endSec, stepWeek, span12w);
             const relMark = buildReleaseMarkLine(r.releases, velAxis.sorted, velAxis.labels, stepWeek, pal);
             const velSeries = [
-                { name: 'Discovered', type: 'bar', itemStyle: { color: pal.pending }, data: seriesIntsAt(r.rngEvents.find(s => s.metric?.event === 'discovered'), velAxis.sorted) },
-                { name: 'Fixed', type: 'bar', itemStyle: { color: pal.ok }, data: seriesIntsAt(r.rngEvents.find(s => s.metric?.event === 'fixed'), velAxis.sorted) },
-                { name: 'Duplicate / Dismissed', type: 'bar', itemStyle: { color: pal.muted }, data: sumSeriesIntsAt(r.rngEvents.filter(s => s.metric?.event === 'duplicate' || s.metric?.event === 'dismissed'), velAxis.sorted) }
+                { name: 'Discovered', type: 'line', smooth: 0.2, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2 }, areaStyle: { opacity: 0.08 }, itemStyle: { color: pal.pending }, data: seriesIntsAt(r.rngEvents.find(s => s.metric?.event === 'discovered'), velAxis.sorted) },
+                { name: 'Fixed', type: 'line', smooth: 0.2, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2 }, areaStyle: { opacity: 0.08 }, itemStyle: { color: pal.ok }, data: seriesIntsAt(r.rngEvents.find(s => s.metric?.event === 'fixed'), velAxis.sorted) }
             ];
             if (relMark) velSeries[0].markLine = relMark;
             mountStatsChart('bugs-chart-velocity', {
@@ -5062,7 +5139,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     yAxis: { type: 'category', data: top12.map(row => row[0]) },
                     series: [
                         { name: 'Open', type: 'bar', stack: 's', itemStyle: { color: pal.pending }, data: top12.map(row => row[1].open) },
-                        { name: 'Fixed', type: 'bar', stack: 's', itemStyle: { color: pal.ok }, data: top12.map(row => row[1].fixed) }
+                        { name: 'Fixed (60d)', type: 'bar', stack: 's', itemStyle: { color: pal.ok }, data: top12.map(row => row[1].fixed_60d) }
                     ]
                 });
             }
@@ -5100,6 +5177,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             if (!selectedSub) {
                 queries.push(
                     { id: 'psCompleted', query: `sum by (status, clean) (increase(sashiko_patchsets_completed_total[${win}]))`, time: endStr },
+                    { id: 'patchesReviewed', query: `sum by (clean) (increase(sashiko_patches_reviewed_total[${win}]))`, time: endStr },
                     { id: 'priorByOrigin', query: `sum by (origin_kind, outcome) (increase(sashiko_prior_feedback_total[${win}]))`, time: endStr },
                     { id: 'rngFixups', query: 'sum by (outcome) (increase(sashiko_prior_feedback_total[7d]))', start: startStr, end: endStr, step: stepStr }
                 );
@@ -5115,7 +5193,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const subNames = Array.from(subNameSet).sort();
             const selEl = document.getElementById('projectSubsystemSelect');
             if (selEl) {
-                selEl.innerHTML = `<option value="">All Subsystems</option>` +
+                selEl.innerHTML = `<option value="">All Mailing Lists</option>` +
                     subNames.map(n => `<option value="${escapeHtml(n)}" ${n === selectedSub ? 'selected' : ''}>${escapeHtml(n)}</option>`).join('');
             }
 
@@ -5157,6 +5235,12 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 const cleanPct = compReviewed > 0 ? Math.round((compClean / compReviewed) * 100) + '%' : '-';
                 const ftaPct = compAll > 0 ? Math.round((compFta / compAll) * 100) + '%' : '-';
 
+                const patchRevMap = promMapBy(r.patchesReviewed || [], 'clean');
+                const patchClean = Math.round(patchRevMap['true'] || 0);
+                const patchDirty = Math.round(patchRevMap['false'] || 0);
+                const patchRevTot = patchClean + patchDirty;
+                const cleanPatchPct = patchRevTot > 0 ? Math.round((patchClean / patchRevTot) * 100) + '%' : '-';
+
                 const prior = {
                     sashiko_review: { addressed: 0, confirmed_finding: 0 },
                     human_reviewer: { addressed: 0, confirmed_finding: 0 },
@@ -5175,13 +5259,24 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 const fixupRate = (totAddressed + totUnaddr) > 0
                     ? Math.round((totAddressed / (totAddressed + totUnaddr)) * 100) + '%'
                     : '-';
+                const fmtOriginFix = (label, o) => {
+                    const tot = o.addressed + o.confirmed_finding;
+                    if (tot <= 0) return '';
+                    return `${label}: ${Math.round((o.addressed / tot) * 100)}% (${fmtNum(o.addressed)}/${fmtNum(tot)})`;
+                };
+                const priorDetail = [
+                    fmtOriginFix('Sashiko reviews', prior.sashiko_review),
+                    fmtOriginFix('Human reviewers', prior.human_reviewer),
+                    fmtOriginFix('Other bots (LKP/CI)', prior.automated_bot)
+                ].filter(Boolean).join(' · ') || 'no follow-up revisions checked';
 
                 summaryRows = [
                     ['Patchsets / Week', fmtNum(Math.round(psTotal / weeks)), `${fmtNum(psTotal)} total (${psTotal > 0 ? Math.round((v2PlusCnt / psTotal) * 100) + '% v2+ revisions' : '-'})`],
                     ['Patches / Week', fmtNum(Math.round(patchesCount / weeks)), `${fmtNum(patchesCount)} total (avg ${psTotal > 0 ? (patchesCount / psTotal).toFixed(1) : '-'} patches/series)`],
                     ['Clean Patchsets', cleanPct, `${fmtNum(compClean)} of ${fmtNum(compReviewed)} reviewed had 0 issues`],
+                    ['Clean Patches', cleanPatchPct, `${fmtNum(patchClean)} of ${fmtNum(patchRevTot)} reviewed had 0 issues`],
                     ['Issues / Patchset', compReviewed > 0 ? (fTotal / compReviewed).toFixed(2) : '-', `${patchesCount > 0 ? (fTotal / patchesCount).toFixed(2) : '-'} / patch · ${fmtNum(fHighCrit)} high/critical`],
-                    ['Author Fixup Rate (vN)', fixupRate, `${fmtNum(prior.sashiko_review.addressed)} Sashiko · ${fmtNum(prior.human_reviewer.addressed)} human · ${fmtNum(prior.automated_bot.addressed)} bot`],
+                    ['Issues Fixed in v2+ Revisions', fixupRate, priorDetail],
                     ['Failed To Apply', ftaPct, `${fmtNum(compFta)} baseline misses`]
                 ];
             }
@@ -5191,7 +5286,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             html += `<h2>Weekly Patchsets &amp; Patches</h2><div class="stats-chart-wrap"><div id="project-chart-volume" class="chart-container"></div></div>`;
             html += `<h2>Issues Discovered per Week by Severity</h2><div class="stats-chart-wrap"><div id="project-chart-findings" class="chart-container"></div></div>`;
             if (!selectedSub) {
-                html += `<h2>Follow-up Revision (vN) Fixups per Week</h2><div class="stats-chart-wrap"><div id="project-chart-fixups" class="chart-container"></div></div>`;
+                html += `<h2>Issues from Prior Versions: Fixed vs Left Unfixed in v2+</h2><div class="stats-chart-wrap"><div id="project-chart-fixups" class="chart-container"></div></div>`;
             }
 
             const subPatchMap = promMapBy(r.subPatchesAll, 'subsystem');
@@ -5211,8 +5306,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 .sort((a, b) => b.ps - a.ps);
 
             if (leaderRows.length > 0) {
-                html += `<h2>Subsystem Volume &amp; Issue Density</h2><div class="stats-table-wrap"><table class="stats-table">
-                    <thead><tr><th>Subsystem</th><th>Patchsets</th><th>Patches</th><th>Issues</th><th>Issues / Patchset</th><th>Issues / Patch</th></tr></thead>
+                html += `<h2>Mailing List Volume &amp; Issue Density</h2><div class="stats-table-wrap"><table class="stats-table">
+                    <thead><tr><th>Mailing List</th><th>Patchsets</th><th>Patches</th><th>Issues</th><th>Issues / Patchset</th><th>Issues / Patch</th></tr></thead>
                     <tbody>${leaderRows.slice(0, 30).map(row => `<tr>
                         <td>${escapeHtml(row.name)}</td>
                         <td>${fmtNum(row.ps)}</td>
@@ -5268,8 +5363,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             if (!selectedSub) {
                 const fxSeries = [
-                    { name: 'Addressed in vN', type: 'bar', stack: 'fx', itemStyle: { color: pal.ok }, data: seriesIntsAt((r.rngFixups || []).find(s => s.metric?.outcome === 'addressed'), axis.sorted) },
-                    { name: 'Still Unaddressed', type: 'bar', stack: 'fx', itemStyle: { color: pal.fail }, data: seriesIntsAt((r.rngFixups || []).find(s => s.metric?.outcome === 'confirmed_finding'), axis.sorted) }
+                    { name: 'Fixed in v2+', type: 'bar', stack: 'fx', itemStyle: { color: pal.ok }, data: seriesIntsAt((r.rngFixups || []).find(s => s.metric?.outcome === 'addressed'), axis.sorted) },
+                    { name: 'Left Unfixed', type: 'bar', stack: 'fx', itemStyle: { color: pal.fail }, data: seriesIntsAt((r.rngFixups || []).find(s => s.metric?.outcome === 'confirmed_finding'), axis.sorted) }
                 ];
                 if (relMark) fxSeries[0].markLine = relMark;
                 mountStatsChart('project-chart-fixups', {
@@ -5316,7 +5411,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             const rawConcerns = Math.round(funnel['raw_concerns'] || 0);
             const stage1Dism = Math.round(funnel['stage1_dismissed'] || 0);
-            const stage1Candidates = rawConcerns + stage1Dism;
             const v1a = Math.round(funnel['verified_1a'] || 0);
             const v1b = Math.round(funnel['dismissed_1b'] || 0);
             const inc = Math.round(funnel['inconclusive'] || 0);
@@ -5325,7 +5419,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const dpv = Math.round(funnel['dismissed_pv'] || 0);
             const totalVerified = v1a + vpv;
             const totalDismissedVerify = v1b + dpv;
-            const finalReported = Math.round((funnel['findings_patch'] || 0) + (funnel['findings_preexisting'] || 0));
+            const reportedPatch = Math.round(funnel['findings_patch'] || 0);
+            const reportedPreex = Math.round(funnel['findings_preexisting'] || 0);
             const verifyDismissPct = verifyCandidates > 0 ? Math.round((totalDismissedVerify / verifyCandidates) * 100) + '%' : '-';
 
             const stages = {};
@@ -5361,8 +5456,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const hmRecall = hmUnaddr > 0 ? Math.round(((priorAl['hm_also_found'] || 0) / hmUnaddr) * 100) + '%' : '-';
 
             const summaryRows = [
-                ['Verify Dismissal Rate', verifyDismissPct, `${fmtNum(totalDismissedVerify)} dismissed · ${fmtNum(totalVerified)} confirmed of ${fmtNum(verifyCandidates)} verified`],
-                ['Findings / Review', nRev > 0 ? (finalReported / nRev).toFixed(2) : '-', `${fmtNum(finalReported)} reported across ${fmtNum(nRev)} reviews`],
+                ['Verify Dismissal Rate', verifyDismissPct, `${fmtNum(totalDismissedVerify)} dismissed · ${fmtNum(totalVerified)} confirmed of ${fmtNum(verifyCandidates)} after dedup`],
+                ['Findings / Review', nRev > 0 ? (reportedPatch / nRev).toFixed(2) : '-', `${fmtNum(reportedPatch)} patch findings${reportedPreex > 0 ? ` · ${fmtNum(reportedPreex)} pre-existing bugs` : ''} across ${fmtNum(nRev)} reviews`],
                 ['Exclusive Stage Catches', totalStageConfirmed > 0 ? Math.round((totalExclusive / totalStageConfirmed) * 100) + '%' : '-', `${fmtNum(totalExclusive)} of ${fmtNum(totalStageConfirmed)} confirmed unique to 1 stage`],
                 ['Tokens / Review', nRev > 0 ? fmtNum(totTok / nRev) : '-', `${cachePct} prompt cache · ${nRev > 0 ? fmtNum((tokMap['out'] || 0) / nRev) : '-'} output`]
             ];
@@ -5373,7 +5468,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             let html = `<h2>Review Pipeline</h2>` +
                 renderSummaryTable(['Metric', 'Value', 'Detail'], summaryRows);
 
-            html += `<h2>Verification Funnel <span class="text-muted-sm">dismissed in verify: ${fmtNum(v1b)} (1b) + ${fmtNum(dpv)} (post-verify)</span></h2><div class="stats-chart-wrap"><div id="pipe-chart-funnel" class="chart-container"></div></div>`;
+            html += `<h2>Verification Funnel <span class="text-muted-sm">stage-1 self-dismissed: ${fmtNum(stage1Dism)} · dismissed in verify: ${fmtNum(v1b)} (1b) + ${fmtNum(dpv)} (post-verify)</span></h2><div class="stats-chart-wrap"><div id="pipe-chart-funnel" class="chart-container"></div></div>`;
             html += `<h2>Stage Discoveries (Exclusive vs Shared vs Dismissed)</h2><div class="stats-chart-wrap"><div id="pipe-chart-stages" class="chart-container"></div></div>`;
             html += `<h2>Stage × Stage Overlap <span class="text-muted-sm">diagonal = exclusive catches</span></h2><div class="stats-chart-wrap"><div id="pipe-chart-overlap" class="chart-container-lg"></div></div>`;
 
@@ -5407,21 +5502,44 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             container.innerHTML = html;
 
             const pal = getStatsPalette();
-            const funnelSteps = [
-                ['Stage-1 Candidates (Concerns + Self-Dismissed)', stage1Candidates, pal.pending],
-                ['Entered Verification (Dedup / Fast-Path)', verifyCandidates, pal.pending],
-                ['Verified (1a + Post-Verify)', totalVerified, pal.ok],
-                ['Final Reported Findings', finalReported, pal.ok]
+            const funnelCategories = [
+                'Final Outcomes',
+                'Verified (1a + Post-Verify)',
+                'After Deduplication',
+                'Stage-1 Concerns'
             ];
             mountStatsChart('pipe-chart-funnel', {
-                grid: { left: '3%', right: '5%', bottom: '8%', top: '6%', containLabel: true },
+                legend: { data: ['Patch Findings', 'Pre-existing Bugs (→ Bugs DB)'], bottom: 0 },
+                grid: { left: '3%', right: '5%', bottom: '14%', top: '6%', containLabel: true },
                 xAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                yAxis: { type: 'category', data: funnelSteps.map(s => s[0]).reverse() },
-                series: [{
-                    name: 'Items',
-                    type: 'bar',
-                    data: funnelSteps.slice().reverse().map(s => ({ value: s[1], itemStyle: { color: s[2] } }))
-                }]
+                yAxis: { type: 'category', data: funnelCategories },
+                series: [
+                    {
+                        name: 'Concerns',
+                        type: 'bar',
+                        stack: 'f',
+                        data: [
+                            null,
+                            { value: totalVerified, itemStyle: { color: pal.ok } },
+                            { value: verifyCandidates, itemStyle: { color: pal.pending } },
+                            { value: rawConcerns, itemStyle: { color: pal.pending } }
+                        ]
+                    },
+                    {
+                        name: 'Patch Findings',
+                        type: 'bar',
+                        stack: 'f',
+                        itemStyle: { color: pal.ok },
+                        data: [reportedPatch, null, null, null]
+                    },
+                    {
+                        name: 'Pre-existing Bugs (→ Bugs DB)',
+                        type: 'bar',
+                        stack: 'f',
+                        itemStyle: { color: pal.warn },
+                        data: [reportedPreex, null, null, null]
+                    }
+                ]
             });
 
             if (stageList.length > 0) {
