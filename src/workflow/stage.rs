@@ -39,6 +39,8 @@ pub struct StageOutcome {
     pub tokens_cached: u32,
     pub history: Vec<AiMessage>,
     pub skipped: bool,
+    /// Why the stage failed.
+    pub error: Option<String>,
 }
 
 impl StageOutcome {
@@ -469,6 +471,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                     tokens_out: 0,
                     tokens_cached: 0,
                     skipped: true,
+                    error: None,
                 },
                 Box::new(|_| {}),
             ));
@@ -542,6 +545,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             tokens_cached,
             history: result.history,
             skipped: false,
+            error: None,
         };
 
         let reducer = self.reducer.clone();

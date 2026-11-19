@@ -697,6 +697,14 @@ impl Worker {
             state.all_dismissed_concerns.clone()
         };
         let dismissed_concerns_count = dismissed_concerns.len();
+        let failed_stages: Vec<Value> = outcome
+            .stage_runs
+            .iter()
+            .filter_map(|r| {
+                let error = r.error.as_ref()?;
+                Some(json!({"stage": r.name, "error": error}))
+            })
+            .collect();
 
         let review_inline = if state.review_inline.is_empty() && !self.skip_report {
             "No issues found.".to_string()
@@ -716,6 +724,7 @@ impl Worker {
             "fixes": state.fixes,
             "concerns_count": concerns_count,
             "dismissed_concerns_count": dismissed_concerns_count,
+            "failed_stages": failed_stages,
             "review_map": review_map,
         });
 
