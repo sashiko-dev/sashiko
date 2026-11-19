@@ -499,7 +499,7 @@ Controls which mailing lists Sashiko tracks via NNTP, embargo delays, how Sashik
 | `defaults.track` | bool | `true` | Whether listed mailing lists are tracked via NNTP by default. |
 | `defaults.embargo_hours` | integer | `0` | Hours to wait before publishing a review with findings. Clean reviews are released immediately after the complete patchset review succeeds. |
 | `defaults.reply_to` | list | `[]` | Recipient targets when findings are present: `"author"`, `"list"`, `"recipients"`. |
-| `defaults.positive_review` | string | `"none"` | Who receives a review email when 0 issues are found: `"none"`, `"author"`, or `"all"`. |
+| `defaults.positive_review` | string | `"none"` | Who receives a review email when patches review clean: `"none"`, `"author"`, or `"all"`. Single-patch submissions receive a reply on the patch; multi-patch series receive a single consolidated summary email replying to the cover letter (or patch 1) whenever at least one patch is clean, while patches with findings still receive individual inline replies. |
 | `defaults.mute_all` | bool | `false` | Suppress all email sending for this scope. |
 | `defaults.cc` | list | `[]` | Static CC addresses always included on review emails. |
 | `defaults.ignored_emails` | list | `[]` | Author addresses whose patches are skipped at ingestion, so they are never reviewed or mailed. Matched as case-insensitive substrings of the author address. |

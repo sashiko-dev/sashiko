@@ -12542,6 +12542,44 @@ impl Database {
         Ok(diffs)
     }
 
+    /// Returns the message that patchset-level replies (consolidated series
+    /// summaries and failure notifications) should thread under: the cover
+    /// letter message when stored in `messages` (ignoring synthetic
+    /// `(placeholder)` rows created for missing thread roots), otherwise the
+    /// first patch.
+    pub async fn get_patchset_reply_target_message(
+        &self,
+        patchset_id: i64,
+        cover_msg_id: Option<&str>,
+    ) -> Result<Option<MessageRow>> {
+        let is_placeholder = |msg: &MessageRow| {
+            msg.author.as_deref() == Some("unknown")
+                && msg.subject.as_deref() == Some("(placeholder)")
+        };
+
+        if let Some(mid) = cover_msg_id.map(str::trim).filter(|m| !m.is_empty())
+            && let Some(msg) = self.get_message_details_by_msgid(mid).await?
+            && !is_placeholder(&msg)
+        {
+            return Ok(Some(msg));
+        }
+
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT message_id FROM patches
+                  WHERE patchset_id = ?
+                  ORDER BY part_index ASC
+                  LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let first_mid: String = row.get(0)?;
+        self.get_message_details_by_msgid(&first_mid).await
+    }
     /// Returns the Git patch ID stored for `patch_id`, if the ingest path
     /// computed one.
     pub async fn get_patch_git_patch_id(&self, patch_id: i64) -> Result<Option<String>> {
