@@ -1728,6 +1728,10 @@ pub enum EmailKind {
     /// A review result or a patchwork notification, tied to a patch.
     #[default]
     ReviewNotification,
+    /// A consolidated review summary for a multi-patch series, tied to a patchset.
+    PatchsetSummary,
+    /// An opt-in notification that a patchset failed to apply or failed review.
+    PatchsetFailure,
     /// A sign-in link, tied to a person.
     SignInLink,
     /// A notice to the person a bug was just assigned to.
@@ -1741,17 +1745,31 @@ impl EmailKind {
     pub fn as_str(self) -> &'static str {
         match self {
             EmailKind::ReviewNotification => "review_notification",
+            EmailKind::PatchsetSummary => "patchset_summary",
+            EmailKind::PatchsetFailure => "patchset_failure",
             EmailKind::SignInLink => "sign_in_link",
             EmailKind::BugAssignment => "bug_assignment",
             EmailKind::Unrecognized => "unrecognized",
         }
     }
 
+    /// True for replies posted into a patch or series mailing-list thread
+    /// (as opposed to transactional emails sent directly to a person).
+    pub fn is_review_thread_reply(self) -> bool {
+        matches!(
+            self,
+            EmailKind::ReviewNotification | EmailKind::PatchsetSummary | EmailKind::PatchsetFailure
+        )
+    }
+
     /// The List-Id label for email sent to a person rather than to a patch's
     /// thread, or None for review notifications.
     pub fn transactional_list_label(self) -> Option<&'static str> {
         match self {
-            EmailKind::ReviewNotification | EmailKind::Unrecognized => None,
+            EmailKind::ReviewNotification
+            | EmailKind::PatchsetSummary
+            | EmailKind::PatchsetFailure
+            | EmailKind::Unrecognized => None,
             EmailKind::SignInLink => Some("sashiko-auth"),
             EmailKind::BugAssignment => Some("sashiko-bugs"),
         }
@@ -1766,6 +1784,8 @@ impl EmailKind {
             "sign_in_link" => EmailKind::SignInLink,
             "bug_assignment" => EmailKind::BugAssignment,
             "review_notification" => EmailKind::ReviewNotification,
+            "patchset_summary" => EmailKind::PatchsetSummary,
+            "patchset_failure" => EmailKind::PatchsetFailure,
             other => {
                 tracing::warn!("Unrecognized email kind {:?}, delivering plainly", other);
                 EmailKind::Unrecognized
@@ -2412,7 +2432,7 @@ impl Database {
                     "SELECT 1 FROM patchsets ps
                      JOIN meta m ON m.key = 'patchset_active_gen:' || CAST(ps.id AS TEXT)
                      WHERE ps.id = ?
-                       AND ps.status IN ('In Review', 'Reviewed', 'Failed')
+                       AND ps.status IN ('In Review', 'Reviewed', 'Failed', 'Failed To Apply', 'FailedToApply')
                        AND CAST(m.value AS INTEGER) = ?",
                     libsql::params![claim.patchset_id, claim.generation],
                 )
@@ -3463,6 +3483,58 @@ impl Database {
             }
         }
 
+        if current_version < 23 {
+            info!("Applying database migration version 23 (patchset email outbox column)...");
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 23 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 23.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                let has_email_outbox = {
+                    let mut rows = tx
+                        .query(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'email_outbox'",
+                            (),
+                        )
+                        .await?;
+                    rows.next().await?.is_some()
+                };
+                if has_email_outbox {
+                    let has_patchset_id = {
+                        let mut columns = tx.query("PRAGMA table_info(email_outbox)", ()).await?;
+                        let mut found = false;
+                        while let Some(row) = columns.next().await? {
+                            let name: String = row.get(1)?;
+                            found |= name == "patchset_id";
+                        }
+                        found
+                    };
+                    if !has_patchset_id {
+                        tx.execute_batch(include_str!("migrations/023_patchset_email_outbox.sql"))
+                            .await?;
+                    } else {
+                        tx.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_email_outbox_patchset_id ON email_outbox(patchset_id)",
+                            (),
+                        )
+                        .await?;
+                    }
+                }
+                tx.execute("PRAGMA user_version = 23", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
         let has_patchwork_outbox = {
             let mut rows = self
                 .read_conn()
@@ -3481,7 +3553,7 @@ impl Database {
             .await?;
         }
 
-        debug!("Database schema is up to date at version 22.");
+        debug!("Database schema is up to date at version 23.");
 
         Ok(())
     }
@@ -10057,6 +10129,43 @@ impl Database {
                     )
                     .await?;
 
+                    // Preserve Sent/Sending patchset-level outbox rows across
+                    // duplicate patchset merges and avoid duplicate rows per kind.
+                    tx.execute(
+                        "DELETE FROM email_outbox
+                          WHERE patch_id IS NULL
+                            AND patchset_id = ?
+                            AND status NOT IN ('Sent', 'Sending', 'Locked')
+                            AND kind IN (
+                                SELECT kind FROM email_outbox
+                                 WHERE patch_id IS NULL
+                                   AND patchset_id = ?
+                                   AND status IN ('Sent', 'Sending', 'Locked')
+                            )",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE email_outbox
+                            SET patchset_id = ?
+                          WHERE patch_id IS NULL
+                            AND patchset_id = ?
+                            AND NOT EXISTS (
+                                SELECT 1 FROM email_outbox teo
+                                 WHERE teo.patch_id IS NULL
+                                   AND teo.patchset_id = ?
+                                   AND teo.kind = email_outbox.kind
+                            )",
+                        libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM email_outbox
+                          WHERE patch_id IS NULL AND patchset_id = ?",
+                        libsql::params![merge_from_id],
+                    )
+                    .await?;
+
                     tx.execute(
                         "INSERT OR IGNORE INTO patches_subsystems (patch_id, subsystem_id)
                          SELECT tp.id, ps.subsystem_id
@@ -13449,8 +13558,11 @@ impl Database {
             "UPDATE email_outbox
                  SET status = 'Cancelled', error_log = ?, locked_at = NULL
                  WHERE status IN ('Pending', 'Embargoed')
-                   AND patch_id IN (SELECT id FROM patches WHERE patchset_id = ?)",
-            libsql::params![reason.to_string(), id],
+                   AND (
+                       patch_id IN (SELECT id FROM patches WHERE patchset_id = ?)
+                       OR patchset_id = ?
+                   )",
+            libsql::params![reason.to_string(), id, id],
         )
         .await?;
 
@@ -15019,6 +15131,15 @@ impl Database {
         .await?;
 
         self.execute(
+            "DELETE FROM email_outbox
+              WHERE patch_id IS NULL
+                AND patchset_id = ?
+                AND status IN ('Pending', 'Embargoed', 'Skipped', 'Muted', 'Disabled', 'Dry-Run', 'Cancelled')",
+            libsql::params![id],
+        )
+        .await?;
+
+        self.execute(
             &format!(
                 "DELETE FROM patchwork_outbox
                   WHERE status IN ('Pending', 'Cancelled')
@@ -16124,6 +16245,126 @@ impl Database {
         Ok(true)
     }
 
+    /// Inserts or refreshes a patchset-level email (`PatchsetSummary` or
+    /// `PatchsetFailure`), deduplicating on `(patchset_id, kind)` with
+    /// `patch_id IS NULL`. Returns `false` if the claim is no longer active,
+    /// the patchset is `Cancelled`, or an already-sent/in-flight row exists.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_patchset_email_outbox(
+        &self,
+        patchset_id: i64,
+        kind: EmailKind,
+        status: &str,
+        to_addresses: &str,
+        cc_addresses: &str,
+        subject: &str,
+        in_reply_to: &str,
+        references_hdr: &str,
+        body: &str,
+    ) -> Result<bool> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db
+            .is_patchset_claim_active_for_outbox(Some(patchset_id))
+            .await?
+        {
+            return Ok(false);
+        }
+        let mut ps_rows = tx
+            .query(
+                "SELECT status FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if let Some(ps_row) = ps_rows.next().await?
+            && ps_row.get::<Option<String>>(0)?.as_deref() == Some("Cancelled")
+        {
+            return Ok(false);
+        }
+        drop(ps_rows);
+
+        let kind_str = kind.as_str();
+        let existing = {
+            let mut rows = tx
+                .query(
+                    "SELECT id, status FROM email_outbox
+                      WHERE patchset_id = ? AND patch_id IS NULL AND kind = ?
+                      ORDER BY id DESC LIMIT 1",
+                    libsql::params![patchset_id, kind_str],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                let id: i64 = row.get(0)?;
+                let existing_status: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+                Some((id, existing_status))
+            } else {
+                None
+            }
+        };
+
+        if let Some((existing_id, existing_status)) = existing {
+            if matches!(
+                existing_status.as_str(),
+                "Pending"
+                    | "Embargoed"
+                    | "Skipped"
+                    | "Muted"
+                    | "Disabled"
+                    | "Dry-Run"
+                    | "Cancelled"
+            ) {
+                tx.execute(
+                    "UPDATE email_outbox
+                        SET status = ?, to_addresses = ?, cc_addresses = ?,
+                            subject = ?, in_reply_to = ?, references_hdr = ?, body = ?,
+                            error_log = NULL
+                      WHERE id = ?",
+                    libsql::params![
+                        status,
+                        to_addresses,
+                        cc_addresses,
+                        subject,
+                        in_reply_to,
+                        references_hdr,
+                        body,
+                        existing_id,
+                    ],
+                )
+                .await?;
+                tx.commit().await?;
+                return Ok(true);
+            }
+            tracing::debug!(
+                "Patchset email outbox entry already exists for patchset_id {} kind {} (status {}), skipping.",
+                patchset_id,
+                kind_str,
+                existing_status
+            );
+            return Ok(false);
+        }
+
+        let created_at = chrono::Utc::now().timestamp();
+        tx.execute(
+            "INSERT INTO email_outbox (patch_id, patchset_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+             VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            libsql::params![
+                patchset_id,
+                kind_str,
+                status,
+                to_addresses,
+                cc_addresses,
+                subject,
+                in_reply_to,
+                references_hdr,
+                body,
+                created_at,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Stamps the live reservations of `disclose_for` as mailed inside the
     /// outbox transaction `tx`, for a `Pending` email only.
     async fn stamp_disclosures_in(
@@ -16156,10 +16397,16 @@ impl Database {
                  error_log = 'Cancelled because patchset was cancelled',
                  locked_at = NULL
              WHERE status IN ('Pending', 'Embargoed')
-               AND EXISTS (
-                   SELECT 1 FROM patches p
-                   JOIN patchsets ps ON ps.id = p.patchset_id
-                   WHERE p.id = email_outbox.patch_id AND ps.status = 'Cancelled'
+               AND (
+                   EXISTS (
+                       SELECT 1 FROM patches p
+                       JOIN patchsets ps ON ps.id = p.patchset_id
+                       WHERE p.id = email_outbox.patch_id AND ps.status = 'Cancelled'
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM patchsets ps
+                       WHERE ps.id = email_outbox.patchset_id AND ps.status = 'Cancelled'
+                   )
                )",
             (),
         )
@@ -17368,7 +17615,7 @@ mod tests {
             .await?
             .expect("user_version row")
             .get(0)?;
-        assert_eq!(version, 22);
+        assert_eq!(version, 23);
 
         let mut columns = db.conn.query("PRAGMA table_info(reviews)", ()).await?;
         let mut names = std::collections::BTreeSet::new();
@@ -31633,7 +31880,7 @@ mod tests {
         let db = setup_db().await;
         let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
         let version: u32 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(version, 22);
+        assert_eq!(version, 23);
 
         for (table, expected_cols) in [
             (
@@ -38286,6 +38533,162 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
                 .await?,
             99
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_patchset_email_outbox_dedup_claim_and_cancel() -> Result<()> {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("cover@example.org", "[PATCH 0/2] test", 100)
+            .await?;
+        db.create_message(
+            "cover@example.org",
+            thread_id,
+            None,
+            "Author <author@example.org>",
+            "[PATCH 0/2] test",
+            100,
+            "Cover body",
+            "list@vger.kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("cover@example.org"),
+                "cover@example.org",
+                "[PATCH 0/2] test",
+                "Author <author@example.org>",
+                100,
+                2,
+                0,
+                "list@vger.kernel.org",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .expect("patchset created");
+
+        // Claim the patchset, transition to Failed To Apply, and verify the claim
+        // still allows queueing a PatchsetFailure email.
+        db.update_patchset_status(ps_id, "Pending").await?;
+        let claim_gen = db
+            .enter_patchset_review_with_gen(ps_id)
+            .await?
+            .expect("claimed");
+        let claimed_db = db.with_patchset_claim(ps_id, claim_gen);
+        assert!(
+            claimed_db
+                .complete_patchset_review_status(ps_id, "Failed To Apply")
+                .await?
+        );
+
+        let inserted = claimed_db
+            .insert_patchset_email_outbox(
+                ps_id,
+                EmailKind::PatchsetFailure,
+                "Pending",
+                "[\"author@example.org\"]",
+                "[]",
+                "Re: [PATCH 0/2] test",
+                "cover@example.org",
+                "cover@example.org",
+                "Failed to apply v1",
+            )
+            .await?;
+        assert!(inserted);
+
+        // Second insert for same (patchset_id, kind) refreshes the unsent row in place.
+        let refreshed = claimed_db
+            .insert_patchset_email_outbox(
+                ps_id,
+                EmailKind::PatchsetFailure,
+                "Pending",
+                "[\"author@example.org\"]",
+                "[]",
+                "Re: [PATCH 0/2] test",
+                "cover@example.org",
+                "cover@example.org",
+                "Failed to apply v2",
+            )
+            .await?;
+        assert!(refreshed);
+
+        let count: i64 = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM email_outbox WHERE patchset_id = ? AND kind = 'patchset_failure'",
+                libsql::params![ps_id],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get(0)?;
+        assert_eq!(count, 1);
+
+        // Lock and mark Sent; subsequent insert must not overwrite a Sent row.
+        let claimed_row = db.lock_pending_email().await?.expect("locked email");
+        assert_eq!(claimed_row.kind, EmailKind::PatchsetFailure);
+        assert_eq!(claimed_row.body, "Failed to apply v2");
+        db.mark_email_sent(claimed_row.id).await?;
+
+        let overwritten = claimed_db
+            .insert_patchset_email_outbox(
+                ps_id,
+                EmailKind::PatchsetFailure,
+                "Pending",
+                "[\"author@example.org\"]",
+                "[]",
+                "Re: [PATCH 0/2] test",
+                "cover@example.org",
+                "cover@example.org",
+                "Duplicate",
+            )
+            .await?;
+        assert!(!overwritten);
+
+        // A different kind (PatchsetSummary) on the same patchset can still be queued,
+        // and cancelling the patchset cancels the pending patchset-level outbox row.
+        let summary_inserted = claimed_db
+            .insert_patchset_email_outbox(
+                ps_id,
+                EmailKind::PatchsetSummary,
+                "Pending",
+                "[\"author@example.org\"]",
+                "[]",
+                "Re: [PATCH 0/2] test",
+                "cover@example.org",
+                "cover@example.org",
+                "Series summary",
+            )
+            .await?;
+        assert!(summary_inserted);
+
+        db.update_patchset_status(ps_id, "Cancelled").await?;
+        assert!(db.lock_pending_email().await?.is_none());
+
+        let summary_status: String = db
+            .conn
+            .query(
+                "SELECT status FROM email_outbox WHERE patchset_id = ? AND kind = 'patchset_summary'",
+                libsql::params![ps_id],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get(0)?;
+        assert_eq!(summary_status, "Cancelled");
         Ok(())
     }
 }

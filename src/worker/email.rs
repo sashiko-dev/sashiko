@@ -270,7 +270,7 @@ fn build_email_message(
         builder = builder
             .header(AutoSubmitted("auto-generated".to_string()))
             .header(ListId(format!("<{}.{}>", label, from.email.domain())));
-    } else if email_row.kind == crate::db::EmailKind::ReviewNotification
+    } else if email_row.kind.is_review_thread_reply()
         && let Some(reply_to) = &settings.reply_to
     {
         match parse_lenient(reply_to) {
@@ -811,6 +811,16 @@ mod tests {
         assert!(!review.contains("Auto-Submitted"));
         assert!(!review.contains("List-Id"));
         assert!(review.contains("Reply-To: reviews@lists.example.org\r\n"));
+
+        for kind in [
+            crate::db::EmailKind::PatchsetSummary,
+            crate::db::EmailKind::PatchsetFailure,
+        ] {
+            let reply = format(kind);
+            assert!(!reply.contains("Auto-Submitted"));
+            assert!(!reply.contains("List-Id"));
+            assert!(reply.contains("Reply-To: reviews@lists.example.org\r\n"));
+        }
 
         let unrecognized = format(crate::db::EmailKind::Unrecognized);
         assert!(!unrecognized.contains("List-Id"));
