@@ -1142,6 +1142,7 @@ pub fn build_review_map(
                 "dismissed_count": dismissed_count,
                 "log_start": r.history_start.saturating_add(history_offset),
                 "log_end": r.history_end.saturating_add(history_offset),
+                "error": r.error,
             })
         })
         .collect();
@@ -1259,6 +1260,7 @@ mod tests {
                 tokens_cached: 0,
                 history_start: 0,
                 history_end: 2,
+                error: None,
             },
             StageRunRecord {
                 name: "verification".to_string(),
@@ -1269,6 +1271,7 @@ mod tests {
                 tokens_cached: 0,
                 history_start: 2,
                 history_end: 6,
+                error: Some("LLM output was truncated by provider".to_string()),
             },
         ];
 
@@ -1278,8 +1281,13 @@ mod tests {
         assert_eq!(map["stages"][0]["log_start"], 1);
         assert_eq!(map["stages"][0]["log_end"], 3);
         assert_eq!(map["stages"][0]["concerns_count"], 1);
+        assert_eq!(map["stages"][0]["error"], Value::Null);
         assert_eq!(map["stages"][1]["concerns_count"], 2);
         assert_eq!(map["stages"][1]["dismissed_count"], 1);
+        assert_eq!(
+            map["stages"][1]["error"],
+            "LLM output was truncated by provider"
+        );
 
         let threads = map["threads"].as_array().unwrap();
         assert_eq!(threads.len(), 3);

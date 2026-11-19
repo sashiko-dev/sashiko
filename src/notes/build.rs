@@ -1361,6 +1361,7 @@ mod tests {
                 tokens_cached: 0,
                 history_start: 0,
                 history_end: 3,
+                error: None,
             }],
             ..Default::default()
         };

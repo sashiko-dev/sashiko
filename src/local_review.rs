@@ -441,7 +441,7 @@ pub async fn run_worker(
     emit(
         progress,
         ProgressEvent::ReviewComplete {
-            partial: result.as_ref().map_or(true, result_has_error),
+            partial: result.as_ref().map_or(true, result_is_incomplete),
         },
     );
 
@@ -1651,6 +1651,7 @@ async fn run_worker_in_worktree(
     let mut combined_findings = Vec::new();
     let mut combined_concerns = Vec::new();
     let mut combined_dismissed_concerns = Vec::new();
+    let mut combined_failed_stages = Vec::new();
     let mut combined_related = Vec::new();
     let mut combined_related_dismissed = Vec::new();
     let mut combined_prior_resolutions = Vec::new();
@@ -1718,6 +1719,14 @@ async fn run_worker_in_worktree(
             }
             if let Some(dismissed) = review.get("dismissed_concerns").and_then(|v| v.as_array()) {
                 combined_dismissed_concerns.extend(dismissed.clone());
+            }
+            if let Some(failed) = review.get("failed_stages").and_then(|v| v.as_array()) {
+                for f in failed {
+                    let mut failed_val = f.clone();
+                    failed_val["patch_index"] = json!(p_idx);
+                    failed_val["patch_subject"] = json!(patch_subject);
+                    combined_failed_stages.push(failed_val);
+                }
             }
             merge_related_preexisting(
                 review,
@@ -1798,6 +1807,7 @@ async fn run_worker_in_worktree(
             "related_preexisting_dismissed".to_string(),
             json!(combined_related_dismissed),
         );
+        obj.insert("failed_stages".to_string(), json!(combined_failed_stages));
         if let Some(exec) = design_exec {
             total_tokens_in = total_tokens_in.saturating_add(exec.tokens_in);
             total_tokens_out = total_tokens_out.saturating_add(exec.tokens_out);
@@ -1925,6 +1935,20 @@ pub fn result_has_error(result: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// The failed stages of every patch review, each stamped with its patch.
+pub fn result_failed_stages(result: &Value) -> &[Value] {
+    result
+        .get("review")
+        .and_then(|review| review.get("failed_stages"))
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// True when a patch's review failed or had a failed stage.
+pub fn result_is_incomplete(result: &Value) -> bool {
+    result_has_error(result) || !result_failed_stages(result).is_empty()
+}
+
 pub fn result_has_high_or_critical_findings(result: &Value) -> bool {
     let Some(findings) = result
         .get("review")
@@ -1967,6 +1991,8 @@ pub fn format_agent_review_output(result: &Value) -> Value {
 
     let status = if result_has_error(result) {
         "error"
+    } else if result_is_incomplete(result) {
+        "incomplete"
     } else if !findings.is_empty() {
         "issues_found"
     } else {
@@ -2021,6 +2047,10 @@ pub fn format_agent_review_output(result: &Value) -> Value {
         }
         if let Some(partial) = result.get("partial") {
             obj.insert("partial".into(), partial.clone());
+        }
+        let failed_stages = result_failed_stages(result);
+        if !failed_stages.is_empty() {
+            obj.insert("failed_stages".into(), json!(failed_stages));
         }
         if let Some(err) = result.get("error")
             && !err.is_null()
@@ -3074,6 +3104,34 @@ mod tests {
         assert_eq!(formatted_err["status"], "error");
         assert_eq!(formatted_err["partial"], true);
         assert_eq!(formatted_err["error"], "patch 1: timed out");
+    }
+
+    #[test]
+    fn test_a_review_that_lost_a_stage_is_incomplete() {
+        let lost = json!({
+            "review": {
+                "findings": [{"problem": "missing bounds check", "severity": "High"}],
+                "concerns": [],
+                "failed_stages": [{
+                    "stage": "execution-flow",
+                    "error": "LLM output was truncated by provider (e.g. hit max tokens)",
+                    "patch_index": 1,
+                }],
+            },
+        });
+        assert!(!result_has_error(&lost));
+        assert!(result_is_incomplete(&lost));
+        let formatted = format_agent_review_output(&lost);
+        assert_eq!(formatted["status"], "incomplete");
+        assert_eq!(formatted["failed_stages"][0]["stage"], "execution-flow");
+
+        let whole = json!({"review": {"findings": [], "failed_stages": []}});
+        assert!(!result_is_incomplete(&whole));
+        assert!(
+            format_agent_review_output(&whole)
+                .get("failed_stages")
+                .is_none()
+        );
     }
 
     #[tokio::test]

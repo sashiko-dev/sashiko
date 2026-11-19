@@ -23,7 +23,8 @@ use sashiko::events::{Event, MessageSource, ParsedArticle};
 use sashiko::ingestor::Ingestor;
 use sashiko::local_review::{
     ProgressEvent, ReviewOptions, WorkerOptions, format_agent_review_output, print_worker_json,
-    result_has_error, result_has_high_or_critical_findings, run_git_review, run_worker_from_stdin,
+    result_failed_stages, result_has_high_or_critical_findings, result_is_incomplete,
+    run_git_review, run_worker_from_stdin,
 };
 use sashiko::project::ProjectId;
 use sashiko::prompt_bundle;
@@ -3297,7 +3298,7 @@ async fn handle_review_command(
         }
     }
 
-    if result_has_error(&result) {
+    if result_is_incomplete(&result) {
         std::process::exit(3);
     }
     if result_has_high_or_critical_findings(&result) {
@@ -4193,6 +4194,17 @@ fn write_review_result(
         write_colored(out, Color::Red, "Error: ")?;
         writeln!(out, "{}", error)?;
     }
+    for lost in result_failed_stages(result) {
+        let field = |key: &str| lost.get(key).and_then(Value::as_str).unwrap_or("?");
+        write_colored(out, Color::Red, "\nIncomplete: ")?;
+        writeln!(
+            out,
+            "patch {} lost stage '{}': {}",
+            lost.get("patch_index").and_then(Value::as_i64).unwrap_or(0),
+            field("stage"),
+            field("error")
+        )?;
+    }
 
     let Some(review) = result.get("review") else {
         return Ok(());
@@ -4217,7 +4229,7 @@ fn write_review_result(
         .and_then(Value::as_array)
         .is_some_and(|items| !items.is_empty());
 
-    if total == 0 && !result_has_error(result) {
+    if total == 0 && !result_is_incomplete(result) {
         let msg = if has_preexisting {
             no_patch_findings_message(true)
         } else if has_design_concerns {
@@ -6512,6 +6524,31 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("    > return -EINVAL;"), "{text}");
+    }
+
+    #[test]
+    fn test_write_review_result_names_a_lost_stage() {
+        let result = serde_json::json!({
+            "review": {
+                "findings": [],
+                "failed_stages": [{
+                    "stage": "execution-flow",
+                    "error": "LLM output was truncated by provider (e.g. hit max tokens)",
+                    "patch_index": 1,
+                }],
+            },
+        });
+        let mut out = termcolor::NoColor::new(Vec::new());
+        write_review_result(&mut out, &result, "HEAD", false).unwrap();
+        let text = String::from_utf8(out.into_inner()).unwrap();
+        assert!(
+            text.contains(
+                "Incomplete: patch 1 lost stage 'execution-flow': LLM output was truncated"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("No issues found"), "{text}");
+        assert!(!text.contains("No patch-introduced issues found"), "{text}");
     }
 
     #[test]

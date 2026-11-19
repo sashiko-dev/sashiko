@@ -35,6 +35,9 @@ pub struct StageRunRecord {
     pub tokens_cached: u32,
     pub history_start: usize,
     pub history_end: usize,
+    /// Why the stage failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Execution outcome and aggregated metrics from running a workflow.
@@ -67,6 +70,7 @@ impl std::fmt::Display for WorkflowFailure {
 impl std::error::Error for WorkflowFailure {}
 
 fn stage_outcome_from_error(err: &anyhow::Error) -> StageOutcome {
+    let error = Some(err.to_string());
     if let Some(failure) = err.downcast_ref::<crate::ai::SessionFailure>() {
         StageOutcome {
             tokens_in: u32::try_from(failure.usage.prompt_tokens).unwrap_or(u32::MAX),
@@ -75,10 +79,12 @@ fn stage_outcome_from_error(err: &anyhow::Error) -> StageOutcome {
                 .unwrap_or(u32::MAX),
             history: failure.history.clone(),
             skipped: false,
+            error,
         }
     } else {
         StageOutcome {
             skipped: false,
+            error,
             ..Default::default()
         }
     }
@@ -108,6 +114,7 @@ fn record_stage_outcome(
         tokens_cached: stage_outcome.tokens_cached,
         history_start,
         history_end,
+        error: stage_outcome.error,
     });
 }
 
@@ -468,6 +475,7 @@ mod tests {
             if content == "__ERROR__" {
                 anyhow::bail!("simulated fatal provider error");
             }
+            let truncated = content == "__TRUNCATED__";
             Ok(AiResponse {
                 content: Some(content),
                 thought: None,
@@ -479,7 +487,7 @@ mod tests {
                     total_tokens: 15,
                     cached_tokens: None,
                 }),
-                truncated: false,
+                truncated,
             })
         }
 
@@ -662,6 +670,58 @@ mod tests {
         assert!(!outcome.stage_runs[1].skipped);
         assert_eq!(outcome.stage_runs[1].history_start, 1);
         assert_eq!(outcome.stage_runs[1].history_end, 3);
+        assert!(outcome.stage_runs[0].error.is_some());
+        assert_eq!(outcome.stage_runs[1].error, None);
+    }
+
+    #[tokio::test]
+    async fn test_workflow_best_effort_records_a_truncated_stage() {
+        let provider = Arc::new(MockProvider::queued(vec![
+            "__TRUNCATED__".to_string(),
+            r#"{"items": ["concern_ok"]}"#.to_string(),
+        ]));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf()));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+        let stage = |name| -> Box<dyn ExecutableStage<DummyState>> {
+            Box::new(
+                Stage::builder(name)
+                    .user_prompt(PromptTemplate::new("Analyze"))
+                    .output_format(OutputFormat::json())
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.concerns.extend(out.items);
+                    })
+                    .build(),
+            )
+        };
+        let workflow = Workflow::builder("best_effort_truncated")
+            .parallel(
+                vec![stage("stage_cut"), stage("stage_ok")],
+                ParallelPolicy::BestEffort,
+            )
+            .build();
+
+        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+            .await
+            .expect("one stage finishing keeps the batch alive");
+        assert_eq!(state.concerns, vec!["concern_ok".to_string()]);
+        let cut = &outcome.stage_runs[0];
+        assert_eq!(cut.name, "stage_cut");
+        assert!(
+            cut.error
+                .as_deref()
+                .is_some_and(|e| e.contains("truncated")),
+            "the record must say why the stage is missing, got {:?}",
+            cut.error
+        );
+        assert_eq!(outcome.stage_runs[1].error, None);
     }
 
     #[tokio::test]
