@@ -241,6 +241,8 @@ pub struct ServerOptions {
     pub email_worker_heartbeat: Option<Arc<std::sync::atomic::AtomicI64>>,
 }
 
+type StateGaugeRows = Vec<(String, std::collections::BTreeMap<String, String>, i64)>;
+
 pub struct AppState {
     pub settings: Arc<crate::settings::Settings>,
     pub db: Arc<Database>,
@@ -263,6 +265,9 @@ pub struct AppState {
     messages_homepage_cache: AsyncCache<Vec<crate::db::MessageRow>>,
     bug_subsystems_cache: AsyncMapCache<Option<String>, Vec<serde_json::Value>>,
     pipeline_stats_cache: AsyncCache<crate::db::PipelineMultiWindowStats>,
+    stats_state_gauges_cache: AsyncCache<StateGaugeRows>,
+    stats_bug_facets_unrestricted_cache: AsyncCache<Vec<crate::db::BugSubsystemFacetSummary>>,
+    project_releases_cache: AsyncCache<Vec<(String, i64)>>,
 }
 
 impl AppState {
@@ -274,6 +279,104 @@ impl AppState {
             .get_or_fetch(|| async { self.db.get_pipeline_multi_window_stats(now_ts).await })
             .await
     }
+
+    pub async fn get_cached_state_gauges(&self) -> anyhow::Result<StateGaugeRows> {
+        self.stats_state_gauges_cache
+            .get_or_fetch(|| async { self.db.get_all_state_gauges().await })
+            .await
+    }
+
+    pub async fn get_cached_unrestricted_bug_facets(
+        &self,
+    ) -> anyhow::Result<Vec<crate::db::BugSubsystemFacetSummary>> {
+        self.stats_bug_facets_unrestricted_cache
+            .get_or_fetch(|| async {
+                self.db
+                    .get_bug_subsystem_facets_o1(None, crate::db::BugVisibility::Unrestricted, 200)
+                    .await
+            })
+            .await
+    }
+
+    /// Returns recent upstream release tags (`vX.Y`, `vX.Y-rc1`, `vX.Y.Z`) and
+    /// their UNIX timestamps from the target git repository, cached for 1 hour.
+    pub async fn get_cached_project_releases(&self) -> Vec<(String, i64)> {
+        let repo_path = self.settings.git.repository_path.clone();
+        self.project_releases_cache
+            .get_or_fetch(|| async move {
+                Ok::<Vec<(String, i64)>, anyhow::Error>(load_recent_release_tags(&repo_path).await)
+            })
+            .await
+            .unwrap_or_default()
+    }
+}
+
+async fn load_recent_release_tags(repo_path: &str) -> Vec<(String, i64)> {
+    let trimmed = repo_path.trim();
+    if trimmed.is_empty() || !std::path::Path::new(trimmed).exists() {
+        return Vec::new();
+    }
+    let output = match crate::git_cmd::in_dir_async(trimmed)
+        .args([
+            "tag",
+            "-l",
+            "--sort=-creatordate",
+            "--format=%(refname:short)\t%(creatordate:unix)",
+        ])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let cutoff = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(2 * 365 * 86_400);
+    let mut out = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((tag, ts_str)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(ts) = ts_str.trim().parse::<i64>() else {
+            continue;
+        };
+        if ts < cutoff {
+            break;
+        }
+        if is_major_release_tag(tag) {
+            out.push((tag.to_string(), ts));
+            if out.len() >= 24 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn is_major_release_tag(tag: &str) -> bool {
+    let Some(rest) = tag.strip_prefix('v') else {
+        return false;
+    };
+    let core = rest.strip_suffix("-rc1").unwrap_or(rest);
+    let mut parts = core.split('.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    let patch_ok = match parts.next() {
+        None => true,
+        Some(p) => {
+            !rest.ends_with("-rc1") && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())
+        }
+    };
+    parts.next().is_none()
+        && !major.is_empty()
+        && major.bytes().all(|b| b.is_ascii_digit())
+        && !minor.is_empty()
+        && minor.bytes().all(|b| b.is_ascii_digit())
+        && patch_ok
 }
 
 async fn redirect_www(req: Request, next: Next) -> impl IntoResponse {
@@ -327,7 +430,10 @@ pub fn build_router(
         patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
         messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
         bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
-        pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
+        pipeline_stats_cache: AsyncCache::new(Duration::from_secs(60)),
+        stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
+        stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+        project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
     });
 
     Router::new()
@@ -341,6 +447,11 @@ pub fn build_router(
         .route(
             "/api/v1/query_range",
             get(crate::prom_api::prom_query_range).post(crate::prom_api::prom_query_range),
+        )
+        .route(
+            "/api/v1/query_batch",
+            post(crate::prom_api::prom_query_batch)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
         )
         .route(
             "/api/v1/labels",
@@ -4923,6 +5034,9 @@ mod tests {
             messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
             pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
+            stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
+            stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+            project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
         });
 
         let blocked_user = crate::auth::AuthUser::new("blocked@example.com");
@@ -5494,6 +5608,9 @@ mod tests {
                 messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
                 bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
                 pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
+                stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
+                stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+                project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
             })
         };
 
@@ -5562,6 +5679,9 @@ mod tests {
                 messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
                 bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
                 pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
+                stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
+                stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+                project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
             })
         };
 
@@ -5734,6 +5854,9 @@ mod tests {
             messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
             pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
+            stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
+            stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+            project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
             local_token: None,
             email_worker_heartbeat: None,
         });
@@ -6951,6 +7074,9 @@ F:	*
             stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(60)),
             pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
+            stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
+            stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+            project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
             sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
         });
 
@@ -7329,6 +7455,9 @@ F:	*
             messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
             pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
+            stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
+            stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+            project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
         });
 
         let payload = serde_json::json!({
@@ -8211,6 +8340,41 @@ F:	net/
             .unwrap();
         assert_eq!(hist_q["status"], "success");
         assert_eq!(hist_q["data"]["result"][0]["value"][1], "17");
+
+        // Batch endpoint executes mixed instant + range queries and enforces ACLs.
+        let batch_resp: serde_json::Value = client
+            .post(format!("http://{addr}/api/v1/query_batch"))
+            .header("Authorization", format!("Bearer {btrfs_jwt}"))
+            .json(&serde_json::json!({
+                "queries": [
+                    { "id": "btrfs", "query": "sashiko_bugs_by_subsystem{facet=\"open\"}" },
+                    { "id": "hist", "query": "sum(increase(sashiko_messages_ingested_total[1h]))", "time": (three_days_ago + 1800).to_string() },
+                    { "id": "rng", "query": "sum(increase(sashiko_messages_ingested_total[300s]))", "start": (now - 600).to_string(), "end": now.to_string(), "step": "300s" }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(batch_resp["status"], "success");
+        assert_eq!(
+            batch_resp["data"]["btrfs"]["result"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(batch_resp["data"]["hist"]["result"][0]["value"][1], "17");
+        assert_eq!(batch_resp["data"]["rng"]["resultType"], "matrix");
+
+        assert!(is_major_release_tag("v7.3"));
+        assert!(is_major_release_tag("v7.4-rc1"));
+        assert!(is_major_release_tag("v0.9.4"));
+        assert!(!is_major_release_tag("v7.4-rc2"));
+        assert!(!is_major_release_tag("v7.3.1-rc1"));
+        assert!(!is_major_release_tag("release-1"));
 
         let meta_resp: serde_json::Value = client
             .get(format!("http://{addr}/api/v1/metadata"))

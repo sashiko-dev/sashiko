@@ -148,6 +148,12 @@ pub static DB_METRIC_CATALOG: &[MetricDef] = &[
         unit: "",
     },
     MetricDef {
+        name: "sashiko_project_release_timestamp_seconds",
+        metric_type: MetricType::Gauge,
+        help: "UNIX timestamp of recent upstream project release tags from the configured git repository.",
+        unit: "seconds",
+    },
+    MetricDef {
         name: "sashiko_pipeline_window_reviews",
         metric_type: MetricType::Gauge,
         help: "Number of completed non-inherited reviews aggregated in each N-review window.",
@@ -762,6 +768,165 @@ pub async fn prom_query_range(
     .into_response()
 }
 
+pub const MAX_BATCH_QUERIES: usize = 64;
+
+#[derive(Debug, Deserialize)]
+pub struct BatchQueryItem {
+    pub id: String,
+    pub query: String,
+    #[serde(default)]
+    pub time: String,
+    #[serde(default)]
+    pub start: String,
+    #[serde(default)]
+    pub end: String,
+    #[serde(default)]
+    pub step: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchQueryRequest {
+    pub queries: Vec<BatchQueryItem>,
+}
+
+/// Executes up to `MAX_BATCH_QUERIES` PromQL instant and range queries in a
+/// single HTTP round-trip so the built-in dashboard never fans out dozens of
+/// concurrent HTTP/1.1 requests.
+pub async fn prom_query_batch(
+    OptionalPrincipal(principal): OptionalPrincipal,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BatchQueryRequest>,
+) -> Response {
+    if req.queries.is_empty() || req.queries.len() > MAX_BATCH_QUERIES {
+        return prom_err_response(PromError::bad_data(format!(
+            "batch must contain between 1 and {MAX_BATCH_QUERIES} queries"
+        )));
+    }
+    let now_ts = chrono::Utc::now().timestamp();
+    let mut results: BTreeMap<String, Value> = BTreeMap::new();
+
+    for item in req.queries {
+        let is_range = !item.start.trim().is_empty()
+            || !item.end.trim().is_empty()
+            || !item.step.trim().is_empty();
+        let val = if is_range {
+            match eval_range_item(&state, &principal, &item, now_ts).await {
+                Ok(v) => v,
+                Err(e) => return prom_err_response(e),
+            }
+        } else {
+            match eval_instant_item(&state, &principal, &item, now_ts).await {
+                Ok(v) => v,
+                Err(e) => return prom_err_response(e),
+            }
+        };
+        results.insert(item.id, val);
+    }
+
+    Json(json!({
+        "status": "success",
+        "data": results,
+    }))
+    .into_response()
+}
+
+async fn eval_instant_item(
+    state: &AppState,
+    principal: &Principal,
+    item: &BatchQueryItem,
+    now_ts: i64,
+) -> Result<Value, PromError> {
+    let eval_ts = parse_prom_timestamp(&item.time, now_ts)?;
+    let expr = parse_promql(&item.query)?;
+    let ds = preload_data_source(state, principal, &expr, eval_ts, eval_ts, now_ts).await?;
+    match eval_instant(&expr, &ds, eval_ts)? {
+        EvalValue::Scalar(v) => Ok(json!({
+            "resultType": "scalar",
+            "result": [eval_ts as f64, format_prom_float(v)],
+        })),
+        EvalValue::Vector(samples) => {
+            let result: Vec<VectorSample> = samples
+                .into_iter()
+                .map(|s| VectorSample {
+                    metric: s.labels,
+                    value: (eval_ts as f64, format_prom_float(s.value)),
+                })
+                .collect();
+            Ok(json!({
+                "resultType": "vector",
+                "result": result,
+            }))
+        }
+    }
+}
+
+async fn eval_range_item(
+    state: &AppState,
+    principal: &Principal,
+    item: &BatchQueryItem,
+    now_ts: i64,
+) -> Result<Value, PromError> {
+    if item.start.trim().is_empty() || item.end.trim().is_empty() || item.step.trim().is_empty() {
+        return Err(PromError::bad_data(
+            "start, end, and step are required for range queries",
+        ));
+    }
+    let start_ts = parse_prom_timestamp(&item.start, now_ts)?;
+    let end_ts = parse_prom_timestamp(&item.end, now_ts)?;
+    if end_ts < start_ts {
+        return Err(PromError::bad_data("end timestamp must not precede start"));
+    }
+    let step_secs = parse_prom_duration_secs(&item.step)?.max(MIN_STEP_SECS);
+    let span_secs = end_ts
+        .checked_sub(start_ts)
+        .ok_or_else(|| PromError::bad_data("query_range span overflow"))?;
+    let num_points = (span_secs / step_secs).saturating_add(1);
+    if num_points as usize > MAX_RANGE_POINTS {
+        return Err(PromError::bad_data(format!(
+            "query_range exceeds maximum {} points; increase step",
+            MAX_RANGE_POINTS
+        )));
+    }
+    let expr = parse_promql(&item.query)?;
+    let ds = preload_data_source(state, principal, &expr, start_ts, end_ts, now_ts).await?;
+    let mut series_map: BTreeMap<Labels, Vec<(f64, String)>> = BTreeMap::new();
+    let mut t = start_ts;
+    while t <= end_ts {
+        match eval_instant(&expr, &ds, t)? {
+            EvalValue::Scalar(v) => {
+                if !v.is_nan() {
+                    series_map
+                        .entry(Labels::new())
+                        .or_default()
+                        .push((t as f64, format_prom_float(v)));
+                }
+            }
+            EvalValue::Vector(samples) => {
+                for s in samples {
+                    if !s.value.is_nan() {
+                        series_map
+                            .entry(s.labels)
+                            .or_default()
+                            .push((t as f64, format_prom_float(s.value)));
+                    }
+                }
+            }
+        }
+        let Some(next_t) = t.checked_add(step_secs) else {
+            break;
+        };
+        t = next_t;
+    }
+    let result: Vec<MatrixSeries> = series_map
+        .into_iter()
+        .map(|(metric, values)| MatrixSeries { metric, values })
+        .collect();
+    Ok(json!({
+        "resultType": "matrix",
+        "result": result,
+    }))
+}
+
 pub async fn prom_labels() -> Json<Value> {
     let labels = [
         "__name__",
@@ -797,6 +962,7 @@ pub async fn prom_labels() -> Json<Value> {
         "status",
         "step",
         "subsystem",
+        "tag",
         "tool",
         "version",
         "version_bucket",
@@ -883,6 +1049,9 @@ struct AstRequirements {
     range_selectors: BTreeMap<String, Vec<Vec<LabelMatcher>>>,
     min_range_secs: i64,
     max_lookback_secs: i64,
+    sum_only_range: bool,
+    single_window: Option<(i64, i64)>,
+    multiple_windows: bool,
 }
 
 fn inspect_ast(expr: &Expr, req: &mut AstRequirements) {
@@ -892,13 +1061,25 @@ fn inspect_ast(expr: &Expr, req: &mut AstRequirements) {
             req.instant_metrics.insert(sel.metric.clone());
             req.max_lookback_secs = req.max_lookback_secs.max(sel.offset_secs);
         }
-        Expr::RangeCall { selector, .. } => {
+        Expr::RangeCall { func, selector } => {
             req.range_metrics.insert(selector.metric.clone());
             req.range_selectors
                 .entry(selector.metric.clone())
                 .or_default()
                 .push(selector.matchers.clone());
+            if !matches!(
+                func,
+                RangeFunc::Increase | RangeFunc::Rate | RangeFunc::SumOverTime
+            ) {
+                req.sum_only_range = false;
+            }
             let w = selector.range_secs.unwrap_or(300).max(60);
+            let win_key = (w, selector.offset_secs);
+            match req.single_window {
+                None => req.single_window = Some(win_key),
+                Some(prev) if prev != win_key => req.multiple_windows = true,
+                _ => {}
+            }
             if req.min_range_secs == 0 || w < req.min_range_secs {
                 req.min_range_secs = w;
             }
@@ -1036,6 +1217,9 @@ async fn preload_data_source(
         range_selectors: BTreeMap::new(),
         min_range_secs: 0,
         max_lookback_secs: 0,
+        sum_only_range: true,
+        single_window: None,
+        multiple_windows: false,
     };
     inspect_ast(expr, &mut req);
 
@@ -1064,24 +1248,49 @@ async fn preload_data_source(
             .saturating_sub(range_res_secs);
         let names: Vec<String> = req.range_metrics.iter().cloned().collect();
         let selectors_ref = &req.range_selectors;
-        let rows = state
-            .db
-            .query_rollup_buckets_filtered(
-                &names,
-                range_res_secs,
-                query_start,
-                max_eval_ts,
-                |metric, labels| {
-                    selectors_ref.get(metric).is_some_and(|sets| {
-                        sets.iter().any(|ms| ms.iter().all(|m| m.matches(labels)))
-                    })
-                },
-            )
-            .await
-            .map_err(|e| {
-                error!("Failed querying stats_rollups: {e}");
-                PromError::internal("failed to read statistics rollups")
-            })?;
+        let accept = |metric: &str, labels: &Labels| {
+            selectors_ref
+                .get(metric)
+                .is_some_and(|sets| sets.iter().any(|ms| ms.iter().all(|m| m.matches(labels))))
+        };
+        let rows = if min_eval_ts == max_eval_ts
+            && req.sum_only_range
+            && !req.multiple_windows
+            && let Some((win_secs, off_secs)) = req.single_window
+        {
+            let shifted_end = max_eval_ts.saturating_sub(off_secs);
+            let win_start = shifted_end.saturating_sub(win_secs);
+            // Interior buckets fully inside [win_start, min(shifted_end, now_ts)] have weight = 1.0.
+            let full_start = win_start;
+            let full_end = shifted_end.min(now_ts).saturating_sub(range_res_secs);
+            state
+                .db
+                .query_rollup_sums_filtered(
+                    &names,
+                    range_res_secs,
+                    query_start,
+                    full_start,
+                    full_end,
+                    shifted_end,
+                    accept,
+                )
+                .await
+        } else {
+            state
+                .db
+                .query_rollup_buckets_filtered(
+                    &names,
+                    range_res_secs,
+                    query_start,
+                    max_eval_ts,
+                    accept,
+                )
+                .await
+        }
+        .map_err(|e| {
+            error!("Failed querying stats_rollups: {e}");
+            PromError::internal("failed to read statistics rollups")
+        })?;
         fold_rollup_rows_and_unflushed(
             rows,
             &req.range_metrics,
@@ -1162,7 +1371,7 @@ async fn populate_instant_metrics(
         )
     });
     if needs_db_gauges {
-        let gauges = state.db.get_all_state_gauges().await.map_err(|e| {
+        let gauges = state.get_cached_state_gauges().await.map_err(|e| {
             error!("Failed reading stats_state_gauges: {e}");
             PromError::internal("failed to read state gauges")
         })?;
@@ -1184,6 +1393,25 @@ async fn populate_instant_metrics(
                 labels: Labels::new(),
                 value: if done { 1.0 } else { 0.0 },
             }],
+        );
+    }
+
+    if needed.contains("sashiko_project_release_timestamp_seconds") {
+        let releases = state.get_cached_project_releases().await;
+        let samples = releases
+            .into_iter()
+            .map(|(tag, ts)| {
+                let mut l = Labels::new();
+                l.insert("tag".to_string(), tag);
+                EvalSample {
+                    labels: l,
+                    value: ts as f64,
+                }
+            })
+            .collect();
+        out.insert(
+            "sashiko_project_release_timestamp_seconds".to_string(),
+            samples,
         );
     }
 
@@ -1238,14 +1466,16 @@ async fn load_authorized_bug_subsystems(
     }
     let scope = principal.readable_section_names();
     let vis = principal.visibility(&scope);
-    state
-        .db
-        .get_bug_subsystem_facets_o1(None, vis, 200)
-        .await
-        .map_err(|e| {
-            error!("Failed reading bug subsystem facets: {e}");
-            PromError::internal("failed to read bug subsystem stats")
-        })
+    let res = match vis {
+        crate::db::BugVisibility::Unrestricted => state.get_cached_unrestricted_bug_facets().await,
+        crate::db::BugVisibility::Sections(_) => {
+            state.db.get_bug_subsystem_facets_o1(None, vis, 200).await
+        }
+    };
+    res.map_err(|e| {
+        error!("Failed reading bug subsystem facets: {e}");
+        PromError::internal("failed to read bug subsystem stats")
+    })
 }
 
 fn populate_runtime_instant_metrics(
