@@ -5100,6 +5100,7 @@ impl Reviewer {
                         &references_hdr,
                         &final_body,
                         (!related.is_empty()).then_some(msg_id),
+                        related.len(),
                     )
                     .await?;
 
