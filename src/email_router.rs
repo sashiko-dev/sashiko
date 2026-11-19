@@ -1,6 +1,7 @@
 use crate::db::Severity;
 use crate::email_policy::{
-    EmailPolicyConfig, PatchworkPolicy, PositiveReviewPolicy, ReplyTarget, extract_bare_email,
+    EmailPolicyConfig, FailedReviewPolicy, MailingListPolicy, PatchworkPolicy,
+    PositiveReviewPolicy, ReplyTarget, extract_bare_email,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -478,125 +479,244 @@ impl EmailRouter {
                     Some((pos_to, Vec::new()))
                 }
             }
-            PositiveReviewPolicy::All => {
-                let all_incoming: Vec<&String> =
-                    incoming_to.iter().chain(incoming_cc.iter()).collect();
-                let configured_lists: HashSet<String> =
-                    policy.lists.keys().map(|k| extract_bare_email(k)).collect();
-
-                let mut matched_lists = Vec::new();
-                for (list_email, list_policy) in &policy.lists {
-                    let list_bare = extract_bare_email(list_email);
-                    if all_incoming
-                        .iter()
-                        .any(|incoming| Self::address_matches_list(incoming, &list_bare))
-                    {
-                        matched_lists.push((list_bare, list_policy));
-                    }
-                }
-
-                if matched_lists.is_empty() {
-                    return Some((to, cc));
-                }
-
-                matched_lists.sort_by(|a, b| a.0.cmp(&b.0));
-
-                let mut include_author = false;
-                let mut include_recipients = false;
-                let mut allowed_lists: HashSet<String> = HashSet::new();
-                let mut static_cc = Vec::new();
-
-                for (list_bare, list_policy) in matched_lists {
-                    let list_pos = list_policy
+            PositiveReviewPolicy::All => Self::resolve_scoped_all_recipients(
+                policy,
+                incoming_to,
+                incoming_cc,
+                patch_author,
+                &sashiko_bare,
+                Some((to, cc)),
+                |list_policy| {
+                    list_policy
                         .positive_review
-                        .unwrap_or(policy.defaults.positive_review);
-                    let reply_to = list_policy
-                        .reply_to
-                        .as_deref()
-                        .unwrap_or(&policy.defaults.reply_to);
+                        .unwrap_or(policy.defaults.positive_review)
+                },
+                false,
+            ),
+        }
+    }
 
-                    if list_pos == PositiveReviewPolicy::All {
-                        if reply_to.contains(&ReplyTarget::Author) {
-                            include_author = true;
-                        }
-                        if reply_to.contains(&ReplyTarget::List) {
-                            allowed_lists.insert(list_bare);
-                        }
-                        if reply_to.contains(&ReplyTarget::Recipients) {
-                            include_recipients = true;
-                        }
-                        for cr in &list_policy.cc {
-                            static_cc.push(cr.clone());
-                        }
-                    } else if list_pos == PositiveReviewPolicy::Author
-                        && reply_to.contains(&ReplyTarget::Author)
-                    {
-                        include_author = true;
-                    }
+    /// Resolves recipients for an opt-in failure notification (`FailedToApply`
+    /// or `Failed` after retries). Respects `mute_all`, ignored authors, and
+    /// cross-posting isolation so lists with `failed_review = "none"` never
+    /// receive failure notifications.
+    pub fn resolve_failure_recipients(
+        policy: &EmailPolicyConfig,
+        incoming_to: &[String],
+        incoming_cc: &[String],
+        patch_author: &str,
+        sashiko_address: &str,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        let sashiko_bare = extract_bare_email(sashiko_address);
+        let author_bare = extract_bare_email(patch_author);
+        if Self::is_ignored_author(policy, patch_author)
+            || (!sashiko_bare.is_empty()
+                && !author_bare.is_empty()
+                && (author_bare == sashiko_bare
+                    || patch_author.to_ascii_lowercase().contains(&sashiko_bare)))
+        {
+            return None;
+        }
+
+        let all_incoming: Vec<&String> = incoming_to.iter().chain(incoming_cc.iter()).collect();
+        let mut matched_lists: Vec<(String, &MailingListPolicy)> = Vec::new();
+        for (list_email, list_policy) in &policy.lists {
+            let list_bare = extract_bare_email(list_email);
+            if all_incoming
+                .iter()
+                .any(|incoming| Self::address_matches_list(incoming, &list_bare))
+            {
+                matched_lists.push((list_bare, list_policy));
+            }
+        }
+
+        let effective_mode = if matched_lists.is_empty() {
+            if policy.defaults.mute_all {
+                return None;
+            }
+            policy.defaults.failed_review
+        } else {
+            let mut mode = FailedReviewPolicy::None;
+            for (_, list_policy) in &matched_lists {
+                if list_policy.mute_all.unwrap_or(policy.defaults.mute_all) {
+                    return None;
                 }
-
-                for cr in &policy.defaults.cc {
-                    static_cc.push(cr.clone());
-                }
-
-                let author_bare = extract_bare_email(patch_author);
-                if include_recipients
-                    && Self::too_many_individuals(
-                        &all_incoming,
-                        &configured_lists,
-                        &sashiko_bare,
-                        include_author.then_some(author_bare.as_str()),
-                        &static_cc,
-                    )
-                {
-                    include_recipients = false;
-                }
-
-                let mut raw_to = Vec::new();
-                let mut raw_cc = Vec::new();
-
-                if include_author && !patch_author.trim().is_empty() {
-                    raw_to.push(patch_author.to_string());
-                }
-
-                for addr in incoming_to {
-                    let is_ml = Self::is_mailing_list_address(addr, &configured_lists);
-                    if is_ml {
-                        let bare = extract_bare_email(addr);
-                        if allowed_lists.contains(&bare) {
-                            raw_to.push(addr.clone());
-                        }
-                    } else if include_recipients {
-                        raw_to.push(addr.clone());
-                    }
-                }
-
-                for addr in incoming_cc {
-                    let is_ml = Self::is_mailing_list_address(addr, &configured_lists);
-                    if is_ml {
-                        let bare = extract_bare_email(addr);
-                        if allowed_lists.contains(&bare) {
-                            raw_cc.push(addr.clone());
-                        }
-                    } else if include_recipients {
-                        raw_cc.push(addr.clone());
-                    }
-                }
-
-                for cr in static_cc {
-                    raw_cc.push(cr);
-                }
-
-                let (final_to, to_bare_set) = Self::dedup_addresses(raw_to, &sashiko_bare, None);
-                let (final_cc, _) =
-                    Self::dedup_addresses(raw_cc, &sashiko_bare, Some(&to_bare_set));
-
-                if final_to.is_empty() && final_cc.is_empty() {
-                    None
-                } else {
-                    Some((final_to, final_cc))
+                let list_mode = list_policy
+                    .failed_review
+                    .unwrap_or(policy.defaults.failed_review);
+                if list_mode > mode {
+                    mode = list_mode;
                 }
             }
+            mode
+        };
+
+        match effective_mode {
+            FailedReviewPolicy::None => None,
+            FailedReviewPolicy::Author => {
+                let author_trimmed = patch_author.trim();
+                if author_trimmed.is_empty() {
+                    return None;
+                }
+                let (to, _) =
+                    Self::dedup_addresses(vec![author_trimmed.to_string()], &sashiko_bare, None);
+                (!to.is_empty()).then_some((to, Vec::new()))
+            }
+            FailedReviewPolicy::All => {
+                let default_fallback = match Self::resolve_recipients(
+                    policy,
+                    incoming_to,
+                    incoming_cc,
+                    patch_author,
+                    sashiko_address,
+                ) {
+                    Action::Send { to, cc, .. } => Some((to, cc)),
+                    Action::Mute => None,
+                };
+                Self::resolve_scoped_all_recipients(
+                    policy,
+                    incoming_to,
+                    incoming_cc,
+                    patch_author,
+                    &sashiko_bare,
+                    default_fallback,
+                    |list_policy| {
+                        list_policy
+                            .failed_review
+                            .unwrap_or(policy.defaults.failed_review)
+                    },
+                    true,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_scoped_all_recipients<F>(
+        policy: &EmailPolicyConfig,
+        incoming_to: &[String],
+        incoming_cc: &[String],
+        patch_author: &str,
+        sashiko_bare: &str,
+        unmatched_fallback: Option<(Vec<String>, Vec<String>)>,
+        list_scope: F,
+        author_mode_always_includes_author: bool,
+    ) -> Option<(Vec<String>, Vec<String>)>
+    where
+        F: Fn(&MailingListPolicy) -> PositiveReviewPolicy,
+    {
+        let all_incoming: Vec<&String> = incoming_to.iter().chain(incoming_cc.iter()).collect();
+        let configured_lists: HashSet<String> =
+            policy.lists.keys().map(|k| extract_bare_email(k)).collect();
+
+        let mut matched_lists = Vec::new();
+        for (list_email, list_policy) in &policy.lists {
+            let list_bare = extract_bare_email(list_email);
+            if all_incoming
+                .iter()
+                .any(|incoming| Self::address_matches_list(incoming, &list_bare))
+            {
+                matched_lists.push((list_bare, list_policy));
+            }
+        }
+
+        if matched_lists.is_empty() {
+            return unmatched_fallback;
+        }
+
+        matched_lists.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut include_author = false;
+        let mut include_recipients = false;
+        let mut allowed_lists: HashSet<String> = HashSet::new();
+        let mut static_cc = Vec::new();
+
+        for (list_bare, list_policy) in matched_lists {
+            let scope = list_scope(list_policy);
+            let reply_to = list_policy
+                .reply_to
+                .as_deref()
+                .unwrap_or(&policy.defaults.reply_to);
+
+            if scope == PositiveReviewPolicy::All {
+                if reply_to.contains(&ReplyTarget::Author) {
+                    include_author = true;
+                }
+                if reply_to.contains(&ReplyTarget::List) {
+                    allowed_lists.insert(list_bare);
+                }
+                if reply_to.contains(&ReplyTarget::Recipients) {
+                    include_recipients = true;
+                }
+                for cr in &list_policy.cc {
+                    static_cc.push(cr.clone());
+                }
+            } else if scope == PositiveReviewPolicy::Author
+                && (author_mode_always_includes_author || reply_to.contains(&ReplyTarget::Author))
+            {
+                include_author = true;
+            }
+        }
+
+        for cr in &policy.defaults.cc {
+            static_cc.push(cr.clone());
+        }
+
+        let author_bare = extract_bare_email(patch_author);
+        if include_recipients
+            && Self::too_many_individuals(
+                &all_incoming,
+                &configured_lists,
+                sashiko_bare,
+                include_author.then_some(author_bare.as_str()),
+                &static_cc,
+            )
+        {
+            include_recipients = false;
+        }
+
+        let mut raw_to = Vec::new();
+        let mut raw_cc = Vec::new();
+
+        if include_author && !patch_author.trim().is_empty() {
+            raw_to.push(patch_author.to_string());
+        }
+
+        for addr in incoming_to {
+            let is_ml = Self::is_mailing_list_address(addr, &configured_lists);
+            if is_ml {
+                let bare = extract_bare_email(addr);
+                if allowed_lists.contains(&bare) {
+                    raw_to.push(addr.clone());
+                }
+            } else if include_recipients {
+                raw_to.push(addr.clone());
+            }
+        }
+
+        for addr in incoming_cc {
+            let is_ml = Self::is_mailing_list_address(addr, &configured_lists);
+            if is_ml {
+                let bare = extract_bare_email(addr);
+                if allowed_lists.contains(&bare) {
+                    raw_cc.push(addr.clone());
+                }
+            } else if include_recipients {
+                raw_cc.push(addr.clone());
+            }
+        }
+
+        for cr in static_cc {
+            raw_cc.push(cr);
+        }
+
+        let (final_to, to_bare_set) = Self::dedup_addresses(raw_to, sashiko_bare, None);
+        let (final_cc, _) = Self::dedup_addresses(raw_cc, sashiko_bare, Some(&to_bare_set));
+
+        if final_to.is_empty() && final_cc.is_empty() {
+            None
+        } else {
+            Some((final_to, final_cc))
         }
     }
 
@@ -1382,5 +1502,90 @@ mod tests {
             }
             Action::Mute => panic!("expected Action::Send"),
         }
+    }
+
+    #[test]
+    fn test_resolve_failure_recipients_opt_in_and_cross_post_isolation() {
+        let policy = EmailPolicyConfig::parse_content(
+            r#"
+            [defaults]
+            reply_to = []
+            failed_review = "none"
+
+            ["opt-out@vger.kernel.org"]
+            reply_to = ["author", "list"]
+
+            ["author-only@vger.kernel.org"]
+            reply_to = []
+            failed_review = "author"
+
+            ["all-fail@vger.kernel.org"]
+            reply_to = ["author", "list"]
+            cc = ["maint@example.org"]
+            failed_review = "all"
+
+            ["muted@vger.kernel.org"]
+            mute_all = true
+            failed_review = "all"
+            "#,
+        )
+        .unwrap();
+
+        // Default is opt-out ("none").
+        assert_eq!(
+            EmailRouter::resolve_failure_recipients(
+                &policy,
+                &["opt-out@vger.kernel.org".to_string()],
+                &[],
+                "Author <author@example.org>",
+                "sashiko@sashiko.dev",
+            ),
+            None
+        );
+
+        // Author-only works even when reply_to = [].
+        assert_eq!(
+            EmailRouter::resolve_failure_recipients(
+                &policy,
+                &["author-only@vger.kernel.org".to_string()],
+                &[],
+                "Author <author@example.org>",
+                "sashiko@sashiko.dev",
+            ),
+            Some((vec!["Author <author@example.org>".to_string()], vec![]))
+        );
+
+        // Cross-posted between all-fail and opt-out: only all-fail's list + cc + author get it.
+        assert_eq!(
+            EmailRouter::resolve_failure_recipients(
+                &policy,
+                &[
+                    "all-fail@vger.kernel.org".to_string(),
+                    "opt-out@vger.kernel.org".to_string(),
+                ],
+                &[],
+                "Author <author@example.org>",
+                "sashiko@sashiko.dev",
+            ),
+            Some((
+                vec![
+                    "Author <author@example.org>".to_string(),
+                    "all-fail@vger.kernel.org".to_string(),
+                ],
+                vec!["maint@example.org".to_string()],
+            ))
+        );
+
+        // mute_all still suppresses failure notifications.
+        assert_eq!(
+            EmailRouter::resolve_failure_recipients(
+                &policy,
+                &["muted@vger.kernel.org".to_string()],
+                &[],
+                "Author <author@example.org>",
+                "sashiko@sashiko.dev",
+            ),
+            None
+        );
     }
 }

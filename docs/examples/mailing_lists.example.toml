@@ -24,6 +24,10 @@ reply_to = ["author"]
 # - "all": send positive review to normal reply_to + cc recipients
 positive_review = "none"
 
+# Opt-in notification when a patchset fails to apply or fails review
+# after all retries ("none", "author", or "all").
+failed_review = "none"
+
 # If true, completely mutes email notifications for this scope.
 mute_all = true
 
