@@ -407,3 +407,6 @@ reply_to = ["author", "list", "recipients"]
 
 ["linux-mmc@vger.kernel.org"]
 reply_to = ["author"]
+
+["gfs2@lists.linux.dev"]
+reply_to = ["author", "list", "recipients"]
