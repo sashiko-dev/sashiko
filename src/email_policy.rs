@@ -278,7 +278,7 @@ pub struct IngestFilterPolicy {
     pub ignored_paths: Vec<String>,
 }
 
-fn path_matches_pattern(path: &str, pattern: &str) -> bool {
+pub(crate) fn path_matches_pattern(path: &str, pattern: &str) -> bool {
     let norm_path = path.trim_start_matches("./").trim_start_matches('/');
     let norm_pat = pattern
         .trim()
@@ -361,6 +361,72 @@ impl IngestFilterPolicy {
     }
 }
 
+/// Per-mailing-list baseline rule selecting which git tree(s) and branch(es)
+/// Sashiko should try first when applying patchsets sent to that list.
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineRule {
+    pub url: String,
+    #[serde(default)]
+    pub branches: Vec<String>,
+    #[serde(default)]
+    pub subject_prefixes: Vec<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+impl BaselineRule {
+    pub fn validate(&self, list_key: &str) -> Result<(), String> {
+        let url = self.url.trim();
+        let valid_scheme = ["https://", "http://", "git://", "ssh://", "file://"]
+            .iter()
+            .any(|scheme| url.starts_with(scheme));
+        if url.is_empty()
+            || !valid_scheme
+            || url.starts_with('-')
+            || url.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(format!(
+                "Mailing list {:?} has an invalid `baselines.url` ({:?}): expected an \
+                 https://, http://, git://, ssh://, or file:// URL without whitespace",
+                list_key, self.url
+            ));
+        }
+
+        for branch in &self.branches {
+            let trimmed = branch.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with('-')
+                || trimmed.contains("..")
+                || trimmed.contains('*')
+                || trimmed.contains('?')
+                || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
+                return Err(format!(
+                    "Mailing list {:?} has an invalid branch {:?} in `baselines.branches`",
+                    list_key, branch
+                ));
+            }
+        }
+
+        if self.subject_prefixes.iter().any(|s| s.trim().is_empty()) {
+            return Err(format!(
+                "Mailing list {:?} has an empty entry in `baselines.subject_prefixes`",
+                list_key
+            ));
+        }
+
+        if self.paths.iter().any(|s| s.trim().is_empty()) {
+            return Err(format!(
+                "Mailing list {:?} has an empty entry in `baselines.paths`",
+                list_key
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MailingListPolicy {
@@ -383,6 +449,8 @@ pub struct MailingListPolicy {
     pub report_preexisting_bugs: RelatedPreexistingOverride,
     #[serde(default)]
     pub ingest_filter: IngestFilterPolicy,
+    #[serde(default)]
+    pub baselines: Vec<BaselineRule>,
 }
 
 pub type SubsystemPolicy = MailingListPolicy;
@@ -504,6 +572,9 @@ impl EmailPolicyConfig {
                 }
             }
             policy.ingest_filter.validate(key)?;
+            for rule in &policy.baselines {
+                rule.validate(key)?;
+            }
         }
         Ok(())
     }
@@ -1267,5 +1338,79 @@ mod tests {
             cfg.lists["netdev@vger.kernel.org"].failed_review,
             Some(FailedReviewPolicy::None)
         );
+    }
+
+    #[test]
+    fn test_baseline_rule_parsing_and_validation() {
+        let valid = r#"
+            ["bpf@vger.kernel.org"]
+            reply_to = ["author", "list"]
+
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git"
+            subject_prefixes = ["bpf-next"]
+
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf.git"
+            branches = ["master"]
+            subject_prefixes = ["bpf"]
+            paths = ["kernel/bpf/", "net/core/filter.c"]
+        "#;
+        let cfg = EmailPolicyConfig::parse_content(valid).expect("valid baselines parse");
+        let rules = &cfg.lists["bpf@vger.kernel.org"].baselines;
+        assert_eq!(rules.len(), 2);
+        assert!(rules[0].branches.is_empty());
+        assert_eq!(rules[1].branches, vec!["master"]);
+
+        for bad in [
+            // Invalid URL scheme
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "/etc/passwd"
+            "#,
+            // URL with whitespace
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git --upload-pack=sh"
+            "#,
+            // Invalid branch name
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git"
+            branches = ["-bad"]
+            "#,
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git"
+            branches = ["net-*"]
+            "#,
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git"
+            branches = ["a..b"]
+            "#,
+            // Empty subject_prefixes or paths
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git"
+            subject_prefixes = ["  "]
+            "#,
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git"
+            paths = [""]
+            "#,
+            // Unknown field rejected
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git"
+            branch = "master"
+            "#,
+        ] {
+            assert!(
+                EmailPolicyConfig::parse_content(bad).is_err(),
+                "expected validation error for:\n{bad}"
+            );
+        }
     }
 }

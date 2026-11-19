@@ -55,6 +55,14 @@ report_preexisting_bugs = true
 # embargo_hours = 0
 # subject_prefixes = ["bpf", "bpf-next"]
 # reply_to = ["author", "list", "recipients"]
+#
+# [["bpf@vger.kernel.org".baselines]]
+# url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git"
+# subject_prefixes = ["bpf-next"]
+#
+# [["bpf@vger.kernel.org".baselines]]
+# url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf.git"
+# subject_prefixes = ["bpf"]
 
 # --- Opt out of related pre-existing bug mentions ---
 # ["linux-mm@kvack.org"]
