@@ -45,6 +45,7 @@ pub struct BugSubsystemFacetSummary {
     pub total: u64,
     pub open: u64,
     pub fixed: u64,
+    pub fixed_60d: u64,
     pub duplicate: u64,
     pub dismissed: u64,
     pub new_untriaged: u64,
@@ -1898,6 +1899,40 @@ impl Database {
                 .then_with(|| a.subsystem.cmp(&b.subsystem))
         });
         list.truncate(clamped_limit);
+
+        if !list.is_empty() && status_filter.is_none_or(|st| st == "fixed") {
+            let cutoff_60d = chrono::Utc::now().timestamp().saturating_sub(60 * 86_400);
+            let mut fixed_60d_by_sub: BTreeMap<String, u64> = BTreeMap::new();
+            let sub_names: Vec<String> = list.iter().map(|s| s.subsystem.clone()).collect();
+            for chunk in sub_names.chunks(SUB_BATCH_SIZE) {
+                let placeholders = vec!["?"; chunk.len()].join(", ");
+                let mut params: Vec<libsql::Value> = Vec::with_capacity(chunk.len() + 1);
+                params.push(libsql::Value::Integer(cutoff_60d));
+                for name in chunk {
+                    params.push(libsql::Value::Text(name.clone()));
+                }
+                let sql = format!(
+                    "SELECT l.subsystem, COUNT(*)
+                     FROM bugs b
+                     JOIN stats_bug_section_links l ON l.bug_id = b.id
+                     WHERE b.lifecycle_status = 'fixed'
+                       AND COALESCE(b.updated_at, b.reported_at, b.created_at, 0) >= ?
+                       AND l.is_authorizing = 1
+                       AND l.subsystem IN ({placeholders})
+                     GROUP BY l.subsystem"
+                );
+                let mut rows = self.read_conn().query(&sql, params).await?;
+                while let Some(row) = rows.next().await? {
+                    let sub: String = row.get(0)?;
+                    let cnt = row.get::<i64>(1)?.max(0) as u64;
+                    *fixed_60d_by_sub.entry(sub).or_insert(0) += cnt;
+                }
+            }
+            for item in &mut list {
+                item.fixed_60d = fixed_60d_by_sub.get(&item.subsystem).copied().unwrap_or(0);
+            }
+        }
+
         Ok(list)
     }
 
@@ -2459,6 +2494,106 @@ impl Database {
         tx.commit().await?;
         Ok(())
     }
+
+    /// Atomically backfills `sashiko_patches_reviewed_total` for one bounded
+    /// `patchsets` ID chunk `(low, cursor]` using per-patchset guard
+    /// `stats_rollup:ps_patches_done:<id>` so live releases and incremental
+    /// backfills across upgrades neither skip post-cutoff series nor double-count.
+    pub async fn backfill_clean_patches_chunk(
+        &self,
+        low: i64,
+        cursor: i64,
+        now_ts: i64,
+    ) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let mut ps_rows = tx
+            .query(
+                "SELECT ps.id, COALESCE(ps.date, 0)
+                 FROM patchsets ps
+                 WHERE ps.id > ? AND ps.id <= ?
+                   AND ps.status = 'Reviewed'
+                   AND (ps.embargo_until IS NULL OR ps.embargo_until <= ?)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM meta m
+                       WHERE m.key = 'stats_rollup:ps_patches_done:' || ps.id
+                   )",
+                libsql::params![low, cursor, now_ts],
+            )
+            .await?;
+        let mut eligible = Vec::new();
+        while let Some(r) = ps_rows.next().await? {
+            eligible.push((r.get::<i64>(0)?, r.get::<i64>(1)?));
+        }
+        drop(ps_rows);
+
+        let mut acc: BTreeMap<(String, String, i64, i64), f64> = BTreeMap::new();
+        for (ps_id, ps_date) in eligible {
+            let guard_key = format!("stats_rollup:ps_patches_done:{ps_id}");
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES (?, '1')",
+                    libsql::params![guard_key],
+                )
+                .await?;
+            if inserted == 0 {
+                continue;
+            }
+            let effective_ts = if ps_date > 0 { ps_date } else { now_ts };
+            let mut pr_rows = tx
+                .query(
+                    "SELECT r.patch_id,
+                            MAX(CASE WHEN EXISTS (
+                                SELECT 1 FROM findings f
+                                WHERE f.review_id = r.id AND COALESCE(f.preexisting, 0) = 0
+                            ) THEN 1 ELSE 0 END) AS has_finding
+                     FROM reviews r
+                     WHERE r.patchset_id = ? AND r.status = 'Reviewed' AND r.patch_id IS NOT NULL
+                     GROUP BY r.patch_id",
+                    libsql::params![ps_id],
+                )
+                .await?;
+            let mut clean_patches = 0.0f64;
+            let mut dirty_patches = 0.0f64;
+            while let Some(row) = pr_rows.next().await? {
+                if row.get::<i64>(1)? == 0 {
+                    clean_patches += 1.0;
+                } else {
+                    dirty_patches += 1.0;
+                }
+            }
+            drop(pr_rows);
+            if clean_patches > 0.0 {
+                add_rollup_to_map(
+                    &mut acc,
+                    now_ts,
+                    effective_ts,
+                    "sashiko_patches_reviewed_total",
+                    &canonical_labels_json(&[("clean", "true")]),
+                    clean_patches,
+                );
+            }
+            if dirty_patches > 0.0 {
+                add_rollup_to_map(
+                    &mut acc,
+                    now_ts,
+                    effective_ts,
+                    "sashiko_patches_reviewed_total",
+                    &canonical_labels_json(&[("clean", "false")]),
+                    dirty_patches,
+                );
+            }
+        }
+
+        flush_bucket_map_in_tx(&tx, &acc).await?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('stats_backfill:v1:cursor:clean_patches', ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            libsql::params![low.to_string()],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 async fn read_cutoff_in_tx(tx: &DatabaseTransaction, table: &str) -> Result<i64> {
@@ -2654,6 +2789,40 @@ async fn record_single_patchset_release_in_tx(
         drop(pr_rows);
     }
 
+    let mut clean_patches = 0.0f64;
+    let mut dirty_patches = 0.0f64;
+    if status == "Reviewed" {
+        let patches_guard_key = format!("stats_rollup:ps_patches_done:{patchset_id}");
+        let patches_inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES (?, '1')",
+                libsql::params![patches_guard_key],
+            )
+            .await?;
+        if patches_inserted > 0 {
+            let mut pr_rows = tx
+                .query(
+                    "SELECT r.patch_id,
+                            MAX(CASE WHEN EXISTS (
+                                SELECT 1 FROM findings f
+                                WHERE f.review_id = r.id AND COALESCE(f.preexisting, 0) = 0
+                            ) THEN 1 ELSE 0 END) AS has_finding
+                     FROM reviews r
+                     WHERE r.patchset_id = ? AND r.status = 'Reviewed' AND r.patch_id IS NOT NULL
+                     GROUP BY r.patch_id",
+                    libsql::params![patchset_id],
+                )
+                .await?;
+            while let Some(row) = pr_rows.next().await? {
+                if row.get::<i64>(1)? == 0 {
+                    clean_patches += 1.0;
+                } else {
+                    dirty_patches += 1.0;
+                }
+            }
+        }
+    }
+
     let mut acc: BTreeMap<(String, String, i64, i64), f64> = BTreeMap::new();
     let effective_ts = if event_ts > 0 { event_ts } else { now_ts };
     let has_patch_finding = findings_list.iter().any(|(_, preex)| !*preex);
@@ -2670,6 +2839,26 @@ async fn record_single_patchset_release_in_tx(
         &canonical_labels_json(&[("clean", clean), ("status", status.as_str())]),
         1.0,
     );
+    if clean_patches > 0.0 {
+        add_rollup_to_map(
+            &mut acc,
+            now_ts,
+            effective_ts,
+            "sashiko_patches_reviewed_total",
+            &canonical_labels_json(&[("clean", "true")]),
+            clean_patches,
+        );
+    }
+    if dirty_patches > 0.0 {
+        add_rollup_to_map(
+            &mut acc,
+            now_ts,
+            effective_ts,
+            "sashiko_patches_reviewed_total",
+            &canonical_labels_json(&[("clean", "false")]),
+            dirty_patches,
+        );
+    }
     if !upgraded_from_non_reviewed {
         for (lin, cnt) in patch_lineages {
             add_rollup_to_map(
@@ -3506,6 +3695,44 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_subsystem_fixed_60d_window() -> Result<()> {
+        let db = setup_migrated_db().await;
+        let now = chrono::Utc::now().timestamp();
+        let old_ts = now - 90 * 86_400;
+        let recent_ts = now - 5 * 86_400;
+        db.execute(
+            "INSERT INTO bugs (id, bugid, title, lifecycle_status, pipeline_state, reporter, reported_at, severity_int, created_at, updated_at)
+             VALUES
+             (1, 'linux-open', 'open bug', 'open', 'succeeded', 'bot', ?, 3, ?, ?),
+             (2, 'linux-oldfix', 'old fix', 'fixed', 'succeeded', 'bot', ?, 2, ?, ?),
+             (3, 'linux-newfix', 'recent fix', 'fixed', 'succeeded', 'bot', ?, 2, ?, ?)",
+            libsql::params![recent_ts, recent_ts, recent_ts, old_ts, old_ts, old_ts, recent_ts, recent_ts, recent_ts],
+        )
+        .await?;
+        db.execute(
+            "INSERT INTO bug_subsystems (bug_id, subsystem, source) VALUES
+             (1, 'NETWORKING', 'maintainers_section'),
+             (2, 'NETWORKING', 'maintainers_section'),
+             (3, 'NETWORKING', 'maintainers_section')",
+            (),
+        )
+        .await?;
+
+        let facets = db
+            .get_bug_subsystem_facets_o1(
+                None,
+                BugVisibility::Sections(&["NETWORKING".to_string()]),
+                50,
+            )
+            .await?;
+        assert_eq!(facets.len(), 1);
+        assert_eq!(facets[0].open, 1);
+        assert_eq!(facets[0].fixed, 2);
+        assert_eq!(facets[0].fixed_60d, 1);
         Ok(())
     }
 }
