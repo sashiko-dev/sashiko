@@ -116,11 +116,27 @@ reply_to = ["author", "list"]
 embargo_hours = 0
 subject_prefixes = ["bpf", "bpf-next"]
 
+[["bpf@vger.kernel.org".baselines]]
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git"
+subject_prefixes = ["bpf-next"]
+
+[["bpf@vger.kernel.org".baselines]]
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf.git"
+subject_prefixes = ["bpf"]
+
 ["damon@lists.linux.dev"]
 reply_to = ["author", "list"]
 positive_review = "all"
 embargo_hours = 0
 subject_prefixes = ["damon"]
+
+[["damon@lists.linux.dev".baselines]]
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/sj/linux.git"
+branches = ["damon/next"]
+
+[["damon@lists.linux.dev".baselines]]
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/akpm/mm.git"
+branches = ["mm-new", "mm-unstable", "mm-stable"]
 
 ["devicetree@vger.kernel.org"]
 reply_to = ["author", "list"]
@@ -143,6 +159,10 @@ reply_to = ["author", "list"]
 positive_review = "all"
 cc = ["tytso@mit.edu"]
 
+[["linux-ext4@vger.kernel.org".baselines]]
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/tytso/ext4.git"
+branches = ["dev"]
+
 ["linux-kbuild@vger.kernel.org"]
 reply_to = ["author", "list", "recipients"]
 cc = ["nathan@kernel.org", "nsc@kernel.org"]
@@ -152,6 +172,14 @@ embargo_hours = 24
 embargo_hours = 24
 subject_prefixes = ["net", "net-next"]
 
+[["netdev@vger.kernel.org".baselines]]
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git"
+subject_prefixes = ["net-next"]
+
+[["netdev@vger.kernel.org".baselines]]
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net.git"
+subject_prefixes = ["net"]
+
 ["mptcp@lists.linux.dev"]
 reply_to = ["author", "list"]
 embargo_hours = 0
@@ -160,6 +188,16 @@ subject_prefixes = ["mptcp", "mptcp-net", "mptcp-next"]
 ["mptcp@lists.linux.dev".patchwork]
 enabled = true
 api_url = "https://patchwork.kernel.org/api/1.3"
+
+[["mptcp@lists.linux.dev".baselines]]
+url = "https://github.com/multipath-tcp/mptcp_net-next.git"
+branches = ["export"]
+subject_prefixes = ["mptcp-next"]
+
+[["mptcp@lists.linux.dev".baselines]]
+url = "https://github.com/multipath-tcp/mptcp_net-next.git"
+branches = ["export-net"]
+subject_prefixes = ["mptcp", "mptcp-net"]
 
 ["cgroups@vger.kernel.org"]
 reply_to = ["author"]
@@ -223,6 +261,18 @@ cc = [
     "Chuck Lever <cel@kernel.org>",
     "Jeff Layton <jlayton@kernel.org>",
     "Anna Schumaker <anna@kernel.org>",
+]
+
+[["linux-nfs@vger.kernel.org".baselines]]
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"
+branches = ["nfsd-next", "nfsd-testing"]
+paths = [
+    "fs/nfsd/",
+    "fs/lockd/",
+    "fs/nfs_common/",
+    "include/linux/lockd/",
+    "include/linux/sunrpc/",
+    "net/sunrpc/",
 ]
 
 ["kexec@lists.infradead.org"]
@@ -366,6 +416,16 @@ positive_review = "all"
 ["intel-wired-lan@lists.osuosl.org"]
 reply_to = ["author", "list"]
 
+[["intel-wired-lan@lists.osuosl.org".baselines]]
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/tnguy/next-queue.git"
+branches = ["dev-queue"]
+subject_prefixes = ["iwl-next"]
+
+[["intel-wired-lan@lists.osuosl.org".baselines]]
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/tnguy/net-queue.git"
+branches = ["dev-queue"]
+subject_prefixes = ["iwl-net"]
+
 ["linux-gpio@vger.kernel.org"]
 reply_to = ["author", "list"]
 
@@ -390,6 +450,10 @@ reply_to = ["author", "list"]
 reply_to = ["author", "list", "recipients"]
 embargo_hours = 24
 report_preexisting_bugs = false
+
+[["linux-mm@kvack.org".baselines]]
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/akpm/mm.git"
+branches = ["mm-new", "mm-unstable", "mm-stable"]
 
 ["linux-sound@vger.kernel.org"]
 reply_to = ["author", "list"]

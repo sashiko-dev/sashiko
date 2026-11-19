@@ -1041,8 +1041,54 @@ impl Reviewer {
             );
             vec![BaselineResolution::Commit(commit)]
         } else {
+            let policy = match EmailPolicyConfig::load_async(&ctx.settings.review.email_policy_path)
+                .await
+            {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn!(
+                        "Failed to load mailing list policy for baseline resolution of patchset {}: {}",
+                        patchset_id, e
+                    );
+                    None
+                }
+            };
+            let mut recipients: Vec<String> = match ctx.db.get_patchset_gate_info(patchset_id).await
+            {
+                Ok(Some(info)) => [&info.to_recipients, &info.cc_recipients]
+                    .into_iter()
+                    .flat_map(|list| {
+                        crate::patch::split_address_list(list.as_deref().unwrap_or_default())
+                    })
+                    .collect(),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    warn!(
+                        "Failed to load patchset {} recipients for baseline resolution: {}",
+                        patchset_id, e
+                    );
+                    Vec::new()
+                }
+            };
+            if recipients.is_empty()
+                && let Some(mid) = body_msg_id
+                && let Ok(Some(msg)) = ctx.db.get_message_details_by_msgid(mid).await
+            {
+                recipients.extend(crate::patch::split_address_list(
+                    msg.to.as_deref().unwrap_or_default(),
+                ));
+                recipients.extend(crate::patch::split_address_list(
+                    msg.cc.as_deref().unwrap_or_default(),
+                ));
+            }
             ctx.baseline_registry
-                .resolve_candidates(&all_files, &subject, body.as_deref())
+                .resolve_candidates_with_policy(
+                    &all_files,
+                    &subject,
+                    body.as_deref(),
+                    policy.as_ref(),
+                    &recipients,
+                )
                 .await
         };
 

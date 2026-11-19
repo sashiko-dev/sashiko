@@ -379,6 +379,36 @@ impl BaselineRegistry {
         subject: &str,
         body: Option<&str>,
     ) -> Vec<BaselineResolution> {
+        self.resolve_candidates_inner(files, subject, body, Vec::new())
+            .await
+    }
+
+    /// Resolves baseline candidates incorporating per-mailing-list baseline
+    /// rules from `mailing_lists.toml` ahead of the generic `MAINTAINERS`
+    /// heuristic.
+    #[cfg(feature = "server")]
+    pub async fn resolve_candidates_with_policy(
+        &self,
+        files: &[String],
+        subject: &str,
+        body: Option<&str>,
+        policy: Option<&crate::email_policy::EmailPolicyConfig>,
+        recipients: &[String],
+    ) -> Vec<BaselineResolution> {
+        let configured = policy
+            .map(|p| self.resolve_mailing_list_baselines(p, recipients, files, subject))
+            .unwrap_or_default();
+        self.resolve_candidates_inner(files, subject, body, configured)
+            .await
+    }
+
+    async fn resolve_candidates_inner(
+        &self,
+        files: &[String],
+        subject: &str,
+        body: Option<&str>,
+        configured_list_candidates: Vec<BaselineResolution>,
+    ) -> Vec<BaselineResolution> {
         let mut candidates = Vec::new();
 
         // 1. Explicit Base Commit
@@ -419,6 +449,9 @@ impl BaselineRegistry {
         {
             candidates.extend(self.active_stable_branch_candidates().await);
         }
+
+        // 1.8 Configured Per-Mailing-List Baselines
+        candidates.extend(configured_list_candidates);
 
         // 2. Subsystem Heuristic
         let heuristic_candidates = self.resolve_subsystem_heuristic(files, subject);
@@ -557,17 +590,127 @@ impl BaselineRegistry {
             candidates.push(BaselineResolution::LocalRef("HEAD".to_string()));
         }
 
-        // Deduplicate
-        // Simple deduplication based on string representation or enum equality
-        // Since we implement PartialEq, dedup works if consecutive. We need unique.
-        let mut unique_candidates = Vec::new();
+        // Deduplicate preserving first occurrence, collapsing scheme-only URL
+        // differences (e.g. https:// vs git://) targeting the same remote and branch.
+        let mut unique_candidates: Vec<BaselineResolution> = Vec::new();
         for c in candidates {
-            if !unique_candidates.contains(&c) {
+            let duplicate = unique_candidates
+                .iter()
+                .any(|existing| match (existing, &c) {
+                    (
+                        BaselineResolution::RemoteTarget {
+                            url: u1,
+                            name: n1,
+                            branch: b1,
+                        },
+                        BaselineResolution::RemoteTarget {
+                            url: u2,
+                            name: n2,
+                            branch: b2,
+                        },
+                    ) => n1 == n2 && b1 == b2 && crate::git_ops::are_git_urls_equivalent(u1, u2),
+                    _ => existing == &c,
+                });
+            if !duplicate {
                 unique_candidates.push(c);
             }
         }
 
         unique_candidates
+    }
+
+    /// Resolves per-mailing-list baseline candidates from `policy`, ordered by
+    /// rule specificity (prefix+path > prefix > path > unconditional default >
+    /// sibling fallback) while excluding rules whose explicit `paths` filter
+    /// does not match any touched file.
+    #[cfg(feature = "server")]
+    fn resolve_mailing_list_baselines(
+        &self,
+        policy: &crate::email_policy::EmailPolicyConfig,
+        recipients: &[String],
+        files: &[String],
+        subject: &str,
+    ) -> Vec<BaselineResolution> {
+        let recipient_bare: std::collections::HashSet<String> = recipients
+            .iter()
+            .map(|r| crate::email_policy::extract_bare_email(r))
+            .filter(|r| !r.is_empty())
+            .collect();
+        if recipient_bare.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matched_lists: Vec<(&String, &crate::email_policy::MailingListPolicy)> = policy
+            .lists
+            .iter()
+            .filter(|(list_email, list_policy)| {
+                !list_policy.baselines.is_empty()
+                    && recipient_bare.contains(&crate::email_policy::extract_bare_email(list_email))
+            })
+            .collect();
+        if matched_lists.is_empty() {
+            return Vec::new();
+        }
+        matched_lists.sort_by(|a, b| {
+            crate::email_policy::extract_bare_email(a.0)
+                .cmp(&crate::email_policy::extract_bare_email(b.0))
+        });
+
+        let subject_tokens: Vec<&str> = crate::patch::subject_prefix_tokens(subject).collect();
+        let mut ranked: Vec<(i32, usize, usize, &crate::email_policy::BaselineRule)> = Vec::new();
+
+        for (list_idx, (_, list_policy)) in matched_lists.iter().enumerate() {
+            for (rule_idx, rule) in list_policy.baselines.iter().enumerate() {
+                let path_match = !rule.paths.is_empty()
+                    && files.iter().any(|file| {
+                        rule.paths
+                            .iter()
+                            .any(|pat| crate::email_policy::path_matches_pattern(file, pat))
+                    });
+                if !rule.paths.is_empty() && !path_match {
+                    continue;
+                }
+
+                let prefix_match = !rule.subject_prefixes.is_empty()
+                    && subject_tokens.iter().any(|tok| {
+                        rule.subject_prefixes
+                            .iter()
+                            .any(|pref| tok.eq_ignore_ascii_case(pref.trim()))
+                    });
+
+                let tier = if prefix_match && path_match {
+                    3
+                } else if prefix_match {
+                    2
+                } else if path_match {
+                    1
+                } else if rule.subject_prefixes.is_empty() {
+                    0
+                } else {
+                    -1
+                };
+                ranked.push((tier, list_idx, rule_idx, rule));
+            }
+        }
+
+        ranked.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+
+        let mut resolved = Vec::new();
+        for (_, _, _, rule) in ranked {
+            let url = rule.url.trim();
+            if rule.branches.is_empty() {
+                resolved.push(self.resolve_url(url, None));
+            } else {
+                for branch in &rule.branches {
+                    resolved.push(self.resolve_url(url, Some(branch.trim().to_string())));
+                }
+            }
+        }
+        resolved
     }
 
     fn resolve_subsystem_heuristic(
@@ -855,6 +998,16 @@ impl BaselineRegistry {
         if let Some(remote_name) = self.remote_map.get(url) {
             BaselineResolution::RemoteTarget {
                 url: url.to_string(),
+                name: remote_name.clone(),
+                branch,
+            }
+        } else if let Some((existing_url, remote_name)) = self
+            .fetch_remotes
+            .iter()
+            .find(|(existing_url, _)| crate::git_ops::are_git_urls_equivalent(existing_url, url))
+        {
+            BaselineResolution::RemoteTarget {
+                url: existing_url.clone(),
                 name: remote_name.clone(),
                 branch,
             }
@@ -2966,5 +3119,207 @@ index 1111111..2222222 100644
             c,
             BaselineResolution::RemoteTarget { name, .. } if name == "stable"
         )));
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_resolve_mailing_list_baselines_rules_and_priority() {
+        let policy = crate::email_policy::EmailPolicyConfig::parse_content(
+            r#"
+            ["bpf@vger.kernel.org"]
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git"
+            subject_prefixes = ["bpf-next"]
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf.git"
+            subject_prefixes = ["bpf"]
+
+            ["netdev@vger.kernel.org"]
+            [["netdev@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git"
+            subject_prefixes = ["net-next"]
+            [["netdev@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net.git"
+            subject_prefixes = ["net"]
+
+            ["intel-wired-lan@lists.osuosl.org"]
+            [["intel-wired-lan@lists.osuosl.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/tnguy/next-queue.git"
+            branches = ["dev-queue"]
+            subject_prefixes = ["iwl-next"]
+            [["intel-wired-lan@lists.osuosl.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/tnguy/net-queue.git"
+            branches = ["dev-queue"]
+            subject_prefixes = ["iwl-net"]
+
+            ["linux-mm@kvack.org"]
+            [["linux-mm@kvack.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/akpm/mm.git"
+            branches = ["mm-new", "mm-unstable", "mm-stable"]
+
+            ["linux-nfs@vger.kernel.org"]
+            [["linux-nfs@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"
+            branches = ["nfsd-next", "nfsd-testing"]
+            paths = ["fs/nfsd/", "net/sunrpc/"]
+            "#,
+        )
+        .unwrap();
+
+        let registry = BaselineRegistry {
+            entries: vec![MaintainersEntry {
+                subsystem: "BPF".to_string(),
+                trees: vec![
+                    (
+                        "git://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf.git".to_string(),
+                        None,
+                    ),
+                    (
+                        "git://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git"
+                            .to_string(),
+                        None,
+                    ),
+                ],
+                patterns: vec!["kernel/bpf/".to_string()],
+            }],
+            remote_map: HashMap::from([(
+                "git://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git".to_string(),
+                "local-bpf-next".to_string(),
+            )]),
+            fetch_remotes: vec![(
+                "git://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git".to_string(),
+                "local-bpf-next".to_string(),
+            )],
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
+            project: Some(ProjectId::Linux),
+            mainline_remote: None,
+        };
+
+        let refs = |cands: &[BaselineResolution]| -> Vec<String> {
+            cands.iter().map(BaselineResolution::as_str).collect()
+        };
+
+        // 1. Explicit [PATCH bpf-next] prefers bpf-next over bpf, and reuses
+        //    the existing git:// remote name via equivalent-URL matching.
+        let cands = registry
+            .resolve_candidates_with_policy(
+                &["kernel/bpf/verifier.c".to_string()],
+                "[PATCH bpf-next v2 1/2] bpf: tighten check",
+                None,
+                Some(&policy),
+                &["bpf@vger.kernel.org".to_string()],
+            )
+            .await;
+        let r = refs(&cands);
+        assert_eq!(r[0], "local-bpf-next/HEAD");
+        assert_eq!(r[1], "bpf/HEAD");
+        // Equivalent git:// and https:// URLs must deduplicate to one entry each.
+        assert_eq!(r.iter().filter(|x| *x == "local-bpf-next/HEAD").count(), 1);
+        assert_eq!(r.iter().filter(|x| *x == "bpf/HEAD").count(), 1);
+
+        // 2. Explicit [PATCH bpf] prefers bpf over bpf-next.
+        let cands = registry
+            .resolve_candidates_with_policy(
+                &["kernel/bpf/verifier.c".to_string()],
+                "[PATCH bpf] bpf: fix leak",
+                None,
+                Some(&policy),
+                &["bpf@vger.kernel.org".to_string()],
+            )
+            .await;
+        let r = refs(&cands);
+        assert_eq!(r[0], "bpf/HEAD");
+        assert_eq!(r[1], "local-bpf-next/HEAD");
+
+        // 3. Untagged [PATCH] follows TOML declaration order (bpf-next, then bpf).
+        let cands = registry
+            .resolve_candidates_with_policy(
+                &["kernel/bpf/verifier.c".to_string()],
+                "[PATCH] bpf: add new helper",
+                None,
+                Some(&policy),
+                &["bpf@vger.kernel.org".to_string()],
+            )
+            .await;
+        let r = refs(&cands);
+        assert_eq!(r[0], "local-bpf-next/HEAD");
+        assert_eq!(r[1], "bpf/HEAD");
+
+        // 4. Cross-posted [PATCH iwl-next] to netdev + intel-wired-lan picks next-queue/dev-queue first.
+        let cands = registry
+            .resolve_candidates_with_policy(
+                &["drivers/net/ethernet/intel/ice/ice_main.c".to_string()],
+                "[PATCH iwl-next 1/3] ice: refactor queue",
+                None,
+                Some(&policy),
+                &[
+                    "netdev@vger.kernel.org".to_string(),
+                    "intel-wired-lan@lists.osuosl.org".to_string(),
+                ],
+            )
+            .await;
+        let r = refs(&cands);
+        assert_eq!(r[0], "next-queue/dev-queue");
+        assert!(r.contains(&"net-next/HEAD".to_string()));
+
+        // 5. Multi-branch ordering for linux-mm.
+        let cands = registry
+            .resolve_candidates_with_policy(
+                &["mm/slub.c".to_string()],
+                "[PATCH] mm/slub: optimize fastpath",
+                None,
+                Some(&policy),
+                &["Linux MM <linux-mm@kvack.org>".to_string()],
+            )
+            .await;
+        let r = refs(&cands);
+        assert_eq!(&r[0..3], &["mm/mm-new", "mm/mm-unstable", "mm/mm-stable"]);
+
+        // 6. Path-scoped rule applies to fs/nfsd/ but is skipped for fs/nfs/.
+        let nfsd_cands = registry
+            .resolve_candidates_with_policy(
+                &["fs/nfsd/nfs4state.c".to_string()],
+                "[PATCH] nfsd: fix lease",
+                None,
+                Some(&policy),
+                &["linux-nfs@vger.kernel.org".to_string()],
+            )
+            .await;
+        let nfsd_refs = refs(&nfsd_cands);
+        assert_eq!(&nfsd_refs[0..2], &["cel/nfsd-next", "cel/nfsd-testing"]);
+
+        let nfs_client_cands = registry
+            .resolve_candidates_with_policy(
+                &["fs/nfs/client.c".to_string()],
+                "[PATCH] NFS: fix mount",
+                None,
+                Some(&policy),
+                &["linux-nfs@vger.kernel.org".to_string()],
+            )
+            .await;
+        assert!(
+            !refs(&nfs_client_cands)
+                .iter()
+                .any(|x| x.starts_with("cel/")),
+            "path-scoped NFSD rule must not apply to fs/nfs/ client patches"
+        );
+
+        // 7. Explicit base-commit stays ahead of configured subsystem baselines.
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let base_cands = registry
+            .resolve_candidates_with_policy(
+                &["mm/slub.c".to_string()],
+                "[PATCH] mm/slub: fix",
+                Some(&format!("base-commit: {sha}\n")),
+                Some(&policy),
+                &["linux-mm@kvack.org".to_string()],
+            )
+            .await;
+        assert_eq!(
+            base_cands[0],
+            BaselineResolution::Commit(CommitId::parse(sha).unwrap())
+        );
+        assert_eq!(base_cands[1].as_str(), "mm/mm-new");
     }
 }
