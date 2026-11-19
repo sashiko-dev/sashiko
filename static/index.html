@@ -503,31 +503,12 @@
         .switch input:checked + .slider:before { transform: translateX(20px); }
         .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px; background-color: white; transition: .4s; border-radius: 50%; }
 
-        /* Reworked 4-Tab Statistics Dashboard */
-        .stats-header-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
-        .stats-header-bar h1 { margin: 0; padding: 0; border: none; font-size: 1.75em; }
-        .stats-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; border-bottom: 1px solid var(--border-light); padding-bottom: 8px; align-items: center; }
-        .stats-tab-btn { padding: 6px 14px; border-radius: 4px; border: 1px solid var(--border); background: var(--btn-bg); color: var(--text-muted); font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; transition: all 0.12s ease; }
-        .stats-tab-btn:hover { background: var(--hover); color: var(--text); text-decoration: none; }
-        .stats-tab-btn.active { background: var(--selected); color: var(--text); border-color: var(--link); box-shadow: inset 0 -2px 0 var(--link); }
-        .stats-toolbar { display: flex; gap: 8px; align-items: center; margin-left: auto; flex-wrap: wrap; }
-        .stats-seg { display: inline-flex; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
-        .stats-seg button { border: none; border-right: 1px solid var(--border-light); border-radius: 0; padding: 4px 10px; font-size: 12px; background: var(--btn-bg); color: var(--text-muted); }
-        .stats-seg button:last-child { border-right: none; }
-        .stats-seg button.active { background: var(--selected); color: var(--text); font-weight: 700; }
-        .stats-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 18px; margin-bottom: 20px; }
-        @media (max-width: 600px) { .stats-grid-2 { grid-template-columns: 1fr; } }
-        .stat-card .sub-deltas { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; font-size: 11px; color: var(--text-muted); }
-        .delta-pill { display: inline-block; padding: 1px 6px; border-radius: 10px; font-weight: 600; border: 1px solid var(--border-light); background: var(--code-bg); }
-        .delta-good { color: var(--status-reviewed); }
-        .delta-bad { color: var(--status-failed); }
-        .delta-warn { color: var(--status-inreview); }
-        .stats-banner-note { padding: 8px 12px; border-radius: 4px; border: 1px solid var(--warn-border); background: var(--warn-bg); color: var(--warn-text); margin-bottom: 14px; font-size: 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-        .stats-table-wrap { overflow-x: auto; }
+        /* Statistics View Helpers */
+        .stats-chart-wrap { margin: 8px 0 28px 0; padding: 4px 0; }
+        .stats-table-wrap { overflow-x: auto; margin: 8px 0 24px 0; }
         .stats-table th, .stats-table td { font-variant-numeric: tabular-nums; cursor: default; }
         .stats-table tr { cursor: default; }
-        .chart-title-sm { font-size: 0.95em; font-weight: 600; margin: 0 0 10px 0; color: var(--text); display: flex; justify-content: space-between; align-items: baseline; }
-        .chart-subtitle { font-size: 11px; font-weight: normal; color: var(--text-muted); }
+        .stats-summary tr:hover { background-color: transparent; }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
 </head>
@@ -712,7 +693,7 @@
             bugMinSeverity: '', bugSecurityFilter: '', bugLifecycleStatus: 'open', bugAssignee: '', bugSortBy: 'severity', bugSortOrder: 'desc',
             patchsetId: null, patchsetPage: 1, patchsetTotalPages: 1, patchsetLimit: 50,
             settings: { theme: 'auto', colorblind: false },
-            statsTab: 'ops', statsOpsWin: '24h', statsMaintWin: '12w', statsMaintSub: '', statsPipeWin: '100',
+            statsTab: 'health', statsHealthWin: '24h', statsProjectWin: '12w', statsProjectSub: '', statsPipeWin: '100',
             activeCharts: []
         };
 
@@ -1105,7 +1086,7 @@
             [/^#\/log\/baseline\/(.+)\/(\d+)$/, m => ({ view: 'baseline_log', id: safeDecodeURI(m[1]), idx: parseInt(m[2], 10) })],
             [/^#\/log\/(\d+)$/, m => ({ view: 'log', id: m[1] })],
             [/^#\/map\/(\d+)$/, m => ({ view: 'map', id: m[1] })],
-            [/^#\/stats(?:\/([a-z]+))?$/, m => ({ view: 'stats', tab: m[1] || 'ops' })]
+            [/^#\/stats(?:\/([a-z]+))?$/, m => ({ view: 'stats', tab: m[1] || 'health' })]
         ];
 
         function parseHash() {
@@ -4449,23 +4430,32 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         // =====================================================================
         // STATS VIEW (4-TAB PROMETHEUS-BACKED DASHBOARD)
         // =====================================================================
-        const VALID_STATS_TABS = ['ops', 'bugs', 'maintainers', 'pipeline'];
+        const VALID_STATS_TABS = ['health', 'bugs', 'project', 'pipeline'];
+        const STATS_TAB_ALIASES = { ops: 'health', maintainers: 'project' };
 
-        async function promQuery(expr) {
-            const res = await fetch('/api/v1/query?query=' + encodeURIComponent(expr));
-            if (!res.ok) throw new Error('PromQL query failed (' + res.status + ')');
-            const body = await res.json();
-            if (body.status !== 'success') throw new Error(body.error || 'PromQL error');
-            return (body.data && body.data.result) || [];
+        function normalizeStatsTab(raw) {
+            const mapped = STATS_TAB_ALIASES[raw] || raw;
+            if (VALID_STATS_TABS.includes(mapped)) return mapped;
+            const prev = STATS_TAB_ALIASES[state.statsTab] || state.statsTab;
+            return VALID_STATS_TABS.includes(prev) ? prev : 'health';
         }
 
-        async function promQueryRange(expr, startSec, endSec, stepSec) {
-            const url = `/api/v1/query_range?query=${encodeURIComponent(expr)}&start=${startSec}&end=${endSec}&step=${stepSec}s`;
-            const res = await fetch(url);
-            if (!res.ok) throw new Error('PromQL range failed (' + res.status + ')');
+        async function promBatch(queries) {
+            const res = await fetch('/api/v1/query_batch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ queries })
+            });
+            if (!res.ok) throw new Error('Stats query failed (' + res.status + ')');
             const body = await res.json();
-            if (body.status !== 'success') throw new Error(body.error || 'PromQL range error');
-            return (body.data && body.data.result) || [];
+            if (body.status !== 'success') throw new Error(body.error || 'Stats query error');
+            const data = body.data || {};
+            const out = {};
+            for (const q of queries) {
+                const entry = data[q.id];
+                out[q.id] = (entry && entry.result) || [];
+            }
+            return out;
         }
 
         function promScalar(vec, fallback = 0) {
@@ -4487,14 +4477,14 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         }
 
         function fmtNum(n, digits = 0) {
-            if (!Number.isFinite(n)) return '—';
+            if (!Number.isFinite(n)) return '-';
             if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M';
             if (Math.abs(n) >= 1e4 && digits === 0) return (n / 1e3).toFixed(1) + 'k';
-            return digits > 0 ? n.toFixed(digits) : String(Math.round(n));
+            return digits > 0 ? n.toFixed(digits) : Math.round(n).toLocaleString('en-US');
         }
 
         function fmtSecs(s) {
-            if (!Number.isFinite(s) || s < 0) return '—';
+            if (!Number.isFinite(s) || s < 0) return '-';
             if (s < 1) return Math.round(s * 1000) + 'ms';
             if (s < 60) return s.toFixed(1) + 's';
             if (s < 3600) return (s / 60).toFixed(1) + 'm';
@@ -4510,22 +4500,26 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             return Math.round(b) + ' B';
         }
 
-        function renderDeltaPill(curr, baseline, label, lowerIsBetter = false) {
-            if (!Number.isFinite(curr) || !Number.isFinite(baseline) || baseline <= 0) {
-                return `<span class="delta-pill">${escapeHtml(label)}: —</span>`;
-            }
-            const pct = ((curr - baseline) / baseline) * 100;
-            const sign = pct > 0 ? '+' : '';
-            let cls = '';
-            if (Math.abs(pct) >= 10) {
-                if (lowerIsBetter) cls = pct > 25 ? 'delta-bad' : (pct < -10 ? 'delta-good' : 'delta-warn');
-                else cls = pct < -30 ? 'delta-warn' : '';
-            }
-            return `<span class="delta-pill ${cls}">${escapeHtml(sign + Math.round(pct) + '% ' + label)}</span>`;
+        function fmtBaseline(val) {
+            return Number.isFinite(val) && val > 0 ? fmtNum(val) : '-';
         }
 
-        function renderRichCard(title, value, subHtml = '') {
-            return `<div class="stat-card"><h3>${escapeHtml(title)}</h3><div class="value">${escapeHtml(String(value))}</div>${subHtml ? `<div class="sub-deltas">${subHtml}</div>` : ''}</div>`;
+        function fmtPctDelta(curr, baseline) {
+            if (!Number.isFinite(curr) || !Number.isFinite(baseline) || baseline <= 0) return '';
+            const pct = Math.round(((curr - baseline) / baseline) * 100);
+            return `${pct > 0 ? '+' : ''}${pct}% vs 7d avg`;
+        }
+
+        function renderSummaryTable(headers, rows) {
+            const ths = headers.map((h, idx) => `<th${idx === 0 ? ' style="width:240px"' : ''}>${escapeHtml(h)}</th>`).join('');
+            const trs = rows.map(cols => `<tr>${cols.map((cell, idx) => {
+                if (cell && typeof cell === 'object' && 'html' in cell) return `<td>${cell.html}</td>`;
+                const txt = escapeHtml(String(cell ?? '-'));
+                if (idx === 0) return `<td>${txt}</td>`;
+                if (idx === 1) return `<td><strong>${txt}</strong></td>`;
+                return `<td class="text-muted-sm">${txt}</td>`;
+            }).join('')}</tr>`).join('');
+            return `<div class="stats-table-wrap"><table class="stats-table stats-summary"><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table></div>`;
         }
 
         function getStatsPalette() {
@@ -4571,28 +4565,70 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             state.activeCharts.push(chart);
         }
 
-        function formatMatrixBuckets(matrix, stepSec, spanSec) {
-            const tsSet = new Set();
-            for (const s of matrix) {
-                for (const pt of (s.values || [])) tsSet.add(Number(pt[0]));
-            }
-            const sorted = Array.from(tsSet).sort((a, b) => a - b);
+        function alignedEndUtc(stepSec) {
+            const nowSec = Math.floor(Date.now() / 1000);
+            if (stepSec >= 86400) return Math.floor(nowSec / 86400) * 86400;
+            return Math.floor(nowSec / stepSec) * stepSec;
+        }
+
+        function buildFixedAxis(startSec, endSec, stepSec, spanSec) {
+            const sorted = [];
+            for (let t = startSec; t <= endSec; t += stepSec) sorted.push(t);
             const labels = sorted.map(ts => {
                 const d = new Date(ts * 1000);
-                if (spanSec <= 86400 * 2) {
-                    return d.toISOString().slice(11, 16);
-                }
-                return d.toISOString().slice(5, 10);
+                return spanSec <= 86400 * 2 ? d.toISOString().slice(11, 16) : d.toISOString().slice(0, 10);
             });
             return { sorted, labels };
         }
 
-        function seriesValuesAt(seriesObj, sortedTs) {
+        function seriesIntsAt(seriesObj, sortedTs) {
             const map = new Map();
             if (seriesObj && Array.isArray(seriesObj.values)) {
-                for (const [ts, val] of seriesObj.values) map.set(Number(ts), Number(val) || 0);
+                for (const [ts, val] of seriesObj.values) {
+                    map.set(Math.round(Number(ts)), Math.round(Number(val) || 0));
+                }
             }
             return sortedTs.map(t => map.get(t) || 0);
+        }
+
+        function sumSeriesIntsAt(seriesList, sortedTs) {
+            const totals = sortedTs.map(() => 0);
+            for (const s of (seriesList || [])) {
+                const vals = seriesIntsAt(s, sortedTs);
+                for (let i = 0; i < totals.length; i++) totals[i] += vals[i];
+            }
+            return totals;
+        }
+
+        function buildReleaseMarkLine(releasesVec, sortedTs, labels, stepSec, pal) {
+            if (!Array.isArray(releasesVec) || !releasesVec.length || !sortedTs.length) return undefined;
+            const minTs = sortedTs[0] - stepSec;
+            const maxTs = sortedTs[sortedTs.length - 1];
+            const data = [];
+            for (const item of releasesVec) {
+                const tag = item.metric?.tag;
+                const ts = Number(item.value?.[1]);
+                if (!tag || !Number.isFinite(ts) || ts < minTs || ts > maxTs) continue;
+                let idx = sortedTs.findIndex(t => ts <= t);
+                if (idx < 0) idx = sortedTs.length - 1;
+                data.push({
+                    xAxis: labels[idx],
+                    name: tag,
+                    label: {
+                        formatter: tag,
+                        position: 'insideEndTop',
+                        color: pal.muted,
+                        fontSize: 10
+                    }
+                });
+            }
+            if (!data.length) return undefined;
+            return {
+                symbol: ['none', 'none'],
+                silent: true,
+                lineStyle: { type: 'dashed', color: pal.muted, width: 1, opacity: 0.7 },
+                data
+            };
         }
 
         function promEscapeStringLiteral(s) {
@@ -4604,33 +4640,26 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         async function renderStatsView(requestedTab) {
             const renderSeq = ++statsRenderSeq;
             clearActiveCharts();
-            const tab = VALID_STATS_TABS.includes(requestedTab)
-                ? requestedTab
-                : (VALID_STATS_TABS.includes(state.statsTab) ? state.statsTab : 'ops');
+            const tab = normalizeStatsTab(requestedTab);
             state.statsTab = tab;
-            if (!state.statsOpsWin) state.statsOpsWin = '24h';
-            if (!state.statsMaintWin) state.statsMaintWin = '12w';
+            if (!state.statsHealthWin) state.statsHealthWin = '24h';
+            if (!state.statsProjectWin) state.statsProjectWin = '12w';
             if (!state.statsPipeWin) state.statsPipeWin = '100';
-            if (typeof state.statsMaintSub === 'undefined') state.statsMaintSub = '';
+            if (typeof state.statsProjectSub === 'undefined') state.statsProjectSub = '';
 
             const toolbarHtml = renderStatsToolbar(tab);
             document.getElementById('app').innerHTML = `
-                <div class="nav" style="justify-content: space-between;">
-                    <a href="#/" id="statsBackLink">← Back</a>
-                    <a href="/metrics" target="_blank" rel="noopener" class="text-muted-sm" title="Prometheus text 0.0.4 scrape endpoint">Prometheus /metrics ↗</a>
-                </div>
-                <div class="stats-header-bar">
-                    <h1>Statistics</h1>
-                </div>
-                <div class="stats-tabs" id="statsTabBar">
-                    <a href="#/stats/ops" class="stats-tab-btn ${tab === 'ops' ? 'active' : ''}" data-stats-tab="ops">1. Operational</a>
-                    <a href="#/stats/bugs" class="stats-tab-btn ${tab === 'bugs' ? 'active' : ''}" data-stats-tab="bugs">2. Bugs Database</a>
-                    <a href="#/stats/maintainers" class="stats-tab-btn ${tab === 'maintainers' ? 'active' : ''}" data-stats-tab="maintainers">3. Maintainers</a>
-                    <a href="#/stats/pipeline" class="stats-tab-btn ${tab === 'pipeline' ? 'active' : ''}" data-stats-tab="pipeline">4. Pipeline</a>
-                    <div class="stats-toolbar">${toolbarHtml}</div>
+                <div class="nav"><a href="#/" id="statsBackLink">← Back</a></div>
+                <h1>Statistics</h1>
+                <div class="controls">
+                    <button type="button" data-stats-tab="health" class="${tab === 'health' ? 'active' : ''}">Health</button>
+                    <button type="button" data-stats-tab="bugs" class="${tab === 'bugs' ? 'active' : ''}">Bugs</button>
+                    <button type="button" data-stats-tab="project" class="${tab === 'project' ? 'active' : ''}">Project</button>
+                    <button type="button" data-stats-tab="pipeline" class="${tab === 'pipeline' ? 'active' : ''}">Pipeline</button>
+                    ${toolbarHtml ? `<div class="mode-switcher">${toolbarHtml}</div>` : ''}
                 </div>
                 <div id="stats-backfill-banner"></div>
-                <div id="stats-content" class="loading">Loading statistics...</div>
+                <div id="stats-content" class="loading">Loading stats...</div>
             `;
 
             const backEl = document.getElementById('statsBackLink');
@@ -4638,18 +4667,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             bindStatsToolbarEvents(tab);
 
             try {
-                const bfVec = await promQuery('sashiko_stats_backfill_complete');
-                if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
-                if (bfVec.length && promScalar(bfVec, 1) < 1) {
-                    const bEl = document.getElementById('stats-backfill-banner');
-                    if (bEl) {
-                        bEl.innerHTML = `<div class="stats-banner-note"><span>Historical time-series rollup backfill is running in the background; live gauges are already current.</span></div>`;
-                    }
-                }
-
-                if (tab === 'ops') await renderOpsStatsTab(renderSeq);
+                if (tab === 'health') await renderHealthStatsTab(renderSeq);
                 else if (tab === 'bugs') await renderBugsStatsTab(renderSeq);
-                else if (tab === 'maintainers') await renderMaintainersStatsTab(renderSeq);
+                else if (tab === 'project') await renderProjectStatsTab(renderSeq);
                 else await renderPipelineStatsTab(renderSeq);
             } catch (e) {
                 if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
@@ -4657,54 +4677,52 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 const container = document.getElementById('stats-content');
                 if (container) {
                     container.classList.remove('loading');
-                    container.innerHTML = `<div class="error">Error loading statistics: ${escapeHtml(e.message)}</div>`;
+                    container.innerHTML = `<div class="error">Error loading stats: ${escapeHtml(e.message)}</div>`;
                 }
             }
         }
 
         function renderStatsToolbar(tab) {
-            if (tab === 'ops') {
-                const w = state.statsOpsWin;
-                return `<span class="bug-filter-label">Window:</span>
-                    <div class="stats-seg">
-                        <button type="button" data-ops-win="1h" class="${w === '1h' ? 'active' : ''}">Last 1h</button>
-                        <button type="button" data-ops-win="24h" class="${w === '24h' ? 'active' : ''}">Last 24h</button>
-                    </div>`;
+            if (tab === 'health') {
+                const w = state.statsHealthWin;
+                return `<span class="bug-filter-label">Window</span>
+                    <button type="button" data-health-win="1h" class="${w === '1h' ? 'active' : ''}">1h</button>
+                    <button type="button" data-health-win="24h" class="${w === '24h' ? 'active' : ''}">24h</button>`;
             }
-            if (tab === 'maintainers') {
-                const w = state.statsMaintWin;
-                return `<span class="bug-filter-label">Subsystem:</span>
-                    <select id="maintSubsystemSelect"><option value="">All Subsystems</option></select>
-                    <span class="bug-filter-label">Window:</span>
-                    <div class="stats-seg">
-                        <button type="button" data-maint-win="4w" class="${w === '4w' ? 'active' : ''}">4w</button>
-                        <button type="button" data-maint-win="12w" class="${w === '12w' ? 'active' : ''}">12w</button>
-                        <button type="button" data-maint-win="26w" class="${w === '26w' ? 'active' : ''}">26w</button>
-                    </div>`;
+            if (tab === 'project') {
+                const w = state.statsProjectWin;
+                return `<select id="projectSubsystemSelect"><option value="">All Subsystems</option></select>
+                    <button type="button" data-project-win="4w" class="${w === '4w' ? 'active' : ''}">4w</button>
+                    <button type="button" data-project-win="12w" class="${w === '12w' ? 'active' : ''}">12w</button>
+                    <button type="button" data-project-win="26w" class="${w === '26w' ? 'active' : ''}">26w</button>`;
             }
             if (tab === 'pipeline') {
                 const w = state.statsPipeWin;
-                return `<span class="bug-filter-label">Sample:</span>
-                    <div class="stats-seg">
-                        <button type="button" data-pipe-win="100" class="${w === '100' ? 'active' : ''}">Last 100</button>
-                        <button type="button" data-pipe-win="500" class="${w === '500' ? 'active' : ''}">Last 500</button>
-                        <button type="button" data-pipe-win="1000" class="${w === '1000' ? 'active' : ''}">Last 1000</button>
-                    </div>`;
+                return `<span class="bug-filter-label">Last</span>
+                    <button type="button" data-pipe-win="100" class="${w === '100' ? 'active' : ''}">100</button>
+                    <button type="button" data-pipe-win="500" class="${w === '500' ? 'active' : ''}">500</button>
+                    <button type="button" data-pipe-win="1000" class="${w === '1000' ? 'active' : ''}">1000</button>`;
             }
             return '';
         }
 
         function bindStatsToolbarEvents(tab) {
-            document.querySelectorAll('[data-ops-win]').forEach(btn => {
+            document.querySelectorAll('[data-stats-tab]').forEach(btn => {
                 btn.addEventListener('click', () => {
-                    state.statsOpsWin = btn.dataset.opsWin;
-                    renderStatsView('ops');
+                    const target = btn.dataset.statsTab;
+                    if (target && target !== state.statsTab) navigate(`#/stats/${target}`);
                 });
             });
-            document.querySelectorAll('[data-maint-win]').forEach(btn => {
+            document.querySelectorAll('[data-health-win]').forEach(btn => {
                 btn.addEventListener('click', () => {
-                    state.statsMaintWin = btn.dataset.maintWin;
-                    renderStatsView('maintainers');
+                    state.statsHealthWin = btn.dataset.healthWin;
+                    renderStatsView('health');
+                });
+            });
+            document.querySelectorAll('[data-project-win]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    state.statsProjectWin = btn.dataset.projectWin;
+                    renderStatsView('project');
                 });
             });
             document.querySelectorAll('[data-pipe-win]').forEach(btn => {
@@ -4713,157 +4731,159 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     renderStatsView('pipeline');
                 });
             });
-            if (tab === 'maintainers') {
-                const sel = document.getElementById('maintSubsystemSelect');
+            if (tab === 'project') {
+                const sel = document.getElementById('projectSubsystemSelect');
                 if (sel) {
                     sel.addEventListener('change', () => {
-                        state.statsMaintSub = sel.value || '';
-                        renderStatsView('maintainers');
+                        state.statsProjectSub = sel.value || '';
+                        renderStatsView('project');
                     });
                 }
             }
         }
 
+        function updateBackfillBanner(bfVec) {
+            const bEl = document.getElementById('stats-backfill-banner');
+            if (!bEl) return;
+            if (bfVec && bfVec.length && promScalar(bfVec, 1) < 1) {
+                bEl.innerHTML = `<div class="bug-filters-bar">Historical rollup backfill is running in the background; live gauges are current.</div>`;
+            } else {
+                bEl.innerHTML = '';
+            }
+        }
+
         // ---------------------------------------------------------------------
-        // TAB 1: OPERATIONAL / SRE (#/stats/ops)
+        // TAB 1: HEALTH — ONGOING MONITORING (#/stats/health)
         // ---------------------------------------------------------------------
-        async function renderOpsStatsTab(renderSeq) {
-            const win = state.statsOpsWin === '1h' ? '1h' : '24h';
+        async function renderHealthStatsTab(renderSeq) {
+            const win = state.statsHealthWin === '1h' ? '1h' : '24h';
             const winHours = win === '1h' ? 1 : 24;
             const scale7d = (7 * 24) / winHours;
             const scale30d = (30 * 24) / winHours;
-            const nowSec = Math.floor(Date.now() / 1000);
             const spanSec = winHours * 3600;
-            const stepSec = win === '1h' ? 300 : 1800;
-            const startSec = nowSec - spanSec;
+            const stepSec = win === '1h' ? 300 : 3600;
+            const endSec = alignedEndUtc(stepSec);
+            const startSec = endSec - spanSec + stepSec;
+            const startStr = String(startSec);
+            const endStr = String(endSec);
+            const stepStr = `${stepSec}s`;
 
-            const [
-                ingCurr, ing7d, ing30d, ingOff7d,
-                revBySt, rev7d, rev30d,
-                logByLvl, log7dErr,
-                tokByDir, tok7d, tok30d,
-                cacheByOut, aiErrByCls, workerRestarts,
-                outboxByOut, gitRemotes, gitMaxAge, nntpLag,
-                queueDepth, outboxDepth, fetchDepth,
-                inflight, cooldown, hbAge, packCnt, packBytes,
-                aiP50, aiP90, aiP99, revP50, revP90, gitOpP90,
-                rngIng, rngIngOff, rngRev, rngLogs, rngTok
-            ] = await Promise.all([
-                promQuery(`sum by (source) (increase(sashiko_messages_ingested_total[${win}]))`),
-                promQuery(`sum(increase(sashiko_messages_ingested_total[7d]))`),
-                promQuery(`sum(increase(sashiko_messages_ingested_total[30d]))`),
-                promQuery(`sum(increase(sashiko_messages_ingested_total[${win}] offset 7d))`),
-                promQuery(`sum by (status) (increase(sashiko_reviews_completed_total[${win}]))`),
-                promQuery(`sum(increase(sashiko_reviews_completed_total[7d]))`),
-                promQuery(`sum(increase(sashiko_reviews_completed_total[30d]))`),
-                promQuery(`sum by (level) (increase(sashiko_log_events_total[${win}]))`),
-                promQuery(`sum(increase(sashiko_log_events_total{level="error"}[7d]))`),
-                promQuery(`sum by (direction) (increase(sashiko_ai_tokens_total[${win}]))`),
-                promQuery(`sum(increase(sashiko_ai_tokens_total[7d]))`),
-                promQuery(`sum(increase(sashiko_ai_tokens_total[30d]))`),
-                promQuery(`sum by (outcome) (increase(sashiko_ai_cache_requests_total[${win}]))`),
-                promQuery(`sum by (class) (increase(sashiko_ai_errors_total[${win}]))`),
-                promQuery(`sum by (reason) (increase(sashiko_worker_restarts_total[${win}]))`),
-                promQuery(`sum by (channel, outcome) (increase(sashiko_outbox_events_total[${win}]))`),
-                promQuery(`sashiko_git_remotes`),
-                promQuery(`sashiko_git_remote_max_age_seconds`),
-                promQuery(`sashiko_nntp_lag_articles`),
-                promQuery(`sashiko_queue_depth`),
-                promQuery(`sum by (channel) (sashiko_outbox_depth{status="Pending"})`),
-                promQuery(`sashiko_fetch_queue_depth{status="Pending"}`),
-                promQuery(`sashiko_ai_inflight_requests`),
-                promQuery(`sashiko_ai_quota_cooldown_seconds`),
-                promQuery(`sashiko_email_worker_heartbeat_age_seconds`),
-                promQuery(`sashiko_repo_packs`),
-                promQuery(`sashiko_repo_pack_bytes`),
-                promQuery(`histogram_quantile(0.5, sum by (le) (increase(sashiko_ai_request_duration_seconds_bucket[${win}])))`),
-                promQuery(`histogram_quantile(0.9, sum by (le) (increase(sashiko_ai_request_duration_seconds_bucket[${win}])))`),
-                promQuery(`histogram_quantile(0.99, sum by (le) (increase(sashiko_ai_request_duration_seconds_bucket[${win}])))`),
-                promQuery(`histogram_quantile(0.5, sum by (le) (increase(sashiko_review_duration_seconds_bucket[${win}])))`),
-                promQuery(`histogram_quantile(0.9, sum by (le) (increase(sashiko_review_duration_seconds_bucket[${win}])))`),
-                promQuery(`histogram_quantile(0.9, sum by (op, le) (increase(sashiko_git_op_duration_seconds_bucket[${win}])))`),
-                promQueryRange(`sum(increase(sashiko_messages_ingested_total[${stepSec}s]))`, startSec, nowSec, stepSec),
-                promQueryRange(`sum(increase(sashiko_messages_ingested_total[${stepSec}s] offset 7d))`, startSec, nowSec, stepSec),
-                promQueryRange(`sum by (status) (increase(sashiko_reviews_completed_total[${stepSec}s]))`, startSec, nowSec, stepSec),
-                promQueryRange(`sum by (level) (increase(sashiko_log_events_total[${stepSec}s]))`, startSec, nowSec, stepSec),
-                promQueryRange(`sum by (direction) (increase(sashiko_ai_tokens_total[${stepSec}s]))`, startSec, nowSec, stepSec)
+            const r = await promBatch([
+                { id: 'bf', query: 'sashiko_stats_backfill_complete' },
+                { id: 'ingCurr', query: `sum(increase(sashiko_messages_ingested_total[${win}]))` },
+                { id: 'ing7d', query: 'sum(increase(sashiko_messages_ingested_total[7d]))' },
+                { id: 'ing30d', query: 'sum(increase(sashiko_messages_ingested_total[30d]))' },
+                { id: 'revBySt', query: `sum by (status) (increase(sashiko_reviews_completed_total[${win}]))` },
+                { id: 'rev7d', query: 'sum(increase(sashiko_reviews_completed_total[7d]))' },
+                { id: 'rev30d', query: 'sum(increase(sashiko_reviews_completed_total[30d]))' },
+                { id: 'logByLvl', query: `sum by (level) (increase(sashiko_log_events_total[${win}]))` },
+                { id: 'tokByDir', query: `sum by (direction) (increase(sashiko_ai_tokens_total[${win}]))` },
+                { id: 'tok7d', query: 'sum(increase(sashiko_ai_tokens_total[7d]))' },
+                { id: 'tok30d', query: 'sum(increase(sashiko_ai_tokens_total[30d]))' },
+                { id: 'aiErrTot', query: `sum(increase(sashiko_ai_errors_total[${win}]))` },
+                { id: 'workerRestarts', query: `sum(increase(sashiko_worker_restarts_total[${win}]))` },
+                { id: 'gitRemotes', query: 'sashiko_git_remotes' },
+                { id: 'gitMaxAge', query: 'sashiko_git_remote_max_age_seconds' },
+                { id: 'nntpLag', query: 'sashiko_nntp_lag_articles{agg="total"}' },
+                { id: 'queueDepth', query: 'sashiko_queue_depth' },
+                { id: 'outboxDepth', query: 'sum(sashiko_outbox_depth{status="Pending"})' },
+                { id: 'fetchDepth', query: 'sashiko_fetch_queue_depth{status="Pending"}' },
+                { id: 'cooldown', query: 'sashiko_ai_quota_cooldown_seconds' },
+                { id: 'aiP90', query: `histogram_quantile(0.9, sum by (le) (increase(sashiko_ai_request_duration_seconds_bucket[${win}])))` },
+                { id: 'rngIng', query: `sum(increase(sashiko_messages_ingested_total[${stepStr}]))`, start: startStr, end: endStr, step: stepStr },
+                { id: 'rngIngOff', query: `sum(increase(sashiko_messages_ingested_total[${stepStr}] offset 7d))`, start: startStr, end: endStr, step: stepStr },
+                { id: 'rngRev', query: `sum by (status) (increase(sashiko_reviews_completed_total[${stepStr}]))`, start: startStr, end: endStr, step: stepStr },
+                { id: 'rngTok', query: `sum by (direction) (increase(sashiko_ai_tokens_total[${stepStr}]))`, start: startStr, end: endStr, step: stepStr },
+                { id: 'rngLogs', query: `sum by (level) (increase(sashiko_log_events_total[${stepStr}]))`, start: startStr, end: endStr, step: stepStr }
             ]);
             if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
+            updateBackfillBanner(r.bf);
 
-            const ingMap = promMapBy(ingCurr, 'source');
-            const ingTot = Object.values(ingMap).reduce((a, b) => a + b, 0);
-            const revMap = promMapBy(revBySt, 'status');
-            const revTot = Object.values(revMap).reduce((a, b) => a + b, 0);
-            const revFail = (revMap['Failed'] || 0) + (revMap['Failed To Apply'] || 0);
-            const logMap = promMapBy(logByLvl, 'level');
-            const errCnt = logMap['error'] || 0;
-            const warnCnt = logMap['warn'] || 0;
-            const tokMap = promMapBy(tokByDir, 'direction');
-            const tokTot = Object.values(tokMap).reduce((a, b) => a + b, 0);
+            const ingTot = Math.round(promScalar(r.ingCurr));
+            const ingAvg7 = promScalar(r.ing7d) / scale7d;
+            const ingAvg30 = promScalar(r.ing30d) / scale30d;
+
+            const revMap = promMapBy(r.revBySt, 'status');
+            const revTot = Math.round(Object.values(revMap).reduce((a, b) => a + b, 0));
+            const revFail = Math.round((revMap['Failed'] || 0) + (revMap['Failed To Apply'] || 0));
+            const revAvg7 = promScalar(r.rev7d) / scale7d;
+            const revAvg30 = promScalar(r.rev30d) / scale30d;
+
+            const logMap = promMapBy(r.logByLvl, 'level');
+            const errCnt = Math.round(logMap['error'] || 0);
+            const warnCnt = Math.round(logMap['warn'] || 0);
+
+            const tokMap = promMapBy(r.tokByDir, 'direction');
+            const tokTot = Math.round(Object.values(tokMap).reduce((a, b) => a + b, 0));
+            const tokAvg7 = promScalar(r.tok7d) / scale7d;
+            const tokAvg30 = promScalar(r.tok30d) / scale30d;
             const tokInAll = (tokMap['uncached_in'] || 0) + (tokMap['cached_in'] || 0);
-            const promptCachePct = tokInAll > 0 ? Math.round(((tokMap['cached_in'] || 0) / tokInAll) * 100) + '%' : '—';
-            const respCache = promMapBy(cacheByOut, 'outcome');
-            const respCacheTot = (respCache['hit'] || 0) + (respCache['miss'] || 0);
-            const respCachePct = respCacheTot > 0 ? Math.round(((respCache['hit'] || 0) / respCacheTot) * 100) + '%' : '—';
+            const cachePct = tokInAll > 0 ? Math.round(((tokMap['cached_in'] || 0) / tokInAll) * 100) + '% prompt cache' : '';
 
-            const remMap = promMapBy(gitRemotes, 'state');
-            const staleCnt = (remMap['stale'] || 0) + (remMap['failed'] || 0) + (remMap['backed_off'] || 0);
-            const lagMap = promMapBy(nntpLag, 'agg');
-            const qMap = promMapBy(queueDepth, 'queue');
-            const obPendMap = promMapBy(outboxDepth, 'channel');
-            const obPendTot = Object.values(obPendMap).reduce((a, b) => a + b, 0);
+            const remMap = promMapBy(r.gitRemotes, 'state');
+            const staleCnt = Math.round((remMap['stale'] || 0) + (remMap['failed'] || 0) + (remMap['backed_off'] || 0));
+            const freshCnt = Math.round(remMap['fresh'] || 0);
+            const totalRemotes = staleCnt + freshCnt;
+            const qMap = promMapBy(r.queueDepth, 'queue');
+            const nntpLagVal = Math.round(promScalar(r.nntpLag));
+            const cdSecs = promScalar(r.cooldown);
+            const aiP90Val = promScalar(r.aiP90, NaN);
 
-            let sentEmail = 0, sentForge = 0, sentPw = 0, obFailed = 0;
-            for (const item of outboxByOut) {
-                const ch = item.metric?.channel;
-                const oc = item.metric?.outcome;
-                const v = Number(item.value?.[1]) || 0;
-                if (oc === 'sent') {
-                    if (ch === 'email') sentEmail += v;
-                    else if (ch === 'forge') sentForge += v;
-                    else if (ch === 'patchwork') sentPw += v;
-                } else if (oc === 'failed') obFailed += v;
+            const rows = [
+                [
+                    'Queue Backlog',
+                    `${fmtNum(qMap['patches_pending'] || 0)} pending`,
+                    '-',
+                    '-',
+                    [`${fmtNum(qMap['patches_reviewing'] || 0)} active`, `${fmtNum(promScalar(r.fetchDepth))} fetch`, `${fmtNum(promScalar(r.outboxDepth))} outbox`, nntpLagVal > 0 ? `${fmtNum(nntpLagVal)} NNTP lag` : ''].filter(Boolean).join(' · ')
+                ],
+                [
+                    'Messages Ingested',
+                    fmtNum(ingTot),
+                    fmtBaseline(ingAvg7),
+                    fmtBaseline(ingAvg30),
+                    fmtPctDelta(ingTot, ingAvg7) || '-'
+                ],
+                [
+                    'Reviews Completed',
+                    fmtNum(revTot),
+                    fmtBaseline(revAvg7),
+                    fmtBaseline(revAvg30),
+                    [revTot > 0 ? `${Math.round((revFail / revTot) * 100)}% failed` : '0 failed', fmtPctDelta(revTot, revAvg7)].filter(Boolean).join(' · ')
+                ],
+                [
+                    'Errors',
+                    { html: `<strong class="${errCnt > 0 ? 'text-error-bold' : ''}">${escapeHtml(fmtNum(errCnt))}</strong>` },
+                    '-',
+                    '-',
+                    `${fmtNum(warnCnt)} warnings · ${fmtNum(promScalar(r.aiErrTot))} AI errors · ${fmtNum(promScalar(r.workerRestarts))} restarts`
+                ],
+                [
+                    'Git Remotes',
+                    { html: `<strong class="${staleCnt > 0 ? 'text-error-bold' : 'text-success-bold'}">${escapeHtml(staleCnt > 0 ? `${fmtNum(staleCnt)} stale` : 'all fresh')}</strong>` },
+                    '-',
+                    '-',
+                    `${fmtNum(freshCnt)}/${fmtNum(totalRemotes)} fresh · oldest sync ${fmtSecs(promScalar(r.gitMaxAge))}`
+                ],
+                [
+                    'LLM Tokens',
+                    fmtNum(tokTot),
+                    fmtBaseline(tokAvg7),
+                    fmtBaseline(tokAvg30),
+                    [cachePct, Number.isFinite(aiP90Val) ? `AI p90 ${fmtSecs(aiP90Val)}` : '', cdSecs > 0 ? `cooldown ${fmtSecs(cdSecs)}` : ''].filter(Boolean).join(' · ') || '-'
+                ]
+            ];
+
+            const avgUnit = win === '1h' ? 'Hourly' : 'Daily';
+            let html = `<h2>Service Health</h2>` +
+                renderSummaryTable(['Metric', `Last ${win}`, `7d ${avgUnit} Avg`, `30d ${avgUnit} Avg`, 'Detail'], rows);
+
+            html += `<h2>Ingestion vs 7d Ago</h2><div class="stats-chart-wrap"><div id="health-chart-ingest" class="chart-container"></div></div>`;
+            html += `<h2>Review Outcomes</h2><div class="stats-chart-wrap"><div id="health-chart-reviews" class="chart-container"></div></div>`;
+            html += `<h2>Token Burn</h2><div class="stats-chart-wrap"><div id="health-chart-tokens" class="chart-container"></div></div>`;
+            if (errCnt > 0 || warnCnt > 0) {
+                html += `<h2>Errors &amp; Warnings</h2><div class="stats-chart-wrap"><div id="health-chart-logs" class="chart-container"></div></div>`;
             }
-            const restartsMap = promMapBy(workerRestarts, 'reason');
-            const aiErrMap = promMapBy(aiErrByCls, 'class');
-            const gitOpMap = promMapBy(gitOpP90, 'op');
-
-            let html = `<div class="stat-card-grid">
-                ${renderRichCard(`Ingested Messages (${win})`, fmtNum(ingTot),
-                    renderDeltaPill(ingTot, promScalar(ing7d) / scale7d, 'vs 7d avg') +
-                    renderDeltaPill(ingTot, promScalar(ing30d) / scale30d, 'vs 30d avg') +
-                    renderDeltaPill(ingTot, promScalar(ingOff7d), 'vs 7d ago'))}
-                ${renderRichCard(`Reviews Completed (${win})`, fmtNum(revTot),
-                    renderDeltaPill(revTot, promScalar(rev7d) / scale7d, 'vs 7d avg') +
-                    renderDeltaPill(revTot, promScalar(rev30d) / scale30d, 'vs 30d avg') +
-                    `<span class="delta-pill ${revFail > 0 ? 'delta-bad' : 'delta-good'}">Failures: ${fmtNum(revFail)}</span>`)}
-                ${renderRichCard(`Errors / Warnings (${win})`, `${fmtNum(errCnt)} / ${fmtNum(warnCnt)}`,
-                    renderDeltaPill(errCnt, promScalar(log7dErr) / scale7d, 'err vs 7d avg', true) +
-                    `<span class="delta-pill ${(restartsMap['panic'] || 0) > 0 ? 'delta-bad' : ''}">Panics: ${fmtNum(restartsMap['panic'] || 0)}</span>`)}
-                ${renderRichCard(`Git Trees (Stale / Fresh)`, `${fmtNum(staleCnt)} / ${fmtNum(remMap['fresh'] || 0)}`,
-                    `<span class="delta-pill ${staleCnt > 0 ? 'delta-warn' : 'delta-good'}">Max age: ${fmtSecs(promScalar(gitMaxAge))}</span>` +
-                    `<span class="delta-pill">Packs: ${fmtNum(promScalar(packCnt))} (${fmtBytes(promScalar(packBytes))})</span>`)}
-                ${renderRichCard(`Queues & NNTP Lag`, `${fmtNum(qMap['patches_pending'] || 0)} pend / ${fmtNum(qMap['patches_reviewing'] || 0)} active`,
-                    `<span class="delta-pill">NNTP lag: ${fmtNum(lagMap['total'] || 0)}</span>` +
-                    `<span class="delta-pill">Fetch Q: ${fmtNum(promScalar(fetchDepth))} | Outbox Q: ${fmtNum(obPendTot)}</span>`)}
-                ${renderRichCard(`LLM Tokens (${win})`, fmtNum(tokTot),
-                    renderDeltaPill(tokTot, promScalar(tok7d) / scale7d, 'vs 7d avg', true) +
-                    renderDeltaPill(tokTot, promScalar(tok30d) / scale30d, 'vs 30d avg', true) +
-                    `<span class="delta-pill">Prompt cache: ${promptCachePct} | Resp cache: ${respCachePct}</span>`)}
-                ${renderRichCard(`AI Latency p50 / p90 / p99`, `${fmtSecs(promScalar(aiP50, NaN))} / ${fmtSecs(promScalar(aiP90, NaN))} / ${fmtSecs(promScalar(aiP99, NaN))}`,
-                    `<span class="delta-pill">Review p50/p90: ${fmtSecs(promScalar(revP50, NaN))} / ${fmtSecs(promScalar(revP90, NaN))}</span>` +
-                    `<span class="delta-pill ${promScalar(cooldown) > 0 ? 'delta-warn' : ''}">Inflight: ${fmtNum(promScalar(inflight))} | Cooldown: ${fmtSecs(promScalar(cooldown))}</span>`)}
-                ${renderRichCard(`Outbox Sent (Mail / Forge / PW)`, `${fmtNum(sentEmail)} / ${fmtNum(sentForge)} / ${fmtNum(sentPw)}`,
-                    `<span class="delta-pill ${obFailed > 0 ? 'delta-bad' : 'delta-good'}">Delivery fails: ${fmtNum(obFailed)}</span>` +
-                    `<span class="delta-pill">SMTP heartbeat: ${hbAge.length ? fmtSecs(promScalar(hbAge)) : 'off'}</span>`)}
-            </div>`;
-
-            html += `<div class="stats-grid-2">
-                <div class="chart-section"><div class="chart-title-sm"><span>Message Ingestion vs 7d Baseline</span><span class="chart-subtitle">Step: ${stepSec / 60}m</span></div><div id="ops-chart-ingest" class="chart-container"></div></div>
-                <div class="chart-section"><div class="chart-title-sm"><span>Review Outcomes (${win})</span><span class="chart-subtitle">Reviewed / Skipped / Failed</span></div><div id="ops-chart-reviews" class="chart-container"></div></div>
-                <div class="chart-section"><div class="chart-title-sm"><span>Warnings & Errors (${win})</span><span class="chart-subtitle">429s: ${fmtNum(aiErrMap['rate_limit'] || 0)} | Timeouts: ${fmtNum(aiErrMap['timeout'] || 0)} | Format: ${fmtNum(aiErrMap['format_violation'] || 0)}</span></div><div id="ops-chart-logs" class="chart-container"></div></div>
-                <div class="chart-section"><div class="chart-title-sm"><span>LLM Token Throughput (${win})</span><span class="chart-subtitle">Git p90 — baseline: ${fmtSecs(gitOpMap['baseline'] ?? NaN)}, fetch: ${fmtSecs(gitOpMap['fetch'] ?? NaN)}</span></div><div id="ops-chart-tokens" class="chart-container"></div></div>
-            </div>`;
 
             const container = document.getElementById('stats-content');
             if (!container) return;
@@ -4871,146 +4891,129 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             container.innerHTML = html;
 
             const pal = getStatsPalette();
-            const ingAxis = formatMatrixBuckets([...rngIng, ...rngIngOff], stepSec, spanSec);
-            mountStatsChart('ops-chart-ingest', {
+            const axis = buildFixedAxis(startSec, endSec, stepSec, spanSec);
+
+            mountStatsChart('health-chart-ingest', {
                 legend: { data: ['Current', '7d Ago'], bottom: 0 },
-                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
-                xAxis: { type: 'category', data: ingAxis.labels },
+                grid: { left: '3%', right: '4%', bottom: '12%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: axis.labels },
                 yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
                 series: [
-                    { name: 'Current', type: 'line', smooth: true, showSymbol: false, itemStyle: { color: pal.pending }, areaStyle: { opacity: 0.12 }, data: seriesValuesAt(rngIng[0], ingAxis.sorted) },
-                    { name: '7d Ago', type: 'line', smooth: true, showSymbol: false, lineStyle: { type: 'dashed', width: 1.5 }, itemStyle: { color: pal.muted }, data: seriesValuesAt(rngIngOff[0], ingAxis.sorted) }
+                    { name: 'Current', type: 'line', smooth: true, showSymbol: false, itemStyle: { color: pal.pending }, areaStyle: { opacity: 0.12 }, data: seriesIntsAt(r.rngIng[0], axis.sorted) },
+                    { name: '7d Ago', type: 'line', smooth: true, showSymbol: false, lineStyle: { type: 'dashed', width: 1.5 }, itemStyle: { color: pal.muted }, data: seriesIntsAt(r.rngIngOff[0], axis.sorted) }
                 ]
             });
 
-            const revAxis = formatMatrixBuckets(rngRev, stepSec, spanSec);
             const revColor = st => st === 'Reviewed' ? pal.ok : st.includes('Failed') ? pal.fail : st.includes('Skipped') ? pal.embargo : pal.warn;
-            mountStatsChart('ops-chart-reviews', {
+            mountStatsChart('health-chart-reviews', {
                 legend: { bottom: 0 },
-                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
-                xAxis: { type: 'category', data: revAxis.labels },
+                grid: { left: '3%', right: '4%', bottom: '12%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: axis.labels },
                 yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                series: rngRev.map(s => {
+                series: r.rngRev.map(s => {
                     const st = s.metric?.status || 'Other';
-                    return { name: st, type: 'bar', stack: 'rev', itemStyle: { color: revColor(st) }, data: seriesValuesAt(s, revAxis.sorted) };
+                    return { name: st, type: 'bar', stack: 'rev', itemStyle: { color: revColor(st) }, data: seriesIntsAt(s, axis.sorted) };
                 })
             });
 
-            const logAxis = formatMatrixBuckets(rngLogs, stepSec, spanSec);
-            mountStatsChart('ops-chart-logs', {
-                legend: { bottom: 0 },
-                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
-                xAxis: { type: 'category', data: logAxis.labels },
-                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                series: ['error', 'warn'].map(lvl => {
-                    const found = rngLogs.find(s => s.metric?.level === lvl);
-                    return { name: lvl.toUpperCase(), type: 'bar', stack: 'logs', itemStyle: { color: lvl === 'error' ? pal.fail : pal.warn }, data: seriesValuesAt(found, logAxis.sorted) };
-                })
-            });
-
-            const tokAxis = formatMatrixBuckets(rngTok, stepSec, spanSec);
             const dirColors = { uncached_in: pal.pending, cached_in: pal.ok, out: pal.warn };
-            mountStatsChart('ops-chart-tokens', {
+            mountStatsChart('health-chart-tokens', {
                 legend: { bottom: 0 },
-                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
-                xAxis: { type: 'category', data: tokAxis.labels },
+                grid: { left: '3%', right: '4%', bottom: '12%', top: '8%', containLabel: true },
+                xAxis: { type: 'category', data: axis.labels },
                 yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
                 series: ['uncached_in', 'cached_in', 'out'].map(dir => {
-                    const found = rngTok.find(s => s.metric?.direction === dir);
-                    return { name: dir, type: 'bar', stack: 'tok', itemStyle: { color: dirColors[dir] }, data: seriesValuesAt(found, tokAxis.sorted) };
+                    const found = r.rngTok.find(s => s.metric?.direction === dir);
+                    return { name: dir, type: 'bar', stack: 'tok', itemStyle: { color: dirColors[dir] }, data: seriesIntsAt(found, axis.sorted) };
                 })
             });
+
+            if (errCnt > 0 || warnCnt > 0) {
+                mountStatsChart('health-chart-logs', {
+                    legend: { bottom: 0 },
+                    grid: { left: '3%', right: '4%', bottom: '12%', top: '8%', containLabel: true },
+                    xAxis: { type: 'category', data: axis.labels },
+                    yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                    series: ['error', 'warn'].map(lvl => {
+                        const found = r.rngLogs.find(s => s.metric?.level === lvl);
+                        return { name: lvl.toUpperCase(), type: 'bar', stack: 'logs', itemStyle: { color: lvl === 'error' ? pal.fail : pal.warn }, data: seriesIntsAt(found, axis.sorted) };
+                    })
+                });
+            }
         }
 
         // ---------------------------------------------------------------------
         // TAB 2: BUGS DATABASE (#/stats/bugs)
         // ---------------------------------------------------------------------
         async function renderBugsStatsTab(renderSeq) {
-            const nowSec = Math.floor(Date.now() / 1000);
-            const span12w = 84 * 86400;
             const stepWeek = 7 * 86400;
+            const endSec = alignedEndUtc(stepWeek);
+            const span12w = 12 * stepWeek;
+            const startSec = endSec - span12w + stepWeek;
 
-            const [
-                byStatus, openBySev, secRatingOpen, secRatingFixed,
-                secClassOpen, attachOpen, subFacets, rngEvents
-            ] = await Promise.all([
-                promQuery(`sum by (status) (sashiko_bugs_total)`),
-                promQuery(`sum by (severity) (sashiko_bugs_total{status="open"})`),
-                promQuery(`sum by (security_rating) (sashiko_bugs_total{status="open"})`),
-                promQuery(`sum by (security_rating) (sashiko_bugs_total{status="fixed"})`),
-                promQuery(`sum by (security_class) (sashiko_bugs_total{status="open"})`),
-                promQuery(`sashiko_bugs_with_attachment{status="open"}`),
-                promQuery(`sashiko_bugs_by_subsystem`),
-                promQueryRange(`sum by (event) (increase(sashiko_bugs_events_total[7d]))`, nowSec - span12w, nowSec, stepWeek)
+            const r = await promBatch([
+                { id: 'bf', query: 'sashiko_stats_backfill_complete' },
+                { id: 'releases', query: 'sashiko_project_release_timestamp_seconds' },
+                { id: 'byStatus', query: 'sum by (status) (sashiko_bugs_total)' },
+                { id: 'openBySev', query: 'sum by (severity) (sashiko_bugs_total{status="open"})' },
+                { id: 'secRatingOpen', query: 'sum by (security_rating) (sashiko_bugs_total{status="open"})' },
+                { id: 'secClassOpen', query: 'sum by (security_class) (sashiko_bugs_total{status="open"})' },
+                { id: 'subFacets', query: 'sashiko_bugs_by_subsystem' },
+                { id: 'rngEvents', query: 'sum by (event) (increase(sashiko_bugs_events_total[7d]))', start: String(startSec), end: String(endSec), step: `${stepWeek}s` }
             ]);
             if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
+            updateBackfillBanner(r.bf);
 
-            const stMap = promMapBy(byStatus, 'status');
-            const openCnt = stMap['open'] || 0;
-            const fixedCnt = stMap['fixed'] || 0;
-            const dupCnt = stMap['duplicate'] || 0;
-            const dismCnt = stMap['dismissed'] || 0;
-            const newCnt = stMap['new'] || 0;
-            const sevMap = promMapBy(openBySev, 'severity');
-            const secOpenMap = promMapBy(secRatingOpen, 'security_rating');
-            const secFixedMap = promMapBy(secRatingFixed, 'security_rating');
-            const secClsMap = promMapBy(secClassOpen, 'security_class');
-            const attMap = promMapBy(attachOpen, 'attachment');
-            const secHighCrit = (secOpenMap['critical'] || 0) + (secOpenMap['high'] || 0);
-            const reproCnt = attMap['reproducer'] || 0;
-            const fixCnt = attMap['proposed_fix'] || 0;
-            const pctOfOpen = c => openCnt > 0 ? Math.round((c / openCnt) * 100) + '% of open' : '0% of open';
+            const stMap = promMapBy(r.byStatus, 'status');
+            const openCnt = Math.round(stMap['open'] || 0);
+            const fixedCnt = Math.round(stMap['fixed'] || 0);
+            const closedCnt = Math.round(stMap['closed'] || 0);
+            const dupCnt = Math.round(stMap['duplicate'] || 0);
+            const dismCnt = Math.round(stMap['dismissed'] || 0);
+            const sevMap = promMapBy(r.openBySev, 'severity');
+            const engHighCrit = Math.round((sevMap['critical'] || 0) + (sevMap['high'] || 0));
+            const secOpenMap = promMapBy(r.secRatingOpen, 'security_rating');
+            const secClsMap = promMapBy(r.secClassOpen, 'security_class');
+            const secCrit = Math.round(secOpenMap['critical'] || 0);
+            const secHigh = Math.round(secOpenMap['high'] || 0);
 
-            // Group per-subsystem facets
             const subs = {};
-            for (const item of subFacets) {
+            for (const item of r.subFacets) {
                 const name = item.metric?.subsystem;
                 const facet = item.metric?.facet;
                 if (!name || !facet) continue;
-                if (!subs[name]) subs[name] = { open: 0, fixed: 0, duplicate: 0, dismissed: 0, total: 0, high_crit_open: 0, sec_high_crit_open: 0 };
-                subs[name][facet] = Number(item.value?.[1]) || 0;
+                if (!subs[name]) subs[name] = { open: 0, fixed: 0, total: 0, high_crit_open: 0, sec_high_crit_open: 0 };
+                subs[name][facet] = Math.round(Number(item.value?.[1]) || 0);
             }
             const subRows = Object.entries(subs)
                 .sort((a, b) => (b[1].open - a[1].open) || (b[1].total - a[1].total) || a[0].localeCompare(b[0]));
 
-            let html = `<div class="stat-card-grid">
-                ${renderRichCard('Open Bugs', fmtNum(openCnt), `<span class="delta-pill">Triaging (new): ${fmtNum(newCnt)}</span>`)}
-                ${renderRichCard('Fixed Upstream', fmtNum(fixedCnt), `<span class="delta-pill delta-good">Closed: ${fmtNum(stMap['closed'] || 0)}</span>`)}
-                ${renderRichCard('Duplicates / Dismissed', `${fmtNum(dupCnt)} / ${fmtNum(dismCnt)}`, `<span class="delta-pill">Dedup + FP triage</span>`)}
-                ${renderRichCard('CVSS High / Critical Open', fmtNum(secHighCrit), `<span class="delta-pill ${secHighCrit > 0 ? 'delta-bad' : 'delta-good'}">Vulns open: ${fmtNum(secClsMap['vulnerability'] || 0)}</span>`)}
-                ${renderRichCard('Open w/ Reproducer (r)', fmtNum(reproCnt), `<span class="delta-pill">${escapeHtml(pctOfOpen(reproCnt))}</span>`)}
-                ${renderRichCard('Open w/ Proposed Fix (f)', fmtNum(fixCnt), `<span class="delta-pill">${escapeHtml(pctOfOpen(fixCnt))}</span>`)}
-            </div>`;
+            const rows = [
+                ['Open Bugs', fmtNum(openCnt), `${fmtNum(engHighCrit)} high/critical engineering`],
+                ['Open Security High / Critical', fmtNum(secCrit + secHigh), `${fmtNum(secCrit)} critical · ${fmtNum(secHigh)} high (CVSS v4.0)`],
+                ['Fixed Upstream', fmtNum(fixedCnt), closedCnt > 0 ? `${fmtNum(closedCnt)} closed` : 'confirmed upstream fixes'],
+                ['Duplicate / Dismissed', fmtNum(dupCnt + dismCnt), `${fmtNum(dupCnt)} duplicate · ${fmtNum(dismCnt)} dismissed`]
+            ];
 
-            html += `<div class="stats-grid-2">
-                <div class="chart-section"><div class="chart-title-sm"><span>Weekly Bug Lifecycle Velocity (12w)</span><span class="chart-subtitle">Discovered vs Fixed vs Duplicate/Dismissed</span></div><div id="bugs-chart-velocity" class="chart-container"></div></div>
-                <div class="chart-section"><div class="chart-title-sm"><span>CVSS v4.0 Security Rating (Open vs Fixed)</span><span class="chart-subtitle">Hardening open: ${fmtNum(secClsMap['hardening'] || 0)}</span></div><div id="bugs-chart-security" class="chart-container"></div></div>
-                <div class="chart-section"><div class="chart-title-sm"><span>Open Bugs by Engineering Severity</span><span class="chart-subtitle">Critical / High / Medium / Low</span></div><div id="bugs-chart-severity" class="chart-container"></div></div>
-                <div class="chart-section"><div class="chart-title-sm"><span>Top Authorized Subsystems (Open Bugs)</span><span class="chart-subtitle">${subRows.length ? subRows.length + ' visible sections' : 'Sign-in scoped'}</span></div><div id="bugs-chart-subsystems" class="chart-container"></div></div>
-            </div>`;
+            let html = `<h2>Bugs Database</h2>` + renderSummaryTable(['Metric', 'Count', 'Detail'], rows);
+            html += `<h2>Weekly Discovery vs Fixes (Last 12 Weeks)</h2><div class="stats-chart-wrap"><div id="bugs-chart-velocity" class="chart-container"></div></div>`;
+            html += `<h2>Open Bugs by Severity: Engineering vs CVSS v4.0 <span class="text-muted-sm">non-security: ${fmtNum(secOpenMap['none'] || 0)} · hardening: ${fmtNum(secClsMap['hardening'] || 0)}</span></h2><div class="stats-chart-wrap"><div id="bugs-chart-severity" class="chart-container"></div></div>`;
 
             if (subRows.length > 0) {
-                html += `<div class="chart-section">
-                    <div class="chart-title-sm"><span>Bugs by MAINTAINERS Subsystem</span><span class="chart-subtitle">Scoped to your authorized sections</span></div>
-                    <div class="stats-table-wrap"><table class="stats-table">
-                        <thead><tr><th>Subsystem</th><th>Open</th><th>Eng High/Crit</th><th>CVSS High/Crit</th><th>Fixed</th><th>Duplicate</th><th>Dismissed</th><th>Total</th></tr></thead>
-                        <tbody>${subRows.slice(0, 50).map(([name, f]) => `<tr>
-                            <td><a href="#/?mode=bugs&subsystem=${encodeURIComponent(name)}">${escapeHtml(name)}</a></td>
-                            <td><strong>${fmtNum(f.open)}</strong></td>
-                            <td>${fmtNum(f.high_crit_open)}</td>
-                            <td>${fmtNum(f.sec_high_crit_open)}</td>
-                            <td>${fmtNum(f.fixed)}</td>
-                            <td>${fmtNum(f.duplicate)}</td>
-                            <td>${fmtNum(f.dismissed)}</td>
-                            <td>${fmtNum(f.total)}</td>
-                        </tr>`).join('')}</tbody>
-                    </table></div>
-                </div>`;
+                html += `<h2>Subsystems with Most Open Bugs</h2><div class="stats-chart-wrap"><div id="bugs-chart-subsystems" class="chart-container"></div></div>`;
+                html += `<h2>Bugs by MAINTAINERS Subsystem</h2><div class="stats-table-wrap"><table class="stats-table">
+                    <thead><tr><th>Subsystem</th><th>Open</th><th>Eng High/Crit</th><th>CVSS High/Crit</th><th>Fixed</th><th>Total</th></tr></thead>
+                    <tbody>${subRows.slice(0, 50).map(([name, f]) => `<tr>
+                        <td><a href="#/?mode=bugs&subsystem=${encodeURIComponent(name)}">${escapeHtml(name)}</a></td>
+                        <td><strong>${fmtNum(f.open)}</strong></td>
+                        <td>${fmtNum(f.high_crit_open)}</td>
+                        <td>${fmtNum(f.sec_high_crit_open)}</td>
+                        <td>${fmtNum(f.fixed)}</td>
+                        <td>${fmtNum(f.total)}</td>
+                    </tr>`).join('')}</tbody>
+                </table></div>`;
             } else if (!isAuthenticatedUser()) {
-                html += `<div class="stats-banner-note">
-                    <span>Per-subsystem bug breakdowns follow MAINTAINERS and embargo visibility rules. Sign in to view subsystem counts within your scope.</span>
-                    <button type="button" id="statsSignInBtn">Sign In</button>
-                </div>`;
+                html += `<div class="bug-filters-bar"><span>Per-subsystem bug counts follow MAINTAINERS and embargo visibility rules.</span><button type="button" id="statsSignInBtn">Sign In</button></div>`;
             }
 
             const container = document.getElementById('stats-content');
@@ -5022,120 +5025,95 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             if (signBtn) signBtn.addEventListener('click', () => openAuthModal());
 
             const pal = getStatsPalette();
-            const velAxis = formatMatrixBuckets(rngEvents, stepWeek, span12w);
-            const evMeta = [
-                ['discovered', 'Discovered', pal.pending],
-                ['fixed', 'Fixed', pal.ok],
-                ['duplicate', 'Duplicate', pal.muted],
-                ['dismissed', 'Dismissed', pal.warn]
+            const velAxis = buildFixedAxis(startSec, endSec, stepWeek, span12w);
+            const relMark = buildReleaseMarkLine(r.releases, velAxis.sorted, velAxis.labels, stepWeek, pal);
+            const velSeries = [
+                { name: 'Discovered', type: 'bar', itemStyle: { color: pal.pending }, data: seriesIntsAt(r.rngEvents.find(s => s.metric?.event === 'discovered'), velAxis.sorted) },
+                { name: 'Fixed', type: 'bar', itemStyle: { color: pal.ok }, data: seriesIntsAt(r.rngEvents.find(s => s.metric?.event === 'fixed'), velAxis.sorted) },
+                { name: 'Duplicate / Dismissed', type: 'bar', itemStyle: { color: pal.muted }, data: sumSeriesIntsAt(r.rngEvents.filter(s => s.metric?.event === 'duplicate' || s.metric?.event === 'dismissed'), velAxis.sorted) }
             ];
+            if (relMark) velSeries[0].markLine = relMark;
             mountStatsChart('bugs-chart-velocity', {
                 legend: { bottom: 0 },
-                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
+                grid: { left: '3%', right: '4%', bottom: '12%', top: '12%', containLabel: true },
                 xAxis: { type: 'category', data: velAxis.labels },
                 yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                series: evMeta.map(([ev, title, col]) => {
-                    const found = rngEvents.find(s => s.metric?.event === ev);
-                    return { name: title, type: 'bar', itemStyle: { color: col }, data: seriesValuesAt(found, velAxis.sorted) };
-                })
-            });
-
-            const ratings = ['critical', 'high', 'medium', 'low', 'hardening', 'none', 'pending'];
-            mountStatsChart('bugs-chart-security', {
-                legend: { data: ['Open', 'Fixed'], bottom: 0 },
-                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
-                xAxis: { type: 'category', data: ratings.map(r => r.toUpperCase()) },
-                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                series: [
-                    { name: 'Open', type: 'bar', stack: 'sec', itemStyle: { color: pal.fail }, data: ratings.map(r => secOpenMap[r] || 0) },
-                    { name: 'Fixed', type: 'bar', stack: 'sec', itemStyle: { color: pal.ok }, data: ratings.map(r => secFixedMap[r] || 0) }
-                ]
+                series: velSeries
             });
 
             const sevs = ['critical', 'high', 'medium', 'low'];
             mountStatsChart('bugs-chart-severity', {
-                tooltip: { trigger: 'axis' },
-                grid: { left: '3%', right: '4%', bottom: '10%', top: '8%', containLabel: true },
+                legend: { data: ['Engineering Severity', 'CVSS v4.0 Security'], bottom: 0 },
+                grid: { left: '3%', right: '4%', bottom: '12%', top: '8%', containLabel: true },
                 xAxis: { type: 'category', data: sevs.map(s => s.toUpperCase()) },
                 yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                series: [{
-                    name: 'Open Bugs',
-                    type: 'bar',
-                    data: sevs.map(s => ({ value: sevMap[s] || 0, itemStyle: { color: pal.sev[s] } }))
-                }]
+                series: [
+                    { name: 'Engineering Severity', type: 'bar', itemStyle: { color: pal.pending }, data: sevs.map(s => Math.round(sevMap[s] || 0)) },
+                    { name: 'CVSS v4.0 Security', type: 'bar', itemStyle: { color: pal.fail }, data: sevs.map(s => Math.round(secOpenMap[s] || 0)) }
+                ]
             });
 
             if (subRows.length > 0) {
                 const top12 = subRows.slice(0, 12).reverse();
                 mountStatsChart('bugs-chart-subsystems', {
-                    grid: { left: '3%', right: '6%', bottom: '8%', top: '6%', containLabel: true },
+                    legend: { bottom: 0 },
+                    grid: { left: '3%', right: '6%', bottom: '12%', top: '6%', containLabel: true },
                     xAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                    yAxis: { type: 'category', data: top12.map(r => r[0]) },
+                    yAxis: { type: 'category', data: top12.map(row => row[0]) },
                     series: [
-                        { name: 'Open', type: 'bar', stack: 's', itemStyle: { color: pal.pending }, data: top12.map(r => r[1].open) },
-                        { name: 'Fixed', type: 'bar', stack: 's', itemStyle: { color: pal.ok }, data: top12.map(r => r[1].fixed) }
+                        { name: 'Open', type: 'bar', stack: 's', itemStyle: { color: pal.pending }, data: top12.map(row => row[1].open) },
+                        { name: 'Fixed', type: 'bar', stack: 's', itemStyle: { color: pal.ok }, data: top12.map(row => row[1].fixed) }
                     ]
                 });
-            } else {
-                const subEl = document.getElementById('bugs-chart-subsystems');
-                if (subEl) subEl.innerHTML = `<p class="loading">${isAuthenticatedUser() ? 'No subsystem bug records in scope.' : 'Sign in to view per-subsystem bug counts.'}</p>`;
             }
         }
 
         // ---------------------------------------------------------------------
-        // TAB 3: PROJECT LEADERS / MAINTAINERS (#/stats/maintainers)
+        // TAB 3: PROJECT — LINUX LEADERS & MAINTAINERS (#/stats/project)
         // ---------------------------------------------------------------------
-        async function renderMaintainersStatsTab(renderSeq) {
-            const win = ['4w', '12w', '26w'].includes(state.statsMaintWin) ? state.statsMaintWin : '12w';
+        async function renderProjectStatsTab(renderSeq) {
+            const win = ['4w', '12w', '26w'].includes(state.statsProjectWin) ? state.statsProjectWin : '12w';
             const weeks = parseInt(win, 10) || 12;
-            const spanSec = weeks * 7 * 86400;
             const stepWeek = 7 * 86400;
-            const nowSec = Math.floor(Date.now() / 1000);
-            const selectedSub = state.statsMaintSub || '';
+            const endSec = alignedEndUtc(stepWeek);
+            const spanSec = weeks * stepWeek;
+            const startSec = endSec - spanSec + stepWeek;
+            const startStr = String(startSec);
+            const endStr = String(endSec);
+            const stepStr = `${stepWeek}s`;
+            const selectedSub = state.statsProjectSub || '';
             const subFilter = selectedSub ? `{subsystem="${promEscapeStringLiteral(selectedSub)}"}` : '';
 
-            const [
-                subPsAll, subPatchesAll, subFindingsAll,
-                psByVer, patchesTot, psCompleted, findingsBySev,
-                priorByOrigin, skippedUnchanged, turnP50, turnP90,
-                rngPsVer, rngPatches, rngFindings, rngFixups
-            ] = await Promise.all([
-                promQuery(`sum by (subsystem) (increase(sashiko_subsystem_patchsets_total[${win}]))`),
-                promQuery(`sum by (subsystem) (increase(sashiko_subsystem_patches_total[${win}]))`),
-                promQuery(`sum by (subsystem, severity) (increase(sashiko_subsystem_findings_total[${win}]))`),
-                selectedSub
-                    ? promQuery(`sum(increase(sashiko_subsystem_patchsets_total${subFilter}[${win}]))`)
-                    : promQuery(`sum by (version_bucket) (increase(sashiko_patchsets_ingested_by_version_total[${win}]))`),
-                selectedSub
-                    ? promQuery(`sum(increase(sashiko_subsystem_patches_total${subFilter}[${win}]))`)
-                    : promQuery(`sum(increase(sashiko_patches_ingested_total[${win}]))`),
-                promQuery(`sum by (status, clean) (increase(sashiko_patchsets_completed_total[${win}]))`),
-                selectedSub
-                    ? promQuery(`sum by (severity) (increase(sashiko_subsystem_findings_total${subFilter}[${win}]))`)
-                    : promQuery(`sum by (severity) (increase(sashiko_findings_discovered_total{preexisting="false"}[${win}]))`),
-                promQuery(`sum by (origin_kind, outcome) (increase(sashiko_prior_feedback_total[${win}]))`),
-                promQuery(`sum(increase(sashiko_reviews_skipped_unchanged_total[${win}]))`),
-                promQuery(`histogram_quantile(0.5, sum by (le) (increase(sashiko_patchset_turnaround_seconds_bucket[${win}])))`),
-                promQuery(`histogram_quantile(0.9, sum by (le) (increase(sashiko_patchset_turnaround_seconds_bucket[${win}])))`),
-                selectedSub
-                    ? promQueryRange(`sum(increase(sashiko_subsystem_patchsets_total${subFilter}[7d]))`, nowSec - spanSec, nowSec, stepWeek)
-                    : promQueryRange(`sum by (version_bucket) (increase(sashiko_patchsets_ingested_by_version_total[7d]))`, nowSec - spanSec, nowSec, stepWeek),
-                selectedSub
-                    ? promQueryRange(`sum(increase(sashiko_subsystem_patches_total${subFilter}[7d]))`, nowSec - spanSec, nowSec, stepWeek)
-                    : promQueryRange(`sum(increase(sashiko_patches_ingested_total[7d]))`, nowSec - spanSec, nowSec, stepWeek),
-                selectedSub
-                    ? promQueryRange(`sum by (severity) (increase(sashiko_subsystem_findings_total${subFilter}[7d]))`, nowSec - spanSec, nowSec, stepWeek)
-                    : promQueryRange(`sum by (severity) (increase(sashiko_findings_discovered_total{preexisting="false"}[7d]))`, nowSec - spanSec, nowSec, stepWeek),
-                promQueryRange(`sum by (outcome) (increase(sashiko_prior_feedback_total[7d]))`, nowSec - spanSec, nowSec, stepWeek)
-            ]);
-            if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
+            const queries = [
+                { id: 'bf', query: 'sashiko_stats_backfill_complete' },
+                { id: 'releases', query: 'sashiko_project_release_timestamp_seconds' },
+                { id: 'subPsAll', query: `sum by (subsystem) (increase(sashiko_subsystem_patchsets_total[${win}]))`, time: endStr },
+                { id: 'subPatchesAll', query: `sum by (subsystem) (increase(sashiko_subsystem_patches_total[${win}]))`, time: endStr },
+                { id: 'subFindingsAll', query: `sum by (subsystem, severity) (increase(sashiko_subsystem_findings_total[${win}]))`, time: endStr },
+                { id: 'psByVer', query: selectedSub ? `sum(increase(sashiko_subsystem_patchsets_total${subFilter}[${win}]))` : `sum by (version_bucket) (increase(sashiko_patchsets_ingested_by_version_total[${win}]))`, time: endStr },
+                { id: 'patchesTot', query: selectedSub ? `sum(increase(sashiko_subsystem_patches_total${subFilter}[${win}]))` : `sum(increase(sashiko_patches_ingested_total[${win}]))`, time: endStr },
+                { id: 'findingsBySev', query: selectedSub ? `sum by (severity) (increase(sashiko_subsystem_findings_total${subFilter}[${win}]))` : `sum by (severity) (increase(sashiko_findings_discovered_total{preexisting="false"}[${win}]))`, time: endStr },
+                { id: 'rngPsVer', query: selectedSub ? `sum(increase(sashiko_subsystem_patchsets_total${subFilter}[7d]))` : 'sum by (version_bucket) (increase(sashiko_patchsets_ingested_by_version_total[7d]))', start: startStr, end: endStr, step: stepStr },
+                { id: 'rngPatches', query: selectedSub ? `sum(increase(sashiko_subsystem_patches_total${subFilter}[7d]))` : 'sum(increase(sashiko_patches_ingested_total[7d]))', start: startStr, end: endStr, step: stepStr },
+                { id: 'rngFindings', query: selectedSub ? `sum by (severity) (increase(sashiko_subsystem_findings_total${subFilter}[7d]))` : 'sum by (severity) (increase(sashiko_findings_discovered_total{preexisting="false"}[7d]))', start: startStr, end: endStr, step: stepStr }
+            ];
+            if (!selectedSub) {
+                queries.push(
+                    { id: 'psCompleted', query: `sum by (status, clean) (increase(sashiko_patchsets_completed_total[${win}]))`, time: endStr },
+                    { id: 'priorByOrigin', query: `sum by (origin_kind, outcome) (increase(sashiko_prior_feedback_total[${win}]))`, time: endStr },
+                    { id: 'rngFixups', query: 'sum by (outcome) (increase(sashiko_prior_feedback_total[7d]))', start: startStr, end: endStr, step: stepStr }
+                );
+            }
 
-            // Populate public subsystem dropdown
-            const subPsMap = promMapBy(subPsAll, 'subsystem');
+            const r = await promBatch(queries);
+            if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
+            updateBackfillBanner(r.bf);
+
+            const subPsMap = promMapBy(r.subPsAll, 'subsystem');
             const subNameSet = new Set(Object.keys(subPsMap));
             if (selectedSub) subNameSet.add(selectedSub);
             const subNames = Array.from(subNameSet).sort();
-            const selEl = document.getElementById('maintSubsystemSelect');
+            const selEl = document.getElementById('projectSubsystemSelect');
             if (selEl) {
                 selEl.innerHTML = `<option value="">All Subsystems</option>` +
                     subNames.map(n => `<option value="${escapeHtml(n)}" ${n === selectedSub ? 'selected' : ''}>${escapeHtml(n)}</option>`).join('');
@@ -5143,85 +5121,82 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             let psTotal = 0, v1Cnt = 0, v2PlusCnt = 0;
             if (selectedSub) {
-                psTotal = promScalar(psByVer);
+                psTotal = Math.round(promScalar(r.psByVer));
             } else {
-                const verMap = promMapBy(psByVer, 'version_bucket');
-                v1Cnt = verMap['v1'] || 0;
-                v2PlusCnt = (verMap['v2'] || 0) + (verMap['v3'] || 0) + (verMap['v4_plus'] || 0);
+                const verMap = promMapBy(r.psByVer, 'version_bucket');
+                v1Cnt = Math.round(verMap['v1'] || 0);
+                v2PlusCnt = Math.round((verMap['v2'] || 0) + (verMap['v3'] || 0) + (verMap['v4_plus'] || 0));
                 psTotal = v1Cnt + v2PlusCnt;
             }
-            const patchesCount = promScalar(patchesTot);
+            const patchesCount = Math.round(promScalar(r.patchesTot));
+            const fSevMap = promMapBy(r.findingsBySev, 'severity');
+            const fTotal = Math.round(Object.values(fSevMap).reduce((a, b) => a + b, 0));
+            const fHighCrit = Math.round((fSevMap['critical'] || 0) + (fSevMap['high'] || 0));
 
-            let compReviewed = 0, compClean = 0, compFta = 0, compFailed = 0;
-            for (const item of psCompleted) {
-                const st = item.metric?.status;
-                const cl = item.metric?.clean;
-                const v = Number(item.value?.[1]) || 0;
-                if (st === 'Reviewed') {
-                    compReviewed += v;
-                    if (cl === 'true') compClean += v;
-                } else if (st === 'Failed To Apply') compFta += v;
-                else if (st === 'Failed') compFailed += v;
+            let summaryRows = [];
+            if (selectedSub) {
+                summaryRows = [
+                    ['Patchsets / Week', fmtNum(Math.round(psTotal / weeks)), `${fmtNum(psTotal)} total`],
+                    ['Patches / Week', fmtNum(Math.round(patchesCount / weeks)), `${fmtNum(patchesCount)} total · avg ${psTotal > 0 ? (patchesCount / psTotal).toFixed(1) : '-'} patches/series`],
+                    ['Issues / Patchset', psTotal > 0 ? (fTotal / psTotal).toFixed(2) : '-', `${fmtNum(fTotal)} total · ${fmtNum(fHighCrit)} high/critical`],
+                    ['Issues / Patch', patchesCount > 0 ? (fTotal / patchesCount).toFixed(2) : '-', 'patch-introduced issues']
+                ];
+            } else {
+                let compReviewed = 0, compClean = 0, compFta = 0, compFailed = 0;
+                for (const item of (r.psCompleted || [])) {
+                    const st = item.metric?.status;
+                    const cl = item.metric?.clean;
+                    const v = Math.round(Number(item.value?.[1]) || 0);
+                    if (st === 'Reviewed') {
+                        compReviewed += v;
+                        if (cl === 'true') compClean += v;
+                    } else if (st === 'Failed To Apply') compFta += v;
+                    else if (st === 'Failed') compFailed += v;
+                }
+                const compAll = compReviewed + compFta + compFailed;
+                const cleanPct = compReviewed > 0 ? Math.round((compClean / compReviewed) * 100) + '%' : '-';
+                const ftaPct = compAll > 0 ? Math.round((compFta / compAll) * 100) + '%' : '-';
+
+                const prior = {
+                    sashiko_review: { addressed: 0, confirmed_finding: 0 },
+                    human_reviewer: { addressed: 0, confirmed_finding: 0 },
+                    automated_bot: { addressed: 0, confirmed_finding: 0 }
+                };
+                for (const item of (r.priorByOrigin || [])) {
+                    const orig = item.metric?.origin_kind;
+                    const oc = item.metric?.outcome;
+                    const v = Math.round(Number(item.value?.[1]) || 0);
+                    if (orig in prior && (oc === 'addressed' || oc === 'confirmed_finding')) {
+                        prior[orig][oc] += v;
+                    }
+                }
+                const totAddressed = prior.sashiko_review.addressed + prior.human_reviewer.addressed + prior.automated_bot.addressed;
+                const totUnaddr = prior.sashiko_review.confirmed_finding + prior.human_reviewer.confirmed_finding + prior.automated_bot.confirmed_finding;
+                const fixupRate = (totAddressed + totUnaddr) > 0
+                    ? Math.round((totAddressed / (totAddressed + totUnaddr)) * 100) + '%'
+                    : '-';
+
+                summaryRows = [
+                    ['Patchsets / Week', fmtNum(Math.round(psTotal / weeks)), `${fmtNum(psTotal)} total (${psTotal > 0 ? Math.round((v2PlusCnt / psTotal) * 100) + '% v2+ revisions' : '-'})`],
+                    ['Patches / Week', fmtNum(Math.round(patchesCount / weeks)), `${fmtNum(patchesCount)} total (avg ${psTotal > 0 ? (patchesCount / psTotal).toFixed(1) : '-'} patches/series)`],
+                    ['Clean Patchsets', cleanPct, `${fmtNum(compClean)} of ${fmtNum(compReviewed)} reviewed had 0 issues`],
+                    ['Issues / Patchset', compReviewed > 0 ? (fTotal / compReviewed).toFixed(2) : '-', `${patchesCount > 0 ? (fTotal / patchesCount).toFixed(2) : '-'} / patch · ${fmtNum(fHighCrit)} high/critical`],
+                    ['Author Fixup Rate (vN)', fixupRate, `${fmtNum(prior.sashiko_review.addressed)} Sashiko · ${fmtNum(prior.human_reviewer.addressed)} human · ${fmtNum(prior.automated_bot.addressed)} bot`],
+                    ['Failed To Apply', ftaPct, `${fmtNum(compFta)} baseline misses`]
+                ];
             }
-            const compAll = compReviewed + compFta + compFailed;
-            const cleanPct = compReviewed > 0 ? Math.round((compClean / compReviewed) * 100) + '%' : '—';
-            const ftaPct = compAll > 0 ? Math.round((compFta / compAll) * 100) + '%' : '—';
 
-            const fSevMap = promMapBy(findingsBySev, 'severity');
-            const fTotal = Object.values(fSevMap).reduce((a, b) => a + b, 0);
-            const denomPs = selectedSub ? psTotal : compReviewed;
-            const issuesPerPs = denomPs > 0 ? (fTotal / denomPs).toFixed(2) : '—';
-            const issuesPerPatch = patchesCount > 0 ? (fTotal / patchesCount).toFixed(2) : '—';
-
-            // Prior feedback fixups by origin
-            const prior = { sashiko_review: { addressed: 0, confirmed_finding: 0, other: 0 }, human_reviewer: { addressed: 0, confirmed_finding: 0, other: 0 } };
-            for (const item of priorByOrigin) {
-                const orig = item.metric?.origin_kind === 'human_reviewer' ? 'human_reviewer' : 'sashiko_review';
-                const oc = item.metric?.outcome || 'other';
-                const v = Number(item.value?.[1]) || 0;
-                if (oc === 'addressed') prior[orig].addressed += v;
-                else if (oc === 'confirmed_finding') prior[orig].confirmed_finding += v;
-                else prior[orig].other += v;
+            let html = `<h2>Project Activity${selectedSub ? ` · ${escapeHtml(selectedSub)}` : ''}</h2>` +
+                renderSummaryTable(['Metric', 'Value', 'Detail'], summaryRows);
+            html += `<h2>Weekly Patchsets &amp; Patches</h2><div class="stats-chart-wrap"><div id="project-chart-volume" class="chart-container"></div></div>`;
+            html += `<h2>Issues Discovered per Week by Severity</h2><div class="stats-chart-wrap"><div id="project-chart-findings" class="chart-container"></div></div>`;
+            if (!selectedSub) {
+                html += `<h2>Follow-up Revision (vN) Fixups per Week</h2><div class="stats-chart-wrap"><div id="project-chart-fixups" class="chart-container"></div></div>`;
             }
-            const totAddressed = prior.sashiko_review.addressed + prior.human_reviewer.addressed;
-            const totUnaddr = prior.sashiko_review.confirmed_finding + prior.human_reviewer.confirmed_finding;
-            const fixupRate = (totAddressed + totUnaddr) > 0
-                ? Math.round((totAddressed / (totAddressed + totUnaddr)) * 100) + '%'
-                : '—';
 
-            let html = `<div class="stat-card-grid">
-                ${renderRichCard(`Patchsets / Week (${win})`, fmtNum(psTotal / weeks, 1),
-                    `<span class="delta-pill">Total: ${fmtNum(psTotal)}</span>` +
-                    (!selectedSub && psTotal > 0 ? `<span class="delta-pill">v2+ revisions: ${Math.round((v2PlusCnt / psTotal) * 100)}%</span>` : ''))}
-                ${renderRichCard(`Patches / Week (${win})`, fmtNum(patchesCount / weeks, 1),
-                    `<span class="delta-pill">Total patches: ${fmtNum(patchesCount)}</span>` +
-                    `<span class="delta-pill">Avg series len: ${psTotal > 0 ? (patchesCount / psTotal).toFixed(1) : '—'}</span>`)}
-                ${renderRichCard('Issues / Patchset', issuesPerPs,
-                    `<span class="delta-pill">Issues / patch: ${escapeHtml(String(issuesPerPatch))}</span>` +
-                    `<span class="delta-pill">High+Crit: ${fmtNum((fSevMap['critical'] || 0) + (fSevMap['high'] || 0))}</span>`)}
-                ${renderRichCard('Clean Patchsets %', cleanPct,
-                    `<span class="delta-pill delta-good">${fmtNum(compClean)} clean of ${fmtNum(compReviewed)} reviewed</span>`)}
-                ${renderRichCard('Author vN Fixup Rate', fixupRate,
-                    `<span class="delta-pill delta-good">Sashiko fixed: ${fmtNum(prior.sashiko_review.addressed)}</span>` +
-                    `<span class="delta-pill">Human fixed: ${fmtNum(prior.human_reviewer.addressed)}</span>`)}
-                ${renderRichCard('Skipped Unchanged Patches', fmtNum(promScalar(skippedUnchanged)),
-                    `<span class="delta-pill">Inherited clean verdicts</span>`)}
-                ${renderRichCard('Failed To Apply %', ftaPct,
-                    `<span class="delta-pill ${compFta > 0 ? 'delta-warn' : ''}">${fmtNum(compFta)} baseline misses</span>`)}
-                ${renderRichCard('Review Turnaround p50 / p90', `${fmtSecs(promScalar(turnP50, NaN))} / ${fmtSecs(promScalar(turnP90, NaN))}`,
-                    `<span class="delta-pill">Arrival → review complete</span>`)}
-            </div>`;
-
-            html += `<div class="stats-grid-2">
-                <div class="chart-section"><div class="chart-title-sm"><span>Weekly Patchset & Patch Volume (${win})</span><span class="chart-subtitle">${selectedSub ? escapeHtml(selectedSub) : 'v1 vs v2+ & patches'}</span></div><div id="maint-chart-volume" class="chart-container"></div></div>
-                <div class="chart-section"><div class="chart-title-sm"><span>Discovered Issues by Severity / Week</span><span class="chart-subtitle">Patch-introduced findings</span></div><div id="maint-chart-findings" class="chart-container"></div></div>
-                <div class="chart-section"><div class="chart-title-sm"><span>Prior-Version Feedback Fixups (${win})</span><span class="chart-subtitle">Addressed in vN vs Still Unaddressed</span></div><div id="maint-chart-fixups" class="chart-container"></div></div>
-                <div class="chart-section"><div class="chart-title-sm"><span>Author Fixups by Reviewer Origin</span><span class="chart-subtitle">Sashiko vs Human Reviewers</span></div><div id="maint-chart-origin" class="chart-container"></div></div>
-            </div>`;
-
-            const subPatchMap = promMapBy(subPatchesAll, 'subsystem');
+            const subPatchMap = promMapBy(r.subPatchesAll, 'subsystem');
             const subFindMap = {};
-            for (const item of subFindingsAll) {
+            for (const item of r.subFindingsAll) {
                 const s = item.metric?.subsystem;
                 if (!s) continue;
                 subFindMap[s] = (subFindMap[s] || 0) + (Number(item.value?.[1]) || 0);
@@ -5229,27 +5204,24 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const leaderRows = Object.keys(subPsMap)
                 .map(name => ({
                     name,
-                    ps: subPsMap[name] || 0,
-                    patches: subPatchMap[name] || 0,
-                    findings: subFindMap[name] || 0
+                    ps: Math.round(subPsMap[name] || 0),
+                    patches: Math.round(subPatchMap[name] || 0),
+                    findings: Math.round(subFindMap[name] || 0)
                 }))
                 .sort((a, b) => b.ps - a.ps);
 
             if (leaderRows.length > 0) {
-                html += `<div class="chart-section">
-                    <div class="chart-title-sm"><span>Subsystem Activity & Issue Density (${win})</span><span class="chart-subtitle">Public mailing-list subsystems</span></div>
-                    <div class="stats-table-wrap"><table class="stats-table">
-                        <thead><tr><th>Subsystem</th><th>Patchsets</th><th>Patches</th><th>Findings</th><th>Findings / Patchset</th><th>Findings / Patch</th></tr></thead>
-                        <tbody>${leaderRows.slice(0, 30).map(r => `<tr>
-                            <td>${escapeHtml(r.name)}</td>
-                            <td>${fmtNum(r.ps)}</td>
-                            <td>${fmtNum(r.patches)}</td>
-                            <td>${fmtNum(r.findings)}</td>
-                            <td>${r.ps > 0 ? (r.findings / r.ps).toFixed(2) : '—'}</td>
-                            <td>${r.patches > 0 ? (r.findings / r.patches).toFixed(2) : '—'}</td>
-                        </tr>`).join('')}</tbody>
-                    </table></div>
-                </div>`;
+                html += `<h2>Subsystem Volume &amp; Issue Density</h2><div class="stats-table-wrap"><table class="stats-table">
+                    <thead><tr><th>Subsystem</th><th>Patchsets</th><th>Patches</th><th>Issues</th><th>Issues / Patchset</th><th>Issues / Patch</th></tr></thead>
+                    <tbody>${leaderRows.slice(0, 30).map(row => `<tr>
+                        <td>${escapeHtml(row.name)}</td>
+                        <td>${fmtNum(row.ps)}</td>
+                        <td>${fmtNum(row.patches)}</td>
+                        <td>${fmtNum(row.findings)}</td>
+                        <td>${row.ps > 0 ? (row.findings / row.ps).toFixed(2) : '-'}</td>
+                        <td>${row.patches > 0 ? (row.findings / row.patches).toFixed(2) : '-'}</td>
+                    </tr>`).join('')}</tbody>
+                </table></div>`;
             }
 
             const container = document.getElementById('stats-content');
@@ -5258,20 +5230,22 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             container.innerHTML = html;
 
             const pal = getStatsPalette();
-            const volAxis = formatMatrixBuckets([...rngPsVer, ...rngPatches], stepWeek, spanSec);
-            const volSeries = selectedSub
-                ? [{ name: 'Patchsets', type: 'bar', itemStyle: { color: pal.pending }, data: seriesValuesAt(rngPsVer[0], volAxis.sorted) }]
-                : ['v1', 'v2', 'v3', 'v4_plus'].map((vb, idx) => {
-                    const f = rngPsVer.find(s => s.metric?.version_bucket === vb);
-                    const cols = [pal.pending, pal.ok, pal.warn, pal.embargo];
-                    return { name: vb, type: 'bar', stack: 'ps', itemStyle: { color: cols[idx] }, data: seriesValuesAt(f, volAxis.sorted) };
-                });
-            volSeries.push({ name: 'Patches', type: 'line', smooth: true, yAxisIndex: 1, itemStyle: { color: pal.fail }, data: seriesValuesAt(rngPatches[0], volAxis.sorted) });
+            const axis = buildFixedAxis(startSec, endSec, stepWeek, spanSec);
+            const relMark = buildReleaseMarkLine(r.releases, axis.sorted, axis.labels, stepWeek, pal);
 
-            mountStatsChart('maint-chart-volume', {
+            const volSeries = selectedSub
+                ? [{ name: 'Patchsets', type: 'bar', itemStyle: { color: pal.pending }, data: seriesIntsAt(r.rngPsVer[0], axis.sorted) }]
+                : [
+                    { name: 'v1 (New)', type: 'bar', stack: 'ps', itemStyle: { color: pal.pending }, data: seriesIntsAt(r.rngPsVer.find(s => s.metric?.version_bucket === 'v1'), axis.sorted) },
+                    { name: 'v2+ (Revisions)', type: 'bar', stack: 'ps', itemStyle: { color: pal.ok }, data: sumSeriesIntsAt(r.rngPsVer.filter(s => s.metric?.version_bucket && s.metric.version_bucket !== 'v1'), axis.sorted) }
+                ];
+            if (relMark && volSeries.length) volSeries[0].markLine = relMark;
+            volSeries.push({ name: 'Patches', type: 'line', smooth: true, yAxisIndex: 1, itemStyle: { color: pal.fail }, data: seriesIntsAt(r.rngPatches[0], axis.sorted) });
+
+            mountStatsChart('project-chart-volume', {
                 legend: { bottom: 0 },
-                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
-                xAxis: { type: 'category', data: volAxis.labels },
+                grid: { left: '3%', right: '4%', bottom: '12%', top: '12%', containLabel: true },
+                xAxis: { type: 'category', data: axis.labels },
                 yAxis: [
                     { type: 'value', name: 'Patchsets', splitLine: { lineStyle: { type: 'dashed' } } },
                     { type: 'value', name: 'Patches', splitLine: { show: false } }
@@ -5279,160 +5253,153 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 series: volSeries
             });
 
-            const fAxis = formatMatrixBuckets(rngFindings, stepWeek, spanSec);
-            mountStatsChart('maint-chart-findings', {
+            mountStatsChart('project-chart-findings', {
                 legend: { bottom: 0 },
-                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
-                xAxis: { type: 'category', data: fAxis.labels },
+                grid: { left: '3%', right: '4%', bottom: '12%', top: '12%', containLabel: true },
+                xAxis: { type: 'category', data: axis.labels },
                 yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                series: ['critical', 'high', 'medium', 'low'].map(sev => {
-                    const f = rngFindings.find(s => s.metric?.severity === sev);
-                    return { name: sev.toUpperCase(), type: 'bar', stack: 'f', itemStyle: { color: pal.sev[sev] }, data: seriesValuesAt(f, fAxis.sorted) };
+                series: ['critical', 'high', 'medium', 'low'].map((sev, idx) => {
+                    const f = r.rngFindings.find(s => s.metric?.severity === sev);
+                    const s = { name: sev.toUpperCase(), type: 'bar', stack: 'f', itemStyle: { color: pal.sev[sev] }, data: seriesIntsAt(f, axis.sorted) };
+                    if (idx === 0 && relMark) s.markLine = relMark;
+                    return s;
                 })
             });
 
-            const fxAxis = formatMatrixBuckets(rngFixups, stepWeek, spanSec);
-            mountStatsChart('maint-chart-fixups', {
-                legend: { bottom: 0 },
-                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
-                xAxis: { type: 'category', data: fxAxis.labels },
-                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                series: [
-                    { name: 'Addressed in vN', type: 'bar', stack: 'fx', itemStyle: { color: pal.ok }, data: seriesValuesAt(rngFixups.find(s => s.metric?.outcome === 'addressed'), fxAxis.sorted) },
-                    { name: 'Still Unaddressed', type: 'bar', stack: 'fx', itemStyle: { color: pal.fail }, data: seriesValuesAt(rngFixups.find(s => s.metric?.outcome === 'confirmed_finding'), fxAxis.sorted) }
-                ]
-            });
-
-            mountStatsChart('maint-chart-origin', {
-                legend: { bottom: 0 },
-                grid: { left: '3%', right: '4%', bottom: '14%', top: '8%', containLabel: true },
-                xAxis: { type: 'category', data: ['Sashiko Prior Reviews', 'Human Mailing-List / PR Reviews'] },
-                yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                series: [
-                    { name: 'Addressed in vN', type: 'bar', stack: 'or', itemStyle: { color: pal.ok }, data: [prior.sashiko_review.addressed, prior.human_reviewer.addressed] },
-                    { name: 'Still Unaddressed', type: 'bar', stack: 'or', itemStyle: { color: pal.fail }, data: [prior.sashiko_review.confirmed_finding, prior.human_reviewer.confirmed_finding] },
-                    { name: 'Settled / Disproven', type: 'bar', stack: 'or', itemStyle: { color: pal.muted }, data: [prior.sashiko_review.other, prior.human_reviewer.other] }
-                ]
-            });
+            if (!selectedSub) {
+                const fxSeries = [
+                    { name: 'Addressed in vN', type: 'bar', stack: 'fx', itemStyle: { color: pal.ok }, data: seriesIntsAt((r.rngFixups || []).find(s => s.metric?.outcome === 'addressed'), axis.sorted) },
+                    { name: 'Still Unaddressed', type: 'bar', stack: 'fx', itemStyle: { color: pal.fail }, data: seriesIntsAt((r.rngFixups || []).find(s => s.metric?.outcome === 'confirmed_finding'), axis.sorted) }
+                ];
+                if (relMark) fxSeries[0].markLine = relMark;
+                mountStatsChart('project-chart-fixups', {
+                    legend: { bottom: 0 },
+                    grid: { left: '3%', right: '4%', bottom: '12%', top: '12%', containLabel: true },
+                    xAxis: { type: 'category', data: axis.labels },
+                    yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                    series: fxSeries
+                });
+            }
         }
 
         // ---------------------------------------------------------------------
-        // TAB 4: SASHIKO PIPELINE (#/stats/pipeline)
+        // TAB 4: PIPELINE — SASHIKO DEVELOPERS (#/stats/pipeline)
         // ---------------------------------------------------------------------
         async function renderPipelineStatsTab(renderSeq) {
             const win = ['100', '500', '1000'].includes(state.statsPipeWin) ? state.statsPipeWin : '100';
             const wf = `{window="${win}"}`;
 
-            const [
-                winReviews, durSum, tokSum, funnelVec,
-                stageRunsVec, stageTurnsVec, stageTokVec, stageItemsVec,
-                overlapVec, toolCallsVec, toolBytesVec, priorAlignVec
-            ] = await Promise.all([
-                promQuery(`sashiko_pipeline_window_reviews${wf}`),
-                promQuery(`sashiko_pipeline_duration_seconds_sum${wf}`),
-                promQuery(`sashiko_pipeline_tokens_sum${wf}`),
-                promQuery(`sashiko_pipeline_funnel_items${wf}`),
-                promQuery(`sashiko_pipeline_stage_runs${wf}`),
-                promQuery(`sashiko_pipeline_stage_turns_sum${wf}`),
-                promQuery(`sashiko_pipeline_stage_tokens_sum${wf}`),
-                promQuery(`sashiko_pipeline_stage_items${wf}`),
-                promQuery(`sashiko_pipeline_stage_overlap${wf}`),
-                promQuery(`sashiko_pipeline_tool_calls${wf}`),
-                promQuery(`sashiko_pipeline_tool_output_bytes_sum${wf}`),
-                promQuery(`sashiko_pipeline_prior_alignment${wf}`)
+            const r = await promBatch([
+                { id: 'bf', query: 'sashiko_stats_backfill_complete' },
+                { id: 'winReviews', query: `sashiko_pipeline_window_reviews${wf}` },
+                { id: 'tokSum', query: `sashiko_pipeline_tokens_sum${wf}` },
+                { id: 'funnelVec', query: `sashiko_pipeline_funnel_items${wf}` },
+                { id: 'stageRunsVec', query: `sashiko_pipeline_stage_runs${wf}` },
+                { id: 'stageTurnsVec', query: `sashiko_pipeline_stage_turns_sum${wf}` },
+                { id: 'stageTokVec', query: `sashiko_pipeline_stage_tokens_sum${wf}` },
+                { id: 'stageItemsVec', query: `sashiko_pipeline_stage_items${wf}` },
+                { id: 'overlapVec', query: `sashiko_pipeline_stage_overlap${wf}` },
+                { id: 'toolCallsVec', query: `sashiko_pipeline_tool_calls${wf}` },
+                { id: 'toolBytesVec', query: `sashiko_pipeline_tool_output_bytes_sum${wf}` },
+                { id: 'priorAlignVec', query: `sashiko_pipeline_prior_alignment${wf}` }
             ]);
             if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
+            updateBackfillBanner(r.bf);
 
-            const nRev = promScalar(winReviews);
-            const avgDur = nRev > 0 ? promScalar(durSum) / nRev : NaN;
-            const tokMap = promMapBy(tokSum, 'direction');
+            const nRev = Math.round(promScalar(r.winReviews));
+            const tokMap = promMapBy(r.tokSum, 'direction');
             const totTok = Object.values(tokMap).reduce((a, b) => a + b, 0);
-            const funnel = promMapBy(funnelVec, 'step');
-            const priorAl = promMapBy(priorAlignVec, 'metric');
+            const tokInAll = (tokMap['uncached_in'] || 0) + (tokMap['cached_in'] || 0);
+            const cachePct = tokInAll > 0 ? Math.round(((tokMap['cached_in'] || 0) / tokInAll) * 100) + '%' : '-';
+            const funnel = promMapBy(r.funnelVec, 'step');
+            const priorAl = promMapBy(r.priorAlignVec, 'metric');
 
-            const rawConcerns = funnel['raw_concerns'] || 0;
-            const finalReported = (funnel['findings_patch'] || 0) + (funnel['findings_preexisting'] || 0);
-            const dismissPct = rawConcerns > 0 ? Math.round((1 - Math.min(1, finalReported / rawConcerns)) * 100) + '%' : '—';
+            const rawConcerns = Math.round(funnel['raw_concerns'] || 0);
+            const stage1Dism = Math.round(funnel['stage1_dismissed'] || 0);
+            const stage1Candidates = rawConcerns + stage1Dism;
+            const v1a = Math.round(funnel['verified_1a'] || 0);
+            const v1b = Math.round(funnel['dismissed_1b'] || 0);
+            const inc = Math.round(funnel['inconclusive'] || 0);
+            const verifyCandidates = v1a + v1b + inc;
+            const vpv = Math.round(funnel['verified_pv'] || 0);
+            const dpv = Math.round(funnel['dismissed_pv'] || 0);
+            const totalVerified = v1a + vpv;
+            const totalDismissedVerify = v1b + dpv;
+            const finalReported = Math.round((funnel['findings_patch'] || 0) + (funnel['findings_preexisting'] || 0));
+            const verifyDismissPct = verifyCandidates > 0 ? Math.round((totalDismissedVerify / verifyCandidates) * 100) + '%' : '-';
 
-            // Build stage map
             const stages = {};
             const ensureStage = s => {
                 if (!stages[s]) {
-                    stages[s] = { executed: 0, skipped: 0, turns: 0, tokens: 0, raw_concerns: 0, stage1_dismissed: 0, confirmed_findings: 0, exclusive_findings: 0, dismissed_in_verify: 0 };
+                    stages[s] = { executed: 0, turns: 0, tokens: 0, confirmed_findings: 0, exclusive_findings: 0, dismissed_in_verify: 0 };
                 }
                 return stages[s];
             };
-            for (const it of stageRunsVec) {
-                const st = ensureStage(it.metric?.stage || 'unknown');
-                st[it.metric?.outcome === 'skipped' ? 'skipped' : 'executed'] += Number(it.value?.[1]) || 0;
+            for (const it of r.stageRunsVec) {
+                if (it.metric?.outcome !== 'skipped') {
+                    ensureStage(it.metric?.stage || 'unknown').executed += Number(it.value?.[1]) || 0;
+                }
             }
-            for (const it of stageTurnsVec) {
+            for (const it of r.stageTurnsVec) {
                 ensureStage(it.metric?.stage || 'unknown').turns += Number(it.value?.[1]) || 0;
             }
-            for (const it of stageTokVec) {
+            for (const it of r.stageTokVec) {
                 ensureStage(it.metric?.stage || 'unknown').tokens += Number(it.value?.[1]) || 0;
             }
-            for (const it of stageItemsVec) {
+            for (const it of r.stageItemsVec) {
                 const st = ensureStage(it.metric?.stage || 'unknown');
                 const k = it.metric?.kind;
                 if (k && k in st) st[k] += Number(it.value?.[1]) || 0;
             }
 
             const stageList = Object.entries(stages)
+                .filter(([, s]) => s.executed > 0)
                 .sort((a, b) => (b[1].confirmed_findings - a[1].confirmed_findings) || (b[1].executed - a[1].executed));
             const totalExclusive = stageList.reduce((acc, [, s]) => acc + s.exclusive_findings, 0);
             const totalStageConfirmed = stageList.reduce((acc, [, s]) => acc + s.confirmed_findings, 0);
-            const hmUnaddr = priorAl['hm_unaddressed'] || 0;
-            const hmRecall = hmUnaddr > 0 ? Math.round(((priorAl['hm_also_found'] || 0) / hmUnaddr) * 100) + '%' : '—';
+            const hmUnaddr = Math.round(priorAl['hm_unaddressed'] || 0);
+            const hmRecall = hmUnaddr > 0 ? Math.round(((priorAl['hm_also_found'] || 0) / hmUnaddr) * 100) + '%' : '-';
 
-            let html = `<div class="stat-card-grid">
-                ${renderRichCard(`Analyzed Reviews (N=${win})`, fmtNum(nRev), `<span class="delta-pill">Excludes inherited skips & embargoes</span>`)}
-                ${renderRichCard('Concern Dismissal %', dismissPct,
-                    `<span class="delta-pill">${fmtNum(rawConcerns)} raw → ${fmtNum(finalReported)} final</span>`)}
-                ${renderRichCard('Avg Review Latency', fmtSecs(avgDur),
-                    `<span class="delta-pill">Wall-clock / patch review</span>`)}
-                ${renderRichCard('Avg Tokens / Review', nRev > 0 ? fmtNum(totTok / nRev) : '—',
-                    `<span class="delta-pill">Uncached: ${nRev > 0 ? fmtNum((tokMap['uncached_in'] || 0) / nRev) : '—'} | Out: ${nRev > 0 ? fmtNum((tokMap['out'] || 0) / nRev) : '—'}</span>`)}
-                ${renderRichCard('Exclusive Stage Catches', fmtNum(totalExclusive),
-                    `<span class="delta-pill delta-good">${totalStageConfirmed > 0 ? Math.round((totalExclusive / totalStageConfirmed) * 100) + '% single-stage unique' : '—'}</span>`)}
-                ${renderRichCard('Human Issue Recall', hmRecall,
-                    `<span class="delta-pill">${fmtNum(priorAl['hm_also_found'] || 0)} of ${fmtNum(hmUnaddr)} unaddressed caught</span>`)}
-            </div>`;
+            const summaryRows = [
+                ['Verify Dismissal Rate', verifyDismissPct, `${fmtNum(totalDismissedVerify)} dismissed · ${fmtNum(totalVerified)} confirmed of ${fmtNum(verifyCandidates)} verified`],
+                ['Findings / Review', nRev > 0 ? (finalReported / nRev).toFixed(2) : '-', `${fmtNum(finalReported)} reported across ${fmtNum(nRev)} reviews`],
+                ['Exclusive Stage Catches', totalStageConfirmed > 0 ? Math.round((totalExclusive / totalStageConfirmed) * 100) + '%' : '-', `${fmtNum(totalExclusive)} of ${fmtNum(totalStageConfirmed)} confirmed unique to 1 stage`],
+                ['Tokens / Review', nRev > 0 ? fmtNum(totTok / nRev) : '-', `${cachePct} prompt cache · ${nRev > 0 ? fmtNum((tokMap['out'] || 0) / nRev) : '-'} output`]
+            ];
+            if (hmUnaddr > 0) {
+                summaryRows.push(['Human Issue Recall', hmRecall, `${fmtNum(priorAl['hm_also_found'] || 0)} of ${fmtNum(hmUnaddr)} unaddressed caught`]);
+            }
 
-            html += `<div class="stats-grid-2">
-                <div class="chart-section"><div class="chart-title-sm"><span>Verification & Dismissal Funnel (Last ${win})</span><span class="chart-subtitle">Stage 1 → Dedup → Verify → Post-Verify → Reported</span></div><div id="pipe-chart-funnel" class="chart-container"></div></div>
-                <div class="chart-section"><div class="chart-title-sm"><span>Bugs Discovered by Stage</span><span class="chart-subtitle">Confirmed vs Exclusive vs Dismissed in Verify</span></div><div id="pipe-chart-stages" class="chart-container"></div></div>
-                <div class="chart-section"><div class="chart-title-sm"><span>Stage × Stage Co-Discovery Overlap</span><span class="chart-subtitle">Diagonal = exclusive catches; off-diagonal = co-discovered</span></div><div id="pipe-chart-overlap" class="chart-container-lg"></div></div>
-                <div class="chart-section"><div class="chart-title-sm"><span>Agent Tool Invocations (Last ${win})</span><span class="chart-subtitle">Calls & output volume by tool</span></div><div id="pipe-chart-tools" class="chart-container-lg"></div></div>
-            </div>`;
+            let html = `<h2>Review Pipeline</h2>` +
+                renderSummaryTable(['Metric', 'Value', 'Detail'], summaryRows);
+
+            html += `<h2>Verification Funnel <span class="text-muted-sm">dismissed in verify: ${fmtNum(v1b)} (1b) + ${fmtNum(dpv)} (post-verify)</span></h2><div class="stats-chart-wrap"><div id="pipe-chart-funnel" class="chart-container"></div></div>`;
+            html += `<h2>Stage Discoveries (Exclusive vs Shared vs Dismissed)</h2><div class="stats-chart-wrap"><div id="pipe-chart-stages" class="chart-container"></div></div>`;
+            html += `<h2>Stage × Stage Overlap <span class="text-muted-sm">diagonal = exclusive catches</span></h2><div class="stats-chart-wrap"><div id="pipe-chart-overlap" class="chart-container-lg"></div></div>`;
 
             if (stageList.length > 0) {
-                html += `<div class="chart-section">
-                    <div class="chart-title-sm"><span>Stage Precision & Token ROI (Last ${win} Reviews)</span><span class="chart-subtitle">Normalized across sharded stages</span></div>
-                    <div class="stats-table-wrap"><table class="stats-table">
-                        <thead><tr><th>Stage</th><th>Executed</th><th>Skipped</th><th>Avg Turns</th><th>Tokens / Run</th><th>Raw Concerns</th><th>Stage-1 Self-Dismiss</th><th>Confirmed</th><th>Exclusive</th><th>Verify Dismissed</th><th>Precision %</th><th>Tokens / Confirmed</th></tr></thead>
-                        <tbody>${stageList.map(([name, s]) => {
-                            const denom = s.confirmed_findings + s.dismissed_in_verify;
-                            const prec = denom > 0 ? Math.round((s.confirmed_findings / denom) * 100) + '%' : '—';
-                            const roi = s.confirmed_findings > 0 ? fmtNum(s.tokens / s.confirmed_findings) : '—';
-                            return `<tr>
-                                <td><strong>${escapeHtml(name)}</strong></td>
-                                <td>${fmtNum(s.executed)}</td>
-                                <td>${fmtNum(s.skipped)}</td>
-                                <td>${s.executed > 0 ? (s.turns / s.executed).toFixed(1) : '—'}</td>
-                                <td>${s.executed > 0 ? fmtNum(s.tokens / s.executed) : '—'}</td>
-                                <td>${fmtNum(s.raw_concerns)}</td>
-                                <td>${fmtNum(s.stage1_dismissed)}</td>
-                                <td><strong>${fmtNum(s.confirmed_findings)}</strong></td>
-                                <td>${fmtNum(s.exclusive_findings)}</td>
-                                <td>${fmtNum(s.dismissed_in_verify)}</td>
-                                <td>${prec}</td>
-                                <td>${roi}</td>
-                            </tr>`;
-                        }).join('')}</tbody>
-                    </table></div>
-                </div>`;
+                html += `<h2>Stage Precision &amp; Token ROI</h2><div class="stats-table-wrap"><table class="stats-table">
+                    <thead><tr><th>Stage</th><th>Runs</th><th>Avg Turns</th><th>Tokens / Run</th><th>Confirmed</th><th>Exclusive</th><th>Dismissed</th><th>Precision</th><th>Tokens / Bug</th></tr></thead>
+                    <tbody>${stageList.map(([name, s]) => {
+                        const denom = s.confirmed_findings + s.dismissed_in_verify;
+                        const prec = denom > 0 ? Math.round((s.confirmed_findings / denom) * 100) + '%' : '-';
+                        const roi = s.confirmed_findings > 0 ? fmtNum(s.tokens / s.confirmed_findings) : '-';
+                        return `<tr>
+                            <td><strong>${escapeHtml(name)}</strong></td>
+                            <td>${fmtNum(s.executed)}</td>
+                            <td>${(s.turns / s.executed).toFixed(1)}</td>
+                            <td>${fmtNum(s.tokens / s.executed)}</td>
+                            <td><strong>${fmtNum(s.confirmed_findings)}</strong></td>
+                            <td>${fmtNum(s.exclusive_findings)}</td>
+                            <td>${fmtNum(s.dismissed_in_verify)}</td>
+                            <td>${prec}</td>
+                            <td>${roi}</td>
+                        </tr>`;
+                    }).join('')}</tbody>
+                </table></div>`;
             }
+
+            html += `<h2>Tool Usage</h2><div class="stats-chart-wrap"><div id="pipe-chart-tools" class="chart-container-lg"></div></div>`;
 
             const container = document.getElementById('stats-content');
             if (!container) return;
@@ -5441,14 +5408,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             const pal = getStatsPalette();
             const funnelSteps = [
-                ['Raw Concerns', rawConcerns, pal.pending],
-                ['Stage-1 Self-Dismissed', funnel['stage1_dismissed'] || 0, pal.muted],
-                ['Deduped Clusters', funnel['deduplicated_clusters'] || 0, pal.pending],
-                ['Verified (1a)', funnel['verified_1a'] || 0, pal.ok],
-                ['Dismissed (1b)', funnel['dismissed_1b'] || 0, pal.fail],
-                ['Post-Verify Passed', funnel['verified_pv'] || 0, pal.ok],
-                ['Patch Findings', funnel['findings_patch'] || 0, pal.ok],
-                ['Pre-existing Bugs', funnel['findings_preexisting'] || 0, pal.embargo]
+                ['Stage-1 Candidates (Concerns + Self-Dismissed)', stage1Candidates, pal.pending],
+                ['Entered Verification (Dedup / Fast-Path)', verifyCandidates, pal.pending],
+                ['Verified (1a + Post-Verify)', totalVerified, pal.ok],
+                ['Final Reported Findings', finalReported, pal.ok]
             ];
             mountStatsChart('pipe-chart-funnel', {
                 grid: { left: '3%', right: '5%', bottom: '8%', top: '6%', containLabel: true },
@@ -5465,7 +5428,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 const topSt = stageList.slice(0, 14).reverse();
                 mountStatsChart('pipe-chart-stages', {
                     legend: { bottom: 0 },
-                    grid: { left: '3%', right: '5%', bottom: '14%', top: '6%', containLabel: true },
+                    grid: { left: '3%', right: '5%', bottom: '12%', top: '6%', containLabel: true },
                     xAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
                     yAxis: { type: 'category', data: topSt.map(s => s[0]) },
                     series: [
@@ -5478,28 +5441,26 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 document.getElementById('pipe-chart-stages').innerHTML = '<p class="loading">No completed reviews in window yet.</p>';
             }
 
-            // Heatmap for pairwise stage overlap
-            if (overlapVec.length > 0) {
+            if (r.overlapVec.length > 0) {
                 const ovStagesSet = new Set();
                 const pairMap = new Map();
                 let maxOv = 1;
-                for (const it of overlapVec) {
+                for (const it of r.overlapVec) {
                     const a = it.metric?.stage_a;
                     const b = it.metric?.stage_b;
                     const v = Number(it.value?.[1]) || 0;
                     if (!a || !b || v <= 0) continue;
                     ovStagesSet.add(a);
                     ovStagesSet.add(b);
-                    pairMap.set(`${a}|${b}`, v);
-                    pairMap.set(`${b}|${a}`, v);
+                    pairMap.set(`${a}\0${b}`, v);
+                    pairMap.set(`${b}\0${a}`, v);
                     if (v > maxOv) maxOv = v;
                 }
                 const axes = Array.from(ovStagesSet).sort();
                 const heatData = [];
                 axes.forEach((a, i) => {
                     axes.forEach((b, j) => {
-                        const v = pairMap.get(`${a}|${b}`) || 0;
-                        heatData.push([i, j, v]);
+                        heatData.push([i, j, pairMap.get(`${a}\0${b}`) || 0]);
                     });
                 });
                 mountStatsChart('pipe-chart-overlap', {
@@ -5531,8 +5492,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 document.getElementById('pipe-chart-overlap').innerHTML = '<p class="loading">No multi-stage finding overlap recorded in window yet.</p>';
             }
 
-            const callMap = promMapBy(toolCallsVec, 'tool');
-            const byteMap = promMapBy(toolBytesVec, 'tool');
+            const callMap = promMapBy(r.toolCallsVec, 'tool');
+            const byteMap = promMapBy(r.toolBytesVec, 'tool');
             const toolNames = Object.keys(callMap).sort((a, b) => callMap[a] - callMap[b]);
             if (toolNames.length > 0) {
                 mountStatsChart('pipe-chart-tools', {
