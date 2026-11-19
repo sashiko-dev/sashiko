@@ -112,6 +112,12 @@ pub static DB_METRIC_CATALOG: &[MetricDef] = &[
         unit: "",
     },
     MetricDef {
+        name: "sashiko_patches_reviewed_total",
+        metric_type: MetricType::Counter,
+        help: "Total reviewed patches on non-embargoed patchsets grouped by clean verdict.",
+        unit: "",
+    },
+    MetricDef {
         name: "sashiko_findings_discovered_total",
         metric_type: MetricType::Counter,
         help: "Total review findings on non-embargoed patchsets grouped by severity and preexisting flag.",
@@ -1424,6 +1430,7 @@ async fn populate_instant_metrics(
             for (facet_name, cnt) in [
                 ("open", f.open),
                 ("fixed", f.fixed),
+                ("fixed_60d", f.fixed_60d),
                 ("duplicate", f.duplicate),
                 ("dismissed", f.dismissed),
                 ("total", f.total),

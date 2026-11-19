@@ -32,6 +32,7 @@ use crate::db::{
 };
 
 const DONE_KEY: &str = "stats_backfill:v1:done";
+const CLEAN_PATCHES_DONE_KEY: &str = "stats_backfill:v1:clean_patches_done";
 const PIPELINE_CURSOR_KEY: &str = "stats_backfill:v1:cursor:pipeline";
 const PIPELINE_COUNT_KEY: &str = "stats_backfill:v1:pipeline_count";
 const PIPELINE_TARGET: usize = 1000;
@@ -92,7 +93,9 @@ pub async fn run_stats_backfill_loop(db: Arc<Database>) {
 pub async fn run_stats_backfill_once(db: &Database) -> Result<()> {
     let main_done = read_meta_str(db, DONE_KEY).await?.as_deref() == Some("1");
     let email_cursor = read_phase_cursor(db, "email_outbox").await?;
-    if main_done && email_cursor <= 0 {
+    let clean_patches_done =
+        read_meta_str(db, CLEAN_PATCHES_DONE_KEY).await?.as_deref() == Some("1");
+    if main_done && email_cursor <= 0 && clean_patches_done {
         debug!("StatsBackfill already completed; exiting.");
         return Ok(());
     }
@@ -106,7 +109,17 @@ pub async fn run_stats_backfill_once(db: &Database) -> Result<()> {
         backfill_reviews(db).await?;
         backfill_bugs(db).await?;
         backfill_email_outbox(db).await?;
-
+        if !clean_patches_done {
+            // Covers any patchsets already processed before upgrading mid-backfill
+            // or post-cutoff; per-patchset ps_patches_done guards skip already-counted rows.
+            backfill_clean_patches(db).await?;
+            db.execute(
+                "INSERT INTO meta (key, value) VALUES (?, '1')
+                 ON CONFLICT(key) DO UPDATE SET value = '1'",
+                libsql::params![CLEAN_PATCHES_DONE_KEY],
+            )
+            .await?;
+        }
         db.execute(
             "INSERT INTO meta (key, value) VALUES (?, '1')
              ON CONFLICT(key) DO UPDATE SET value = '1'",
@@ -115,9 +128,22 @@ pub async fn run_stats_backfill_once(db: &Database) -> Result<()> {
         .await?;
         info!("StatsBackfill: historical statistics backfill completed.");
     } else {
-        info!("StatsBackfill: running incremental email_outbox rollup backfill...");
-        backfill_email_outbox(db).await?;
-        info!("StatsBackfill: email_outbox rollup backfill completed.");
+        if email_cursor > 0 {
+            info!("StatsBackfill: running incremental email_outbox rollup backfill...");
+            backfill_email_outbox(db).await?;
+            info!("StatsBackfill: email_outbox rollup backfill completed.");
+        }
+        if !clean_patches_done {
+            info!("StatsBackfill: running incremental clean_patches rollup backfill...");
+            backfill_clean_patches(db).await?;
+            db.execute(
+                "INSERT INTO meta (key, value) VALUES (?, '1')
+                 ON CONFLICT(key) DO UPDATE SET value = '1'",
+                libsql::params![CLEAN_PATCHES_DONE_KEY],
+            )
+            .await?;
+            info!("StatsBackfill: clean_patches rollup backfill completed.");
+        }
     }
     Ok(())
 }
@@ -551,6 +577,31 @@ async fn backfill_email_outbox(db: &Database) -> Result<()> {
     Ok(())
 }
 
+async fn backfill_clean_patches(db: &Database) -> Result<()> {
+    let cursor_key = "stats_backfill:v1:cursor:clean_patches";
+    let mut cursor = match read_meta_str(db, cursor_key).await? {
+        Some(s) => s.parse::<i64>().unwrap_or(0).max(0),
+        None => {
+            let mut r = db
+                .read_conn()
+                .query("SELECT COALESCE(MAX(id), 0) FROM patchsets", ())
+                .await?;
+            match r.next().await? {
+                Some(row) => row.get::<i64>(0)?.max(0),
+                None => 0,
+            }
+        }
+    };
+    while cursor > 0 {
+        let low = (cursor - TX_ENTITY_CHUNK).max(0);
+        db.backfill_clean_patches_chunk(low, cursor, now_unix())
+            .await?;
+        cursor = low;
+        sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,7 +615,7 @@ mod tests {
             token: String::new(),
         })
         .await?;
-        // Migrate to v22 first, insert pre-upgrade data, then migrate to v23 so cutoffs capture it.
+        // Migrate to v23 first, insert pre-upgrade data, then migrate to v24 so cutoffs capture it.
         db.migrate().await?;
         db.execute("PRAGMA user_version = 23", ()).await?;
         db.execute("DELETE FROM meta WHERE key LIKE 'stats_backfill:%'", ())
@@ -636,7 +687,7 @@ mod tests {
         )
         .await?;
 
-        // Re-run v23 migration so cutoffs capture the pre-upgrade rows.
+        // Re-run v24 migration so cutoffs capture the pre-upgrade rows.
         db.migrate().await?;
 
         run_stats_backfill_once(&db).await?;
@@ -673,6 +724,14 @@ mod tests {
             .await?;
         let pf_sum2: f64 = r2.next().await?.unwrap().get(0)?;
         assert!((pf_sum2 - 1.0).abs() < f64::EPSILON);
+
+        let dirty_patches = sum_rollup_86400(
+            &db,
+            "sashiko_patches_reviewed_total",
+            r#"{"clean":"false"}"#,
+        )
+        .await?;
+        assert!((dirty_patches - 1.0).abs() < f64::EPSILON);
 
         Ok(())
     }
@@ -836,6 +895,99 @@ mod tests {
         .await?;
         assert!((sub_mm - 1.0).abs() < f64::EPSILON);
         assert!((sub_fs - 1.0).abs() < f64::EPSILON);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_clean_patches_backfill_handles_post_cutoff_and_no_double_count() -> Result<()> {
+        let db = Database::new(&DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await?;
+        db.migrate().await?;
+        db.execute("PRAGMA user_version = 23", ()).await?;
+        db.execute("DELETE FROM meta WHERE key LIKE 'stats_backfill:%'", ())
+            .await?;
+
+        let now = chrono::Utc::now().timestamp() - 300;
+        db.execute(
+            "INSERT INTO messages (id, message_id, subject, date) VALUES
+             (1, '<p1@ex>', '[PATCH] pre-cutoff embargo', ?),
+             (2, '<p2@ex>', '[PATCH] post-cutoff', ?)",
+            libsql::params![now, now],
+        )
+        .await?;
+        // Pre-cutoff embargoed patchset (id=1) with 1 clean patch.
+        db.execute(
+            "INSERT INTO patchsets (id, subject, status, date, version, embargo_until)
+             VALUES (1, '[PATCH] pre-cutoff embargo', 'Reviewed', ?, 1, ?)",
+            libsql::params![now, now + 3600],
+        )
+        .await?;
+        db.execute(
+            "INSERT INTO patches (id, patchset_id, message_id, part_index) VALUES (1, 1, '<p1@ex>', 1)",
+            (),
+        )
+        .await?;
+        db.execute(
+            "INSERT INTO reviews (id, patchset_id, patch_id, status, created_at)
+             VALUES (1, 1, 1, 'Reviewed', ?)",
+            libsql::params![now],
+        )
+        .await?;
+
+        db.migrate().await?;
+
+        // Simulate older binary finishing v1 backfill (main_done=1, clean_patches_done unset)
+        // AND a post-cutoff patchset (id=2) completing on the older binary (ps_done=1, no ps_patches_done).
+        db.execute(
+            "INSERT INTO meta (key, value) VALUES
+             ('stats_backfill:v1:done', '1'),
+             ('stats_backfill:v1:cursor:email_outbox', '0'),
+             ('stats_rollup:ps_done:2', '1')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (),
+        )
+        .await?;
+        db.execute(
+            "INSERT INTO patchsets (id, subject, status, date, version)
+             VALUES (2, '[PATCH] post-cutoff', 'Reviewed', ?, 1)",
+            libsql::params![now],
+        )
+        .await?;
+        db.execute(
+            "INSERT INTO patches (id, patchset_id, message_id, part_index) VALUES (2, 2, '<p2@ex>', 1)",
+            (),
+        )
+        .await?;
+        db.execute(
+            "INSERT INTO reviews (id, patchset_id, patch_id, status, created_at)
+             VALUES (2, 2, 2, 'Reviewed', ?)",
+            libsql::params![now],
+        )
+        .await?;
+
+        // Release embargo on patchset 1 under new binary BEFORE incremental clean_patches backfill runs.
+        db.clear_patchset_embargo(1).await?;
+
+        // Incremental backfill must count post-cutoff patchset 2 and NOT double-count patchset 1.
+        run_stats_backfill_once(&db).await?;
+        let clean_cnt =
+            sum_rollup_86400(&db, "sashiko_patches_reviewed_total", r#"{"clean":"true"}"#).await?;
+        assert!(
+            (clean_cnt - 2.0).abs() < f64::EPSILON,
+            "expected exactly 2 clean patches (ps 1 + ps 2), got {clean_cnt}"
+        );
+
+        // Re-running backfill and release must stay at 2 (strictly idempotent).
+        db.record_patchset_release_rollups(1).await?;
+        db.record_patchset_release_rollups(2).await?;
+        run_stats_backfill_once(&db).await?;
+        let clean_cnt2 =
+            sum_rollup_86400(&db, "sashiko_patches_reviewed_total", r#"{"clean":"true"}"#).await?;
+        assert!((clean_cnt2 - 2.0).abs() < f64::EPSILON);
 
         Ok(())
     }
