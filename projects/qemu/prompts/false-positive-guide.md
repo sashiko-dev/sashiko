@@ -70,6 +70,22 @@ divided across commits in a series:
   (`Series End Commit` via `git_read_files` or `git_diff`) and discard the
   concern as a false positive.
 
+### 7. History used as evidence
+
+Concerns from the `history` stage cite historical commits. They are false
+positives when:
+
+- **Churn alone:** the only argument is that an area was fixed or changed
+  often. Frequent fixes justify a closer look, never a finding.
+- **Superseded reasons:** the historical commit's reason was later withdrawn
+  or replaced by another commit before `Baseline SHA` (for example a
+  workaround removed once the underlying bug was fixed). Read the history
+  after the cited commit with `git_log` before relying on it.
+- **Refactoring read as a revert:** the change moves or rewrites a check
+  that still exists in another form at the `Series End Commit`.
+- **Mail without code:** the argument rests on a mailing list excerpt that
+  neither the historical commit nor the current code confirms.
+
 ## Before you report
 
 For each finding, confirm you can answer all of these. If you cannot answer
