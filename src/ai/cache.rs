@@ -60,7 +60,11 @@ impl CachingAiProvider {
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_response_cache_provider_model
-                ON response_cache (provider, model);",
+                ON response_cache (provider, model);
+            -- Without this index, deleting expired rows on every open reads
+            -- the whole table.
+            CREATE INDEX IF NOT EXISTS idx_response_cache_created_at
+                ON response_cache (created_at);",
         )
         .await?;
 
