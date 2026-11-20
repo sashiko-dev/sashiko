@@ -1109,7 +1109,9 @@ fn inspect_ast(expr: &Expr, req: &mut AstRequirements) {
 fn select_resolution_tier(min_range_secs: i64, max_lookback_secs: i64) -> i64 {
     // Subtract one bucket width from the 48h (5m) and 45d (1h) retention
     // cutoffs so a left-edge straddling bucket cannot have been reaped.
-    if max_lookback_secs > 45 * 86_400 - 3600 || min_range_secs > 45 * 86_400 - 3600 {
+    // Weekly and longer windows (`>= 7d`) always read the compact `1d` tier
+    // (24x fewer rows than `1h`).
+    if max_lookback_secs > 45 * 86_400 - 3600 || min_range_secs >= 7 * 86_400 {
         86_400
     } else if max_lookback_secs > 48 * 3600 - 300 || min_range_secs > 48 * 3600 - 300 {
         3600
@@ -1268,21 +1270,37 @@ async fn preload_data_source(
         {
             let shifted_end = max_eval_ts.saturating_sub(off_secs);
             let win_start = shifted_end.saturating_sub(win_secs);
-            // Interior buckets fully inside [win_start, min(shifted_end, now_ts)] have weight = 1.0.
+            // Any bucket with bucket_ts >= win_start and bucket_ts + res <= shifted_end
+            // has weight = 1.0 even for the current in-progress bucket.
             let full_start = win_start;
-            let full_end = shifted_end.min(now_ts).saturating_sub(range_res_secs);
+            let full_end = shifted_end.saturating_sub(range_res_secs);
+            let sum_query_start = if win_start.rem_euclid(range_res_secs) == 0 {
+                win_start
+            } else {
+                win_start.saturating_sub(range_res_secs)
+            };
+            let sum_query_end =
+                if full_start <= full_end && shifted_end.rem_euclid(range_res_secs) == 0 {
+                    full_end
+                } else {
+                    shifted_end
+                };
             state
-                .db
-                .query_rollup_sums_filtered(
-                    &names,
+                .get_cached_rollup_sums(
+                    names,
                     range_res_secs,
-                    query_start,
+                    sum_query_start,
                     full_start,
                     full_end,
-                    shifted_end,
-                    accept,
+                    sum_query_end,
                 )
                 .await
+                .map(|cached| {
+                    cached
+                        .into_iter()
+                        .filter(|r| accept(&r.metric, &r.labels))
+                        .collect()
+                })
         } else {
             state
                 .db
