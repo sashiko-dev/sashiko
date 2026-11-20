@@ -5226,7 +5226,11 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 queries.push(
                     { id: 'psCompleted', query: `sum by (status, clean) (increase(sashiko_patchsets_completed_total[${dur}]))`, time: endStr },
                     { id: 'patchesReviewed', query: `sum by (clean) (increase(sashiko_patches_reviewed_total[${dur}]))`, time: endStr },
+                    { id: 'patchesByVer', query: `sum by (version_bucket) (increase(sashiko_patches_reviewed_by_version_total[${dur}]))`, time: endStr },
+                    { id: 'findingsByVer', query: `sum by (version_bucket) (increase(sashiko_findings_by_version_total[${dur}]))`, time: endStr },
                     { id: 'priorByOrigin', query: `sum by (origin_kind, outcome) (increase(sashiko_prior_feedback_total[${dur}]))`, time: endStr },
+                    { id: 'rngPatchesByVer', query: 'sum by (version_bucket) (increase(sashiko_patches_reviewed_by_version_total[7d]))', start: startStr, end: endStr, step: stepStr },
+                    { id: 'rngFindingsByVer', query: 'sum by (version_bucket) (increase(sashiko_findings_by_version_total[7d]))', start: startStr, end: endStr, step: stepStr },
                     { id: 'rngCleanPatches', query: 'sum by (clean) (increase(sashiko_patches_reviewed_total[7d]))', start: startStr, end: endStr, step: stepStr },
                     { id: 'rngCleanPatchsets', query: 'sum by (clean) (increase(sashiko_patchsets_completed_total{status="Reviewed"}[7d]))', start: startStr, end: endStr, step: stepStr },
                     { id: 'rngFixups', query: 'sum by (outcome) (increase(sashiko_prior_feedback_total[7d]))', start: startStr, end: endStr, step: stepStr }
@@ -5336,12 +5340,30 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     fmtOriginFix('Other bots (LKP/CI)', prior.automated_bot)
                 ].filter(Boolean).join(' · ') || 'no follow-up revisions checked';
 
+                const pVerMap = promMapBy(r.patchesByVer || [], 'version_bucket');
+                const fVerMap = promMapBy(r.findingsByVer || [], 'version_bucket');
+                const pV1 = pVerMap['v1'] || 0;
+                const pV2p = (pVerMap['v2'] || 0) + (pVerMap['v3'] || 0) + (pVerMap['v4_plus'] || 0);
+                const fV1 = fVerMap['v1'] || 0;
+                const fV2p = (fVerMap['v2'] || 0) + (fVerMap['v3'] || 0) + (fVerMap['v4_plus'] || 0);
+                const pVerTot = pV1 + pV2p;
+                const fVerTot = fV1 + fV2p;
+                const issuesPerPatchVal = pVerTot > 0
+                    ? (fVerTot / pVerTot).toFixed(2)
+                    : (patchesCount > 0 ? (fTotal / patchesCount).toFixed(2) : '-');
+                const issuesPerPatchDetail = [
+                    pV1 > 0 ? `v1: ${(fV1 / pV1).toFixed(2)}` : '',
+                    pV2p > 0 ? `v2+: ${(fV2p / pV2p).toFixed(2)}` : '',
+                    compReviewed > 0 ? `${(fTotal / compReviewed).toFixed(2)} / patchset` : '',
+                    `${fmtNum(fHighCrit)} high/critical`
+                ].filter(Boolean).join(' · ');
+
                 summaryRows = [
                     ['Patchsets / Week', fmtNum(Math.round(psTotal / activeWeeks)), `${fmtNum(psTotal)} total (${psTotal > 0 ? Math.round((v2PlusCnt / psTotal) * 100) + '% v2+ revisions' : '-'})`],
                     ['Patches / Week', fmtNum(Math.round(patchesCount / activeWeeks)), `${fmtNum(patchesCount)} total (avg ${psTotal > 0 ? (patchesCount / psTotal).toFixed(1) : '-'} patches/series)`],
+                    ['Issues / Patch', issuesPerPatchVal, issuesPerPatchDetail],
                     ['Clean Patchsets', cleanPct, `${fmtNum(compClean)} of ${fmtNum(compReviewed)} reviewed had 0 issues`],
                     ['Clean Patches', cleanPatchPct, `${fmtNum(patchClean)} of ${fmtNum(patchRevTot)} reviewed had 0 issues`],
-                    ['Issues / Patchset', compReviewed > 0 ? (fTotal / compReviewed).toFixed(2) : '-', `${patchesCount > 0 ? (fTotal / patchesCount).toFixed(2) : '-'} / patch · ${fmtNum(fHighCrit)} high/critical`],
                     ['Issues Fixed in v2+ Revisions', fixupRate, priorDetail],
                     ['Failed To Apply', ftaPct, `${fmtNum(compFta)} baseline misses`]
                 ];
@@ -5351,6 +5373,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 renderSummaryTable(['Metric', 'Value', 'Detail'], summaryRows);
             html += `<h2>Weekly Patchsets &amp; Patches</h2><div class="stats-chart-wrap"><div id="project-chart-volume" class="chart-container"></div></div>`;
             if (!selectedSub) {
+                html += `<h2>Issues per Patch by Revision (v1 vs v2+)</h2><div class="stats-chart-wrap"><div id="project-chart-density" class="chart-container"></div></div>`;
                 html += `<h2>Clean Patches &amp; Patchsets per Week (%)</h2><div class="stats-chart-wrap"><div id="project-chart-clean" class="chart-container"></div></div>`;
             }
             html += `<h2>Issues Discovered per Week by Severity</h2><div class="stats-chart-wrap"><div id="project-chart-findings" class="chart-container"></div></div>`;
@@ -5417,6 +5440,29 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             });
 
             if (!selectedSub) {
+                const showDot = axis.sorted.length <= 26;
+                const pV1Wk = seriesIntsAt((r.rngPatchesByVer || []).find(s => s.metric?.version_bucket === 'v1'), axis.sorted);
+                const pV2pWk = sumSeriesIntsAt((r.rngPatchesByVer || []).filter(s => s.metric?.version_bucket && s.metric.version_bucket !== 'v1'), axis.sorted);
+                const fV1Wk = seriesIntsAt((r.rngFindingsByVer || []).find(s => s.metric?.version_bucket === 'v1'), axis.sorted);
+                const fV2pWk = sumSeriesIntsAt((r.rngFindingsByVer || []).filter(s => s.metric?.version_bucket && s.metric.version_bucket !== 'v1'), axis.sorted);
+                const ratioWk = (num, den) => axis.sorted.map((_, i) => den[i] > 0 ? Math.round((num[i] / den[i]) * 100) / 100 : null);
+                const pAllWk = axis.sorted.map((_, i) => pV1Wk[i] + pV2pWk[i]);
+                const fAllWk = axis.sorted.map((_, i) => fV1Wk[i] + fV2pWk[i]);
+                const densitySeries = [
+                    { name: 'v1', type: 'line', smooth: 0.2, showSymbol: showDot, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2 }, itemStyle: { color: pal.pending }, data: ratioWk(fV1Wk, pV1Wk) },
+                    { name: 'v2+', type: 'line', smooth: 0.2, showSymbol: showDot, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2 }, itemStyle: { color: pal.ok }, data: ratioWk(fV2pWk, pV2pWk) },
+                    { name: 'All', type: 'line', smooth: 0.2, showSymbol: false, lineStyle: { width: 1.5, type: 'dashed' }, itemStyle: { color: pal.muted }, data: ratioWk(fAllWk, pAllWk) }
+                ];
+                if (relMark) densitySeries[0].markLine = relMark;
+                mountStatsChart('project-chart-density', {
+                    tooltip: { trigger: 'axis', valueFormatter: v => (v == null ? '-' : Number(v).toFixed(2)) },
+                    legend: { bottom: 0 },
+                    grid: { left: '3%', right: '4%', bottom: '12%', top: '12%', containLabel: true },
+                    xAxis: { type: 'category', data: axis.labels },
+                    yAxis: { type: 'value', min: 0, splitLine: { lineStyle: { type: 'dashed' } } },
+                    series: densitySeries
+                });
+
                 const cleanPctAt = vec => {
                     const c = seriesIntsAt((vec || []).find(s => s.metric?.clean === 'true'), axis.sorted);
                     const d = seriesIntsAt((vec || []).find(s => s.metric?.clean === 'false'), axis.sorted);
@@ -5425,7 +5471,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         return tot > 0 ? Math.round((c[i] / tot) * 1000) / 10 : null;
                     });
                 };
-                const showDot = axis.sorted.length <= 26;
                 const cleanSeries = [
                     { name: 'Clean Patches %', type: 'line', smooth: 0.2, showSymbol: showDot, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2 }, itemStyle: { color: pal.ok }, data: cleanPctAt(r.rngCleanPatches) },
                     { name: 'Clean Patchsets %', type: 'line', smooth: 0.2, showSymbol: showDot, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2 }, itemStyle: { color: pal.pending }, data: cleanPctAt(r.rngCleanPatchsets) }

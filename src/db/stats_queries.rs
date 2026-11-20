@@ -2635,6 +2635,115 @@ impl Database {
         tx.commit().await?;
         Ok(())
     }
+
+    /// Atomically backfills `sashiko_patches_reviewed_by_version_total` and
+    /// `sashiko_findings_by_version_total` for one bounded `patchsets` ID chunk
+    /// `(low, cursor]` using per-patchset guard
+    /// `stats_rollup:ps_ver_issues_done:<id>`.
+    pub async fn backfill_versioned_issues_chunk(
+        &self,
+        low: i64,
+        cursor: i64,
+        now_ts: i64,
+    ) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let mut ps_rows = tx
+            .query(
+                "SELECT ps.id, COALESCE(ps.date, 0), ps.version
+                 FROM patchsets ps
+                 WHERE ps.id > ? AND ps.id <= ?
+                   AND ps.status = 'Reviewed'
+                   AND (ps.embargo_until IS NULL OR ps.embargo_until <= ?)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM meta m
+                       WHERE m.key = 'stats_rollup:ps_ver_issues_done:' || ps.id
+                   )",
+                libsql::params![low, cursor, now_ts],
+            )
+            .await?;
+        let mut eligible = Vec::new();
+        while let Some(r) = ps_rows.next().await? {
+            eligible.push((r.get::<i64>(0)?, r.get::<i64>(1)?, r.get::<i64>(2).ok()));
+        }
+        drop(ps_rows);
+
+        let mut acc: BTreeMap<(String, String, i64, i64), f64> = BTreeMap::new();
+        for (ps_id, ps_date, version) in eligible {
+            let guard_key = format!("stats_rollup:ps_ver_issues_done:{ps_id}");
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES (?, '1')",
+                    libsql::params![guard_key],
+                )
+                .await?;
+            if inserted == 0 {
+                continue;
+            }
+            let effective_ts = if ps_date > 0 { ps_date } else { now_ts };
+            let vb = crate::worker::stats_backfill::version_bucket_label(version);
+            let mut pr_rows = tx
+                .query(
+                    "SELECT COUNT(DISTINCT r.patch_id)
+                     FROM reviews r
+                     WHERE r.patchset_id = ? AND r.status = 'Reviewed' AND r.patch_id IS NOT NULL",
+                    libsql::params![ps_id],
+                )
+                .await?;
+            let patches_cnt = match pr_rows.next().await? {
+                Some(row) => row.get::<i64>(0)? as f64,
+                None => 0.0,
+            };
+            drop(pr_rows);
+
+            let mut f_rows = tx
+                .query(
+                    "SELECT COUNT(f.id)
+                     FROM findings f
+                     JOIN reviews r ON r.id = f.review_id
+                     WHERE r.patchset_id = ? AND r.status = 'Reviewed'
+                       AND COALESCE(f.preexisting, 0) = 0",
+                    libsql::params![ps_id],
+                )
+                .await?;
+            let findings_cnt = match f_rows.next().await? {
+                Some(row) => row.get::<i64>(0)? as f64,
+                None => 0.0,
+            };
+            drop(f_rows);
+
+            let lbl = canonical_labels_json(&[("version_bucket", vb)]);
+            if patches_cnt > 0.0 {
+                add_rollup_to_map(
+                    &mut acc,
+                    now_ts,
+                    effective_ts,
+                    "sashiko_patches_reviewed_by_version_total",
+                    &lbl,
+                    patches_cnt,
+                );
+            }
+            if findings_cnt > 0.0 {
+                add_rollup_to_map(
+                    &mut acc,
+                    now_ts,
+                    effective_ts,
+                    "sashiko_findings_by_version_total",
+                    &lbl,
+                    findings_cnt,
+                );
+            }
+        }
+
+        flush_bucket_map_in_tx(&tx, &acc).await?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('stats_backfill:v1:cursor:versioned_issues', ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            libsql::params![low.to_string()],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 async fn read_cutoff_in_tx(tx: &DatabaseTransaction, table: &str) -> Result<i64> {
@@ -2714,7 +2823,7 @@ async fn record_single_patchset_release_in_tx(
 ) -> Result<()> {
     let mut ps_rows = tx
         .query(
-            "SELECT COALESCE(status, 'Incomplete'), embargo_until
+            "SELECT COALESCE(status, 'Incomplete'), embargo_until, version
              FROM patchsets WHERE id = ?",
             libsql::params![patchset_id],
         )
@@ -2724,6 +2833,7 @@ async fn record_single_patchset_release_in_tx(
     };
     let status: String = ps_row.get(0)?;
     let embargo_until: Option<i64> = ps_row.get(1).ok();
+    let version: Option<i64> = ps_row.get(2).ok();
     drop(ps_rows);
 
     if embargo_until.is_some_and(|u| u > now_ts)
@@ -2832,6 +2942,8 @@ async fn record_single_patchset_release_in_tx(
 
     let mut clean_patches = 0.0f64;
     let mut dirty_patches = 0.0f64;
+    let mut ver_patches_cnt = 0.0f64;
+    let mut record_ver_issues = false;
     if status == "Reviewed" {
         let patches_guard_key = format!("stats_rollup:ps_patches_done:{patchset_id}");
         let patches_inserted = tx
@@ -2859,6 +2971,31 @@ async fn record_single_patchset_release_in_tx(
                     clean_patches += 1.0;
                 } else {
                     dirty_patches += 1.0;
+                }
+            }
+        }
+        let ver_guard_key = format!("stats_rollup:ps_ver_issues_done:{patchset_id}");
+        let ver_inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES (?, '1')",
+                libsql::params![ver_guard_key],
+            )
+            .await?;
+        if ver_inserted > 0 {
+            record_ver_issues = true;
+            if patches_inserted > 0 {
+                ver_patches_cnt = clean_patches + dirty_patches;
+            } else {
+                let mut pr_rows = tx
+                    .query(
+                        "SELECT COUNT(DISTINCT r.patch_id)
+                         FROM reviews r
+                         WHERE r.patchset_id = ? AND r.status = 'Reviewed' AND r.patch_id IS NOT NULL",
+                        libsql::params![patchset_id],
+                    )
+                    .await?;
+                if let Some(row) = pr_rows.next().await? {
+                    ver_patches_cnt = row.get::<i64>(0)? as f64;
                 }
             }
         }
@@ -2899,6 +3036,31 @@ async fn record_single_patchset_release_in_tx(
             &canonical_labels_json(&[("clean", "false")]),
             dirty_patches,
         );
+    }
+    if record_ver_issues {
+        let vb = crate::worker::stats_backfill::version_bucket_label(version);
+        let vb_lbl = canonical_labels_json(&[("version_bucket", vb)]);
+        if ver_patches_cnt > 0.0 {
+            add_rollup_to_map(
+                &mut acc,
+                now_ts,
+                effective_ts,
+                "sashiko_patches_reviewed_by_version_total",
+                &vb_lbl,
+                ver_patches_cnt,
+            );
+        }
+        let patch_findings_cnt = findings_list.iter().filter(|(_, preex)| !*preex).count() as f64;
+        if patch_findings_cnt > 0.0 {
+            add_rollup_to_map(
+                &mut acc,
+                now_ts,
+                effective_ts,
+                "sashiko_findings_by_version_total",
+                &vb_lbl,
+                patch_findings_cnt,
+            );
+        }
     }
     if !upgraded_from_non_reviewed {
         for (lin, cnt) in patch_lineages {
