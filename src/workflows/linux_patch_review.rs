@@ -568,35 +568,44 @@ pub(crate) fn validate_locations_side(
     container: &str,
     idx: usize,
 ) -> Result<(), String> {
-    for (l_idx, loc) in locations.iter().enumerate() {
-        if !loc.is_object() {
-            return Err(format!(
-                "{container}[{idx}].locations[{l_idx}] must be an object."
-            ));
-        }
-        let Some(side_val) = loc.get("side") else {
-            return Err(format!(
-                "{container}[{idx}].locations[{l_idx}] missing required 'side' ('PARENT' or 'REVISION')."
-            ));
-        };
-        let Some(side) = side_val.as_str() else {
-            return Err(format!(
-                "{container}[{idx}].locations[{l_idx}] 'side' must be a string ('PARENT' or 'REVISION')."
-            ));
-        };
-        if !side.eq_ignore_ascii_case("PARENT") && !side.eq_ignore_ascii_case("REVISION") {
-            return Err(format!(
-                "{container}[{idx}].locations[{l_idx}] 'side' must be 'PARENT' or 'REVISION'."
-            ));
-        }
+    let errors: Vec<String> = locations
+        .iter()
+        .enumerate()
+        .filter_map(|(l_idx, loc)| {
+            let at = format!("{container}[{idx}].locations[{l_idx}]");
+            if !loc.is_object() {
+                return Some(format!("{at} must be an object."));
+            }
+            let Some(side_val) = loc.get("side") else {
+                return Some(format!(
+                    "{at} missing required 'side' ('PARENT' or 'REVISION')."
+                ));
+            };
+            let Some(side) = side_val.as_str() else {
+                return Some(format!(
+                    "{at} 'side' must be a string ('PARENT' or 'REVISION')."
+                ));
+            };
+            if !side.eq_ignore_ascii_case("PARENT") && !side.eq_ignore_ascii_case("REVISION") {
+                return Some(format!("{at} 'side' must be 'PARENT' or 'REVISION'."));
+            }
+            None
+        })
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(" "))
     }
-    Ok(())
 }
 
 fn validate_concerns_output(
     output: &StageConcernsOutput,
     _state: &LinuxPatchReviewState,
 ) -> Result<(), String> {
+    // Every violation at once: a model told only the first fixes one
+    // per attempt and can run out of attempts with violations unreported.
+    let mut errors = Vec::new();
     for (idx, concern) in output.concerns.iter().enumerate() {
         let has_desc = concern
             .get("description")
@@ -607,15 +616,16 @@ fn validate_concerns_output(
             .and_then(Value::as_str)
             .is_some_and(|s| !s.trim().is_empty());
         if !has_desc || !has_reasoning {
-            return Err(format!(
+            errors.push(format!(
                 "concerns[{idx}] must have non-empty 'description' and 'reasoning' strings."
             ));
         }
-        let locations = concern.get("locations").and_then(Value::as_array);
-        if locations.is_none() {
-            return Err(format!("concerns[{idx}] must have a 'locations' array."));
+        match concern.get("locations").and_then(Value::as_array) {
+            Some(locations) => {
+                errors.extend(validate_locations_side(locations, "concerns", idx).err())
+            }
+            None => errors.push(format!("concerns[{idx}] must have a 'locations' array.")),
         }
-        validate_locations_side(locations.unwrap(), "concerns", idx)?;
     }
 
     for (idx, dismissed) in output.dismissed_concerns.iter().enumerate() {
@@ -628,21 +638,25 @@ fn validate_concerns_output(
             .and_then(Value::as_str)
             .is_some_and(|s| !s.trim().is_empty());
         if !has_desc || !has_reasoning {
-            return Err(format!(
+            errors.push(format!(
                 "dismissed_concerns[{idx}] must have non-empty 'description' and 'reasoning' strings proving why the candidate concern does not apply."
             ));
         }
         if let Some(locations) = dismissed.get("locations").and_then(Value::as_array) {
-            validate_locations_side(locations, "dismissed_concerns", idx)?;
+            errors.extend(validate_locations_side(locations, "dismissed_concerns", idx).err());
         }
         if !has_valid_proof_location(dismissed) {
-            return Err(format!(
+            errors.push(format!(
                 "dismissed_concerns[{idx}] must include at least one entry in 'locations' with non-empty 'file', 'function_or_symbol', valid 'side' ('PARENT' or 'REVISION'), and verbatim disproving 'code_snippet' proving the candidate concern cannot occur. If you do not have concrete code proof, move the candidate issue to 'concerns' instead."
             ));
         }
     }
 
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(" "))
+    }
 }
 
 fn format_concerns_feedback(violation: &str) -> String {
@@ -4938,6 +4952,25 @@ mod tests {
         let loc_err = validate_concerns_output(&missing_locs, &state)
             .expect_err("missing locations array must fail validation");
         assert!(loc_err.contains("must have a 'locations' array"));
+
+        // Every violation is reported in one rejection, not only the first.
+        let both = StageConcernsOutput {
+            concerns: missing_side.concerns.clone(),
+            dismissed_concerns: missing_snippet.dismissed_concerns.clone(),
+        };
+        let both_err = validate_concerns_output(&both, &state)
+            .expect_err("an answer with two violations must fail validation");
+        assert!(both_err.contains("concerns[0].locations[0] missing required 'side'"));
+        assert!(both_err.contains("dismissed_concerns[0] must include"));
+
+        // So is every bad location of one item.
+        let two_locs = vec![json!({"file": "a.c"}), json!({"file": "b.c", "side": "X"})];
+        let locs_err = validate_locations_side(&two_locs, "concerns", 0)
+            .expect_err("two bad locations must fail validation");
+        assert!(locs_err.contains("concerns[0].locations[0] missing required 'side'"));
+        assert!(
+            locs_err.contains("concerns[0].locations[1] 'side' must be 'PARENT' or 'REVISION'")
+        );
     }
 
     #[test]

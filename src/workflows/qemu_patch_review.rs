@@ -480,9 +480,13 @@ pub(crate) fn validate_concerns_output(
     output: &StageConcernsOutput,
     _state: &QemuPatchReviewState,
 ) -> Result<(), String> {
+    // Every violation at once: a model told only the first fixes one
+    // per attempt and can run out of attempts with violations unreported.
+    let mut errors = Vec::new();
     for (idx, concern) in output.concerns.iter().enumerate() {
         let Some(obj) = concern.as_object() else {
-            return Err(format!("concerns[{idx}] must be a JSON object."));
+            errors.push(format!("concerns[{idx}] must be a JSON object."));
+            continue;
         };
         let has_type = obj
             .get("type")
@@ -497,25 +501,27 @@ pub(crate) fn validate_concerns_output(
             .and_then(Value::as_str)
             .is_some_and(|s| !s.trim().is_empty());
         if !has_type || !has_desc || !has_reasoning {
-            return Err(format!(
+            errors.push(format!(
                 "concerns[{idx}] must have non-empty 'type', 'description', and 'reasoning' strings."
             ));
         }
         if !obj.get("preexisting").is_some_and(Value::is_boolean) {
-            return Err(format!(
+            errors.push(format!(
                 "concerns[{idx}] must have a boolean 'preexisting' field (true or false)."
             ));
         }
-        let locations = obj.get("locations").and_then(Value::as_array);
-        if locations.is_none() {
-            return Err(format!("concerns[{idx}] must have a 'locations' array."));
+        match obj.get("locations").and_then(Value::as_array) {
+            Some(locations) => {
+                errors.extend(validate_locations_side(locations, "concerns", idx).err())
+            }
+            None => errors.push(format!("concerns[{idx}] must have a 'locations' array.")),
         }
-        validate_locations_side(locations.unwrap(), "concerns", idx)?;
     }
 
     for (idx, dismissed) in output.dismissed_concerns.iter().enumerate() {
         let Some(obj) = dismissed.as_object() else {
-            return Err(format!("dismissed_concerns[{idx}] must be a JSON object."));
+            errors.push(format!("dismissed_concerns[{idx}] must be a JSON object."));
+            continue;
         };
         let has_type = obj
             .get("type")
@@ -530,21 +536,25 @@ pub(crate) fn validate_concerns_output(
             .and_then(Value::as_str)
             .is_some_and(|s| !s.trim().is_empty());
         if !has_type || !has_desc || !has_reasoning {
-            return Err(format!(
+            errors.push(format!(
                 "dismissed_concerns[{idx}] must have non-empty 'type', 'description', and 'reasoning' strings."
             ));
         }
         if let Some(locations) = obj.get("locations").and_then(Value::as_array) {
-            validate_locations_side(locations, "dismissed_concerns", idx)?;
+            errors.extend(validate_locations_side(locations, "dismissed_concerns", idx).err());
         }
         if !has_valid_proof_location(dismissed) {
-            return Err(format!(
+            errors.push(format!(
                 "dismissed_concerns[{idx}] must include at least one entry in 'locations' with non-empty 'file', 'function_or_symbol', valid 'side' ('PARENT' or 'REVISION'), and verbatim disproving 'code_snippet' proving the candidate concern cannot occur. If you do not have concrete code proof, move the candidate issue to 'concerns' instead."
             ));
         }
     }
 
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(" "))
+    }
 }
 
 pub(crate) fn format_concerns_feedback(violation: &str) -> String {
