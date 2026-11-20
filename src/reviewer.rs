@@ -1531,16 +1531,23 @@ impl Reviewer {
                 );
             }
 
-            match Self::complete_patchset_review_status_with_retry(
+            match Self::complete_failed_to_apply_or_requeue_with_retry(
                 &ctx.db,
                 patchset_id,
-                ReviewStatus::FailedToApply.as_str(),
-                None,
+                patchset.message_id.as_deref(),
+                &subject,
+                body.is_some(),
             )
             .await
             {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(crate::db::FailedToApplyOutcome::MarkedFailedToApply) => {}
+                Ok(crate::db::FailedToApplyOutcome::RequeuedForLateCover) => {
+                    info!(
+                        "Patchset {} received a late cover letter with baseline/prerequisite metadata during apply; requeued to Pending",
+                        patchset_id
+                    );
+                }
+                Ok(crate::db::FailedToApplyOutcome::Superseded) => {
                     info!(
                         "Patchset {} was cancelled or superseded during baseline search, preserving status",
                         patchset_id
@@ -2137,6 +2144,45 @@ impl Reviewer {
                 "failing orphaned In Review rows for patchset {} failed",
                 patchset_id
             )
+        }))
+    }
+
+    async fn complete_failed_to_apply_or_requeue_with_retry(
+        db: &Database,
+        patchset_id: i64,
+        started_cover_id: Option<&str>,
+        started_subject: &str,
+        started_had_body: bool,
+    ) -> Result<crate::db::FailedToApplyOutcome> {
+        let mut last_err = None;
+        for attempt in 1..=Self::DB_WRITE_ATTEMPTS {
+            match db
+                .complete_failed_to_apply_or_requeue(
+                    patchset_id,
+                    started_cover_id,
+                    started_subject,
+                    started_had_body,
+                )
+                .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(e) => {
+                    warn!(
+                        "Failed to finalize Failed To Apply for patchset {} (attempt {}/{}): {}",
+                        patchset_id,
+                        attempt,
+                        Self::DB_WRITE_ATTEMPTS,
+                        e
+                    );
+                    last_err = Some(e);
+                    if attempt < Self::DB_WRITE_ATTEMPTS {
+                        tokio::time::sleep(Self::DB_WRITE_RETRY_PAUSE * attempt).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            anyhow!("patchset {} Failed To Apply completion failed", patchset_id)
         }))
     }
 

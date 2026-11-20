@@ -1102,6 +1102,30 @@ pub fn extract_base_commit(body: &str) -> Option<CommitId> {
         .find_map(|caps| CommitId::parse(caps.get(1)?.as_str()))
 }
 
+/// Returns true when a late-arriving cover letter introduces baseline or
+/// prerequisite metadata that was unavailable when the series was attempted
+/// without its cover letter.
+#[cfg(feature = "server")]
+pub(crate) fn cover_letter_adds_baseline_metadata(
+    previous_subject: &str,
+    cover_subject: &str,
+    cover_body: Option<&str>,
+) -> bool {
+    if extract_version_tag(cover_subject)
+        .is_some_and(|v| extract_version_tag(previous_subject).as_deref() != Some(v.as_str()))
+    {
+        return true;
+    }
+    let Some(body) = cover_body else {
+        return false;
+    };
+    extract_base_commit(body).is_some()
+        || extract_body_version_tag(body).is_some()
+        || crate::prerequisites::has_prerequisite_metadata(body)
+        || (is_unversioned_stable_backport(cover_subject, Some(body))
+            && !is_unversioned_stable_backport(previous_subject, None))
+}
+
 pub fn extract_version_tag(subject: &str) -> Option<String> {
     static VERSION_TAG_RE: OnceLock<Regex> = OnceLock::new();
     let re = VERSION_TAG_RE

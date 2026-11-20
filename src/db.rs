@@ -366,6 +366,14 @@ pub struct PatchsetRow {
 }
 
 #[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedToApplyOutcome {
+    MarkedFailedToApply,
+    RequeuedForLateCover,
+    Superseded,
+}
+
+#[cfg(feature = "server")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredPrerequisitePatch {
     pub(crate) git_patch_id: Option<String>,
@@ -9841,11 +9849,50 @@ impl Database {
                     if let Some(clid) = cover_letter_message_id {
                         self.adopt_series_identity(id, clid, 0, false).await?;
                     }
-                    self.execute(
+                    let subject_updated = self
+                        .execute(
                             "UPDATE patchsets SET subject = ?, subject_index = 0 WHERE id = ? AND subject_index > 0",
                             libsql::params![subject, id],
                         )
                         .await?;
+                    // When a series failed to apply before its 0/N cover letter arrived,
+                    // re-queue it once if the late cover letter supplies baseline or
+                    // prerequisite metadata that patch 1 lacked.
+                    if subject_updated > 0
+                        && matches!(
+                            ReviewStatus::from_str(&existing_status),
+                            Ok(ReviewStatus::FailedToApply)
+                        )
+                        && let Some(clid) = cover_letter_message_id
+                    {
+                        let cover_body = self.get_message_body(clid).await?;
+                        if crate::baseline::cover_letter_adds_baseline_metadata(
+                            &existing_subject,
+                            subject,
+                            cover_body.as_deref(),
+                        ) {
+                            let requeued = self
+                                .execute(
+                                    "UPDATE patchsets
+                                        SET status = 'Pending',
+                                            baseline_id = NULL,
+                                            baseline_logs = NULL,
+                                            failed_reason = NULL
+                                      WHERE id = ?
+                                        AND status IN ('Failed To Apply', 'FailedToApply')
+                                        AND cover_letter_message_id = ?",
+                                    libsql::params![id, clid],
+                                )
+                                .await?;
+                            if requeued > 0 {
+                                self.reset_patchset_review_state(id).await?;
+                                info!(
+                                    "Patchset {} received late cover letter {} with baseline/prerequisite metadata; requeued from Failed To Apply to Pending",
+                                    id, clid
+                                );
+                            }
+                        }
+                    }
                     return Ok(Some(id));
                 }
                 continue;
@@ -13198,6 +13245,110 @@ impl Database {
 
     pub async fn complete_patchset_review_status(&self, id: i64, status: &str) -> Result<bool> {
         self.complete_patchset_review(id, status, None).await
+    }
+
+    /// Atomically marks an `'In Review'` patchset as `'Failed To Apply'`, or
+    /// re-queues it to `'Pending'` if a late 0/N cover letter carrying baseline
+    /// or prerequisite metadata arrived while this worker was trying baselines.
+    ///
+    /// Running inside an immediate write transaction serializes against
+    /// `create_patchset_in_tx`, eliminating the race where a late cover letter
+    /// lands during baseline resolution and would otherwise be stranded behind
+    /// `'Failed To Apply'`.
+    pub async fn complete_failed_to_apply_or_requeue(
+        &self,
+        id: i64,
+        started_cover_id: Option<&str>,
+        started_subject: &str,
+        started_had_body: bool,
+    ) -> Result<FailedToApplyOutcome> {
+        if let Some(claim) = self.patchset_claim
+            && claim.patchset_id != id
+        {
+            return Ok(FailedToApplyOutcome::Superseded);
+        }
+
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+
+        let current_row = if let Some(claim) = tx_db.patchset_claim {
+            let mut rows = tx_db
+                .read_conn()
+                .query(
+                    "SELECT cover_letter_message_id, subject, subject_index
+                       FROM patchsets
+                      WHERE id = ?
+                        AND status = 'In Review'
+                        AND EXISTS (
+                            SELECT 1 FROM meta m
+                             WHERE m.key = 'patchset_active_gen:' || CAST(patchsets.id AS TEXT)
+                               AND CAST(m.value AS INTEGER) = ?
+                        )",
+                    libsql::params![id, claim.generation],
+                )
+                .await?;
+            rows.next().await?
+        } else {
+            let mut rows = tx_db
+                .read_conn()
+                .query(
+                    "SELECT cover_letter_message_id, subject, subject_index
+                       FROM patchsets
+                      WHERE id = ?
+                        AND status != 'Cancelled'",
+                    libsql::params![id],
+                )
+                .await?;
+            rows.next().await?
+        };
+
+        let Some(row) = current_row else {
+            tx.commit().await?;
+            return Ok(FailedToApplyOutcome::Superseded);
+        };
+
+        let current_cover_id: Option<String> = row.get(0).ok();
+        let current_subject: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+        let subject_index: u32 = row.get::<Option<u32>>(2)?.unwrap_or(9999);
+        drop(row);
+
+        let cover_arrived_after_start = subject_index == 0
+            && current_cover_id.is_some()
+            && (current_cover_id.as_deref() != started_cover_id || !started_had_body);
+
+        if cover_arrived_after_start && let Some(ref cover_id) = current_cover_id {
+            let cover_body = tx_db.get_message_body(cover_id).await?;
+            if crate::baseline::cover_letter_adds_baseline_metadata(
+                started_subject,
+                &current_subject,
+                cover_body.as_deref(),
+            ) {
+                tx_db
+                    .execute(
+                        "UPDATE patchsets
+                            SET status = 'Pending',
+                                baseline_id = NULL,
+                                baseline_logs = NULL,
+                                failed_reason = NULL
+                          WHERE id = ?",
+                        libsql::params![id],
+                    )
+                    .await?;
+                tx_db.reset_patchset_review_state(id).await?;
+                tx.commit().await?;
+                return Ok(FailedToApplyOutcome::RequeuedForLateCover);
+            }
+        }
+
+        let updated = tx_db
+            .complete_patchset_review(id, ReviewStatus::FailedToApply.as_str(), None)
+            .await?;
+        tx.commit().await?;
+        Ok(if updated {
+            FailedToApplyOutcome::MarkedFailedToApply
+        } else {
+            FailedToApplyOutcome::Superseded
+        })
     }
 
     /// Moves a patchset to its final review status and records why it
@@ -38285,6 +38436,441 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
             db.get_last_article_num("org.kernel.vger.linux-kernel")
                 .await?,
             99
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_cover_with_baseline_metadata_requeues_failed_to_apply_once() -> Result<()> {
+        let db = setup_db().await;
+        let cover_id = "cover.1794584066.git.ralf@mandelbit.com";
+        let p1_id = "p1.1794584066.git.ralf@mandelbit.com";
+        let p2_id = "p2.1794584066.git.ralf@mandelbit.com";
+        let author = "Ralf Lici <ralf@mandelbit.com>";
+
+        // Patches arrive before cover letter, creating a placeholder cover message.
+        let tid = db.ensure_thread_for_message(cover_id, 1000).await?;
+        db.create_message(
+            p1_id,
+            tid,
+            Some(cover_id),
+            author,
+            "[PATCH 1/2] ovpn: part 1",
+            1001,
+            "patch 1 body",
+            "openvpn-devel@lists.sourceforge.net",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                tid,
+                Some(p1_id),
+                p1_id,
+                "[PATCH 1/2] ovpn: part 1",
+                author,
+                1001,
+                2,
+                1,
+                "openvpn-devel@lists.sourceforge.net",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.create_patch(ps_id, p1_id, 1, "diff 1").await?;
+
+        db.create_message(
+            p2_id,
+            tid,
+            Some(cover_id),
+            author,
+            "[PATCH 2/2] ovpn: part 2",
+            1002,
+            "patch 2 body",
+            "openvpn-devel@lists.sourceforge.net",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_patchset(
+            tid,
+            Some(p2_id),
+            p2_id,
+            "[PATCH 2/2] ovpn: part 2",
+            author,
+            1002,
+            2,
+            1,
+            "openvpn-devel@lists.sourceforge.net",
+            "",
+            None,
+            2,
+            None,
+            true,
+            None,
+            None,
+        )
+        .await?;
+        db.create_patch(ps_id, p2_id, 2, "diff 2").await?;
+
+        // Worker runs before cover arrives and marks Failed To Apply with stale logs.
+        let claim_gen = db.enter_patchset_review_with_gen(ps_id).await?.unwrap();
+        let claimed_db = db.with_patchset_claim(ps_id, claim_gen);
+        claimed_db
+            .update_patchset_baseline_info(
+                ps_id,
+                None,
+                Some("model"),
+                Some("hash"),
+                Some("[{\"baseline\":\"net-next\",\"status\":\"Failed\"}]"),
+                Some("gemini"),
+            )
+            .await?;
+        assert!(
+            claimed_db
+                .complete_patchset_review_status(ps_id, ReviewStatus::FailedToApply.as_str())
+                .await?
+        );
+
+        // Late cover letter arrives carrying base-commit and prerequisite trailers.
+        let cover_body = "Hi,\n\nbase-commit: 7b6ab4dbc156e2f96419715130b3d5738a306c93\n\
+            prerequisite-message-id: cover.1794244231.git.ralf@mandelbit.com\n\
+            prerequisite-patch-id: 0cc7597aca91a5984596d971b1b066ad6616c329\n";
+        db.create_message(
+            cover_id,
+            tid,
+            None,
+            author,
+            "[PATCH 0/2] ovpn: cover",
+            1000,
+            cover_body,
+            "openvpn-devel@lists.sourceforge.net",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let matched = db
+            .create_patchset(
+                tid,
+                Some(cover_id),
+                cover_id,
+                "[PATCH 0/2] ovpn: cover",
+                author,
+                1000,
+                2,
+                1,
+                "openvpn-devel@lists.sourceforge.net",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await?;
+        assert_eq!(matched, Some(ps_id));
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, cover_letter_message_id, subject_index, baseline_logs
+                   FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await?;
+        let row = rows.next().await?.unwrap();
+        assert_eq!(row.get::<String>(0)?, "Pending");
+        assert_eq!(row.get::<Option<String>>(1)?.as_deref(), Some(cover_id));
+        assert_eq!(row.get::<u32>(2)?, 0);
+        assert_eq!(row.get::<Option<String>>(3)?, None);
+
+        // If the retry still fails to apply, redelivering the same cover must not loop.
+        let claim_gen2 = db.enter_patchset_review_with_gen(ps_id).await?.unwrap();
+        let claimed_db2 = db.with_patchset_claim(ps_id, claim_gen2);
+        assert!(
+            claimed_db2
+                .complete_patchset_review_status(ps_id, ReviewStatus::FailedToApply.as_str())
+                .await?
+        );
+        db.create_patchset(
+            tid,
+            Some(cover_id),
+            cover_id,
+            "[PATCH 0/2] ovpn: cover",
+            author,
+            1000,
+            2,
+            1,
+            "openvpn-devel@lists.sourceforge.net",
+            "",
+            None,
+            0,
+            None,
+            true,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("Failed To Apply")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_cover_without_baseline_metadata_does_not_requeue() -> Result<()> {
+        let db = setup_db().await;
+        let cover_id = "cover-plain@example.org";
+        let p1_id = "p1-plain@example.org";
+        let p2_id = "p2-plain@example.org";
+        let author = "Dev <dev@example.org>";
+
+        let tid = db.ensure_thread_for_message(cover_id, 1000).await?;
+        db.create_message(
+            p1_id,
+            tid,
+            Some(cover_id),
+            author,
+            "[PATCH 1/2] net: p1",
+            1001,
+            "p1",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                tid,
+                Some(p1_id),
+                p1_id,
+                "[PATCH 1/2] net: p1",
+                author,
+                1001,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.create_patch(ps_id, p1_id, 1, "diff 1").await?;
+        db.create_message(
+            p2_id,
+            tid,
+            Some(cover_id),
+            author,
+            "[PATCH 2/2] net: p2",
+            1002,
+            "p2",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_patch(ps_id, p2_id, 2, "diff 2").await?;
+        db.execute(
+            "UPDATE patchsets SET received_parts = 2, status = 'Failed To Apply' WHERE id = ?",
+            libsql::params![ps_id],
+        )
+        .await?;
+
+        db.create_message(
+            cover_id,
+            tid,
+            None,
+            author,
+            "[PATCH 0/2] net: plain cover",
+            1000,
+            "Just a prose overview with no trailers.",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_patchset(
+            tid,
+            Some(cover_id),
+            cover_id,
+            "[PATCH 0/2] net: plain cover",
+            author,
+            1000,
+            2,
+            1,
+            "",
+            "",
+            None,
+            0,
+            None,
+            true,
+            None,
+            None,
+        )
+        .await?;
+
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("Failed To Apply")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_complete_failed_to_apply_requeues_when_late_cover_arrived_during_review()
+    -> Result<()> {
+        let db = setup_db().await;
+        let cover_id = "cover-race@example.org";
+        let p1_id = "p1-race@example.org";
+        let p2_id = "p2-race@example.org";
+        let author = "Dev <dev@example.org>";
+
+        let tid = db.ensure_thread_for_message(cover_id, 1000).await?;
+        db.create_message(
+            p1_id,
+            tid,
+            Some(cover_id),
+            author,
+            "[PATCH 1/2] ovpn: p1",
+            1001,
+            "p1 body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                tid,
+                Some(p1_id),
+                p1_id,
+                "[PATCH 1/2] ovpn: p1",
+                author,
+                1001,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.create_patch(ps_id, p1_id, 1, "diff 1").await?;
+        db.create_message(
+            p2_id,
+            tid,
+            Some(cover_id),
+            author,
+            "[PATCH 2/2] ovpn: p2",
+            1002,
+            "p2 body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_patch(ps_id, p2_id, 2, "diff 2").await?;
+        db.execute(
+            "UPDATE patchsets SET received_parts = 2, status = 'Pending' WHERE id = ?",
+            libsql::params![ps_id],
+        )
+        .await?;
+
+        // Worker starts reviewing with patch 1's identity before cover arrives.
+        let claim_gen = db.enter_patchset_review_with_gen(ps_id).await?.unwrap();
+        let claimed_db = db.with_patchset_claim(ps_id, claim_gen);
+
+        // Late cover letter arrives while patchset is In Review.
+        db.create_message(
+            cover_id,
+            tid,
+            None,
+            author,
+            "[PATCH 0/2] ovpn: cover",
+            1000,
+            "Cover\nbase-commit: 7b6ab4dbc156e2f96419715130b3d5738a306c93\n",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_patchset(
+            tid,
+            Some(cover_id),
+            cover_id,
+            "[PATCH 0/2] ovpn: cover",
+            author,
+            1000,
+            2,
+            1,
+            "",
+            "",
+            None,
+            0,
+            None,
+            true,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("In Review")
+        );
+
+        // Worker finishes failing baselines and tries to mark Failed To Apply -> requeued!
+        let outcome = claimed_db
+            .complete_failed_to_apply_or_requeue(ps_id, Some(p1_id), "[PATCH 1/2] ovpn: p1", true)
+            .await?;
+        assert_eq!(outcome, FailedToApplyOutcome::RequeuedForLateCover);
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("Pending")
+        );
+
+        // Next run starts with the cover letter; if it still fails, it marks Failed To Apply.
+        let claim_gen2 = db.enter_patchset_review_with_gen(ps_id).await?.unwrap();
+        let claimed_db2 = db.with_patchset_claim(ps_id, claim_gen2);
+        let outcome2 = claimed_db2
+            .complete_failed_to_apply_or_requeue(
+                ps_id,
+                Some(cover_id),
+                "[PATCH 0/2] ovpn: cover",
+                true,
+            )
+            .await?;
+        assert_eq!(outcome2, FailedToApplyOutcome::MarkedFailedToApply);
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("Failed To Apply")
         );
         Ok(())
     }
