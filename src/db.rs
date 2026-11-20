@@ -55,8 +55,8 @@ pub use prior_context_queries::PriorContextOptions;
 mod stats_queries;
 #[cfg(feature = "server")]
 pub use stats_queries::{
-    BugSubsystemFacetSummary, ROLLUP_RESOLUTIONS, RollupBucketRow, canonical_labels_json,
-    decode_labels_json,
+    BugSubsystemFacetSummary, ROLLUP_RESOLUTIONS, RollupBucketRow, RollupRowLimitExceeded,
+    canonical_labels_json, decode_labels_json,
 };
 
 /// The SQL form of [`Database::is_closed_to_new_parts`], for the statements

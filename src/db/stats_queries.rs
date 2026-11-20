@@ -37,6 +37,25 @@ pub const ROLLUP_RESOLUTIONS: [(i64, i64); 3] = [
     (86_400, 5 * 365 * 86_400),
 ];
 
+/// Hard ceiling on raw rollup rows materialized by a single stats query so an
+/// attacker cannot trigger unbounded memory or SQLite scan work via wide
+/// unfiltered range selectors.
+pub const MAX_PRELOADED_ROLLUP_ROWS: usize = 50_000;
+
+#[derive(Debug)]
+pub struct RollupRowLimitExceeded;
+
+impl std::fmt::Display for RollupRowLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "query exceeds maximum {MAX_PRELOADED_ROLLUP_ROWS} rollup rows; narrow time range or label filters"
+        )
+    }
+}
+
+impl std::error::Error for RollupRowLimitExceeded {}
+
 /// Pre-aggregated per-subsystem bug counts across severity and CVSS v4.0
 /// security rating dimensions.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1462,6 +1481,9 @@ impl Database {
                 let bucket_ts: i64 = r.get(1)?;
                 let value: f64 = r.get(2)?;
                 if let Some((metric, labels)) = series_meta.get(&sid) {
+                    if out.len() >= MAX_PRELOADED_ROLLUP_ROWS {
+                        return Err(RollupRowLimitExceeded.into());
+                    }
                     out.push(RollupBucketRow {
                         metric: metric.clone(),
                         labels: labels.clone(),
