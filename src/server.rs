@@ -595,13 +595,17 @@ impl AppState {
             .await
     }
 
-    /// Returns recent upstream release tags (`vX.Y`, `vX.Y-rc1`, `vX.Y.Z`) and
-    /// their UNIX timestamps from the target git repository, cached for 1 hour.
+    /// Returns recent major upstream release tags for the configured project
+    /// and their UNIX timestamps from the target git repository, cached for
+    /// 1 hour.
     pub async fn get_cached_project_releases(&self) -> Vec<(String, i64)> {
+        let project = self.settings.project.kind.unwrap_or_default();
         let repo_path = self.settings.git.repository_path.clone();
         self.project_releases_cache
             .get_or_fetch(|| async move {
-                Ok::<Vec<(String, i64)>, anyhow::Error>(load_recent_release_tags(&repo_path).await)
+                Ok::<Vec<(String, i64)>, anyhow::Error>(
+                    load_recent_release_tags(project, &repo_path).await,
+                )
             })
             .await
             .unwrap_or_default()
@@ -721,7 +725,10 @@ impl AppState {
     }
 }
 
-async fn load_recent_release_tags(repo_path: &str) -> Vec<(String, i64)> {
+async fn load_recent_release_tags(
+    project: crate::project::ProjectId,
+    repo_path: &str,
+) -> Vec<(String, i64)> {
     let trimmed = repo_path.trim();
     if trimmed.is_empty() || !std::path::Path::new(trimmed).exists() {
         return Vec::new();
@@ -753,8 +760,8 @@ async fn load_recent_release_tags(repo_path: &str) -> Vec<(String, i64)> {
         if ts < cutoff {
             break;
         }
-        if is_major_release_tag(tag) {
-            out.push((tag.to_string(), ts));
+        if let Some(label) = release_tag_display_label(project, tag) {
+            out.push((label, ts));
             if out.len() >= 24 {
                 break;
             }
@@ -763,30 +770,67 @@ async fn load_recent_release_tags(repo_path: &str) -> Vec<(String, i64)> {
     out
 }
 
-fn is_major_release_tag(tag: &str) -> bool {
-    let Some(rest) = tag.strip_prefix('v') else {
-        return false;
-    };
-    let core = rest.strip_suffix("-rc1").unwrap_or(rest);
-    let mut parts = core.split('.');
-    let Some(major) = parts.next() else {
-        return false;
-    };
-    let Some(minor) = parts.next() else {
-        return false;
-    };
-    let patch_ok = match parts.next() {
-        None => true,
-        Some(p) => {
-            !rest.ends_with("-rc1") && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())
+fn is_ascii_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_two_part_version(s: &str) -> bool {
+    let mut parts = s.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(major), Some(minor), None) => is_ascii_digits(major) && is_ascii_digits(minor),
+        _ => false,
+    }
+}
+
+fn parse_three_part_version(s: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = s.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(major), Some(minor), Some(patch), None)
+            if is_ascii_digits(major) && is_ascii_digits(minor) && is_ascii_digits(patch) =>
+        {
+            Some((major, minor, patch))
         }
-    };
-    parts.next().is_none()
-        && !major.is_empty()
-        && major.bytes().all(|b| b.is_ascii_digit())
-        && !minor.is_empty()
-        && minor.bytes().all(|b| b.is_ascii_digit())
-        && patch_ok
+        _ => None,
+    }
+}
+
+/// Filters git tags down to major upstream release milestones for `project`
+/// and returns the short display label used on statistics charts.
+///
+/// Project-specific filtering keeps stable point releases (for example Linux
+/// `v6.12.118` or Sashiko `v.0.9.5`) from crowding out mainline milestones
+/// while supporting non-`vX.Y` conventions such as GCC `releases/gcc-X.Y.0`.
+fn release_tag_display_label(project: crate::project::ProjectId, tag: &str) -> Option<String> {
+    use crate::project::ProjectId;
+
+    match project {
+        ProjectId::Linux => {
+            let rest = tag.strip_prefix('v')?;
+            let core = rest.strip_suffix("-rc1").unwrap_or(rest);
+            is_two_part_version(core).then(|| tag.to_string())
+        }
+        ProjectId::Sashiko => {
+            let rest = tag.strip_prefix("v.").or_else(|| tag.strip_prefix('v'))?;
+            let (_, _, patch) = parse_three_part_version(rest)?;
+            (patch == "0").then(|| tag.to_string())
+        }
+        ProjectId::Gcc => {
+            let rest = tag.strip_prefix("releases/gcc-")?;
+            let (major, minor, patch) = parse_three_part_version(rest)?;
+            (patch == "0").then(|| format!("gcc-{major}.{minor}.{patch}"))
+        }
+        ProjectId::Qemu | ProjectId::Zephyr => {
+            let rest = tag.strip_prefix('v')?;
+            let matches = is_two_part_version(rest)
+                || parse_three_part_version(rest).is_some_and(|(_, _, patch)| patch == "0");
+            matches.then(|| tag.to_string())
+        }
+        ProjectId::E2fsprogs => {
+            let rest = tag.strip_prefix('v')?;
+            let matches = is_two_part_version(rest) || parse_three_part_version(rest).is_some();
+            matches.then(|| tag.to_string())
+        }
+    }
 }
 
 async fn redirect_www(req: Request, next: Next) -> impl IntoResponse {
@@ -8847,12 +8891,85 @@ F:	net/
         assert_eq!(batch_resp["data"]["hist"]["result"][0]["value"][1], "17");
         assert_eq!(batch_resp["data"]["rng"]["resultType"], "matrix");
 
-        assert!(is_major_release_tag("v7.3"));
-        assert!(is_major_release_tag("v7.4-rc1"));
-        assert!(is_major_release_tag("v0.9.4"));
-        assert!(!is_major_release_tag("v7.4-rc2"));
-        assert!(!is_major_release_tag("v7.3.1-rc1"));
-        assert!(!is_major_release_tag("release-1"));
+        use crate::project::ProjectId;
+        assert_eq!(
+            release_tag_display_label(ProjectId::Linux, "v7.3").as_deref(),
+            Some("v7.3")
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::Linux, "v7.4-rc1").as_deref(),
+            Some("v7.4-rc1")
+        );
+        assert_eq!(release_tag_display_label(ProjectId::Linux, "v7.3.5"), None);
+        assert_eq!(
+            release_tag_display_label(ProjectId::Linux, "v6.18.64"),
+            None
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::Linux, "v7.4-rc2"),
+            None
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::Linux, "v7.3.1-rc1"),
+            None
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::Linux, "release-1"),
+            None
+        );
+
+        assert_eq!(
+            release_tag_display_label(ProjectId::Sashiko, "v.0.9.0").as_deref(),
+            Some("v.0.9.0")
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::Sashiko, "v0.10.0").as_deref(),
+            Some("v0.10.0")
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::Sashiko, "v.0.9.5"),
+            None
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::Sashiko, "v0.9.4"),
+            None
+        );
+
+        assert_eq!(
+            release_tag_display_label(ProjectId::Gcc, "releases/gcc-16.2.0").as_deref(),
+            Some("gcc-16.2.0")
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::Gcc, "releases/gcc-16.2.1"),
+            None
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::Gcc, "basepoints/gcc-17"),
+            None
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::Gcc, "vendors/ARM/release-12.3.rel1"),
+            None
+        );
+
+        assert_eq!(
+            release_tag_display_label(ProjectId::Qemu, "v10.1.0").as_deref(),
+            Some("v10.1.0")
+        );
+        assert_eq!(release_tag_display_label(ProjectId::Qemu, "v10.1.2"), None);
+        assert_eq!(
+            release_tag_display_label(ProjectId::Zephyr, "v4.3.0").as_deref(),
+            Some("v4.3.0")
+        );
+        assert_eq!(release_tag_display_label(ProjectId::Zephyr, "v4.3.1"), None);
+        assert_eq!(
+            release_tag_display_label(ProjectId::E2fsprogs, "v1.47.2").as_deref(),
+            Some("v1.47.2")
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::E2fsprogs, "v1.47.2-rc1"),
+            None
+        );
 
         let meta_resp: serde_json::Value = client
             .get(format!("http://{addr}/api/v1/metadata"))

@@ -1990,7 +1990,10 @@ pub async fn refresh_remote_with_policy(
         debug!("Fetching remote {}", name);
 
         let mut fetch_args = vec!["fetch", "--prune"];
-        if !url.contains("torvalds/linux.git") && !url.contains("stable/linux.git") {
+        if name != "origin"
+            && !url.contains("torvalds/linux.git")
+            && !url.contains("stable/linux.git")
+        {
             fetch_args.push("--no-tags");
         }
         fetch_args.push(name);

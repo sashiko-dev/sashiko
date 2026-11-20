@@ -4605,18 +4605,33 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             if (!Array.isArray(releasesVec) || !releasesVec.length || !sortedTs.length) return undefined;
             const minTs = sortedTs[0] - stepSec;
             const maxTs = sortedTs[sortedTs.length - 1];
-            const data = [];
+            const byBucket = new Map();
             for (const item of releasesVec) {
                 const tag = item.metric?.tag;
                 const ts = Number(item.value?.[1]);
                 if (!tag || !Number.isFinite(ts) || ts < minTs || ts > maxTs) continue;
                 let idx = sortedTs.findIndex(t => ts <= t);
                 if (idx < 0) idx = sortedTs.length - 1;
+                if (!byBucket.has(idx)) byBucket.set(idx, []);
+                byBucket.get(idx).push({ tag, ts });
+            }
+            const data = [];
+            for (const [idx, items] of byBucket.entries()) {
+                items.sort((a, b) => a.ts - b.ts || a.tag.localeCompare(b.tag));
+                const seen = new Set();
+                const uniqueTags = [];
+                for (const it of items) {
+                    if (!seen.has(it.tag)) {
+                        seen.add(it.tag);
+                        uniqueTags.push(it.tag);
+                    }
+                }
+                const labelText = uniqueTags.join(', ');
                 data.push({
                     xAxis: labels[idx],
-                    name: tag,
+                    name: labelText,
                     label: {
-                        formatter: tag,
+                        formatter: labelText,
                         position: 'insideEndTop',
                         color: pal.muted,
                         fontSize: 10
