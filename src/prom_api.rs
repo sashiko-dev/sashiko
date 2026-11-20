@@ -32,15 +32,18 @@ use subtle::ConstantTimeEq;
 use tracing::error;
 
 use crate::access::{OptionalPrincipal, Principal};
-use crate::db::{BugSubsystemFacetSummary, PipelineMultiWindowStats, RollupBucketRow};
+use crate::db::{
+    BugSubsystemFacetSummary, PipelineMultiWindowStats, RollupBucketRow, RollupRowLimitExceeded,
+};
 use crate::metrics::{
     METRIC_CATALOG, MetricDef, MetricType, render_runtime_prometheus, unflushed_runtime_deltas,
     write_prometheus_header, write_prometheus_sample,
 };
 use crate::promql::{
-    EvalSample, EvalValue, Expr, LabelMatcher, Labels, MAX_RANGE_POINTS, MIN_STEP_SECS,
-    MatrixSeries, PromDataSource, PromError, RangeFunc, VectorSample, VectorSelector, eval_instant,
-    format_prom_float, parse_prom_duration_secs, parse_prom_timestamp, parse_promql,
+    EvalSample, EvalValue, Expr, LabelMatchOp, LabelMatcher, Labels, MAX_RANGE_POINTS,
+    MIN_STEP_SECS, MatrixSeries, PromDataSource, PromError, RangeFunc, VectorSample,
+    VectorSelector, eval_instant, format_prom_float, parse_prom_duration_secs,
+    parse_prom_timestamp, parse_promql,
 };
 use crate::server::{AppState, presents_local_token};
 
@@ -300,11 +303,11 @@ pub async fn prometheus_metrics(
     let mut buf = String::with_capacity(32 * 1024);
     render_runtime_prometheus(&mut buf);
 
-    match state.db.get_all_state_gauges().await {
+    match state.get_cached_state_gauges().await {
         Ok(gauges) => append_db_state_gauges(&mut buf, &gauges),
         Err(e) => error!("Failed reading state gauges for /metrics: {e}"),
     }
-    let backfill_done = state.db.is_stats_backfill_done().await.unwrap_or(false);
+    let backfill_done = state.get_cached_stats_backfill_done().await;
     write_prometheus_header(
         &mut buf,
         "sashiko_stats_backfill_complete",
@@ -684,40 +687,11 @@ pub async fn prom_query_range(
 ) -> Response {
     let params = merge_range_params(&method, url_params, &body);
     let now_ts = chrono::Utc::now().timestamp();
-    if params.start.trim().is_empty()
-        || params.end.trim().is_empty()
-        || params.step.trim().is_empty()
-    {
-        return prom_err_response(PromError::bad_data(
-            "start, end, and step are required for query_range",
-        ));
-    }
-    let start_ts = match parse_prom_timestamp(&params.start, now_ts) {
-        Ok(t) => t,
-        Err(e) => return prom_err_response(e),
-    };
-    let end_ts = match parse_prom_timestamp(&params.end, now_ts) {
-        Ok(t) => t,
-        Err(e) => return prom_err_response(e),
-    };
-    if end_ts < start_ts {
-        return prom_err_response(PromError::bad_data("end timestamp must not precede start"));
-    }
-    let raw_step = match parse_prom_duration_secs(&params.step) {
-        Ok(s) => s,
-        Err(e) => return prom_err_response(e),
-    };
-    let step_secs = raw_step.max(MIN_STEP_SECS);
-    let Some(span_secs) = end_ts.checked_sub(start_ts) else {
-        return prom_err_response(PromError::bad_data("query_range span overflow"));
-    };
-    let num_points = (span_secs / step_secs).saturating_add(1);
-    if num_points as usize > MAX_RANGE_POINTS {
-        return prom_err_response(PromError::bad_data(format!(
-            "query_range exceeds maximum {} points; increase step",
-            MAX_RANGE_POINTS
-        )));
-    }
+    let (start_ts, end_ts, step_secs, _) =
+        match validate_range_bounds(&params.start, &params.end, &params.step, now_ts) {
+            Ok(v) => v,
+            Err(e) => return prom_err_response(e),
+        };
 
     let expr = match parse_promql(&params.query) {
         Ok(e) => e,
@@ -729,40 +703,12 @@ pub async fn prom_query_range(
         Err(e) => return prom_err_response(e),
     };
 
-    let mut series_map: BTreeMap<Labels, Vec<(f64, String)>> = BTreeMap::new();
-    let mut t = start_ts;
-    while t <= end_ts {
-        match eval_instant(&expr, &ds, t) {
-            Ok(EvalValue::Scalar(v)) => {
-                if !v.is_nan() {
-                    series_map
-                        .entry(Labels::new())
-                        .or_default()
-                        .push((t as f64, format_prom_float(v)));
-                }
-            }
-            Ok(EvalValue::Vector(samples)) => {
-                for s in samples {
-                    if !s.value.is_nan() {
-                        series_map
-                            .entry(s.labels)
-                            .or_default()
-                            .push((t as f64, format_prom_float(s.value)));
-                    }
-                }
-            }
+    let mut sample_budget = MAX_RESULT_SAMPLES;
+    let result =
+        match eval_range_matrix(&expr, &ds, start_ts, end_ts, step_secs, &mut sample_budget) {
+            Ok(r) => r,
             Err(e) => return prom_err_response(e),
-        }
-        let Some(next_t) = t.checked_add(step_secs) else {
-            break;
         };
-        t = next_t;
-    }
-
-    let result: Vec<MatrixSeries> = series_map
-        .into_iter()
-        .map(|(metric, values)| MatrixSeries { metric, values })
-        .collect();
 
     Json(json!({
         "status": "success",
@@ -774,7 +720,64 @@ pub async fn prom_query_range(
     .into_response()
 }
 
-pub const MAX_BATCH_QUERIES: usize = 64;
+pub const MAX_BATCH_QUERIES: usize = 40;
+pub const MAX_BATCH_EVAL_POINTS: usize = 2_400;
+pub const MAX_RESULT_SAMPLES: usize = 25_000;
+
+fn eval_range_matrix(
+    expr: &Expr,
+    ds: &PreloadedPromDataSource,
+    start_ts: i64,
+    end_ts: i64,
+    step_secs: i64,
+    remaining_samples: &mut usize,
+) -> Result<Vec<MatrixSeries>, PromError> {
+    let mut series_map: BTreeMap<Labels, Vec<(f64, String)>> = BTreeMap::new();
+    let mut t = start_ts;
+    while t <= end_ts {
+        match eval_instant(expr, ds, t)? {
+            EvalValue::Scalar(v) => {
+                if !v.is_nan() {
+                    if *remaining_samples == 0 {
+                        return Err(PromError::bad_data(format!(
+                            "query_range exceeds maximum {MAX_RESULT_SAMPLES} result samples; increase step or narrow matchers"
+                        )));
+                    }
+                    *remaining_samples -= 1;
+                    series_map
+                        .entry(Labels::new())
+                        .or_default()
+                        .push((t as f64, format_prom_float(v)));
+                }
+            }
+            EvalValue::Vector(samples) => {
+                for s in samples {
+                    if !s.value.is_nan() {
+                        if *remaining_samples == 0 {
+                            return Err(PromError::bad_data(format!(
+                                "query_range exceeds maximum {MAX_RESULT_SAMPLES} result samples; increase step or narrow matchers"
+                            )));
+                        }
+                        *remaining_samples -= 1;
+                        series_map
+                            .entry(s.labels)
+                            .or_default()
+                            .push((t as f64, format_prom_float(s.value)));
+                    }
+                }
+            }
+        }
+        let Some(next_t) = t.checked_add(step_secs) else {
+            break;
+        };
+        t = next_t;
+    }
+
+    Ok(series_map
+        .into_iter()
+        .map(|(metric, values)| MatrixSeries { metric, values })
+        .collect())
+}
 
 #[derive(Debug, Deserialize)]
 pub struct BatchQueryItem {
@@ -809,14 +812,36 @@ pub async fn prom_query_batch(
         )));
     }
     let now_ts = chrono::Utc::now().timestamp();
+    let mut total_eval_points: usize = 0;
+    for item in &req.queries {
+        let is_range = !item.start.trim().is_empty()
+            || !item.end.trim().is_empty()
+            || !item.step.trim().is_empty();
+        let pts = if is_range {
+            match validate_range_bounds(&item.start, &item.end, &item.step, now_ts) {
+                Ok((_, _, _, n)) => n,
+                Err(e) => return prom_err_response(e),
+            }
+        } else {
+            1
+        };
+        total_eval_points = total_eval_points.saturating_add(pts);
+        if total_eval_points > MAX_BATCH_EVAL_POINTS {
+            return prom_err_response(PromError::bad_data(format!(
+                "batch exceeds maximum {MAX_BATCH_EVAL_POINTS} total evaluation points"
+            )));
+        }
+    }
+
     let mut results: BTreeMap<String, Value> = BTreeMap::new();
+    let mut sample_budget = MAX_RESULT_SAMPLES;
 
     for item in req.queries {
         let is_range = !item.start.trim().is_empty()
             || !item.end.trim().is_empty()
             || !item.step.trim().is_empty();
         let val = if is_range {
-            match eval_range_item(&state, &principal, &item, now_ts).await {
+            match eval_range_item(&state, &principal, &item, now_ts, &mut sample_budget).await {
                 Ok(v) => v,
                 Err(e) => return prom_err_response(e),
             }
@@ -834,6 +859,36 @@ pub async fn prom_query_batch(
         "data": results,
     }))
     .into_response()
+}
+
+fn validate_range_bounds(
+    start: &str,
+    end: &str,
+    step: &str,
+    now_ts: i64,
+) -> Result<(i64, i64, i64, usize), PromError> {
+    if start.trim().is_empty() || end.trim().is_empty() || step.trim().is_empty() {
+        return Err(PromError::bad_data(
+            "start, end, and step are required for range queries",
+        ));
+    }
+    let start_ts = parse_prom_timestamp(start, now_ts)?;
+    let end_ts = parse_prom_timestamp(end, now_ts)?;
+    if end_ts < start_ts {
+        return Err(PromError::bad_data("end timestamp must not precede start"));
+    }
+    let step_secs = parse_prom_duration_secs(step)?.max(MIN_STEP_SECS);
+    let span_secs = end_ts
+        .checked_sub(start_ts)
+        .ok_or_else(|| PromError::bad_data("query_range span overflow"))?;
+    let num_points = (span_secs / step_secs).saturating_add(1);
+    if num_points as usize > MAX_RANGE_POINTS {
+        return Err(PromError::bad_data(format!(
+            "query_range exceeds maximum {} points; increase step",
+            MAX_RANGE_POINTS
+        )));
+    }
+    Ok((start_ts, end_ts, step_secs, num_points as usize))
 }
 
 async fn eval_instant_item(
@@ -871,116 +926,68 @@ async fn eval_range_item(
     principal: &Principal,
     item: &BatchQueryItem,
     now_ts: i64,
+    remaining_samples: &mut usize,
 ) -> Result<Value, PromError> {
-    if item.start.trim().is_empty() || item.end.trim().is_empty() || item.step.trim().is_empty() {
-        return Err(PromError::bad_data(
-            "start, end, and step are required for range queries",
-        ));
-    }
-    let start_ts = parse_prom_timestamp(&item.start, now_ts)?;
-    let end_ts = parse_prom_timestamp(&item.end, now_ts)?;
-    if end_ts < start_ts {
-        return Err(PromError::bad_data("end timestamp must not precede start"));
-    }
-    let step_secs = parse_prom_duration_secs(&item.step)?.max(MIN_STEP_SECS);
-    let span_secs = end_ts
-        .checked_sub(start_ts)
-        .ok_or_else(|| PromError::bad_data("query_range span overflow"))?;
-    let num_points = (span_secs / step_secs).saturating_add(1);
-    if num_points as usize > MAX_RANGE_POINTS {
-        return Err(PromError::bad_data(format!(
-            "query_range exceeds maximum {} points; increase step",
-            MAX_RANGE_POINTS
-        )));
-    }
+    let (start_ts, end_ts, step_secs, _) =
+        validate_range_bounds(&item.start, &item.end, &item.step, now_ts)?;
     let expr = parse_promql(&item.query)?;
     let ds = preload_data_source(state, principal, &expr, start_ts, end_ts, now_ts).await?;
-    let mut series_map: BTreeMap<Labels, Vec<(f64, String)>> = BTreeMap::new();
-    let mut t = start_ts;
-    while t <= end_ts {
-        match eval_instant(&expr, &ds, t)? {
-            EvalValue::Scalar(v) => {
-                if !v.is_nan() {
-                    series_map
-                        .entry(Labels::new())
-                        .or_default()
-                        .push((t as f64, format_prom_float(v)));
-                }
-            }
-            EvalValue::Vector(samples) => {
-                for s in samples {
-                    if !s.value.is_nan() {
-                        series_map
-                            .entry(s.labels)
-                            .or_default()
-                            .push((t as f64, format_prom_float(s.value)));
-                    }
-                }
-            }
-        }
-        let Some(next_t) = t.checked_add(step_secs) else {
-            break;
-        };
-        t = next_t;
-    }
-    let result: Vec<MatrixSeries> = series_map
-        .into_iter()
-        .map(|(metric, values)| MatrixSeries { metric, values })
-        .collect();
+    let result = eval_range_matrix(&expr, &ds, start_ts, end_ts, step_secs, remaining_samples)?;
     Ok(json!({
         "resultType": "matrix",
         "result": result,
     }))
 }
 
+const KNOWN_PROM_LABELS: &[&str] = &[
+    "__name__",
+    "agg",
+    "attachment",
+    "channel",
+    "class",
+    "clean",
+    "component",
+    "direction",
+    "event",
+    "facet",
+    "kind",
+    "le",
+    "level",
+    "lineage",
+    "metric",
+    "op",
+    "origin_kind",
+    "outcome",
+    "pipeline",
+    "preexisting",
+    "queue",
+    "reason",
+    "remote",
+    "security_class",
+    "security_rating",
+    "severity",
+    "source",
+    "stage",
+    "stage_a",
+    "stage_b",
+    "state",
+    "status",
+    "step",
+    "subsystem",
+    "tag",
+    "tool",
+    "url",
+    "version",
+    "version_bucket",
+    "window",
+    "worker",
+    "workload",
+];
+
 pub async fn prom_labels() -> Json<Value> {
-    let labels = [
-        "__name__",
-        "agg",
-        "attachment",
-        "channel",
-        "class",
-        "clean",
-        "component",
-        "direction",
-        "event",
-        "facet",
-        "kind",
-        "le",
-        "level",
-        "lineage",
-        "metric",
-        "op",
-        "origin_kind",
-        "outcome",
-        "pipeline",
-        "preexisting",
-        "queue",
-        "reason",
-        "remote",
-        "security_class",
-        "security_rating",
-        "severity",
-        "source",
-        "stage",
-        "stage_a",
-        "stage_b",
-        "state",
-        "status",
-        "step",
-        "subsystem",
-        "tag",
-        "tool",
-        "url",
-        "version",
-        "version_bucket",
-        "window",
-        "worker",
-        "workload",
-    ];
     Json(json!({
         "status": "success",
-        "data": &labels[..],
+        "data": KNOWN_PROM_LABELS,
     }))
 }
 
@@ -989,6 +996,13 @@ pub async fn prom_label_values(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Response {
+    if !KNOWN_PROM_LABELS.contains(&name.as_str()) {
+        return Json(json!({
+            "status": "success",
+            "data": [],
+        }))
+        .into_response();
+    }
     let mut vals = BTreeSet::new();
     match name.as_str() {
         "__name__" => {
@@ -997,16 +1011,14 @@ pub async fn prom_label_values(
             }
         }
         "subsystem" => {
-            if let Ok(pub_subs) = state.db.list_public_subsystem_names(200).await {
+            if let Ok(pub_subs) = state.get_cached_public_subsystems().await {
                 vals.extend(pub_subs);
             }
-            if principal.is_authenticated() {
-                let scope = principal.readable_section_names();
-                let vis = principal.visibility(&scope);
-                if let Ok(facets) = state.db.get_bug_subsystem_facets_o1(None, vis, 200).await {
-                    for f in facets {
-                        vals.insert(f.subsystem);
-                    }
+            if principal.is_authenticated()
+                && let Ok(facets) = load_authorized_bug_subsystems(&state, &principal).await
+            {
+                for f in facets {
+                    vals.insert(f.subsystem);
                 }
             }
         }
@@ -1016,7 +1028,7 @@ pub async fn prom_label_values(
             }
         }
         _ => {
-            if let Ok(found) = state.db.list_series_label_values(&name, 200).await {
+            if let Ok(found) = state.get_cached_series_label_values(&name).await {
                 vals.extend(found);
             }
         }
@@ -1154,11 +1166,13 @@ impl PromDataSource for PreloadedPromDataSource {
         let win = selector.range_secs.unwrap_or(300).max(1);
         let start = eval_ts.saturating_sub(win);
         let res = self.range_res_secs.max(1);
+        let lower_ts = start.saturating_sub(res);
+        let first_idx = rows.partition_point(|(_, bts, _)| *bts < lower_ts);
 
         let mut grouped: BTreeMap<Labels, (f64, usize, f64)> = BTreeMap::new();
-        for (labels, bucket_ts, val) in rows {
+        for (labels, bucket_ts, val) in &rows[first_idx..] {
             if *bucket_ts > eval_ts {
-                continue;
+                break;
             }
             let bucket_end = bucket_ts.saturating_add(res);
             let effective_end = if bucket_end > self.now_ts {
@@ -1211,6 +1225,47 @@ impl PromDataSource for PreloadedPromDataSource {
             })
             .collect()
     }
+}
+
+fn floor_multiple(ts: i64, step: i64) -> i64 {
+    let s = step.max(1);
+    ts.div_euclid(s).saturating_mul(s)
+}
+
+fn ceil_multiple(ts: i64, step: i64) -> i64 {
+    let s = step.max(1);
+    let rem = ts.rem_euclid(s);
+    if rem == 0 {
+        ts
+    } else {
+        ts.saturating_add(s - rem)
+    }
+}
+
+fn canonical_range_filter_key(selectors: &BTreeMap<String, Vec<Vec<LabelMatcher>>>) -> String {
+    let mut parts = Vec::new();
+    for (metric, sets) in selectors {
+        let mut set_strs: Vec<String> = sets
+            .iter()
+            .map(|ms| {
+                let mut m_strs: Vec<String> = ms
+                    .iter()
+                    .map(|m| match &m.op {
+                        LabelMatchOp::Eq(v) => format!("{}={v:?}", m.name),
+                        LabelMatchOp::NotEq(v) => format!("{}!={v:?}", m.name),
+                        LabelMatchOp::RegexEq(re) => format!("{}=~{:?}", m.name, re.as_str()),
+                        LabelMatchOp::RegexNotEq(re) => format!("{}!~{:?}", m.name, re.as_str()),
+                    })
+                    .collect();
+                m_strs.sort();
+                m_strs.join(",")
+            })
+            .collect();
+        set_strs.sort();
+        set_strs.dedup();
+        parts.push(format!("{metric}:[{}]", set_strs.join("|")));
+    }
+    parts.join(";")
 }
 
 async fn preload_data_source(
@@ -1272,18 +1327,21 @@ async fn preload_data_source(
             let win_start = shifted_end.saturating_sub(win_secs);
             // Any bucket with bucket_ts >= win_start and bucket_ts + res <= shifted_end
             // has weight = 1.0 even for the current in-progress bucket.
-            let full_start = win_start;
-            let full_end = shifted_end.saturating_sub(range_res_secs);
+            // Aligning SQL bounds to bucket multiples produces the exact same DB
+            // rows while collapsing jittered timestamps onto a single cache key.
+            let full_start = ceil_multiple(win_start, range_res_secs);
+            let full_end =
+                floor_multiple(shifted_end.saturating_sub(range_res_secs), range_res_secs);
             let sum_query_start = if win_start.rem_euclid(range_res_secs) == 0 {
                 win_start
             } else {
-                win_start.saturating_sub(range_res_secs)
+                floor_multiple(win_start, range_res_secs)
             };
             let sum_query_end =
                 if full_start <= full_end && shifted_end.rem_euclid(range_res_secs) == 0 {
                     full_end
                 } else {
-                    shifted_end
+                    floor_multiple(shifted_end, range_res_secs)
                 };
             state
                 .get_cached_rollup_sums(
@@ -1302,18 +1360,24 @@ async fn preload_data_source(
                         .collect()
                 })
         } else {
+            let aligned_start = ceil_multiple(query_start, range_res_secs);
+            let aligned_end = floor_multiple(max_eval_ts, range_res_secs);
+            let filter_key = canonical_range_filter_key(&req.range_selectors);
             state
-                .db
-                .query_rollup_buckets_filtered(
-                    &names,
+                .get_cached_rollup_buckets(
+                    names,
+                    filter_key,
                     range_res_secs,
-                    query_start,
-                    max_eval_ts,
+                    aligned_start,
+                    aligned_end,
                     accept,
                 )
                 .await
         }
         .map_err(|e| {
+            if let Some(limit_err) = e.downcast_ref::<RollupRowLimitExceeded>() {
+                return PromError::bad_data(limit_err.to_string());
+            }
             error!("Failed querying stats_rollups: {e}");
             PromError::internal("failed to read statistics rollups")
         })?;
@@ -1372,6 +1436,9 @@ fn fold_rollup_rows_and_unflushed(
             .or_default()
             .push((labels, bucket_ts, val));
     }
+    for vec in out.values_mut() {
+        vec.sort_unstable_by_key(|(_, bts, _)| *bts);
+    }
 }
 
 async fn populate_instant_metrics(
@@ -1412,7 +1479,7 @@ async fn populate_instant_metrics(
     }
 
     if needed.contains("sashiko_stats_backfill_complete") {
-        let done = state.db.is_stats_backfill_done().await.unwrap_or(false);
+        let done = state.get_cached_stats_backfill_done().await;
         out.insert(
             "sashiko_stats_backfill_complete".to_string(),
             vec![EvalSample {

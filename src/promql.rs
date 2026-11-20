@@ -22,7 +22,9 @@ use serde::Serialize;
 
 pub const MAX_QUERY_LEN: usize = 2048;
 pub const MAX_AST_DEPTH: usize = 8;
-pub const MAX_RANGE_POINTS: usize = 1500;
+pub const MAX_AST_NODES: usize = 64;
+pub const MAX_MATCHERS_PER_SELECTOR: usize = 16;
+pub const MAX_RANGE_POINTS: usize = 400;
 pub const MIN_STEP_SECS: i64 = 60;
 pub const MAX_DURATION_SECS: i64 = 10 * 365 * 86_400;
 pub const MAX_TIMESTAMP_SECS: i64 = 10_000_000_000;
@@ -287,7 +289,11 @@ pub fn parse_promql(input: &str) -> Result<Expr, PromError> {
     if trimmed.len() > MAX_QUERY_LEN {
         return Err(PromError::bad_data("query exceeds maximum length"));
     }
-    let mut p = Parser { s: trimmed, pos: 0 };
+    let mut p = Parser {
+        s: trimmed,
+        pos: 0,
+        nodes: 0,
+    };
     let expr = p.parse_expr(0)?;
     p.skip_ws();
     if p.pos != p.s.len() {
@@ -302,9 +308,19 @@ pub fn parse_promql(input: &str) -> Result<Expr, PromError> {
 struct Parser<'a> {
     s: &'a str,
     pos: usize,
+    nodes: usize,
 }
 
 impl<'a> Parser<'a> {
+    fn bump_node(&mut self) -> Result<(), PromError> {
+        self.nodes += 1;
+        if self.nodes > MAX_AST_NODES {
+            return Err(PromError::bad_data(format!(
+                "expression exceeds maximum {MAX_AST_NODES} AST nodes"
+            )));
+        }
+        Ok(())
+    }
     fn skip_ws(&mut self) {
         while let Some(b) = self.s.as_bytes().get(self.pos) {
             if b.is_ascii_whitespace() {
@@ -346,6 +362,7 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.pos += 1;
+            self.bump_node()?;
             let rhs = self.parse_mul_div(depth + 1)?;
             lhs = Expr::Binary {
                 op,
@@ -366,6 +383,7 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.pos += 1;
+            self.bump_node()?;
             let rhs = self.parse_primary(depth + 1)?;
             lhs = Expr::Binary {
                 op,
@@ -377,6 +395,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary(&mut self, depth: usize) -> Result<Expr, PromError> {
+        self.bump_node()?;
         self.skip_ws();
         if self.eat_char(b'(') {
             let inner = self.parse_expr(depth + 1)?;
@@ -575,6 +594,11 @@ impl<'a> Parser<'a> {
                     self.skip_ws();
                     if self.eat_char(b'}') {
                         break;
+                    }
+                    if matchers.len() >= MAX_MATCHERS_PER_SELECTOR {
+                        return Err(PromError::bad_data(format!(
+                            "selector exceeds maximum {MAX_MATCHERS_PER_SELECTOR} label matchers"
+                        )));
                     }
                     let label_name = self.parse_ident()?;
                     self.skip_ws();
@@ -1203,5 +1227,14 @@ mod tests {
         assert!(parse_prom_duration_secs("99999y").is_err());
         assert!(parse_prom_timestamp("1e20", 1_700_000_000).is_err());
         assert!(parse_prom_timestamp("1960-01-01T00:00:00Z", 1_700_000_000).is_err());
+        // AST node explosion (e.g. a+a+... > MAX_AST_NODES) must be rejected.
+        let wide_sum = vec!["1"; MAX_AST_NODES].join("+");
+        assert!(parse_promql(&wide_sum).is_err());
+        // Excessive matchers in a single selector must be rejected.
+        let many_matchers = (0..=MAX_MATCHERS_PER_SELECTOR)
+            .map(|i| format!(r#"k{i}="v""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_promql(&format!("m{{{many_matchers}}}")).is_err());
     }
 }

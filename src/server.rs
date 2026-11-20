@@ -114,6 +114,15 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<V, E>>,
     {
+        self.get_or_fetch_if(key, fetch, |_| true).await
+    }
+
+    async fn get_or_fetch_if<F, Fut, E, P>(&self, key: K, fetch: F, should_cache: P) -> Result<V, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<V, E>>,
+        P: FnOnce(&V) -> bool,
+    {
         if let Some(cached) = self.inner.read().await.get(&key)
             && cached.timestamp.elapsed() < self.ttl
         {
@@ -128,27 +137,29 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
         }
 
         let value = fetch().await?;
-        if let Some(cap) = self.max_entries
-            && write_guard.len() >= cap
-        {
-            let ttl = self.ttl;
-            write_guard.retain(|_, v| v.timestamp.elapsed() < ttl);
-            if write_guard.len() >= cap
-                && let Some(oldest_key) = write_guard
-                    .iter()
-                    .min_by_key(|(_, v)| v.timestamp)
-                    .map(|(k, _)| k.clone())
+        if should_cache(&value) {
+            if let Some(cap) = self.max_entries
+                && write_guard.len() >= cap
             {
-                write_guard.remove(&oldest_key);
+                let ttl = self.ttl;
+                write_guard.retain(|_, v| v.timestamp.elapsed() < ttl);
+                if write_guard.len() >= cap
+                    && let Some(oldest_key) = write_guard
+                        .iter()
+                        .min_by_key(|(_, v)| v.timestamp)
+                        .map(|(k, _)| k.clone())
+                {
+                    write_guard.remove(&oldest_key);
+                }
             }
+            write_guard.insert(
+                key,
+                CachedValue {
+                    value: value.clone(),
+                    timestamp: Instant::now(),
+                },
+            );
         }
-        write_guard.insert(
-            key,
-            CachedValue {
-                value: value.clone(),
-                timestamp: Instant::now(),
-            },
-        );
         Ok(value)
     }
 }
@@ -243,6 +254,265 @@ impl SignInLinkRateLimiter {
     }
 }
 
+const STATS_PER_IP_BURST: f64 = 30.0;
+const STATS_PER_IP_REFILL_PER_SEC: f64 = 2.0;
+const STATS_GLOBAL_BURST: f64 = 120.0;
+const STATS_GLOBAL_REFILL_PER_SEC: f64 = 20.0;
+const STATS_MAX_TRACKED_IPS: usize = 4_096;
+const STATS_IDLE_EVICT_SECS: u64 = 300;
+const STATS_MAX_INFLIGHT: usize = 8;
+const STATS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const STATS_MAX_CACHED_BUCKET_ROWS: usize = 10_000;
+
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(burst: f64, now: Instant) -> Self {
+        Self {
+            tokens: burst,
+            last_refill: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant, burst: f64, refill_per_sec: f64) {
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.tokens = (self.tokens + elapsed * refill_per_sec).min(burst);
+        self.last_refill = now;
+    }
+}
+
+struct StatsRateLimiterState {
+    per_ip: std::collections::HashMap<String, TokenBucket>,
+    global: TokenBucket,
+}
+
+/// Bounds request rate, concurrency, and execution time across all stats and
+/// Prometheus HTTP endpoints so loop or distributed floods cannot starve
+/// SQLite reads or Tokio worker threads.
+pub struct StatsApiGuard {
+    rate: std::sync::Mutex<StatsRateLimiterState>,
+    inflight: Arc<tokio::sync::Semaphore>,
+}
+
+impl StatsApiGuard {
+    pub fn new() -> Self {
+        Self::with_max_inflight(STATS_MAX_INFLIGHT)
+    }
+
+    fn with_max_inflight(max_inflight: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            rate: std::sync::Mutex::new(StatsRateLimiterState {
+                per_ip: std::collections::HashMap::new(),
+                global: TokenBucket::new(STATS_GLOBAL_BURST, now),
+            }),
+            inflight: Arc::new(tokio::sync::Semaphore::new(max_inflight.max(1))),
+        }
+    }
+
+    /// Checks per-IP and global token buckets. Per-IP is checked before
+    /// debiting the global bucket so a single flooding client cannot starve
+    /// legitimate users on other IPs.
+    pub fn check_rate(&self, client_ip: &str) -> bool {
+        let now = Instant::now();
+        let mut guard = match self.rate.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if !guard.per_ip.contains_key(client_ip) && guard.per_ip.len() >= STATS_MAX_TRACKED_IPS {
+            let idle_cutoff = Duration::from_secs(STATS_IDLE_EVICT_SECS);
+            guard
+                .per_ip
+                .retain(|_, b| now.saturating_duration_since(b.last_refill) < idle_cutoff);
+            if guard.per_ip.len() >= STATS_MAX_TRACKED_IPS
+                && let Some(oldest_ip) = guard
+                    .per_ip
+                    .iter()
+                    .min_by_key(|(_, b)| b.last_refill)
+                    .map(|(k, _)| k.clone())
+            {
+                guard.per_ip.remove(&oldest_ip);
+            }
+        }
+
+        let ip_allowed = {
+            let ip_bucket = guard
+                .per_ip
+                .entry(client_ip.to_string())
+                .or_insert_with(|| TokenBucket::new(STATS_PER_IP_BURST, now));
+            ip_bucket.refill(now, STATS_PER_IP_BURST, STATS_PER_IP_REFILL_PER_SEC);
+            ip_bucket.tokens >= 1.0
+        };
+        if !ip_allowed {
+            return false;
+        }
+
+        guard
+            .global
+            .refill(now, STATS_GLOBAL_BURST, STATS_GLOBAL_REFILL_PER_SEC);
+        if guard.global.tokens < 1.0 {
+            return false;
+        }
+
+        if let Some(ip_bucket) = guard.per_ip.get_mut(client_ip) {
+            ip_bucket.tokens -= 1.0;
+        }
+        guard.global.tokens -= 1.0;
+        true
+    }
+
+    pub fn try_acquire_inflight(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.inflight.clone().try_acquire_owned().ok()
+    }
+}
+
+impl Default for StatsApiGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+type RollupBucketsCacheKey = (Vec<String>, String, i64, i64, i64);
+
+pub(crate) struct StatsApiResources {
+    pub guard: StatsApiGuard,
+    backfill_done_flag: std::sync::atomic::AtomicBool,
+    backfill_done_cache: AsyncCache<bool>,
+    rollup_buckets_cache: AsyncMapCache<RollupBucketsCacheKey, Vec<crate::db::RollupBucketRow>>,
+    label_values_cache: AsyncMapCache<String, Vec<String>>,
+    public_subsystems_cache: AsyncCache<Vec<String>>,
+}
+
+impl StatsApiResources {
+    pub fn new() -> Self {
+        Self {
+            guard: StatsApiGuard::new(),
+            backfill_done_flag: std::sync::atomic::AtomicBool::new(false),
+            backfill_done_cache: AsyncCache::new(Duration::from_secs(30)),
+            rollup_buckets_cache: AsyncMapCache::new_bounded(Duration::from_secs(60), 64),
+            label_values_cache: AsyncMapCache::new_bounded(Duration::from_secs(60), 64),
+            public_subsystems_cache: AsyncCache::new(Duration::from_secs(60)),
+        }
+    }
+}
+
+fn is_trusted_proxy_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Resolves the rate-limit client key safely: remote clients cannot spoof
+/// `X-Forwarded-For` to bypass per-IP rate limiting because proxy headers are
+/// only consulted when the direct TCP peer is a loopback/private reverse proxy,
+/// and the rightmost valid `X-Forwarded-For` address (appended by the proxy)
+/// is preferred.
+fn stats_rate_limit_client_ip(peer: Option<SocketAddr>, headers: &axum::http::HeaderMap) -> String {
+    let Some(sock) = peer else {
+        return "local".to_string();
+    };
+    let peer_ip = sock.ip();
+    if is_trusted_proxy_ip(peer_ip) {
+        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            for part in xff.rsplit(',') {
+                if let Ok(ip) = part.trim().parse::<std::net::IpAddr>() {
+                    return ip.to_string();
+                }
+            }
+        }
+        if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok())
+            && let Ok(ip) = real.trim().parse::<std::net::IpAddr>()
+        {
+            return ip.to_string();
+        }
+    }
+    peer_ip.to_string()
+}
+
+fn stats_guard_error_response(
+    path: &str,
+    status: StatusCode,
+    error_type: &'static str,
+    message: &'static str,
+    retry_after: Option<&'static str>,
+) -> axum::response::Response {
+    let mut resp = if path.starts_with("/api/v1/") {
+        (
+            status,
+            axum::Json(serde_json::json!({
+                "status": "error",
+                "errorType": error_type,
+                "error": message,
+            })),
+        )
+            .into_response()
+    } else {
+        (status, message).into_response()
+    };
+    if let Some(secs) = retry_after {
+        resp.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static(secs),
+        );
+    }
+    resp
+}
+
+async fn guard_stats_api(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path().to_string();
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0);
+    let client_ip = stats_rate_limit_client_ip(peer, request.headers());
+
+    if !state.stats_api.guard.check_rate(&client_ip) {
+        return stats_guard_error_response(
+            &path,
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "stats API rate limit exceeded; retry shortly",
+            Some("1"),
+        );
+    }
+
+    let Some(_permit) = state.stats_api.guard.try_acquire_inflight() else {
+        return stats_guard_error_response(
+            &path,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded",
+            "too many concurrent stats API requests; retry shortly",
+            Some("1"),
+        );
+    };
+
+    match tokio::time::timeout(STATS_REQUEST_TIMEOUT, next.run(request)).await {
+        Ok(resp) => resp,
+        Err(_) => stats_guard_error_response(
+            &path,
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            "stats API query timed out",
+            None,
+        ),
+    }
+}
+
 /// What the router needs to know about the process it runs in.
 ///
 /// These are facts about this invocation rather than configuration, which is
@@ -294,6 +564,7 @@ pub struct AppState {
     stats_bug_facets_unrestricted_cache: AsyncCache<Vec<crate::db::BugSubsystemFacetSummary>>,
     stats_rollup_sum_cache: AsyncMapCache<RollupSumCacheKey, Vec<crate::db::RollupBucketRow>>,
     project_releases_cache: AsyncCache<Vec<(String, i64)>>,
+    pub(crate) stats_api: StatsApiResources,
 }
 
 impl AppState {
@@ -367,6 +638,85 @@ impl AppState {
                     )
                     .await
             })
+            .await
+    }
+
+    pub async fn get_cached_stats_backfill_done(&self) -> bool {
+        if self
+            .stats_api
+            .backfill_done_flag
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return true;
+        }
+        let done = self
+            .stats_api
+            .backfill_done_cache
+            .get_or_fetch(|| async { self.db.is_stats_backfill_done().await })
+            .await
+            .unwrap_or(false);
+        if done {
+            self.stats_api
+                .backfill_done_flag
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        done
+    }
+
+    pub async fn get_cached_rollup_buckets<F>(
+        &self,
+        metrics: Vec<String>,
+        filter_key: String,
+        resolution_secs: i64,
+        min_bucket_ts: i64,
+        max_bucket_ts: i64,
+        accept_series: F,
+    ) -> anyhow::Result<Vec<crate::db::RollupBucketRow>>
+    where
+        F: Fn(&str, &std::collections::BTreeMap<String, String>) -> bool,
+    {
+        let key = (
+            metrics.clone(),
+            filter_key,
+            resolution_secs,
+            min_bucket_ts,
+            max_bucket_ts,
+        );
+        self.stats_api
+            .rollup_buckets_cache
+            .get_or_fetch_if(
+                key,
+                || async move {
+                    self.db
+                        .query_rollup_buckets_filtered(
+                            &metrics,
+                            resolution_secs,
+                            min_bucket_ts,
+                            max_bucket_ts,
+                            accept_series,
+                        )
+                        .await
+                },
+                |rows| rows.len() <= STATS_MAX_CACHED_BUCKET_ROWS,
+            )
+            .await
+    }
+
+    pub async fn get_cached_series_label_values(&self, name: &str) -> anyhow::Result<Vec<String>> {
+        let key = name.to_string();
+        let db = self.db.clone();
+        self.stats_api
+            .label_values_cache
+            .get_or_fetch(key.clone(), || async move {
+                db.list_series_label_values(&key, 200).await
+            })
+            .await
+    }
+
+    pub async fn get_cached_public_subsystems(&self) -> anyhow::Result<Vec<String>> {
+        self.stats_api
+            .public_subsystems_cache
+            .get_or_fetch(|| async { self.db.list_public_subsystem_names(200).await })
             .await
     }
 }
@@ -482,7 +832,7 @@ pub fn build_router(
         local_token: options.local_token,
         email_worker_heartbeat: options.email_worker_heartbeat,
         sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
-        stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+        stats_timeline_cache: AsyncMapCache::new_bounded(Duration::from_secs(60), 128),
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
         stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
         messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
@@ -495,19 +845,22 @@ pub fn build_router(
         stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(60)),
         stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(60), 128),
         project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
+        stats_api: StatsApiResources::new(),
     });
 
-    Router::new()
-        .route("/health", get(health_check))
-        .route("/api/health", get(health_check))
+    let stats_routes = Router::new()
         .route("/metrics", get(crate::prom_api::prometheus_metrics))
         .route(
             "/api/v1/query",
-            get(crate::prom_api::prom_query).post(crate::prom_api::prom_query),
+            get(crate::prom_api::prom_query)
+                .post(crate::prom_api::prom_query)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
         .route(
             "/api/v1/query_range",
-            get(crate::prom_api::prom_query_range).post(crate::prom_api::prom_query_range),
+            get(crate::prom_api::prom_query_range)
+                .post(crate::prom_api::prom_query_range)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
         .route(
             "/api/v1/query_batch",
@@ -516,13 +869,28 @@ pub fn build_router(
         )
         .route(
             "/api/v1/labels",
-            get(crate::prom_api::prom_labels).post(crate::prom_api::prom_labels),
+            get(crate::prom_api::prom_labels)
+                .post(crate::prom_api::prom_labels)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
         .route(
             "/api/v1/label/{name}/values",
             get(crate::prom_api::prom_label_values),
         )
         .route("/api/v1/metadata", get(crate::prom_api::prom_metadata))
+        .route("/api/stats", get(get_stats))
+        .route("/api/stats/timeline", get(stats_timeline))
+        .route("/api/stats/reviews", get(stats_reviews))
+        .route("/api/stats/tools", get(stats_tools))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            guard_stats_api,
+        ));
+
+    Router::new()
+        .route("/health", get(health_check))
+        .route("/api/health", get(health_check))
+        .merge(stats_routes)
         .route("/api/config", get(get_config))
         .route("/api/lists", get(list_mailing_lists))
         .route("/api/patchsets", get(list_patchsets))
@@ -532,10 +900,6 @@ pub fn build_router(
         .route("/api/message", get(get_message))
         .route("/api/review", get(get_review))
         .route("/api/review_log", get(get_review_log))
-        .route("/api/stats", get(get_stats))
-        .route("/api/stats/timeline", get(stats_timeline))
-        .route("/api/stats/reviews", get(stats_reviews))
-        .route("/api/stats/tools", get(stats_tools))
         .route(
             "/api/submit",
             post(submit_patch).layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024)),
@@ -5086,7 +5450,7 @@ mod tests {
             local_token: None,
             email_worker_heartbeat: None,
             sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
-            stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+            stats_timeline_cache: AsyncMapCache::new_bounded(Duration::from_secs(60), 128),
             stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
             stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
             messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
@@ -5099,6 +5463,7 @@ mod tests {
             stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
             stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(30), 128),
             project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
+            stats_api: StatsApiResources::new(),
         });
 
         let blocked_user = crate::auth::AuthUser::new("blocked@example.com");
@@ -5509,6 +5874,47 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_api_guard_rate_concurrency_and_proxy_ip() {
+        let guard = StatsApiGuard::with_max_inflight(2);
+        // Single flooding IP exhausts its own burst without starving another IP.
+        let mut allowed_a = 0;
+        for _ in 0..40 {
+            if guard.check_rate("198.51.100.10") {
+                allowed_a += 1;
+            }
+        }
+        assert_eq!(allowed_a, STATS_PER_IP_BURST as usize);
+        assert!(!guard.check_rate("198.51.100.10"));
+        assert!(guard.check_rate("198.51.100.11"));
+
+        // Concurrency permits cap in-flight work and release cleanly on drop.
+        let p1 = guard.try_acquire_inflight();
+        let p2 = guard.try_acquire_inflight();
+        assert!(p1.is_some() && p2.is_some());
+        assert!(guard.try_acquire_inflight().is_none());
+        drop(p1);
+        assert!(guard.try_acquire_inflight().is_some());
+
+        // Public peers cannot spoof X-Forwarded-For; trusted loopback proxies
+        // resolve to the rightmost proxy-appended client IP.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.1, 198.51.100.77".parse().unwrap(),
+        );
+        let public_peer: SocketAddr = "198.51.100.5:44321".parse().unwrap();
+        assert_eq!(
+            stats_rate_limit_client_ip(Some(public_peer), &headers),
+            "198.51.100.5"
+        );
+        let loopback_peer: SocketAddr = "127.0.0.1:44321".parse().unwrap();
+        assert_eq!(
+            stats_rate_limit_client_ip(Some(loopback_peer), &headers),
+            "198.51.100.77"
+        );
+    }
+
+    #[test]
     fn test_sign_in_link_rate_limiter_buckets() {
         let limiter = SignInLinkRateLimiter::new();
 
@@ -5661,7 +6067,7 @@ mod tests {
                 local_token: None,
                 email_worker_heartbeat: None,
                 sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
-                stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+                stats_timeline_cache: AsyncMapCache::new_bounded(Duration::from_secs(60), 128),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
                 stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
                 messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
@@ -5674,6 +6080,7 @@ mod tests {
                 stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
                 stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(30), 128),
                 project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
+                stats_api: StatsApiResources::new(),
             })
         };
 
@@ -5733,7 +6140,7 @@ mod tests {
                 local_token,
                 email_worker_heartbeat: None,
                 sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
-                stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+                stats_timeline_cache: AsyncMapCache::new_bounded(Duration::from_secs(60), 128),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
                 stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
                 messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
@@ -5746,6 +6153,7 @@ mod tests {
                 stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
                 stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(30), 128),
                 project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
+                stats_api: StatsApiResources::new(),
             })
         };
 
@@ -5909,7 +6317,7 @@ mod tests {
             dry_run: true,
             forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
             sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
-            stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+            stats_timeline_cache: AsyncMapCache::new_bounded(Duration::from_secs(60), 128),
             stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
             stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
             messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
@@ -5922,6 +6330,7 @@ mod tests {
             stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
             stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(30), 128),
             project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
+            stats_api: StatsApiResources::new(),
             local_token: None,
             email_worker_heartbeat: None,
         });
@@ -7134,7 +7543,7 @@ F:	*
             messages_homepage_cache: AsyncCache::new(Duration::from_secs(2)),
             patchsets_count_cache: AsyncCache::new(Duration::from_secs(10)),
             messages_count_cache: AsyncCache::new(Duration::from_secs(10)),
-            stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+            stats_timeline_cache: AsyncMapCache::new_bounded(Duration::from_secs(60), 128),
             stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
             stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(60)),
@@ -7143,6 +7552,7 @@ F:	*
             stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
             stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(30), 128),
             project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
+            stats_api: StatsApiResources::new(),
             sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
         });
 
@@ -7512,7 +7922,7 @@ F:	*
             local_token: None,
             email_worker_heartbeat: None,
             sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
-            stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+            stats_timeline_cache: AsyncMapCache::new_bounded(Duration::from_secs(60), 128),
             stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
             stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
             messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
@@ -7525,6 +7935,7 @@ F:	*
             stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
             stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(30), 128),
             project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
+            stats_api: StatsApiResources::new(),
         });
 
         let payload = serde_json::json!({
@@ -8453,6 +8864,61 @@ F:	net/
             .unwrap();
         assert_eq!(meta_resp["status"], "success");
         assert!(meta_resp["data"]["sashiko_messages_ingested_total"].is_array());
+
+        // Unknown label names return an empty array without scanning stats_series.
+        let unknown_lbl: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/api/v1/label/nonexistent_label/values"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(unknown_lbl["status"], "success");
+        assert_eq!(unknown_lbl["data"], serde_json::json!([]));
+
+        // Oversized batch evaluation-point budget is rejected with 400 Bad Request.
+        let big_batch: Vec<serde_json::Value> = (0..10)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("q{i}"),
+                    "query": "sum(increase(sashiko_messages_ingested_total[1h]))",
+                    "start": (now - 350 * 3600).to_string(),
+                    "end": now.to_string(),
+                    "step": "3600s"
+                })
+            })
+            .collect();
+        let batch_reject = client
+            .post(format!("http://{addr}/api/v1/query_batch"))
+            .json(&serde_json::json!({ "queries": big_batch }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(batch_reject.status(), StatusCode::BAD_REQUEST);
+
+        // Looping against the stats API trips per-IP rate limiting (429 Too Many Requests).
+        let mut saw_429 = false;
+        for _ in 0..40 {
+            let r = client
+                .get(format!("http://{addr}/api/v1/metadata"))
+                .send()
+                .await
+                .unwrap();
+            if r.status() == StatusCode::TOO_MANY_REQUESTS {
+                assert!(r.headers().contains_key(axum::http::header::RETRY_AFTER));
+                let body: serde_json::Value = r.json().await.unwrap();
+                assert_eq!(body["errorType"], "rate_limited");
+                saw_429 = true;
+                break;
+            }
+        }
+        assert!(
+            saw_429,
+            "expected 429 Too Many Requests when polling stats API in a loop"
+        );
 
         // 5. EXPLAIN QUERY PLAN on stats_series + stats_rollups proves index seeks only.
         for sql in [
