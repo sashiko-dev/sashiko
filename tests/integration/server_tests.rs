@@ -142,6 +142,24 @@ async fn test_empty_db_smoke_endpoints() {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["total"], 0);
         assert!(body["items"].as_array().unwrap().is_empty());
+
+        let page20 = client
+            .get(format!("{}/api/{endpoint}?page=20", server.base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page20.status(), 200);
+
+        let page21 = client
+            .get(format!("{}/api/{endpoint}?page=21", server.base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            page21.status(),
+            403,
+            "{endpoint}: unauthenticated deep pagination"
+        );
     }
 
     let resp = client
@@ -402,11 +420,26 @@ async fn test_patchset_page_size_reaches_the_query() {
     tx.commit().await.unwrap();
 
     let get = |route: &str, query: &str| {
-        let url = format!("{}/api/{route}?id=1&{query}", server.base_url);
+        let url = format!(
+            "{}/api/{route}?id=%3Cpage-1%40example.com%3E&{query}",
+            server.base_url
+        );
         let client = client.clone();
         async move { client.get(url).send().await.unwrap() }
     };
     for route in ["patch", "patchset"] {
+        // Sequential numeric patchset IDs are rejected for unauthenticated callers.
+        let forbidden = client
+            .get(format!("{}/api/{route}?id=1", server.base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            forbidden.status(),
+            403,
+            "{route}: unauthenticated numeric id"
+        );
+
         for (query, expected) in [
             ("limit=7", 7),
             ("per_page=7", 7),

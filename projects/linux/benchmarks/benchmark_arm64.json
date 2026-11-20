@@ -1,0 +1,374 @@
+[
+    {
+        "Commit": "f5df26961853d6809d704cedcaf082c57f635a64",
+        "Fixed-by": "58c1eb84e97701c583605ba2fd553b69afba2245",
+        "subsystem": "arm64",
+        "problem_description": "The new SDEI entry path never saves ELR_EL1, SPSR_EL1, ESR_EL1 and FAR_EL1, yet an event can interrupt exception entry/return. If the handler takes an exception, do_sdei_event() only warns and resumes the interrupted context with clobbered exception registers (wrong ERET target, wrong syndrome)."
+    },
+    {
+        "Commit": "79e9aa59dc29a995921fb01e64cd36b73cf5abe0",
+        "Fixed-by": "9bf6ee7952c7ee151c30e0fffcfc61b58127c899",
+        "subsystem": "arm64",
+        "problem_description": "With KPTI, __sdei_asm_entry_trampoline remaps the kernel but leaves VBAR_EL1 pointing at tramp_vectors, whose current-EL vectors are zero-filled. An exception taken by the SDEI handler after interrupting EL0 executes zeros, UNDEFs into the same vector forever and the CPU is lost."
+    },
+    {
+        "Commit": "108aa503657ee2fe8aa071dc620d96372c252ecd",
+        "Fixed-by": "ac302aea3d824ccc99f29b8e499c365cb9a684a9",
+        "subsystem": "arm64",
+        "problem_description": "image_load() now retries load_other_segments() on failure, but load_other_segments()'s error path does not free image->arch.elf_headers allocated for KEXEC_TYPE_CRASH; the next attempt overwrites the pointer, leaking the previous ELF core header buffer on every retry."
+    },
+    {
+        "Commit": "1d18c47c735e8adfe531fc41fae31e98f86b68fe",
+        "Fixed-by": "b0958b1397fb5ffdb995c0ccc74349841929c08d",
+        "subsystem": "arm64",
+        "problem_description": "valid_mmap_phys_addr_range() checks (pfn << PAGE_SHIFT) + size against PHYS_MASK without overflow handling: an offset like 0xfffffffffffff000 wraps the sum to 0 and passes, letting /dev/mem map an out-of-range PFN whose access raises an external abort and panics."
+    },
+    {
+        "Commit": "506496bcbb4204c9ff5cfe82b1b90e1f14366992",
+        "Fixed-by": "078e122f3bf000dd45965997b66deac10ee580fa",
+        "subsystem": "arm64",
+        "problem_description": "copy_thread_gcs() maps a GCS for a CLONE_VM child, but if copy_process() later fails nothing unmaps it: arm64 has no exit_thread() and gcs_free() bails when task->mm != current->mm, so the VMA leaks in the parent mm. Kernel threads also inherit gcs_base and unmap the parent's GCS on exit."
+    },
+    {
+        "Commit": "235b2fe772f559416a5dfda33cf141ee07ce78d6",
+        "Fixed-by": "4d0f560f4926417f010ce38f8628c41bcad29c9f",
+        "subsystem": "arm64",
+        "problem_description": "The arm64 JIT passes BPF stack arguments 6-8 in x5-x7 on the claim they need no saving, but may_goto's slow path arch_bpf_timed_may_goto() calls C code and preserves only x8 and x0-x4. A may_goto between the store and the callee's read clobbers x5-x7, so the callee consumes unverified values."
+    },
+    {
+        "Commit": "858c7bfcb35e1100b58bb63c9f562d86e09418d9",
+        "Fixed-by": "b52ef450139f5632d7e53e6fd5f5ec46c7029dac",
+        "subsystem": "arm64",
+        "problem_description": "__init_el2_fgt2 tests ID_AA64DFR0_EL1.PMUVer >= PMUv3p9 without excluding 0b1111 (IMPLEMENTATION DEFINED PMU), so on such CPUs with FGT2 it writes 1 to the PMUv3p9 trap bits of HDFGRTR2_EL2/HDFGWTR2_EL2, which are RES0 without PMUv3."
+    },
+    {
+        "Commit": "7dde62f0687c8856b6c0660066c7ee83a6a6f033",
+        "Fixed-by": "e060d9069b49fe55f38057dfe592068014652671",
+        "subsystem": "arm64",
+        "problem_description": "On SME-only systems restore_sve_fpsimd_context() now accepts a non-streaming SVE signal frame but does not require it to have no SVE payload; a crafted frame with a payload sets TIF_SVE, giving the task non-streaming SVE state the hardware lacks, and a later ZCR_EL1 access UNDEFs at EL1."
+    },
+    {
+        "Commit": "16d1e27475f673295f3eaac296dd835db3b8c4d4",
+        "Fixed-by": "3872cc6b92940af0f73c6f9a45d65300492d648d",
+        "subsystem": "arm64",
+        "problem_description": "arch_freq_get_on_cpu() assigns the u64 product scale * arch_scale_freq_ref(cpu) to an unsigned int before shifting by SCHED_CAPACITY_SHIFT, so the product is truncated to 32 bits and the reported average frequency wraps for CPUs whose reference frequency exceeds about 4.19 GHz."
+    },
+    {
+        "Commit": "7efa1cd5f89b53e15659f84efb2c7a21076df04f",
+        "Fixed-by": "1fef81669147d63eb8c5d3627d54eadc21173a0b",
+        "subsystem": "arm64",
+        "problem_description": "modify_prot_start_ptes() passes nr * PAGE_SIZE as the end argument of __flush_tlb_range() instead of addr + nr * PAGE_SIZE, so the erratum 2645198 break-before-make TLB invalidation misses part or all of the cleared range (or degenerates to a full-mm flush), leaving stale executable entries."
+    },
+    {
+        "Commit": "858c7bfcb35e1100b58bb63c9f562d86e09418d9",
+        "Fixed-by": "2bc6b218717b9d08f466f88209251d54bc09b207",
+        "subsystem": "arm64",
+        "problem_description": "__init_el2_fgt2 writes the same read-trap mask to HDFGRTR2_EL2 and HDFGWTR2_EL2. PMZR_EL0 is write-only, so its disable bit nPMZR_EL0 exists only in HDFGWTR2_EL2 and is left clear: an EL0 PMZR_EL0 write (perf user access) traps to EL2, which nVHE does not handle."
+    },
+    {
+        "Commit": "68c5debcc06d6d24f15dbf978780fc5efc147d5e",
+        "Fixed-by": "36e96b469da24868f727b4cd168d7cf01cbd163d",
+        "subsystem": "arm64",
+        "problem_description": "counters_read_on_cpu() ignores smp_call_function_single()'s return value and always returns 0. For an offline CPU the callback never runs, so cpc_read_ffh() masks and returns the caller's uninitialized *val as a successful counter read, exposing stale stack data through CPPC sysfs."
+    },
+    {
+        "Commit": "5d4fa9ec5643a5c75d3c1e6abf50fb9284caf1ff",
+        "Fixed-by": "ef1fb82f12186dd26153b14d9fbcf4ec98db81b3",
+        "subsystem": "arm64",
+        "problem_description": "build_prologue() now emits the BPF FP setup (mov x25, sp) only if ctx->fp_used, set only in find_used_callee_regs() via push_callee_regs(). The exception_cb path skips that, so x25 keeps a dead frame's value; FP-derived addresses passed to helpers can corrupt the stack."
+    },
+    {
+        "Commit": "959bf2fd03b59fc107584c21425f3dc73c49f762",
+        "Fixed-by": "8cf2093f5372952a9ebc805c418d45df7112cd14",
+        "subsystem": "arm64",
+        "problem_description": "In __percpu_##name##_case_##sz() and the _return_ variant, the LSE alternative omits the size suffix, so 8/16-bit this_cpu_add/and/or/add_return emit a 32-bit atomic: it touches adjacent per-cpu bytes (carry from add corrupts them) and can fault on an unaligned address."
+    },
+    {
+        "Commit": "959bf2fd03b59fc107584c21425f3dc73c49f762",
+        "Fixed-by": "44274c657256b4911de82f8104e9e22f054cf742",
+        "subsystem": "arm64",
+        "problem_description": "this_cpu_and_N() passes '~val' to the ANDNOT helper: without brackets '~' binds only to the first token of an expression arg, and negating before widening to the pcp width leaves the upper bits clear, so the ANDNOT preserves bits the AND should have cleared."
+    },
+    {
+        "Commit": "959bf2fd03b59fc107584c21425f3dc73c49f762",
+        "Fixed-by": "885bff055a0f251a51a0d4fd4f0a7b525582a3de",
+        "subsystem": "arm64",
+        "problem_description": "this_cpu_write_N() casts '(unsigned long)val' without brackets, so for an expression argument the cast applies to its first operand only: 'zero - 1' with a u32 zero becomes 0xffff...ffff, and pointer arithmetic 'p + 1' loses its scaling, storing the wrong value."
+    },
+    {
+        "Commit": "788bfdd97434982b6d575062581e8e72eea755af",
+        "Fixed-by": "955d86e5f3b95b731991fdb84966c50b16314629",
+        "subsystem": "arm64",
+        "problem_description": "Commit changes the hibernate EL2 stub to require x0 = HVC_SET_VECTORS and x1 = vectors, but swsusp_arch_suspend_exit() still issues a bare hvc with neither set, so VBAR_EL2 is never restored and stays on the trans_pgd vector page, which is freed after resume."
+    },
+    {
+        "Commit": "86edf6bdcf0571c07103b8751e9d792a4b808e97",
+        "Fixed-by": "5541432e09dc2031978188f3e8a00b9fc78cf097",
+        "subsystem": "arm64",
+        "problem_description": "is_affected_midr_range(), for target implementation CPUs, passes target_impl_cpus[i].midr as the REVIDR argument, so the entry's REVIDR fixed-revision mask is checked against MIDR and errata may be wrongly applied or skipped."
+    },
+    {
+        "Commit": "1d18c47c735e8adfe531fc41fae31e98f86b68fe",
+        "Fixed-by": "a77644d009dece1104b6fcc6e322b0e4503db0d6",
+        "subsystem": "arm64",
+        "problem_description": "show_pte() walks a task's page tables without mmap_sem and with interrupts enabled, re-reading each parent entry to find the next table. A concurrent munmap from another thread can free or clear a table mid-walk, so show_pte() dereferences freed or bogus table pointers."
+    },
+    {
+        "Commit": "3fc24ef32d3b9368f4c103dcd21d6a3f959b4870",
+        "Fixed-by": "f5b8b9037df387394a73aab47c5437bbac975077",
+        "subsystem": "arm64",
+        "problem_description": "do_alignment_ldmstm() negates the unsigned int nr_regs for decrementing LDM/STM and adds it to an unsigned long address, so it adds nearly 4 GiB instead of subtracting: the emulated access faults (SIGBUS) and the writeback base is wrong."
+    },
+    {
+        "Commit": "4d51ff5bba00a13ca9b0b24883fa7adb07a167fc",
+        "Fixed-by": "b8f070ac3167595069feb1f794c127b805115645",
+        "subsystem": "arm64",
+        "problem_description": "The new per-task SCTLR_EL1.TCSO0 bit (MTE store-only checking) is missing from SCTLR_USER_MASK, so update_sctlr_el1() never clears it on context switch: once one task enables store-only mode, other tasks on that CPU inherit it and lose tag checks on loads."
+    },
+    {
+        "Commit": "9014cf56f13d8ce21329837c148f723490950e28",
+        "Fixed-by": "50de1c47a41d4031f6002969e71dc6954dedb6b2",
+        "subsystem": "arm64",
+        "problem_description": "save_args() reads stack-passed arguments from FP + 32, assuming the fentry two-frame prologue; struct_ops trampolines push only the FP/LR frame, so for struct_ops callbacks with more than eight argument slots every stack argument is read two slots off."
+    },
+    {
+        "Commit": "e612b5c1d3ee325aff991b4078b4999bf6bac096",
+        "Fixed-by": "ea3f20cb5918fea8e3786899b78fc7bb867c6a5e",
+        "subsystem": "arm64",
+        "problem_description": "For arena (BPF_PROBE_ATOMIC) RMW atomics with BPF_FETCH, a fault leaves the fetch destination (src_reg, or r0 for CMPXCHG) unchanged rather than zeroed like other probe loads, so a faulting cmpxchg appears to succeed and fetch ops return the operand."
+    },
+    {
+        "Commit": "a5baf582f4c026c25a206ac121bceade926aec74",
+        "Fixed-by": "e98a9d0146372b046d863164025a66ab4488b972",
+        "subsystem": "arm64",
+        "problem_description": "arch_efi_call_virt_setup() is now preemptible but calls __efi_fpsimd_begin() after uaccess_ttbr0_enable(); kernel_neon_begin() can reschedule, and with CONFIG_ARM64_SW_TTBR0_PAN the task resumes with the wrong TTBR0_EL1, so EFI faults accessing its own mappings."
+    },
+    {
+        "Commit": "9bb12368d539d40457af593bc1b6b380430cc9d7",
+        "Fixed-by": "af22d273aa1f61fb86ec712b3ed785da73c3296e",
+        "subsystem": "arm64",
+        "problem_description": "An arena load_acquire (BPF_STX class) is treated as a store by add_exception_handler(), so on a fault dst_reg is not zeroed and keeps its old value, which may be a pointer the verifier now believes is an unknown scalar, unlike every other faulting arena load."
+    },
+    {
+        "Commit": "ee11f332af96a3b5d29586bc6d69b41531f62648",
+        "Fixed-by": "541549827889d0380fd73f8aacb5de6ef7a5a1ac",
+        "subsystem": "arm64",
+        "problem_description": "swsusp_arch_suspend() returns early when swsusp_mte_save_tags() fails, skipping local_daif_restore(flags), so the caller is left with all DAIF exceptions masked (debug and SError stay masked)."
+    },
+    {
+        "Commit": "82869ac57b5d3b550446932c918dbf2caf020c9e",
+        "Fixed-by": "684bde100117931f4c51c644a95f42f2dab041bc",
+        "subsystem": "arm64",
+        "problem_description": "swsusp_arch_resume() enters hibernate_exit() with debug and SError exceptions unmasked; while the image overwrites the running kernel, exception vectors are not mapped, so any such exception is fatal, and the resumed kernel is re-entered with DAIF bits it did not save."
+    },
+    {
+        "Commit": "b93e685ecff77e0b231c12802fb632ef36a62140",
+        "Fixed-by": "c3f83d021162571bcd87b062ec9e587828d2b7f3",
+        "subsystem": "arm64",
+        "problem_description": "In sve_init_header_from_task(), inactive-mode header->size = sizeof(header) takes the pointer size (8), not the 16-byte user_sve_header; the header.size == sizeof(header) check in sve_get_common() never matches, so NT_ARM_SVE/SSVE still expose the other mode's registers."
+    },
+    {
+        "Commit": "ba1004f861d16f24179f14f13f70c09227ccbffb",
+        "Fixed-by": "4c9c81a0860415284e9d260f998fbd755d3a7469",
+        "subsystem": "arm64",
+        "problem_description": "ipi_teardown() uses disable_irq() for routable (non-percpu) IPIs, but it is called from __cpu_disable() in the CPU-offline stopper with IRQs off; disable_irq() waits via synchronize_irq() and may sleep, giving a sleeping-in-atomic bug on every CPU offline on a GICv5 host."
+    },
+    {
+        "Commit": "7f1635737823a6c0c412ccf3767a12bec642c10f",
+        "Fixed-by": "2f6fc0612607c95489c960aaefc8cb5578cdab8c",
+        "subsystem": "arm64",
+        "problem_description": "spectre_bhb_enable_mitigation() loses its cpu_mitigations_off()/__nospectre_bhb branch along with the printk, so nospectre_bhb and mitigations=off no longer disable the BHB mitigation, while the new spectre_print_disabled_mitigations() still reports it disabled."
+    },
+    {
+        "Commit": "29cb80519689706387bde47000dbb2ed91143063",
+        "Fixed-by": "f73a8edc2ccc6ec72c37d5c578e7592d2e1f9922",
+        "subsystem": "arm64",
+        "problem_description": "huge_ptep_get() now sizes the contiguous range with find_num_contig(), which compares pmd_offset(addr) against ptep; for an unaligned addr inside a contpmd hugetlb mapping the test fails; on 16K pages, where CONT_PTES != CONT_PMDS, CONT_PTES entries are then walked from ptep, reading past the block and possibly past the PMD table page."
+    },
+    {
+        "Commit": "95a58852b0e5413b6ef4c93da60a80e89da9986a",
+        "Fixed-by": "285f90a4d1141c7594f2368e19cbb307388eff30",
+        "subsystem": "arm64",
+        "problem_description": "prevent_memory_remove_notifier() passes the loop cursor pfn, already at or past end_pfn, to can_unmap_without_split(), so the leaf-split check runs on the following range: valid removals can be refused and removals that split a leaf mapping can be allowed."
+    },
+    {
+        "Commit": "fb8a3eba9c812b67f9cf5531e5b55d13a51e938e",
+        "Fixed-by": "b877075d0baa22c225842c2f19e3ea0a9cbcbe39",
+        "subsystem": "arm64",
+        "problem_description": "ESR_ELx_FSC_ADDRSZ_nL(-1) yields 0x25, but the level -1 address size fault FSC is 0x29 (as fault_info[] in fault.c names it). esr_fsc_is_addr_sz_fault() misses real level -1 address size faults (so __hpfar_valid() ignores a valid HPFAR_EL2) and matches an unrelated code."
+    },
+    {
+        "Commit": "e057b94772328221405b067c3a85fe479b915dc8",
+        "Fixed-by": "26b483d52417253d88a3a01262ac85914a7aec8e",
+        "subsystem": "arm64",
+        "problem_description": "syscall_trace_enter() resyncs orig_x0 from x0 only after secure_computing() returns, but a SECCOMP_RET_TRACE stop inside secure_computing() lets the tracer change x0 and then re-runs the filter on the stale orig_x0, so the tracer can still alter arg0 behind seccomp's back."
+    },
+    {
+        "Commit": "eba4675008a6e4cbff27b579a837bd29be2642de",
+        "Fixed-by": "18a4e5cf633fad5c40ac9d936c51bf38db68796d",
+        "subsystem": "arm64",
+        "problem_description": "arch_unregister_cpu() returns early without unregister_cpu() when _STA fails or reports not present, but it is void and acpi_processor_post_eject() continues tearing the CPU down, leaving a stale registered cpu device that breaks a later hot-add of that CPU."
+    },
+    {
+        "Commit": "f2ba877402e5f74b27d9dbc2c8d059e7e9daf500",
+        "Fixed-by": "36fa5ffa60344bcc59fb3f50b33af8187e6b8753",
+        "subsystem": "arm64",
+        "problem_description": "map_mem() makes the linear alias of .data/.bss read-only during early boot, but kvm_apply_hyp_relocations() later rewrites hyp pointers in .data through lm_alias(), so with hyp data needing relocation the write faults on a read-only mapping and boot crashes."
+    },
+    {
+        "Commit": "b08fb180bb8802d1c599beb1acd6a3b26163b4f6",
+        "Fixed-by": "4cc70f75853bebac022334b6a86b953348072f74",
+        "subsystem": "arm64",
+        "problem_description": "arch_validate_hwbkpt_settings() now accepts unaligned AArch64 watchpoints and shifts ctrl.len (an 8-bit BAS bitfield) by the address offset without checking that offset + length fits; the high bits are silently dropped and the hardware watches fewer bytes than requested."
+    },
+    {
+        "Commit": "258df8fce42fecc23cd04242de3d39f1fe836433",
+        "Fixed-by": "71385b78dbc290328e3b04ebd9b27786642afaca",
+        "subsystem": "arm64",
+        "problem_description": "arm64 ptep_try_set() writes a valid kernel PTE with try_cmpxchg() but omits the DSB/ISB that __set_pte() issues for valid kernel mappings, so an access right after a successful install can still take a translation fault on the new mapping."
+    },
+    {
+        "Commit": "5e8eb9aeeda3a7aaf48efa1d34ae804e894e307f",
+        "Fixed-by": "c594b83457ccdee76d458416fb3bc9348a37592f",
+        "subsystem": "arm64",
+        "problem_description": "Hot-added linear-map page tables are now constructed with pagetable_pte/pmd_ctor(), but free_hotplug_pgtable_page() frees them on memory hot-remove without pagetable_dtor(), leaving page_type set (bad page state on free) and NR_PAGETABLE permanently inflated."
+    },
+    {
+        "Commit": "0a35bd285f43c26ccec33872fc6bb679069eaea8",
+        "Fixed-by": "d7396a72eae795d7f968fb451237b6ac1616d712",
+        "subsystem": "arm64",
+        "problem_description": "Replacing the hand-rolled SCTLR_EL2_RES1 with the generated one drops EOS (bit 11) and EIS (bit 22), so INIT_SCTLR_EL2_MMU_ON writes them as 0; on FEAT_ExS CPUs EL2 exception entry/exit stop being context-synchronization events that KVM relies on to omit ISBs."
+    },
+    {
+        "Commit": "316283f276ebd5596d2015e4653198bdc2e138d4",
+        "Fixed-by": "5cbb61bf4168859d97c068d88d364f4f1f440325",
+        "subsystem": "arm64",
+        "problem_description": "sve_set_common() zeroes current->thread.uw.fpsimd_state instead of the target's, so PTRACE_SETREGSET(NT_ARM_SVE/SSVE) can clobber the tracer's saved V0-V31/FPSR/FPCR and leaves the tracee's FPSIMD state un-zeroed for partial writes."
+    },
+    {
+        "Commit": "2e8a1acea8597ff42189ea94f0a63fa58640223d",
+        "Fixed-by": "030e8a40fff65ca6ac1c04a4d3c08afe72438922",
+        "subsystem": "arm64",
+        "problem_description": "rt_sigreturn's on-stack user_access_state is only filled by restore_poe_context() when a poe_context record is present, yet restore_user_access_state() always writes ua_state->por_el0 to POR_EL0; a frame without poe_context loads uninitialised kernel stack into POR_EL0."
+    },
+    {
+        "Commit": "5973a62efa34c80c9a4e5eac1fca6f6209b902af",
+        "Fixed-by": "4d8e74ad4585672489da6145b3328d415f50db82",
+        "subsystem": "arm64",
+        "problem_description": "map_kernel() now maps [_text, _stext) as its own segment, adding one more SWAPPER_BLOCK_SIZE-unaligned split, but EARLY_SEGMENT_EXTRA_PAGES still sizes init_pg_dir for KERNEL_SEGMENT_COUNT+1; with 4K pages the early tables can overrun init_pg_end."
+    },
+    {
+        "Commit": "f4a66cf1cb141997be35465bcd44c45404146441",
+        "Fixed-by": "f6606a44bc438ec5f1d450d0153878e80e79ff80",
+        "subsystem": "arm64",
+        "problem_description": "The arm64 JIT implements BPF indirect jumps with BR but emits no BTI J at the jump-table targets, so on BTI-enabled CPUs the indirect branch into the guarded JIT image takes a BTI exception and oopses the kernel."
+    },
+    {
+        "Commit": "99eb057ccd675b2f0fc71a362553164c65c349a2",
+        "Fixed-by": "2371bd83b3df9d833191fe58dadb0e69a794a1cd",
+        "subsystem": "arm64",
+        "problem_description": "Moving arm64_preempt_schedule_irq() into __exit_to_kernel_mode() lets any non-NMI exception return preempt, often with DAIF.D/A masked; arm64_preempt_schedule_irq() checks DAIF only under pseudo-NMI, so the next task runs with SError/Debug masked, losing breakpoints, watchpoints and RAS events."
+    },
+    {
+        "Commit": "a166563e7ec375b38a0fd3a58f7b77e50a6bc6a8",
+        "Fixed-by": "15bfba1ad77fad8e45a37aae54b3c813b33fe27c",
+        "subsystem": "arm64",
+        "problem_description": "With linear-map blocks under rodata=full, update_range_prot() can clear PTE_VALID on a whole block; pageattr_pmd_entry()/pud_entry() only touch entries passing pmd_sect()/pud_sect(), false once invalid, so revalidation skips the block and it stays unmapped, faulting on access."
+    },
+    {
+        "Commit": "a166563e7ec375b38a0fd3a58f7b77e50a6bc6a8",
+        "Fixed-by": "f12b435de2f2bb09ce406467020181ada528844c",
+        "subsystem": "arm64",
+        "problem_description": "force_pte_mapping() block-maps the linear map for realms when the boot CPU has BBML2_NOABORT, but split_kernel_leaf_mapping() refuses to split until the system cap is finalized, so early realm __set_memory_enc_dec() calls (ITS, swiotlb) hit unsplit blocks and fail."
+    },
+    {
+        "Commit": "bbd6ec605c0fc286c3f8ce60b4ed44635361d58b",
+        "Fixed-by": "48478b9f791376b4b89018d7afdfd06865498f65",
+        "subsystem": "arm64",
+        "problem_description": "unmap_hotplug_range() tears down the linear map one entry at a time, issuing a TLBI after each clear; for CONT-mapped linear memory this breaks the clear-all-then-invalidate rule, so a speculative walk can leave stale TLB entries for already-cleared parts of the range."
+    },
+    {
+        "Commit": "752a0d1d483e9479f5c59519256fd190139d0b39",
+        "Fixed-by": "b7d9d2e3a8ab535ff3bc8e9156a917bb8934f856",
+        "subsystem": "arm64",
+        "problem_description": "__flush_tlb_page() now hints TTL level 3, but __ptep_set_access_flags() still calls it for PMD/PUD entries cast to PTEs (pmdp_set_access_flags, hugetlb); the TLBI misses the block entry, so the stale entry keeps faulting and the task loops on spurious faults."
+    },
+    {
+        "Commit": "3dd681d944f6d861f12ee03aff17a14342963330",
+        "Fixed-by": "e43dce8a0bc09083ea1145a1a0c61d83cbe72d97",
+        "subsystem": "arm64",
+        "problem_description": "The AArch32 compat ftruncate64 wrapper branches to sys_ftruncate, which uses do_sys_ftruncate(..., small=1); since compat open() does not force O_LARGEFILE, ftruncate64 on such fds rejects lengths above 2 GiB with -EINVAL, unlike the LFS semantics of ftruncate64."
+    },
+    {
+        "Commit": "399306954996be58ac20b4b29f6334e3d55a2ce7",
+        "Fixed-by": "8c6e9b60f5c7985a9fe41320556a92d7a33451df",
+        "subsystem": "arm64",
+        "problem_description": "arm64_rsi_init() sets prot_ns_shared = BIT(ipa_bits - 1) and PROT_NS_SHARED ORs it into PTEs, but with 52-bit PA (LPA/LPA2) output-address bits [51:48] sit in low PTE bits, so a realm with 52-bit IPA sets the wrong PTE bit and shared mappings are not marked shared."
+    },
+    {
+        "Commit": "2a28810cbb8b21a4016182617cc1fd72eddf4a36",
+        "Fixed-by": "a79f7b4aeb8e7562cd6dbf9c223e2c2a04b1a85f",
+        "subsystem": "arm64",
+        "problem_description": "can_trap_icv_dir_el1() probes ICH_VTR_EL2 via the HVC_GET_ICH_VTR_EL2 hyp-stub call on nVHE, and is re-run when a CPU is hotplugged in; under pKVM the stubs are gone after deprivilege, the probe fails, the capability mismatches and the CPU never comes online."
+    },
+    {
+        "Commit": "4602e5757bcceb231c3a13c36c373ad4a750eddb",
+        "Fixed-by": "97c5550b763171dbef61e6239cab372b9f9cd4a2",
+        "subsystem": "arm64",
+        "problem_description": "contpte_ptep_set_access_flags() decides no-op by comparing the gathered ptep_get() value, which ORs AF/dirty from all sub-PTEs; a dirty sibling makes the target look updated while it still has PTE_RDONLY/no AF, so per-descriptor walkers loop on the fault."
+    },
+    {
+        "Commit": "143937ca51cc6ae2fccc61a1cb916abb24cd34f5",
+        "Fixed-by": "c25c4aa3f79a488cc270507935a29c07dc6bddfc",
+        "subsystem": "arm64",
+        "problem_description": "pte_mkwrite_novma() now leaves PTE_RDONLY set unless PTE_DIRTY is set; _copy_pte() in trans_pgd.c uses it to make kernel linear-map copies writable, and PAGE_KERNEL* PTEs lack PTE_DIRTY, so kexec/hibernation writes through the temporary map fault."
+    },
+    {
+        "Commit": "b2ad54e1533e91449cb2a371e034942bd7882b58",
+        "Fixed-by": "ef06fd16d48704eac868441d98d4ef083d8f3d07",
+        "subsystem": "arm64",
+        "problem_description": "build_plt() aligns the u64 plt->target relative to the JIT image start, but the image is only 4-byte aligned, so target can be misaligned; bpf_arch_text_poke() updates it with WRITE_ONCE while code loads it with ldr, risking a torn branch target."
+    },
+    {
+        "Commit": "6497b66ba6945f142902c7e8fce86e47016ead1c",
+        "Fixed-by": "47a8aad135ac1aed04b7b0c0a8157fd208075827",
+        "subsystem": "arm64",
+        "problem_description": "vm_get_page_prot() short-circuits VM_SHADOW_STACK to _PAGE_GCS_RO regardless of the access flags, so a shadow-stack mapping changed to PROT_NONE keeps an accessible PTE and mprotect(PROT_NONE) is ignored."
+    },
+    {
+        "Commit": "6497b66ba6945f142902c7e8fce86e47016ead1c",
+        "Fixed-by": "8a85b3131225a8c8143ba2ae29c0eef8c1f9117f",
+        "subsystem": "arm64",
+        "problem_description": "vm_get_page_prot() returns _PAGE_GCS_RO, which hardcodes PTE_SHARED; with FEAT_LPA2 bits 8-9 are output-address bits 50-51, and unlike protection_map[] entries this value is not stripped, so GCS PTEs point at the wrong physical address."
+    },
+    {
+        "Commit": "893dea9ccd08dab924839354aba21d4ed7a9abc0",
+        "Fixed-by": "8f098037139b294050053123ab2bc0f819d08932",
+        "subsystem": "arm64",
+        "problem_description": "Enabling HAVE_IOREMAP_PROT lets generic_access_phys() call ioremap_prot() with all non-address bits of the user PTE (from pte_pgprot()), including PTE_USER; the kernel alias becomes a user mapping and memcpy_fromio faults under PAN."
+    },
+    {
+        "Commit": "7d26b0516a0df5888fd1486054bc5159f6c0b88f",
+        "Fixed-by": "29cc0f3aa7c64d3b3cb9d94c0a0984ba6717bf72",
+        "subsystem": "arm64",
+        "problem_description": "__delay() computes the WFIT/WFET deadline from get_cycles(), which may read the physical counter, while WFxT times out against the virtual counter; with a non-zero CNTVOFF_EL2 (vcpu loaded under nVHE or hVHE) the deadline is wrong and delays are far too long or short."
+    },
+    {
+        "Commit": "b57180c75c7ebff6613886cb69ef6e283a10358b",
+        "Fixed-by": "53c998527ffa60f9deda8974a11ad39790684159",
+        "subsystem": "arm64",
+        "problem_description": "arch_set_shadow_stack_status() tests alloc_gcs()'s result against 0, but alloc_gcs() returns do_mmap()'s error-encoded value on failure; an error value is then stored in gcs_base and written to GCSPR_EL0 and the prctl reports success."
+    },
+    {
+        "Commit": "e35123d83ee35c31f64ecfbdfabbe5142d3025b8",
+        "Fixed-by": "bb0c99e08ab9aa6d04b40cb63c72db9950d51749",
+        "subsystem": "arm64",
+        "problem_description": "__READ_ONCE()'s non-atomic fallback casts to volatile typeof(__x), a volatile pointer to a non-volatile object, so for types larger than 8 bytes the load is not volatile and the compiler may refetch or elide it."
+    },
+    {
+        "Commit": "17519819926211e6b2834e00e4554bec0daf22ac",
+        "Fixed-by": "1f3b950492db411e6c30ee0076b61ef2694c100a",
+        "subsystem": "arm64",
+        "problem_description": "poe_get() returns target->thread.por_el0 even when target is current, but EL0 writes POR_EL0 directly and the saved copy is only refreshed on context switch, so a coredump taken before a switch records a stale POR_EL0."
+    }
+]

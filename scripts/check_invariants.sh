@@ -91,6 +91,11 @@ fi
 check_compressed_column() {
     local table="$1"
     local column="$2"
+    local exists
+    exists=$(count "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '$table';")
+    if [ "$exists" -eq 0 ]; then
+        return 0
+    fi
     local bad
     bad=$(count "SELECT count(*) FROM $table WHERE typeof($column) = 'text' AND length($column) > 1024;")
     if [ "$bad" -gt 0 ]; then
@@ -108,6 +113,7 @@ check_compressed_column ai_interactions input_context
 check_compressed_column ai_interactions output_raw
 check_compressed_column bug_enrichments content
 check_compressed_column bug_enrichments logs
+check_compressed_column forge_comments body
 
 if [ "$FAILED" -ne 0 ]; then
     exit 1

@@ -7,14 +7,12 @@ analysis traverses the full callstack — both up and down — to identify
 side effects, unintended consequences, and regressions that would be invisible
 when examining modified functions in isolation.
 
-See pointer-guards.md for how to decide whether a NULL pointer is guarded.
-
 Note: foo->ptr dereferences foo BUT NOT ptr
 
 This callstack analysis is required for all non-trivial changes.
 
-Add each Task from this prompt (Task 1,2,3,4,5,6,7,8,9) into a TodoWrite.
-The TodoWrite must ensure that you complete every task before completing
+Add each Task from this prompt (Task 1,2,3,4,5,6,7,8,9) to a checklist.
+The checklist must ensure that you complete every task before completing
 this prompt.
 
 ---
@@ -201,9 +199,8 @@ complete caller analysis.
   - Output: list of pointers you found for the same memory
 - step resource.4: Verify resources are properly initialized, locked, and freed
 - step resource.4b: For any suspected race, including a use-after-free where the other side is asynchronous work, an RCU callback or a workqueue item:
-  - Load `locking.md` if not already loaded, and follow its tracing method
-  - For a suspected use-after-free, complete "Step 5: Check Object Lifetime", including the reference budget, before reporting
-  - Output: "locking.md loaded: [ y / n ]", plus the `budget:` line for a suspected use-after-free
+  - For a suspected use-after-free, list what keeps the object alive on each side (references, held locks, RCU read-side sections) up to the free, and report only if the free can run while the using side still holds a pointer with no pin
+  - Output: the pins held on each side, and the free point
 - step resource.5: Continue into Task 5B, even if you think you've found enough details to complete the analysis
 - Output: Category NUMBER [ list of resources checked: line of code where each resource was assigned ]
 
@@ -212,7 +209,7 @@ complete caller analysis.
 **CRITICAL**: This task catches use-after-free bugs in RCU-protected data structures.
 
 - step rcu.1: For any `call_rcu()`, `synchronize_rcu()`, or `kfree_rcu()` in the diff:
-  - Check the code notes for the RCU rules of the structures involved, and the RCU section of `locking.md`
+  - Check the code notes for the RCU rules of the structures involved
 - step rcu.2: Identify what data structures the object is part of (rhashtable, hlist, list, rb-tree, etc.)
   - Output: "Object in data structures: [ list ]"
 - step rcu.3: Verify removal from ALL lookup structures happens BEFORE call_rcu()
@@ -240,7 +237,7 @@ complete caller analysis.
 - Identify inner loops that modify these variables
 - Identify conditions that allow the loop to exit normally
 - Identify functions not yet in context that control loop iteration and exit
-  - Add to TodoWrite
+  - Add to the checklist
   - **IMPORTANT** You will want to skip this step.  Skipping this step will
     cause you to miss critical information that is needed to properly judge
     the safety of loop exit criteria.  DO NOT, FOR ANY REASON, SKIP THIS STEP.
@@ -264,7 +261,7 @@ Additional functions identified for context reading [ list ]
 exit conditions
 ```
 
-- Load all functions added into TodoWrite that were not yet in context
+- Load all functions added to the checklist that were not yet in context
 
 ## Task 6b: **Mandatory loop control flow validation**:
 - step loop.1: Track what happens to resource-holding variables across loop iterations

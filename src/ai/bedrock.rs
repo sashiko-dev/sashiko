@@ -28,7 +28,7 @@ use aws_sdk_bedrockruntime::types::{
 use aws_smithy_types::{Document, Number};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 // --- serde_json::Value <-> aws_smithy_types::Document conversion ---
 
@@ -222,7 +222,7 @@ struct ConverseParams {
 }
 
 /// Application inference profile ARNs carry no model name and fall back to Anthropic fields.
-fn is_openai_model(model_id: &str) -> bool {
+pub(crate) fn is_openai_model(model_id: &str) -> bool {
     model_id.contains("openai.")
 }
 
@@ -580,7 +580,7 @@ impl AiProvider for BedrockClient {
                 )
             })
             .unwrap_or_else(|| "unknown".to_string());
-        info!("Bedrock response received. Tokens: {}", usage_str);
+        debug!("Bedrock response received. Tokens: {}", usage_str);
 
         translate_response(&resp)
     }
@@ -624,6 +624,7 @@ mod tests {
             response_format: None,
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         }
     }
 

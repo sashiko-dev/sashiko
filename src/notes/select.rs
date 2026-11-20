@@ -98,7 +98,15 @@ async fn commit_time(repo: &Path, rev: &str) -> Result<Option<i64>> {
         return Ok(None);
     }
     let output = git_cmd::in_dir_async(repo)
-        .args(["log", "-1", "--format=%ct", rev, "--"])
+        .args([
+            "-c",
+            "safe.bareRepository=all",
+            "log",
+            "-1",
+            "--format=%ct",
+            rev,
+            "--",
+        ])
         .output()
         .await
         .context("failed to run git log")?;
@@ -113,7 +121,14 @@ async fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bo
         return Ok(false);
     }
     let status = git_cmd::in_dir_async(repo)
-        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .args([
+            "-c",
+            "safe.bareRepository=all",
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ])
         .status()
         .await
         .context("failed to run git merge-base")?;
@@ -688,6 +703,20 @@ pub fn diff_identifiers(diff: &str) -> HashSet<String> {
             continue;
         };
         for m in IDENT.find_iter(text) {
+            if is_specific(m.as_str()) {
+                out.insert(m.as_str().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The specific identifiers appearing in a source slice (`source`), used when
+/// selecting and focusing unit and symbol notes for active codebase scanning.
+pub fn source_identifiers(source: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for line in source.lines() {
+        for m in IDENT.find_iter(line) {
             if is_specific(m.as_str()) {
                 out.insert(m.as_str().to_string());
             }

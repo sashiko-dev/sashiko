@@ -54,23 +54,28 @@ impl ClassifyAiError for ReviewError {
 
 use crate::project::ProjectId;
 use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
+use crate::workflows::e2fsprogs_patch_review::{
+    build_e2fsprogs_patch_review_workflow_with_effort, e2fsprogs_system_prompt,
+};
 use crate::workflows::gcc_patch_review::{
     build_gcc_patch_review_workflow_with_effort, gcc_system_prompt,
 };
 use crate::workflows::linux_patch_review::{
     LinuxPatchReviewState, build_linux_patch_review_workflow_with_effort, linux_system_prompt,
 };
+use crate::workflows::qemu_patch_review::{
+    build_qemu_patch_review_workflow_with_effort, qemu_system_prompt,
+};
 use crate::workflows::sashiko_patch_review::{
     build_sashiko_patch_review_workflow_with_effort, sashiko_system_prompt,
 };
+use crate::workflows::zephyr_patch_review::{
+    build_zephyr_patch_review_workflow_with_effort, zephyr_system_prompt,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
-
-/// System identity prompt - used across all AI interactions
-pub const SYSTEM_IDENTITY: &str = "";
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct PatchInput {
@@ -83,6 +88,8 @@ pub struct PatchInput {
     pub message_id: Option<String>,
     #[serde(default)]
     pub commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_version_context: Option<crate::prior_context::PriorVersionContext>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -90,6 +97,14 @@ pub struct ReviewInput {
     pub id: i64,
     pub subject: String,
     pub patches: Vec<PatchInput>,
+    /// Related pre-existing bugs already reported in the files this series
+    /// touches, so the review does not pick them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_disclosures: Vec<crate::related_preexisting::BugKey>,
+    /// Verified open canonical bugs from the database in the files this
+    /// series touches, eligible for related pre-existing bug selection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_bugs: Vec<Value>,
 }
 
 /// Selects the code notes for a review and renders their prompt block.
@@ -123,7 +138,7 @@ async fn select_code_notes(
     let mut notes = crate::notes::select::select_notes(set, &files, identifiers);
     let symbol_notes = crate::notes::select::select_symbol_notes(set, &specific, &notes);
     notes.extend(symbol_notes);
-    tracing::info!(
+    tracing::debug!(
         "code notes: set {} for {} touched file(s): {:?}",
         set.manifest.set,
         files.len(),
@@ -151,7 +166,7 @@ fn select_maintainer_notes(prompts_dir: &std::path::Path, diff: &str) -> String 
         .iter()
         .filter(|note| note.applies(&files, &identifiers))
         .collect();
-    tracing::info!(
+    tracing::debug!(
         "maintainer notes: {} of {} apply: {:?}",
         selected.len(),
         notes.len(),
@@ -170,8 +185,11 @@ pub struct WorkerConfig {
     pub series_range: Option<String>,
     pub baseline_sha: Option<String>,
     pub stages: Option<Vec<String>>,
+    pub cheap: bool,
     pub skip_report: bool,
     pub report_preexisting: bool,
+    /// Whether to look for related pre-existing bugs to report.
+    pub related_preexisting: crate::related_preexisting::RelatedPreexistingMode,
     pub effort: Option<crate::ai::EffortMode>,
     /// Whether to load code notes into the review.
     pub use_code_notes: bool,
@@ -219,29 +237,6 @@ impl PromptRegistry {
     pub fn new(base_dir: PathBuf) -> Self {
         Self { base_dir }
     }
-
-    pub fn get_system_identity() -> &'static str {
-        SYSTEM_IDENTITY
-    }
-
-    pub fn calculate_content_hash<T: serde::Serialize>(
-        &self,
-        content: &str,
-        tools: Option<&[T]>,
-    ) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(content);
-        if let Some(tools) = tools
-            && let Ok(json) = serde_json::to_string(tools)
-        {
-            hasher.update(json);
-        }
-        hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect()
-    }
 }
 
 pub struct Worker {
@@ -256,9 +251,11 @@ pub struct Worker {
     baseline_sha: Option<String>,
     context_tag: Option<String>,
     stages: Option<Vec<String>>,
+    cheap: bool,
     custom_prompt: Option<String>,
     skip_report: bool,
     report_preexisting: bool,
+    related_preexisting: crate::related_preexisting::RelatedPreexistingMode,
     effort: Option<crate::ai::EffortMode>,
     use_code_notes: bool,
     code_notes_scope: CodeNotesScope,
@@ -283,9 +280,11 @@ impl Worker {
             baseline_sha: config.baseline_sha,
             context_tag: None,
             stages: config.stages,
+            cheap: config.cheap,
             custom_prompt: config.custom_prompt,
             skip_report: config.skip_report,
             report_preexisting: config.report_preexisting,
+            related_preexisting: config.related_preexisting,
             effort: config.effort,
             use_code_notes: config.use_code_notes,
             code_notes_scope: config.code_notes_scope,
@@ -352,6 +351,8 @@ impl Worker {
             target_commit_sha = vhead;
         }
 
+        let mut prior_version_context: Option<crate::prior_context::PriorVersionContext> = None;
+
         if let Some(patches) = patchset["patches"].as_array() {
             let target_patches: Vec<&Value> = if let Some(idx) = patchset["patch_index"].as_i64() {
                 let filtered: Vec<&Value> = patches
@@ -366,6 +367,18 @@ impl Worker {
             } else {
                 patches.iter().collect()
             };
+
+            if let Some(first) = target_patches.first()
+                && let Some(raw_ctx) = first.get("prior_version_context")
+                && !raw_ctx.is_null()
+            {
+                match serde_json::from_value(raw_ctx.clone()) {
+                    Ok(parsed) => prior_version_context = Some(parsed),
+                    Err(err) => {
+                        tracing::warn!("Failed to deserialize prior_version_context: {err}");
+                    }
+                }
+            }
 
             for p in target_patches {
                 let diff_body = p["diff"].as_str().unwrap_or("");
@@ -412,7 +425,11 @@ impl Worker {
         };
 
         let follow_up_series_context = match self.project {
-            ProjectId::Linux | ProjectId::Gcc => build_follow_up_series_context(
+            ProjectId::Linux
+            | ProjectId::Gcc
+            | ProjectId::Qemu
+            | ProjectId::Zephyr
+            | ProjectId::E2fsprogs => build_follow_up_series_context(
                 self.series_range.as_deref(),
                 &patchset,
                 &target_commit_sha,
@@ -438,6 +455,21 @@ impl Worker {
         };
         let maintainer_notes =
             select_maintainer_notes(&self.prompts.base_dir, &target_commit_diff_only);
+        let kernel_threat_model = if self.project == ProjectId::Linux {
+            crate::threat_model::KernelThreatModel::load(worktree_path).await
+        } else {
+            None
+        };
+        let fixes_analysis = crate::worker::fixes_check::analyze_fixes_for_commit(
+            self.project,
+            worktree_path,
+            &baseline_sha,
+            &target_commit_sha,
+            self.series_range.as_deref(),
+            &target_commit_diff,
+            &target_commit_diff_only,
+        )
+        .await;
 
         let mut state = LinuxPatchReviewState {
             ps_id,
@@ -453,28 +485,42 @@ impl Worker {
             worktree_path: Some(self.tools.get_worktree_path().to_path_buf()),
             selected_guides: Vec::new(),
             manual_stages: self.stages.clone(),
+            cheap_mode: self.cheap,
             custom_prompt: self.custom_prompt.clone(),
             code_notes,
             maintainer_notes,
+            kernel_threat_model,
             planned_stages: Vec::new(),
             effort: self.effort,
             planned_efforts: std::collections::BTreeMap::new(),
             skip_report: self.skip_report,
             report_preexisting: self.report_preexisting,
+            related_preexisting: self.related_preexisting,
+            known_disclosures: serde_json::from_value(patchset["known_disclosures"].clone())
+                .unwrap_or_default(),
+            candidate_bugs: serde_json::from_value(patchset["candidate_bugs"].clone())
+                .unwrap_or_default(),
+            related_preexisting_selected: Vec::new(),
+            related_preexisting_dismissed: Vec::new(),
+            related_preexisting_reported: Vec::new(),
             project: self.project.as_str().to_string(),
+            prior_version_context,
+            prior_resolutions: Vec::new(),
             all_concerns: Vec::new(),
             all_dismissed_concerns: Vec::new(),
+            deduplicated_clusters: Vec::new(),
             verification_findings: Vec::new(),
             verification_dismissed: Vec::new(),
             post_verification_findings: Vec::new(),
             post_verification_dismissed: Vec::new(),
             deduplicated_dismissed_concerns: Vec::new(),
-            hard_cases: Vec::new(),
+            inconclusive_concerns: Vec::new(),
             concerns: Vec::new(),
             findings: Vec::new(),
             summary: String::new(),
             review_inline: String::new(),
             fixes: String::new(),
+            fixes_analysis,
         };
 
         if self.global_history.is_empty() {
@@ -482,6 +528,9 @@ impl Worker {
                 ProjectId::Linux => linux_system_prompt(true),
                 ProjectId::Sashiko => sashiko_system_prompt(true),
                 ProjectId::Gcc => gcc_system_prompt(true),
+                ProjectId::Qemu => qemu_system_prompt(true),
+                ProjectId::Zephyr => zephyr_system_prompt(true),
+                ProjectId::E2fsprogs => e2fsprogs_system_prompt(true),
             };
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
@@ -506,6 +555,21 @@ impl Worker {
                 self.effort,
             ),
             ProjectId::Gcc => build_gcc_patch_review_workflow_with_effort(
+                self.max_interactions,
+                self.temperature,
+                self.effort,
+            ),
+            ProjectId::Qemu => build_qemu_patch_review_workflow_with_effort(
+                self.max_interactions,
+                self.temperature,
+                self.effort,
+            ),
+            ProjectId::Zephyr => build_zephyr_patch_review_workflow_with_effort(
+                self.max_interactions,
+                self.temperature,
+                self.effort,
+            ),
+            ProjectId::E2fsprogs => build_e2fsprogs_patch_review_workflow_with_effort(
                 self.max_interactions,
                 self.temperature,
                 self.effort,
@@ -618,6 +682,7 @@ impl Worker {
             .map_err(|e| anyhow::anyhow!("spawn_blocking failed for location resolution: {}", e))?;
         }
 
+        crate::workflows::review_map::enrich_prior_resolutions(&mut state);
         let review_map = crate::workflows::review_map::build_review_map(
             self.project,
             &state,
@@ -632,6 +697,14 @@ impl Worker {
             state.all_dismissed_concerns.clone()
         };
         let dismissed_concerns_count = dismissed_concerns.len();
+        let failed_stages: Vec<Value> = outcome
+            .stage_runs
+            .iter()
+            .filter_map(|r| {
+                let error = r.error.as_ref()?;
+                Some(json!({"stage": r.name, "error": error}))
+            })
+            .collect();
 
         let review_inline = if state.review_inline.is_empty() && !self.skip_report {
             "No issues found.".to_string()
@@ -644,10 +717,14 @@ impl Worker {
             "findings": state.findings,
             "dismissed_concerns": dismissed_concerns,
             "concerns": state.concerns,
+            "related_preexisting": state.related_preexisting_reported,
+            "related_preexisting_dismissed": state.related_preexisting_dismissed,
+            "prior_resolutions": state.prior_resolutions,
             "review_inline": review_inline,
             "fixes": state.fixes,
             "concerns_count": concerns_count,
             "dismissed_concerns_count": dismissed_concerns_count,
+            "failed_stages": failed_stages,
             "review_map": review_map,
         });
 
@@ -903,6 +980,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zephyr_device_lookup_loads_devicetree_guidance() {
+        let prompts =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("projects/zephyr/prompts");
+        let marker = "<maintainer_note subsystem=\"Devicetree and Bindings\">";
+        for expression in [
+            "DEVICE_DT_GET(node)",
+            "DEVICE_DT_GET_OR_NULL(node)",
+            "DT_GPIO_CTLR(node, gpios)",
+        ] {
+            let diff = format!(
+                "diff --git a/samples/demo/src/main.c b/samples/demo/src/main.c\n@@ -0,0 +1 @@\n+const void *dev = {expression};\n"
+            );
+            assert!(
+                select_maintainer_notes(&prompts, &diff).contains(marker),
+                "{expression}"
+            );
+        }
+        let unrelated = "diff --git a/samples/demo/src/main.c b/samples/demo/src/main.c\n@@ -0,0 +1 @@\n+int answer = 42;\n";
+        assert!(!select_maintainer_notes(&prompts, unrelated).contains(marker));
+    }
+
+    #[test]
     fn test_planned_stages_follow_the_resolved_fan_out() {
         assert_eq!(
             crate::workflows::planned_stages_from(
@@ -913,6 +1012,7 @@ mod tests {
                 "goal",
                 "implementation",
                 "locking",
+                "deduplication",
                 "verification",
                 "post-verification",
                 "report"
@@ -928,6 +1028,7 @@ mod tests {
                 "implementation",
                 "concurrency",
                 "llm-pipeline",
+                "deduplication",
                 "verification",
                 "post-verification",
                 "report",
@@ -944,23 +1045,48 @@ mod tests {
             Vec::<String>::new()
         );
 
-        // Once verification resolves the concrete post-verification batch
-        // fan-out, the placeholder is replaced by 0..=10 concrete stages.
+        // Once deduplication resolves sharded verification stages (when >10 clusters)
+        // and verification resolves concrete post-verification stages (0..=10),
+        // each placeholder is replaced without disturbing the others.
         let initial =
             crate::workflows::planned_stages_from(ProjectId::Linux, &["goal", "implementation"]);
         assert_eq!(
             crate::workflows::refine_planned_stages_with_post_verification(&initial, &[]),
-            ["goal", "implementation", "verification", "report"]
+            [
+                "goal",
+                "implementation",
+                "deduplication",
+                "verification",
+                "report"
+            ]
+        );
+        let sharded_ver = crate::workflows::refine_planned_stages_with_post_verification(
+            &initial,
+            &["verification-1", "verification-2"],
+        );
+        assert_eq!(
+            sharded_ver,
+            [
+                "goal",
+                "implementation",
+                "deduplication",
+                "verification-1",
+                "verification-2",
+                "post-verification",
+                "report"
+            ]
         );
         assert_eq!(
             crate::workflows::refine_planned_stages_with_post_verification(
-                &initial,
+                &sharded_ver,
                 &["post-verification-1", "post-verification-2"]
             ),
             [
                 "goal",
                 "implementation",
-                "verification",
+                "deduplication",
+                "verification-1",
+                "verification-2",
                 "post-verification-1",
                 "post-verification-2",
                 "report"
@@ -1008,6 +1134,7 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: commit_id.map(str::to_string),
+            prior_version_context: None,
         };
         let p1 = make_patch(1, Some("sha1"));
         let p2 = make_patch(2, Some("sha2"));
@@ -1162,7 +1289,7 @@ mod tests {
         std::fs::create_dir_all(&prompts_dir).unwrap();
 
         let provider = std::sync::Arc::new(MockProviderAlwaysFails);
-        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf());
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
             project: ProjectId::Linux,
@@ -1173,8 +1300,10 @@ mod tests {
             baseline_sha: None,
             custom_prompt: None,
             stages: None,
+            cheap: false,
             skip_report: false,
             report_preexisting: false,
+            related_preexisting: Default::default(),
             effort: None,
             use_code_notes: false,
             code_notes_scope: Default::default(),
@@ -1275,7 +1404,7 @@ mod tests {
         let provider = std::sync::Arc::new(MockBlockedProvider {
             attempts: AtomicUsize::new(0),
         });
-        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf());
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
             project: ProjectId::Linux,
@@ -1286,8 +1415,10 @@ mod tests {
             baseline_sha: None,
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
+            cheap: false,
             skip_report: false,
             report_preexisting: false,
+            related_preexisting: Default::default(),
             effort: None,
             use_code_notes: false,
             code_notes_scope: Default::default(),
@@ -1315,7 +1446,7 @@ mod tests {
         let provider = std::sync::Arc::new(MockBlockedProvider {
             attempts: AtomicUsize::new(0),
         });
-        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf());
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
             project: ProjectId::Linux,
@@ -1326,8 +1457,10 @@ mod tests {
             baseline_sha: Some("explicit_baseline_sha".to_string()),
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
+            cheap: false,
             skip_report: false,
             report_preexisting: false,
+            related_preexisting: Default::default(),
             effort: None,
             use_code_notes: false,
             code_notes_scope: Default::default(),
@@ -1359,7 +1492,7 @@ mod tests {
         let provider = std::sync::Arc::new(MockBlockedProvider {
             attempts: AtomicUsize::new(0),
         });
-        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf());
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
             project: ProjectId::Linux,
@@ -1370,8 +1503,10 @@ mod tests {
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
+            cheap: false,
             skip_report: false,
             report_preexisting: false,
+            related_preexisting: Default::default(),
             effort: None,
             use_code_notes: false,
             code_notes_scope: Default::default(),
@@ -1424,17 +1559,17 @@ mod tests {
 
             // Dispatch on the heading each stage's instruction opens with.
             // Analysis stages return concerns/dismissed_concerns, verification
-            // returns findings/hard_cases/dismissed_concerns, and
+            // returns findings/inconclusive_concerns/dismissed_concerns, and
             // post-verification returns findings/dismissed_concerns.
             let content = if last_user.contains("# Analyze commit main goal") {
                 r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
             } else if last_user.contains("# Verification and severity estimation")
                 || last_user.contains("# Consolidate, classify, and verify concerns")
             {
-                r#"{"findings": [], "hard_cases": [{"source_ids": ["C1"], "type": "Bug", "description": "some issue", "estimated_severity": "High", "signal_reason": "series_interaction", "concern_arguments": "reason", "dismissal_arguments": "", "verification_question": "check series end", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
+                r#"{"findings": [], "inconclusive_concerns": [{"source_ids": ["C1"], "type": "Bug", "description": "some issue", "estimated_severity": "High", "signal_reason": "series_interaction", "concern_arguments": "reason", "dismissal_arguments": "", "verification_question": "check series end", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
             } else if last_user.contains("# Per-finding post-verification and conflict resolution")
             {
-                r#"{"findings": [], "dismissed_concerns": [{"source_ids": ["H1"], "description": "some issue", "reasoning": "fixed in patch 2", "locations": [{"file": "file2.c", "function_or_symbol": "patch2", "line": 1, "code_snippet": "int patch2;", "side": "REVISION"}]}]}"#
+                r#"{"findings": [], "dismissed_concerns": [{"source_ids": ["I1"], "description": "some issue", "reasoning": "fixed in patch 2", "locations": [{"file": "file2.c", "function_or_symbol": "patch2", "line": 1, "code_snippet": "int patch2;", "side": "REVISION"}]}]}"#
             } else {
                 r#"{"concerns": [], "dismissed_concerns": []}"#
             };
@@ -1464,7 +1599,7 @@ mod tests {
         std::fs::create_dir_all(&prompts_dir).unwrap();
 
         let provider = std::sync::Arc::new(MockMultiStageSeriesProvider);
-        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf());
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
             project: ProjectId::Linux,
@@ -1475,8 +1610,10 @@ mod tests {
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
+            cheap: false,
             skip_report: false,
             report_preexisting: false,
+            related_preexisting: Default::default(),
             effort: None,
             use_code_notes: false,
             code_notes_scope: Default::default(),
@@ -1622,7 +1759,7 @@ mod tests {
                 } else if last_user.contains("# Verification and severity estimation")
                     || last_user.contains("# Consolidate, classify, and verify concerns")
                 {
-                    r#"{"findings": [{"source_ids": ["C1"], "problem": "some issue", "severity": "High", "severity_explanation": "bad", "preexisting": false, "locations": []}], "hard_cases": [], "dismissed_concerns": []}"#
+                    r#"{"findings": [{"source_ids": ["C1"], "problem": "some issue", "severity": "High", "severity_explanation": "bad", "preexisting": false, "locations": []}], "inconclusive_concerns": [], "dismissed_concerns": []}"#
                 } else {
                     r#"{"concerns": [], "dismissed_concerns": []}"#
                 };
@@ -1651,7 +1788,7 @@ mod tests {
 
         for project in [ProjectId::Linux, ProjectId::Sashiko] {
             let provider = std::sync::Arc::new(MockFindingWithoutReportProvider);
-            let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+            let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf());
             let prompts = PromptRegistry::new(prompts_dir.clone());
             let config = WorkerConfig {
                 project,
@@ -1662,8 +1799,10 @@ mod tests {
                 baseline_sha: Some("base_sha".to_string()),
                 custom_prompt: None,
                 stages: Some(vec!["goal".to_string()]),
+                cheap: false,
                 skip_report: true,
                 report_preexisting: false,
+                related_preexisting: Default::default(),
                 effort: None,
                 use_code_notes: false,
                 code_notes_scope: Default::default(),
@@ -1713,7 +1852,7 @@ mod tests {
                 } else if last_user.contains("# Verification and severity estimation")
                     || last_user.contains("# Consolidate, classify, and verify concerns")
                 {
-                    r#"{"findings": [{"source_ids": ["C1"], "problem": "mm: memory leak in foo()", "severity": "High", "severity_explanation": "foo() returns -ENOMEM without freeing buf", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "side": "REVISION", "why_this_location_matters": "leaks buf"}]}], "hard_cases": [], "dismissed_concerns": []}"#
+                    r#"{"findings": [{"source_ids": ["C1"], "problem": "mm: memory leak in foo()", "severity": "High", "severity_explanation": "foo() returns -ENOMEM without freeing buf", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "side": "REVISION", "why_this_location_matters": "leaks buf"}]}], "inconclusive_concerns": [], "dismissed_concerns": []}"#
                 } else if last_user.contains("# LKML-friendly report generation") {
                     "commit sha1\nAuthor: Test <test@example.com>\n\nSubject\n\nSummary.\n\n> +int x;\n\n[Severity: High]\nThis problem wasn't introduced by this patch, but foo() leaks buf on error.\n"
                 } else {
@@ -1751,10 +1890,7 @@ mod tests {
         // With report_preexisting: false, verification routes pre-existing findings only to concerns (0 findings).
         let mut worker_default = Worker::new(
             std::sync::Arc::new(MockPreexistingOnlyProvider),
-            std::sync::Arc::new(crate::toolbox::ToolBox::new(
-                temp_dir.path().to_path_buf(),
-                None,
-            )),
+            std::sync::Arc::new(crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf())),
             PromptRegistry::new(prompts_dir.clone()),
             WorkerConfig {
                 project: ProjectId::Linux,
@@ -1765,8 +1901,10 @@ mod tests {
                 baseline_sha: Some("base_sha".to_string()),
                 custom_prompt: None,
                 stages: Some(vec!["goal".to_string()]),
+                cheap: false,
                 skip_report: false,
                 report_preexisting: false,
+                related_preexisting: Default::default(),
                 effort: None,
                 use_code_notes: false,
                 code_notes_scope: Default::default(),
@@ -1785,10 +1923,7 @@ mod tests {
         // With report_preexisting: true, verification and report stages run and produce findings + inline report.
         let mut worker_preexisting = Worker::new(
             std::sync::Arc::new(MockPreexistingOnlyProvider),
-            std::sync::Arc::new(crate::toolbox::ToolBox::new(
-                temp_dir.path().to_path_buf(),
-                None,
-            )),
+            std::sync::Arc::new(crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf())),
             PromptRegistry::new(prompts_dir),
             WorkerConfig {
                 project: ProjectId::Linux,
@@ -1799,8 +1934,10 @@ mod tests {
                 baseline_sha: Some("base_sha".to_string()),
                 custom_prompt: None,
                 stages: Some(vec!["goal".to_string()]),
+                cheap: false,
                 skip_report: false,
                 report_preexisting: true,
+                related_preexisting: Default::default(),
                 effort: None,
                 use_code_notes: false,
                 code_notes_scope: Default::default(),
@@ -1856,7 +1993,7 @@ mod tests {
             let content = if last_user.contains("# Analyze commit main goal") {
                 r#"{"concerns": [{"type": "Bug", "description": "foo() leaks buf", "reasoning": "Missing kfree", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
             } else if verification {
-                r#"{"findings": [{"source_ids": ["C1"], "problem": "foo() leaks buf", "severity": "High", "severity_explanation": "bad", "preexisting": false, "locations": []}], "hard_cases": [], "dismissed_concerns": []}"#
+                r#"{"findings": [{"source_ids": ["C1"], "problem": "foo() leaks buf", "severity": "High", "severity_explanation": "bad", "preexisting": false, "locations": []}], "inconclusive_concerns": [], "dismissed_concerns": []}"#
             } else if last_user.contains("# LKML-friendly report generation") {
                 "commit sha1\nAuthor: Test <test@example.com>\n\nSubject\n\n> +int x;\n\n[Severity: High]\nfoo() leaks buf.\n"
             } else {
@@ -1897,10 +2034,7 @@ mod tests {
         let review = |provider: std::sync::Arc<dyn crate::ai::AiProvider>| {
             let mut worker = Worker::new(
                 provider,
-                std::sync::Arc::new(crate::toolbox::ToolBox::new(
-                    temp_dir.path().to_path_buf(),
-                    None,
-                )),
+                std::sync::Arc::new(crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf())),
                 PromptRegistry::new(prompts_dir.clone()),
                 WorkerConfig {
                     project: ProjectId::Linux,
@@ -1911,8 +2045,10 @@ mod tests {
                     baseline_sha: Some("base_sha".to_string()),
                     custom_prompt: None,
                     stages: Some(vec!["goal".to_string()]),
+                    cheap: false,
                     skip_report: false,
                     report_preexisting: false,
+                    related_preexisting: Default::default(),
                     effort: None,
                     use_code_notes: false,
                     code_notes_scope: Default::default(),

@@ -34,7 +34,7 @@ use google_cloud_auth::credentials::{AccessTokenCredentials, Builder};
 use reqwest::Client;
 use serde::Serialize;
 use std::time::Duration;
-use tracing::info;
+use tracing::debug;
 
 // --- Model family detection ---
 
@@ -46,9 +46,9 @@ enum ModelFamily {
 }
 
 fn detect_model_family(model: &str) -> Result<ModelFamily> {
-    if model.starts_with("claude") {
+    if model.trim().to_ascii_lowercase().starts_with("claude") {
         Ok(ModelFamily::Claude)
-    } else if model.starts_with("gemini") {
+    } else if crate::ai::is_gemini_model_name(model) {
         Ok(ModelFamily::Gemini)
     } else {
         bail!(
@@ -148,6 +148,8 @@ pub struct VertexClient {
     client: Client,
     enable_caching: bool,
     max_tokens: u32,
+    max_tokens_explicit: bool,
+    max_tokens_unsupported: std::sync::atomic::AtomicBool,
     thinking: Option<String>,
     effort: Option<String>,
     context_window_size: usize,
@@ -201,11 +203,18 @@ impl VertexClient {
             client: Client::new(),
             enable_caching,
             max_tokens,
+            max_tokens_explicit: true,
+            max_tokens_unsupported: std::sync::atomic::AtomicBool::new(false),
             thinking,
             effort,
             context_window_size,
             credentials,
         })
+    }
+
+    pub(crate) fn with_max_tokens_explicit(mut self, explicit: bool) -> Self {
+        self.max_tokens_explicit = explicit;
+        self
     }
 
     async fn get_access_token(&self) -> Result<String> {
@@ -253,7 +262,7 @@ impl VertexClient {
             let response: ClaudeResponse = serde_json::from_str(&body_text)
                 .context("Failed to parse Vertex AI Claude response")?;
 
-            info!(
+            debug!(
                 "Vertex AI response received. Tokens: in={}, out={}, cache_read={} cache_write={}",
                 response.usage.input_tokens,
                 response.usage.output_tokens,
@@ -268,16 +277,23 @@ impl VertexClient {
             let error_body = res
                 .text()
                 .await
+                .map(|t| claude::loggable_body(&t))
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
             match status.as_u16() {
                 429 => {
-                    let duration = retry_after_duration.unwrap_or(Duration::from_secs(60));
-                    Err(ClaudeError::RateLimitExceeded(duration))?
+                    let retry_after = retry_after_duration.unwrap_or(Duration::from_secs(60));
+                    Err(ClaudeError::RateLimitExceeded {
+                        retry_after,
+                        detail: error_body,
+                    })?
                 }
                 500..=599 => {
-                    let duration = retry_after_duration.unwrap_or(Duration::from_secs(0));
-                    Err(ClaudeError::OverloadedError(duration))?
+                    let retry_after = retry_after_duration.unwrap_or(Duration::from_secs(0));
+                    Err(ClaudeError::OverloadedError {
+                        retry_after,
+                        detail: error_body,
+                    })?
                 }
                 400 => Err(ClaudeError::InvalidRequest(error_body))?,
                 401 | 403 => Err(ClaudeError::AuthenticationError(error_body))?,
@@ -327,19 +343,38 @@ impl VertexClient {
     }
 
     async fn generate_gemini(&self, request: AiRequest) -> Result<AiResponse> {
+        let max_tokens = gemini::effective_defaulted_max_tokens(
+            self.max_tokens,
+            self.max_tokens_explicit,
+            &self.max_tokens_unsupported,
+        );
         let mut gemini_req = gemini::translate_ai_request_with_options(
             request,
             self.thinking.as_deref(),
-            Some(self.max_tokens),
+            max_tokens,
         )?;
-        let mut acc = self.post_gemini_request(&gemini_req).await?;
+        let mut acc = match self.post_gemini_request(&gemini_req).await {
+            Ok(resp) => resp,
+            Err(err)
+                if gemini::strip_max_output_tokens_on_rejection(
+                    &mut gemini_req,
+                    self.max_tokens_explicit,
+                    &self.max_tokens_unsupported,
+                    &self.model,
+                    &err,
+                ) =>
+            {
+                self.post_gemini_request(&gemini_req).await?
+            }
+            Err(err) => return Err(err),
+        };
         for hop in 1..=gemini::MAX_CONTINUATION_HOPS {
             let Some(token) =
                 gemini::next_continuation_token(&acc, gemini_req.continuation_token.as_deref())
             else {
                 return gemini::translate_ai_response(acc);
             };
-            info!(
+            debug!(
                 "{}Vertex AI Gemini response reached per-hop limit (finishReason=CONTINUATION); requesting continuation hop {}/{}...",
                 crate::ai::get_log_prefix(),
                 hop,
@@ -528,6 +563,7 @@ mod tests {
                 response_format: None,
                 context_tag: None,
                 reasoning_effort: None,
+                conversation_id: None,
             },
             false,
             1024,
@@ -835,6 +871,7 @@ mod tests {
             response_format: None,
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         };
 
         let vertex_req = claude_request_body(&ai_req, false, 4096, None, None).unwrap();
@@ -869,6 +906,7 @@ mod tests {
             response_format: None,
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         };
 
         let vertex_req = claude_request_body(

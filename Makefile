@@ -1,7 +1,7 @@
 # Sashiko Development and CI Tasks
 
 .PHONY: help build fmt lint lint-local lint-local-cache test clean
-.PHONY: check-pr check-all sob check-db-invariants repo
+.PHONY: check-pr check-all sob check-db-invariants repo dist
 
 # Default target
 .DEFAULT_GOAL := help
@@ -12,6 +12,7 @@ help:
 	@echo ""
 	@echo "  Development:"
 	@echo "    build               - Build release binary"
+	@echo "    dist                - Build and package release tarballs"
 	@echo "    fmt                 - Auto-format Rust code"
 	@echo "    lint                - Run all linters (clippy, fmt --check, yamllint)"
 	@echo "    lint-local          - Run clippy on local-review profile (no cache)"
@@ -33,6 +34,10 @@ help:
 # Build release binary
 build:
 	@cargo build --all-features --release
+
+# Build and package release tarballs
+dist:
+	@./scripts/package-release.sh
 
 # Auto-format Rust code
 fmt:
@@ -59,6 +64,7 @@ test:
 # Remove build artifacts
 clean:
 	@cargo clean
+	@rm -rf dist
 
 # ── CI Suites ────────────────────────────────────────────
 

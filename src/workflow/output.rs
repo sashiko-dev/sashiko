@@ -192,12 +192,13 @@ where
 
 /// Parses JSON from text with fallback extraction of embedded JSON objects.
 pub fn parse_json_from_text<T: DeserializeOwned>(raw_text: &str) -> Result<T, String> {
-    let cleaned = crate::utils::clean_json_string(raw_text);
+    let unfenced = strip_leading_json_fence(raw_text);
+    let cleaned = crate::utils::clean_json_string(unfenced);
     let primary_err = match serde_json::from_str::<T>(&cleaned) {
         Ok(val) => return Ok(val),
         Err(e) => e,
     };
-    if let Ok(val) = serde_json::from_str::<T>(raw_text) {
+    if let Ok(val) = serde_json::from_str::<T>(unfenced) {
         return Ok(val);
     }
 
@@ -213,6 +214,24 @@ pub fn parse_json_from_text<T: DeserializeOwned>(raw_text: &str) -> Result<T, St
         "Failed to parse JSON from output ({primary_err}): {}",
         crate::utils::utf8_prefix(raw_text, 200)
     ))
+}
+
+/// Removes a leading ```json (or bare ```) fence and its closing marker.
+/// Models sometimes wrap the whole payload in a code fence despite being
+/// asked for raw JSON, and a fenced non-object payload is invisible to the
+/// balanced-brace fallback below.
+fn strip_leading_json_fence(text: &str) -> &str {
+    let Some(body) = text
+        .trim_start()
+        .strip_prefix("```")
+        .and_then(|rest| rest.split_once('\n').map(|(_, body)| body))
+    else {
+        return text;
+    };
+    match body.trim_end().strip_suffix("```") {
+        Some(inner) => inner.trim_end(),
+        None => text,
+    }
 }
 
 fn find_json_candidates(text: &str) -> Vec<Value> {
@@ -319,5 +338,52 @@ mod tests {
                 count: 7
             }
         );
+    }
+
+    #[test]
+    fn test_parse_json_from_text_strips_json_fence() {
+        let raw = "```json\n{\"name\": \"fenced\", \"count\": 3}\n```\n";
+        let res = parse_json_from_text::<DummyOutput>(raw).unwrap();
+        assert_eq!(res.name, "fenced");
+        assert_eq!(res.count, 3);
+    }
+
+    #[test]
+    fn test_parse_json_from_text_strips_bare_fence() {
+        let raw = "```\n{\"name\": \"bare\", \"count\": 4}\n```";
+        let res = parse_json_from_text::<DummyOutput>(raw).unwrap();
+        assert_eq!(res.name, "bare");
+        assert_eq!(res.count, 4);
+    }
+
+    #[test]
+    fn test_parse_json_from_text_strips_fenced_array() {
+        // A fenced non-object payload is invisible to the balanced-brace
+        // fallback; stripping the fence is the only way in.
+        let raw =
+            "```json\n[{\"name\": \"a\", \"count\": 1}, {\"name\": \"b\", \"count\": 2}]\n```";
+        let res = parse_json_from_text::<Vec<DummyOutput>>(raw).unwrap();
+        assert_eq!(
+            res,
+            vec![
+                DummyOutput {
+                    name: "a".to_string(),
+                    count: 1
+                },
+                DummyOutput {
+                    name: "b".to_string(),
+                    count: 2
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_json_from_text_keeps_unfenced_output_for_fallback() {
+        // An unclosed fence falls through to the brace-scanning fallback.
+        let raw = "```json\n{\"name\": \"unclosed\", \"count\": 5}";
+        let res = parse_json_from_text::<DummyOutput>(raw).unwrap();
+        assert_eq!(res.name, "unclosed");
+        assert_eq!(res.count, 5);
     }
 }

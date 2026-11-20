@@ -22,7 +22,7 @@ use std::process::{Output, Stdio};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, interval, timeout};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const GIT_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -504,7 +504,7 @@ impl FetchAgent {
     }
 
     async fn process_queue(&self, queue: &mut HashMap<Option<String>, HashSet<String>>) {
-        info!("Processing fetch queue with {} repos", queue.len());
+        debug!("Processing fetch queue with {} repos", queue.len());
 
         for (url_opt, commits) in queue.drain() {
             if commits.is_empty() {
@@ -517,7 +517,7 @@ impl FetchAgent {
                 .map(redact_secret)
                 .unwrap_or_else(|| "local".to_string());
 
-            info!(
+            debug!(
                 "Processing {} commits for remote {}",
                 commit_list.len(),
                 url_display
@@ -559,7 +559,7 @@ impl FetchAgent {
             let mut fetch_failed = false;
 
             if missing_commits.is_empty() {
-                info!(
+                debug!(
                     "All commits present locally, skipping fetch for {}",
                     url_display
                 );
@@ -895,7 +895,7 @@ impl FetchAgent {
             let current_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
             if current_url != authenticated_url {
-                info!(
+                debug!(
                     "Updating remote {} from {} to {}",
                     name,
                     redact_secret(&current_url),
@@ -915,7 +915,7 @@ impl FetchAgent {
                 }
             }
         } else {
-            info!(
+            debug!(
                 "Adding remote {} -> {}",
                 name,
                 redact_secret(&authenticated_url)
@@ -1019,41 +1019,16 @@ impl FetchAgent {
     }
 
     async fn is_present(&self, commit_or_range: &str) -> bool {
-        let mut args = vec!["-c", "safe.bareRepository=all"];
-        let arg_str: String;
-
-        if let Some((start, end)) = commit_or_range.split_once("..") {
-            arg_str = format!("{}^{{commit}}..{}^{{commit}}", start, end);
-            args.extend(["rev-list", "-n", "1", &arg_str]);
+        let present = crate::git_ops::git_range_exists(&self.repo_path, commit_or_range).await;
+        if present {
+            debug!("is_present: {} is present", commit_or_range);
         } else {
-            arg_str = format!("{}^{{commit}}", commit_or_range);
-            args.extend(["rev-parse", "--verify", &arg_str]);
-        };
-
-        let output = crate::git_cmd::in_dir_async(&self.repo_path)
-            .args(&args)
-            .output()
-            .await;
-
-        match output {
-            Ok(s) => {
-                let success = s.status.success();
-                if success {
-                    info!("is_present: {} is present", commit_or_range);
-                } else {
-                    info!(
-                        "is_present: {} is missing or not a commit. stderr: {}",
-                        commit_or_range,
-                        String::from_utf8_lossy(&s.stderr)
-                    );
-                }
-                success
-            }
-            Err(e) => {
-                error!("is_present: {} check failed: {}", commit_or_range, e);
-                false
-            }
+            debug!(
+                "is_present: {} is missing or not a commit in local repository",
+                commit_or_range
+            );
         }
+        present
     }
 
     async fn resolve_sha(&self, commit: &str) -> Result<String> {

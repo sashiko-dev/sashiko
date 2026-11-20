@@ -15,15 +15,23 @@
 use crate::project::ProjectId;
 
 pub mod code_notes;
+pub mod design_assessment;
+pub mod e2fsprogs_patch_review;
 pub mod gcc_patch_review;
 pub mod guard;
-#[cfg(feature = "server")]
 pub mod linux_bug;
 pub mod linux_patch_review;
+pub mod linux_scan;
 pub mod notes_agenda;
 pub mod notes_corpus;
+pub mod prior_attribution;
+pub mod prior_feedback;
+pub mod qemu_patch_review;
+pub mod related_preexisting;
 pub mod review_map;
 pub mod sashiko_patch_review;
+pub mod verification_shards;
+pub mod zephyr_patch_review;
 
 /// Returns the short UI label for a review stage belonging to `project`.
 pub fn stage_short_label(project: ProjectId, stage: &str) -> Option<&'static str> {
@@ -31,6 +39,9 @@ pub fn stage_short_label(project: ProjectId, stage: &str) -> Option<&'static str
         ProjectId::Linux => linux_patch_review::stage_short_label(stage),
         ProjectId::Sashiko => sashiko_patch_review::stage_short_label(stage),
         ProjectId::Gcc => gcc_patch_review::stage_short_label(stage),
+        ProjectId::Qemu => qemu_patch_review::stage_short_label(stage),
+        ProjectId::Zephyr => zephyr_patch_review::stage_short_label(stage),
+        ProjectId::E2fsprogs => e2fsprogs_patch_review::stage_short_label(stage),
     }
 }
 
@@ -49,6 +60,17 @@ pub fn default_stage_count(project: ProjectId) -> usize {
         ProjectId::Gcc => {
             gcc_patch_review::ANALYSIS_STAGES.len() + gcc_patch_review::CONSOLIDATION_STAGES.len()
         }
+        ProjectId::Qemu => {
+            qemu_patch_review::ANALYSIS_STAGES.len() + qemu_patch_review::CONSOLIDATION_STAGES.len()
+        }
+        ProjectId::Zephyr => {
+            zephyr_patch_review::ANALYSIS_STAGES.len()
+                + zephyr_patch_review::CONSOLIDATION_STAGES.len()
+        }
+        ProjectId::E2fsprogs => {
+            e2fsprogs_patch_review::ANALYSIS_STAGES.len()
+                + e2fsprogs_patch_review::CONSOLIDATION_STAGES.len()
+        }
     }
 }
 
@@ -66,11 +88,18 @@ pub fn is_counted_stage(project: ProjectId, name: &str) -> bool {
 /// Resolves the ordered list of stages a review will run (analysis fan-out
 /// followed by consolidation stages).
 pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> Vec<String> {
+    let is_combined = |n: &str| {
+        guard::normalize_stage_name(n) == linux_patch_review::COMBINED_ANALYSIS_STAGE_NAME
+    };
     match project {
         ProjectId::Linux => {
             let mut planned: Vec<String> = stage_names
                 .iter()
-                .filter(|n| linux_patch_review::analysis_stage_by_name(n).is_some())
+                .filter(|n| {
+                    linux_patch_review::analysis_stage_by_name(n).is_some()
+                        || is_combined(n)
+                        || prior_feedback::is_prior_feedback_stage_name(n)
+                })
                 .map(|n| n.to_string())
                 .collect();
             if !planned.is_empty() {
@@ -85,7 +114,11 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
         ProjectId::Sashiko => {
             let mut planned: Vec<String> = stage_names
                 .iter()
-                .filter(|n| sashiko_patch_review::analysis_stage_by_name(n).is_some())
+                .filter(|n| {
+                    sashiko_patch_review::analysis_stage_by_name(n).is_some()
+                        || is_combined(n)
+                        || prior_feedback::is_prior_feedback_stage_name(n)
+                })
                 .map(|n| n.to_string())
                 .collect();
             if !planned.is_empty() {
@@ -100,7 +133,11 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
         ProjectId::Gcc => {
             let mut planned: Vec<String> = stage_names
                 .iter()
-                .filter(|n| gcc_patch_review::analysis_stage_by_name(n).is_some())
+                .filter(|n| {
+                    gcc_patch_review::analysis_stage_by_name(n).is_some()
+                        || is_combined(n)
+                        || prior_feedback::is_prior_feedback_stage_name(n)
+                })
                 .map(|n| n.to_string())
                 .collect();
             if !planned.is_empty() {
@@ -112,22 +149,101 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
             }
             planned
         }
+        ProjectId::Qemu => {
+            let mut planned: Vec<String> = stage_names
+                .iter()
+                .filter(|n| {
+                    qemu_patch_review::analysis_stage_by_name(n).is_some() || is_combined(n)
+                })
+                .map(|n| n.to_string())
+                .collect();
+            if !planned.is_empty() {
+                planned.extend(
+                    qemu_patch_review::CONSOLIDATION_STAGES
+                        .iter()
+                        .map(|s| s.name.to_string()),
+                );
+            }
+            planned
+        }
+        ProjectId::Zephyr => {
+            let mut planned: Vec<String> = stage_names
+                .iter()
+                .filter(|n| {
+                    zephyr_patch_review::analysis_stage_by_name(n).is_some() || is_combined(n)
+                })
+                .map(|n| n.to_string())
+                .collect();
+            if !planned.is_empty() {
+                planned.extend(
+                    zephyr_patch_review::CONSOLIDATION_STAGES
+                        .iter()
+                        .map(|s| s.name.to_string()),
+                );
+            }
+            planned
+        }
+        ProjectId::E2fsprogs => {
+            let mut planned: Vec<String> = stage_names
+                .iter()
+                .filter(|n| {
+                    e2fsprogs_patch_review::analysis_stage_by_name(n).is_some()
+                        || is_combined(n)
+                        || prior_feedback::is_prior_feedback_stage_name(n)
+                })
+                .map(|n| n.to_string())
+                .collect();
+            if !planned.is_empty() {
+                planned.extend(
+                    e2fsprogs_patch_review::CONSOLIDATION_STAGES
+                        .iter()
+                        .map(|s| s.name.to_string()),
+                );
+            }
+            planned
+        }
     }
 }
 
-/// Replaces the `"post-verification"` placeholder in `planned_stages` with the
-/// concrete `post-verification-*` stages resolved after `verification` (which
-/// may be empty when no hard cases exist, or up to 10 stages when hard cases
-/// fan out in parallel).
+/// Replaces a dynamic consolidation placeholder (`"verification"` or
+/// `"post-verification"`) in `planned_stages` with the concrete stages
+/// resolved at runtime (for example `"verification-1..M"` when verification
+/// shards >10 candidate clusters, or 0..=10 `"post-verification-*"` stages).
 pub fn refine_planned_stages_with_post_verification(
     planned_stages: &[String],
-    post_verification_stages: &[&'static str],
+    resolved_stages: &[&'static str],
 ) -> Vec<String> {
+    if resolved_stages.first().is_some_and(|name| {
+        prior_attribution::is_prior_attribution_stage_name(name)
+            || related_preexisting::is_related_preexisting_stage_name(name)
+    }) {
+        // `prior-attribution` and the related pre-existing stages have no
+        // placeholder: they run only when their inputs exist, so they are
+        // inserted ahead of the report stages once resolved.
+        let insert_at = planned_stages
+            .iter()
+            .position(|s| s == "report" || s == "summary")
+            .unwrap_or(planned_stages.len());
+        let mut updated = planned_stages.to_vec();
+        updated.splice(
+            insert_at..insert_at,
+            resolved_stages.iter().map(|s| (*s).to_string()),
+        );
+        return updated;
+    }
+    let target_placeholder = if resolved_stages
+        .first()
+        .is_some_and(|name| name.starts_with(linux_patch_review::VERIFICATION.name))
+    {
+        linux_patch_review::VERIFICATION.name
+    } else {
+        linux_patch_review::POST_VERIFICATION.name
+    };
     let mut updated =
-        Vec::with_capacity(planned_stages.len().saturating_sub(1) + post_verification_stages.len());
+        Vec::with_capacity(planned_stages.len().saturating_sub(1) + resolved_stages.len());
     for stage in planned_stages {
-        if stage == linux_patch_review::POST_VERIFICATION.name {
-            updated.extend(post_verification_stages.iter().map(|s| (*s).to_string()));
+        if stage == target_placeholder {
+            updated.extend(resolved_stages.iter().map(|s| (*s).to_string()));
         } else {
             updated.push(stage.clone());
         }

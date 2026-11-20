@@ -89,7 +89,10 @@ kubectl apply -k routing/       # back to the application
 - Worktrees: an `emptyDir` on the node, rebuilt from the clone on demand.
 - Backups: nightly at 05:00 America/Los_Angeles into
   `gs://sashiko-data-backup-163135/sashiko-gcc`, staggered an hour after
-  `sashiko-self` and two hours after `sashiko.dev`.
+  `sashiko-self` and three hours after `sashiko.dev` (`02:00`). The
+  `sashiko-gcc-nightly-backup` CronJob authenticates via the shared
+  `sashiko-self-ksa` Workload Identity binding documented in
+  `../sashiko.sashiko.dev/README.md`.
 
 To inspect or restore the database, use the shared `data-manager` pod in
 `sashiko-self`:

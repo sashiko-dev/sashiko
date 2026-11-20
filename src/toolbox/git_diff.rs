@@ -99,24 +99,18 @@ impl LlmTool<SashikoToolContext> for GitDiffTool {
         }
 
         let content = String::from_utf8_lossy(&output.stdout).to_string();
-        let total_diff_lines = content.lines().count();
-        let res = Truncator::truncate_diff(&content, 10_000, "Diff");
-        let truncated_diff = res.content;
-        let is_truncated = res.truncated;
-        let returned_diff_lines = truncated_diff.lines().count();
+        if content.trim().is_empty() {
+            return Ok(Value::String("No differences found.".to_string()));
+        }
 
-        Ok(json!({
-            "content": truncated_diff,
-            "truncated": is_truncated,
-            "metadata": {
-                "total_items": total_diff_lines,
-                "returned_items": returned_diff_lines
-            },
-            "next_page_hint": if is_truncated {
-                Some("This diff is too large and was truncated by dropping the middle. To see complete changes, filter by specific 'paths' (e.g., folders/files).".to_string())
-            } else {
-                None
-            }
-        }))
+        let res = Truncator::truncate_diff(&content, 10_000, "Diff");
+        let mut out = res.content;
+        if res.truncated {
+            out.push_str(
+                "\n[Truncated: diff exceeded token budget and middle lines were dropped. Filter by specific paths to view complete changes.]",
+            );
+        }
+
+        Ok(Value::String(out))
     }
 }

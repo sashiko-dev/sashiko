@@ -24,6 +24,10 @@ reply_to = ["author"]
 # - "all": send positive review to normal reply_to + cc recipients
 positive_review = "none"
 
+# Opt-in notification when a patchset fails to apply or fails review
+# after all retries ("none", "author", or "all").
+failed_review = "none"
+
 # If true, completely mutes email notifications for this scope.
 mute_all = true
 
@@ -35,6 +39,12 @@ cc = []
 # every list, not only to that section.
 ignored_emails = []
 
+# Mention 1-2 closely related, non-security-sensitive pre-existing bugs on
+# the first non-RFC posting of a series (each bug at most once). Accepts
+# true, false ("none"), or a severity floor ("low".."critical"; true uses
+# "high").
+report_preexisting_bugs = true
+
 # --- Author-only delivery (inherits defaults when mute_all = false) ---
 # ["intel-xe@lists.freedesktop.org"]
 # mute_all = false
@@ -45,6 +55,20 @@ ignored_emails = []
 # embargo_hours = 0
 # subject_prefixes = ["bpf", "bpf-next"]
 # reply_to = ["author", "list", "recipients"]
+#
+# [["bpf@vger.kernel.org".baselines]]
+# url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git"
+# subject_prefixes = ["bpf-next"]
+#
+# [["bpf@vger.kernel.org".baselines]]
+# url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf.git"
+# subject_prefixes = ["bpf"]
+
+# --- Opt out of related pre-existing bug mentions ---
+# ["linux-mm@kvack.org"]
+# mute_all = false
+# reply_to = ["author", "list", "recipients"]
+# report_preexisting_bugs = false
 
 # --- Custom NNTP group override ---
 # Needed only when the group is not the reversed domain followed by the
@@ -73,3 +97,13 @@ ignored_emails = []
 #
 # The same keys in a [defaults.patchwork] table apply to patches that
 # match no list section above.
+
+# --- Shared mailing-list ingestion filter ---
+# Useful when a single list carries patches for several repositories
+# (for example linux-ext4@vger.kernel.org carrying kernel ext4, xfstests,
+# and e2fsprogs patches).
+# ["linux-ext4@vger.kernel.org".ingest_filter]
+# allowed_subject_prefixes = ["e2fsprogs"]
+# ignored_subject_prefixes = ["fstests", "xfstests"]
+# allowed_paths = ["e2fsck/", "lib/ext2fs/", "misc/"]
+# ignored_paths = ["fs/", "tests/ext4/"]

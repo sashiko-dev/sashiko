@@ -75,7 +75,7 @@ async fn review_requests_use_target_prefetch_or_explicit_failure() {
             sha.clone()
         };
         let provider = Arc::new(RecordingProvider::default());
-        let mut tools = ToolBox::new(repo.to_path_buf(), None);
+        let mut tools = ToolBox::new(repo.to_path_buf());
         tools.set_virtual_head(target.clone());
         let mut worker = Worker::new(
             provider.clone(),
@@ -90,8 +90,10 @@ async fn review_requests_use_target_prefetch_or_explicit_failure() {
                 baseline_sha: None,
                 custom_prompt: None,
                 stages: Some(vec!["goal".to_string()]),
+                cheap: false,
                 skip_report: false,
                 report_preexisting: false,
+                related_preexisting: Default::default(),
                 effort: None,
                 use_code_notes: false,
                 code_notes_scope: Default::default(),

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use config::{Config, ConfigError, Environment, File};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub use crate::ai::{EffortMode, model_supports_effort};
@@ -129,6 +129,12 @@ pub struct ForgeSettings {
     /// ingestion active).
     #[serde(default = "default_forge_poll_interval_secs")]
     pub poll_interval_secs: u64,
+    /// Forge login Sashiko posts reviews as. Fetched PR comments carrying
+    /// the Sashiko review header are dropped as Sashiko's own output only
+    /// when posted by this login; when unset, only by a GitHub App account
+    /// (a login ending in `[bot]`).
+    #[serde(default)]
+    pub bot_login: Option<String>,
 }
 
 fn default_forge_poll_interval_secs() -> u64 {
@@ -175,10 +181,18 @@ pub struct NntpSettings {
     /// operator turning this on also moves `port` to 563.
     #[serde(default)]
     pub tls: bool,
+    /// Maximum number of concurrent NNTP worker connections polling tracked
+    /// mailing lists in parallel.
+    #[serde(default = "default_nntp_concurrency")]
+    pub concurrency: usize,
 }
 
 fn default_nntp_port() -> u16 {
     119
+}
+
+fn default_nntp_concurrency() -> usize {
+    4
 }
 
 impl Default for NntpSettings {
@@ -187,6 +201,7 @@ impl Default for NntpSettings {
             server: String::new(),
             port: default_nntp_port(),
             tls: false,
+            concurrency: default_nntp_concurrency(),
         }
     }
 }
@@ -337,6 +352,8 @@ pub struct ClaudeSettings {
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
+    pub client_cert: Option<PathBuf>,
+    #[serde(default)]
     pub thinking: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
@@ -352,12 +369,15 @@ pub(crate) fn default_claude_max_tokens() -> u32 {
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct GeminiSettings {
+    /// Deprecated no-op retained so existing `~/.config/sashiko.toml` and
+    /// `Settings.toml` files written before v0.8.0 continue to load on upgrade.
+    #[doc(hidden)]
     #[serde(default)]
-    pub explicit_prompt_caching: bool,
+    pub explicit_prompt_caching: Option<bool>,
     /// Max output tokens per `generateContent` request, thinking included.
     /// Sent as `generationConfig.maxOutputTokens`. When unset, defaults to
-    /// `131_072` on models with Long Decodes v2 (`CONTINUATION` support, such
-    /// as Argon) and is omitted (`0`) on other Gemini models so the backend
+    /// `131_072` on Gemini 4+ models with Long Decodes v2 (`CONTINUATION`
+    /// support) and is omitted (`0`) on pre-Gemini-4 models so the backend
     /// uses the model's native output ceiling.
     #[serde(default)]
     pub max_tokens: Option<u32>,
@@ -376,7 +396,7 @@ pub struct GeminiSettings {
     pub auth_token_command: Option<String>,
     /// Optional default thinking level sent as `thinkingConfig.thinkingLevel`
     /// (`"LOW"`, `"MEDIUM"`, `"HIGH"`) when a stage does not specify a
-    /// per-request reasoning effort. Every stage specifies one on Argon
+    /// per-request reasoning effort. Every stage specifies one on Gemini 4+
     /// models, where only `"LOW"` matters: it selects `EffortMode::Low` when
     /// `[review] effort` is unset.
     #[serde(default)]
@@ -384,7 +404,7 @@ pub struct GeminiSettings {
 }
 
 /// Default `max_tokens` for Long Decodes v2 models (`CONTINUATION` support,
-/// such as Argon), where thinking counts toward the budget and unary hops
+/// such as Gemini 4+), where thinking counts toward the budget and unary hops
 /// continue up to this cap.
 pub(crate) fn default_gemini_max_tokens() -> u32 {
     131_072
@@ -393,13 +413,25 @@ pub(crate) fn default_gemini_max_tokens() -> u32 {
 /// Resolves the default `max_tokens` for a Gemini `model` when neither
 /// `[ai.vertex]` nor `[ai.gemini]` sets `max_tokens`.
 ///
-/// Models with Long Decodes v2 continuation (matched via
-/// [`model_supports_effort`]) default to `131_072` so multi-hop continuation
-/// is enabled. All other Gemini models default to `0` (omitting
-/// `generationConfig.maxOutputTokens` so the backend uses the model's native
-/// output ceiling instead of rejecting a 128k value with 400 INVALID_ARGUMENT).
+/// Gemini 4+ models (matched via [`model_supports_effort`]) default to
+/// `131_072` so multi-hop continuation is enabled. Pre-Gemini-4 and non-Gemini
+/// model identifiers default to `0` (omitting `generationConfig.maxOutputTokens`
+/// so the backend uses the model's native output ceiling instead of rejecting
+/// a 128k value with 400 INVALID_ARGUMENT).
+#[cfg(any(feature = "vertex", test))]
 pub(crate) fn default_gemini_max_tokens_for_model(model: &str) -> u32 {
     if model_supports_effort(model) {
+        default_gemini_max_tokens()
+    } else {
+        0
+    }
+}
+
+/// Resolves the default `max_tokens` when `provider = "gemini"` is already
+/// selected and `[ai.gemini] max_tokens` is unset, enabling `131_072` for any
+/// non-legacy model identifier (including bare internal aliases).
+pub(crate) fn default_gemini_provider_max_tokens(model: &str) -> u32 {
+    if !model.trim().is_empty() && !crate::ai::is_legacy_gemini_model(model) {
         default_gemini_max_tokens()
     } else {
         0
@@ -429,6 +461,28 @@ pub struct BedrockSettings {
     /// Leave unset to use the model default.
     #[serde(default)]
     pub effort: Option<String>,
+    /// API for OpenAI foundation model IDs ("openai.*"): the bedrock-mantle
+    /// Responses API (default) or the Converse API. Inference profile IDs
+    /// always use Converse, since Mantle does not accept them.
+    #[serde(default)]
+    pub openai_api: BedrockOpenAiApi,
+    /// Override the bedrock-mantle API root, e.g. for models served under
+    /// /openai/v1. Defaults to https://bedrock-mantle.<region>.api.aws/v1.
+    #[serde(default)]
+    pub mantle_base_url: Option<String>,
+    /// bedrock-mantle prompt cache TTL sent as prompt_cache_options.ttl, e.g.
+    /// "30m". Leave unset for the service default.
+    #[serde(default)]
+    pub prompt_cache_ttl: Option<String>,
+}
+
+#[cfg(feature = "bedrock")]
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BedrockOpenAiApi {
+    #[default]
+    Mantle,
+    Converse,
 }
 
 #[cfg(feature = "bedrock")]
@@ -484,14 +538,15 @@ pub struct OpenAiCompatSettings {
     pub context_window_size: Option<usize>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
-    /// Reasoning effort, sent as the `reasoning_effort` request field. The
-    /// valid set belongs to the model rather than to the API: "none" is
-    /// legal, and is what a gpt-5.6 chat completion carrying function tools
-    /// requires, while gpt-5.4-pro takes only "medium" and "high". A level
-    /// the model rejects comes back as a 400, which classifies fatal and
-    /// ends the review. Leave unset for the model default; the field is
-    /// then omitted entirely, which is what a compatible endpoint that does
-    /// not implement it needs.
+    /// Reasoning effort, sent as `reasoning_effort` on /v1/chat/completions
+    /// and as `reasoning.effort` on /v1/responses. The valid set belongs to
+    /// the model rather than to the API: "none" is legal, and is what a
+    /// gpt-5.6 chat completion carrying function tools requires, while
+    /// gpt-5.4-pro takes only "medium" and "high". A level the model rejects
+    /// comes back as a 400, which classifies fatal and ends the review.
+    /// Leave unset for the model default; the field is then omitted
+    /// entirely, which is what a compatible endpoint that does not implement
+    /// it needs.
     #[serde(default)]
     pub effort: Option<String>,
     /// Send a reasoning model's chain of thought back as `reasoning_content`
@@ -501,6 +556,73 @@ pub struct OpenAiCompatSettings {
     /// off by default.
     #[serde(default)]
     pub send_reasoning_content: bool,
+    /// HTTP headers added to every request, for gateways that
+    /// authenticate clients with a key header next to the bearer token.
+    /// Maps each header name to the environment variable holding its
+    /// value, so client credentials never sit in the settings file. A
+    /// header named here replaces the one Sashiko would send.
+    #[serde(default)]
+    pub extra_headers: std::collections::BTreeMap<String, String>,
+    /// Optional header carrying a random ID for each stage conversation.
+    /// Providers can use the ID to send all turns to the same replica
+    /// and reuse its prompt cache. No header is sent when unset.
+    #[serde(default)]
+    pub session_affinity_header: Option<String>,
+    /// Top-level JSON fields added to every request body, for gateways
+    /// that expect client metadata in the payload. Fields Sashiko sets
+    /// itself are rejected rather than overridden.
+    #[serde(default)]
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
+    /// Send an empty content string on assistant messages that carry
+    /// only tool calls instead of omitting the field. Some strict
+    /// endpoints reject such messages, and some chat templates render
+    /// the missing field as a literal None.
+    #[serde(default)]
+    pub send_empty_tool_call_content: bool,
+    /// Which OpenAI endpoint to speak: "chat" for /v1/chat/completions,
+    /// the default and the only one a third-party compatible endpoint
+    /// serves, or "responses" for OpenAI's /v1/responses.
+    #[serde(default)]
+    pub api: Option<String>,
+    /// Processing tier, sent as `service_tier` on both OpenAI endpoints.
+    /// Omitted when unset, which leaves the request on the account's
+    /// default tier. Only OpenAI's own API accepts the field, so setting
+    /// it with `provider = "openai-compatible"` is a configuration error.
+    #[serde(default)]
+    pub service_tier: Option<ServiceTier>,
+}
+
+/// OpenAI processing tier. The set is fixed by the API rather than by the
+/// model, so a misspelling fails at config load instead of as a 400 on the
+/// first request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceTier {
+    /// The project's configured default, which is `Default` unless the
+    /// project was set up for scale tier.
+    Auto,
+    /// Standard pricing and latency.
+    Default,
+    /// Half the standard per-token price in exchange for higher latency
+    /// and more 429s, which the usual retry absorbs.
+    Flex,
+    /// Lower latency at a higher per-token price.
+    Priority,
+    /// Reserved capacity bought in advance.
+    Scale,
+}
+
+impl ServiceTier {
+    /// The wire spelling, which is also what the response echoes back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Default => "default",
+            Self::Flex => "flex",
+            Self::Priority => "priority",
+            Self::Scale => "scale",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -967,6 +1089,48 @@ pub struct CustomRemoteSettings {
     pub url: String,
     pub check_all_branches: bool,
     pub only_branches: Option<Vec<String>>,
+    #[serde(default)]
+    pub branch_patterns: Option<Vec<String>>,
+}
+
+impl CustomRemoteSettings {
+    /// Returns the refspecs to configure and fetch for this custom remote,
+    /// or Some(vec![]) if all branches should be fetched without restriction
+    /// (restoring default wildcard refspecs).
+    pub fn refspecs(&self) -> Option<Vec<String>> {
+        let has_patterns = self
+            .branch_patterns
+            .as_deref()
+            .is_some_and(|p| !p.is_empty());
+
+        if has_patterns {
+            let mut specs = Vec::new();
+            if let Some(patterns) = &self.branch_patterns {
+                for p in patterns {
+                    if crate::git_ops::is_valid_refspec_pattern(p) {
+                        specs.push(format!(
+                            "+refs/heads/{}:refs/remotes/{}/{}",
+                            p, self.name, p
+                        ));
+                    }
+                }
+            }
+            if let Some(only) = &self.only_branches {
+                for b in only {
+                    let b = b.trim();
+                    if !b.is_empty() {
+                        let spec = format!("+refs/heads/{}:refs/remotes/{}/{}", b, self.name, b);
+                        if !specs.contains(&spec) {
+                            specs.push(spec);
+                        }
+                    }
+                }
+            }
+            Some(specs)
+        } else {
+            Some(Vec::new())
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -990,11 +1154,40 @@ impl Default for GitSettings {
     }
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BatchTier {
+    pub min_size: usize,
+    pub priority: i64,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PriorityRule {
+    pub regex: String,
+    pub priority: i64,
+}
+
+fn default_priority() -> i64 {
+    500
+}
+
+fn default_batch_window_secs() -> u64 {
+    30
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ReviewSettings {
     pub concurrency: usize,
+    /// Whether completed patchsets are queued for review automatically.
+    #[serde(default = "default_true")]
+    pub auto_review: bool,
+    /// Deprecated no-op retained so existing `Settings.toml` files continue to load on upgrade.
+    #[doc(hidden)]
+    #[serde(default)]
+    pub series_review_enabled: Option<bool>,
     /// Parent directory for the worktrees a review worker checks patches out
     /// into, or None for one under the system temporary directory.
     ///
@@ -1029,32 +1222,94 @@ pub struct ReviewSettings {
     /// How much of each selected unit note a review gets.
     #[serde(default)]
     pub code_notes_scope: CodeNotesScope,
+    /// Deprecated no-op retained so existing `Settings.toml` files continue to load on upgrade.
+    #[doc(hidden)]
+    #[serde(default)]
+    pub code_notes_bytes: Option<usize>,
     /// Maximum cumulative output tokens (including thinking tokens) across all turns in a
     /// single review. Set to 0 to disable.
     #[serde(default = "default_max_total_output_tokens")]
     pub max_total_output_tokens: usize,
     /// Reasoning effort mode (`"low"`, `"mid"` or its alias `"medium"`,
-    /// `"high"`, or `"dynamic"`) for models that support configurable effort
-    /// levels (currently Argon 4). Defaults to `"mid"` when the model
-    /// supports effort levels and is ignored otherwise.
+    /// `"high"`, or `"dynamic"`) for Gemini models. Defaults to `"mid"` on
+    /// Gemini 4+ models when unset, and is always honored on Gemini when
+    /// explicitly set.
     #[serde(default)]
     pub effort: Option<EffortMode>,
+    /// Default queue dispatch priority for patchsets without matching priority rules.
+    #[serde(default = "default_priority")]
+    pub default_priority: i64,
+    /// Sliding window duration in seconds for author batch submission deprioritization.
+    #[serde(default = "default_batch_window_secs")]
+    pub batch_window_secs: u64,
+    /// Sliding-window batch thresholds that demote queue priority for bulk submissions.
+    #[serde(default)]
+    pub batch_tiers: Vec<BatchTier>,
+    /// Regex rules matching subject prefixes to assign elevated queue priority tiers.
+    #[serde(default)]
+    pub priority_rules: Vec<PriorityRule>,
+    /// Combine exploratory analysis stages into a single stage to reduce cost and latency.
+    #[serde(default)]
+    pub cheap: bool,
+    /// Run an experimental series-level design assessment alongside bug review
+    /// in local `sashiko review` runs. Ignored by the daemon.
+    #[serde(default)]
+    pub design: bool,
+    /// Skip the model run for a patch whose diff matches, modulo rebase
+    /// noise, a patch already reviewed to completion with no findings.
+    /// The patch gets a Skipped review that names the review it inherits
+    /// from. A review narrowed by `cheap` or `--stages` is reused only by
+    /// a review narrowed the same way. Off by default; see
+    /// designs/DESIGN_SKIP_UNCHANGED_CLEAN_PATCHES.md.
+    #[serde(default)]
+    pub skip_unchanged_clean: bool,
+    /// Only a clean review completed within this many days is reused.
+    /// With the baseline check off this is the only bound on how stale an
+    /// inherited verdict can be.
+    #[serde(default = "default_skip_unchanged_clean_max_age_days")]
+    pub skip_unchanged_clean_max_age_days: u64,
+    /// Reuse a clean review produced by a different model or prompt set.
+    /// Off by default, because a prompt or model change is exactly when a
+    /// re-review of an old clean patch is worth paying for.
+    #[serde(default)]
+    pub skip_unchanged_clean_any_model: bool,
+    /// Reuse a clean review only when it ran against the same baseline
+    /// commit and the patches ahead of it in the series are unchanged
+    /// too. Off by default: a reposted series nearly always lands on a
+    /// newer tip, so requiring the same tree would skip almost nothing.
+    #[serde(default)]
+    pub skip_unchanged_clean_require_same_baseline: bool,
     #[serde(skip)]
     pub stages: Option<Vec<String>>,
+    /// Set when `apply_overrides` switches `ai.provider` to `stdio-gemini` or
+    /// `stdio-claude`, making the `--effort` CLI flag passed by the parent
+    /// daemon/benchmark process authoritative inside the worker subprocess.
+    #[serde(skip)]
+    pub stdio_worker_authoritative: bool,
 }
 
 impl ReviewSettings {
     /// Resolves the effective reasoning effort mode for `model`.
     ///
-    /// Returns `None` when `model` does not support configurable effort levels
-    /// (currently only Argon 4 supports it). When `model` supports effort
-    /// levels, returns the configured `effort` or defaults to
-    /// [`EffortMode::Mid`].
+    /// When `self.effort` is explicitly set, honors it for any Gemini model
+    /// (`gemini-*`). When unset, defaults to [`EffortMode::Mid`] for Gemini 4+
+    /// models (matched via [`model_supports_effort`]) and returns `None`
+    /// otherwise.
     pub fn effective_effort(&self, model: &str) -> Option<EffortMode> {
-        if !model_supports_effort(model) {
-            return None;
+        if let Some(effort) = self.effort {
+            return crate::ai::is_gemini_model_name(model).then_some(effort);
         }
-        Some(self.effort.unwrap_or(EffortMode::Mid))
+        model_supports_effort(model).then_some(EffortMode::Mid)
+    }
+
+    /// Computes the initial priority for a patchset based on subject regex rules.
+    pub fn calculate_priority(&self, subject: &str) -> i64 {
+        for rule in &self.priority_rules {
+            if regex::Regex::new(&rule.regex).is_ok_and(|re| re.is_match(subject)) {
+                return rule.priority;
+            }
+        }
+        self.default_priority
     }
 }
 
@@ -1094,6 +1349,10 @@ fn default_max_retries() -> u32 {
     3
 }
 
+fn default_skip_unchanged_clean_max_age_days() -> u64 {
+    90
+}
+
 fn default_email_policy_path() -> String {
     ProjectId::Linux.mailing_lists_path().to_string()
 }
@@ -1129,6 +1388,19 @@ pub struct LinuxBugSettings {
     /// Maximum number of open bugs to evaluate per upstream fix check cycle.
     #[serde(default = "default_fix_check_batch_size")]
     pub fix_check_batch_size: usize,
+    /// Whether canonical bugs are automatically evaluated for security
+    /// importance (CVSS v4.0 + threat model) on discovery and via periodic
+    /// background backfill sweeps.
+    #[serde(default = "default_security_eval_enabled")]
+    pub security_eval_enabled: bool,
+    /// Interval in seconds between periodic background security evaluation
+    /// sweeps for existing unevaluated or queued bugs. Set to 0 to disable
+    /// periodic sweeps while keeping new-bug evaluation active.
+    #[serde(default = "default_security_eval_interval_seconds")]
+    pub security_eval_interval_seconds: u64,
+    /// Maximum number of bugs evaluated per periodic security evaluation cycle.
+    #[serde(default = "default_security_eval_batch_size")]
+    pub security_eval_batch_size: usize,
 }
 
 fn default_bug_concurrency() -> usize {
@@ -1151,6 +1423,18 @@ fn default_fix_check_batch_size() -> usize {
     50
 }
 
+fn default_security_eval_enabled() -> bool {
+    true
+}
+
+fn default_security_eval_interval_seconds() -> u64 {
+    60
+}
+
+fn default_security_eval_batch_size() -> usize {
+    25
+}
+
 impl Default for LinuxBugSettings {
     fn default() -> Self {
         Self {
@@ -1161,6 +1445,9 @@ impl Default for LinuxBugSettings {
             max_attempts: default_bug_max_attempts(),
             fix_check_interval_seconds: default_fix_check_interval_seconds(),
             fix_check_batch_size: default_fix_check_batch_size(),
+            security_eval_enabled: default_security_eval_enabled(),
+            security_eval_interval_seconds: default_security_eval_interval_seconds(),
+            security_eval_batch_size: default_security_eval_batch_size(),
         }
     }
 }
@@ -1212,6 +1499,8 @@ pub struct Overrides {
     pub worktree_dir: Option<String>,
     pub no_ai: bool,
     pub resume: bool,
+    pub cheap: bool,
+    pub design: bool,
     pub ai_provider: Option<String>,
     pub ai_model: Option<String>,
     pub effort: Option<EffortMode>,
@@ -1241,13 +1530,23 @@ impl Settings {
             self.ai.no_ai = true;
         }
         self.ai.resume |= overrides.resume;
+        self.review.cheap |= overrides.cheap;
+        self.review.design |= overrides.design;
+        let is_stdio_worker = overrides.ai_provider.as_deref().is_some_and(|p| {
+            p.eq_ignore_ascii_case("stdio-gemini") || p.eq_ignore_ascii_case("stdio-claude")
+        });
         if let Some(provider) = overrides.ai_provider {
             self.ai.provider = provider;
         }
         if let Some(model) = overrides.ai_model {
             self.ai.model = model;
         }
-        if let Some(effort) = overrides.effort {
+        if is_stdio_worker {
+            // The parent process already resolved `settings.effective_effort()`
+            // against the real provider and passed `--effort` iff active.
+            self.review.stdio_worker_authoritative = true;
+            self.review.effort = overrides.effort;
+        } else if let Some(effort) = overrides.effort {
             self.review.effort = Some(effort);
         }
         if overrides.read_only {
@@ -1267,17 +1566,22 @@ impl Settings {
 
     /// Resolves the effective reasoning effort mode for this configuration.
     ///
-    /// Returns `None` when `self.ai.model` does not support configurable
-    /// effort levels (currently only Argon 4 supports it). When the model
-    /// supports effort levels, resolves `[review] effort`, falls back to
+    /// When `[review] effort` (or `--effort`) is explicitly configured, honors
+    /// it for any Gemini provider/model. When unset, returns `None` unless the
+    /// configured provider and model default to per-stage effort (Gemini 4+ and
+    /// non-legacy aliases on `provider = "gemini"`), falling back to
     /// [`EffortMode::Low`] if the provider's global thinking level is set to
-    /// `"low"`, and otherwise defaults to [`EffortMode::Mid`].
+    /// `"low"` and otherwise defaulting to [`EffortMode::Mid`].
     pub fn effective_effort(&self) -> Option<EffortMode> {
-        if !model_supports_effort(&self.ai.model) {
-            return None;
+        if self.review.stdio_worker_authoritative {
+            return self.review.effort;
         }
         if let Some(effort) = self.review.effort {
-            return Some(effort);
+            return crate::ai::provider_accepts_per_stage_effort(&self.ai.provider, &self.ai.model)
+                .then_some(effort);
+        }
+        if !crate::ai::provider_defaults_to_effort(&self.ai.provider, &self.ai.model) {
+            return None;
         }
         if self.has_global_low_thinking_level() {
             return Some(EffortMode::Low);
@@ -1308,6 +1612,33 @@ impl Settings {
         let level = gemini_level;
 
         level.is_some_and(|s| s.eq_ignore_ascii_case("low"))
+    }
+
+    /// Returns human-readable deprecation notices for obsolete configuration
+    /// keys that were accepted for backwards compatibility during load.
+    pub fn deprecated_setting_warnings(&self) -> Vec<&'static str> {
+        let mut warnings = Vec::new();
+        if self
+            .ai
+            .gemini
+            .as_ref()
+            .is_some_and(|g| g.explicit_prompt_caching.is_some())
+        {
+            warnings.push(
+                "Deprecated setting '[ai.gemini] explicit_prompt_caching' has no effect and can be removed",
+            );
+        }
+        if self.review.series_review_enabled.is_some() {
+            warnings.push(
+                "Deprecated setting '[review] series_review_enabled' has no effect and can be removed",
+            );
+        }
+        if self.review.code_notes_bytes.is_some() {
+            warnings.push(
+                "Deprecated setting '[review] code_notes_bytes' has no effect and can be removed",
+            );
+        }
+        warnings
     }
 
     /// Refuses a configuration that names no database, no repository, or no
@@ -1345,6 +1676,9 @@ impl Settings {
                     .to_string(),
             );
         }
+        if self.nntp.concurrency == 0 {
+            return Err("[nntp] concurrency must be at least 1".to_string());
+        }
         #[cfg(feature = "server")]
         if let Err(e) = crate::email_policy::EmailPolicyConfig::load(&self.review.email_policy_path)
         {
@@ -1352,6 +1686,42 @@ impl Settings {
                 "[review] email_policy_path ({}) is invalid: {}",
                 self.review.email_policy_path, e
             ));
+        }
+        for rule in &self.review.priority_rules {
+            if let Err(e) = regex::Regex::new(&rule.regex) {
+                return Err(format!(
+                    "[review.priority_rules] invalid regex {:?}: {}",
+                    rule.regex, e
+                ));
+            }
+        }
+        if let Some(custom_remotes) = &self.git.custom_remotes {
+            for remote in custom_remotes {
+                if let Some(patterns) = &remote.branch_patterns {
+                    for pattern in patterns {
+                        if !crate::git_ops::is_valid_refspec_pattern(pattern) {
+                            return Err(format!(
+                                "[git.custom_remotes] invalid branch_pattern '{}' for remote '{}': \
+                                 refspec patterns must contain exactly one '*' wildcard and must not \
+                                 contain '?', spaces, or invalid ref characters",
+                                pattern, remote.name
+                            ));
+                        }
+                    }
+                }
+                if let Some(branches) = &remote.only_branches {
+                    for branch in branches {
+                        if !crate::git_ops::is_valid_branch_name(branch) {
+                            return Err(format!(
+                                "[git.custom_remotes] invalid only_branches entry '{}' for remote '{}': \
+                                 branch names must not be empty or contain spaces, wildcards ('*', '?'), \
+                                 or invalid ref characters",
+                                branch, remote.name
+                            ));
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1403,6 +1773,7 @@ fn default_forge() -> ForgeSettings {
         app_private_key_path: None,
         repos: Vec::new(),
         poll_interval_secs: default_forge_poll_interval_secs(),
+        bot_login: None,
     }
 }
 
@@ -1627,6 +1998,39 @@ mod tests {
         assert!(settings.validate_for_daemon().is_err());
     }
 
+    /// The clean-review reuse knobs are off unless asked for, with the age
+    /// bound the only one that carries a non-zero default.
+    #[test]
+    fn test_skip_unchanged_clean_defaults_off_and_parses() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Settings.toml");
+        let ai = "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n";
+
+        std::fs::write(&path, format!("{}\n[review]\nconcurrency = 8\n", ai)).unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        assert!(!settings.review.skip_unchanged_clean);
+        assert_eq!(settings.review.skip_unchanged_clean_max_age_days, 90);
+        assert!(!settings.review.skip_unchanged_clean_any_model);
+        assert!(!settings.review.skip_unchanged_clean_require_same_baseline);
+
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n[review]\nconcurrency = 8\nskip_unchanged_clean = true\n\
+                 skip_unchanged_clean_max_age_days = 7\n\
+                 skip_unchanged_clean_any_model = true\n\
+                 skip_unchanged_clean_require_same_baseline = true\n",
+                ai
+            ),
+        )
+        .unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        assert!(settings.review.skip_unchanged_clean);
+        assert_eq!(settings.review.skip_unchanged_clean_max_age_days, 7);
+        assert!(settings.review.skip_unchanged_clean_any_model);
+        assert!(settings.review.skip_unchanged_clean_require_same_baseline);
+    }
+
     /// A local review's own reduced shape ignored keys it did not know, so a
     /// mistyped one did nothing and said nothing. The one shape refuses an
     /// unknown key or section by name, for a review as for the daemon.
@@ -1715,6 +2119,8 @@ mod tests {
         assert!(!settings.ai.no_ai);
         assert!(!settings.ai.resume);
         assert!(settings.review.stages.is_none());
+        assert!(!settings.review.cheap);
+        assert!(!settings.review.design);
 
         let changed = settings.apply_overrides(Overrides {
             repository_path: Some("from_flag".to_string()),
@@ -1725,6 +2131,8 @@ mod tests {
             ai_model: Some("from_flag".to_string()),
             effort: Some(EffortMode::Dynamic),
             stages: Some(vec!["pre-screen".to_string()]),
+            cheap: true,
+            design: true,
             read_only: true,
             port: Some(9090),
         });
@@ -1750,6 +2158,7 @@ mod tests {
             settings.review.stages.as_deref(),
             Some(&["pre-screen".to_string()][..])
         );
+        assert!(settings.review.cheap);
         assert!(settings.server.read_only);
         assert_eq!(settings.server.port, 9090);
     }
@@ -1885,6 +2294,26 @@ mod tests {
         let tls_nntp: NntpSettings =
             toml::from_str("server = \"news.internal.example\"\nport = 563\ntls = true\n").unwrap();
         assert!(tls_nntp.tls);
+        assert_eq!(tls_nntp.concurrency, 4);
+
+        let custom_nntp: NntpSettings =
+            toml::from_str("server = \"nntp.lore.kernel.org\"\nconcurrency = 8\n").unwrap();
+        assert_eq!(custom_nntp.concurrency, 8);
+    }
+
+    #[test]
+    fn test_nntp_zero_concurrency_rejected_for_daemon() {
+        let mut settings = Settings::new().unwrap();
+        settings.database.url = "sashiko.db".into();
+        settings.git.repository_path = "third_party/linux".into();
+        settings.review.worktree_dir = Some("review_trees".into());
+        settings.nntp.concurrency = 0;
+
+        let err = settings.validate_for_daemon().unwrap_err();
+        assert!(
+            err.contains("[nntp] concurrency must be at least 1"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2155,15 +2584,43 @@ mod tests {
         assert_eq!(gemini.max_tokens, None);
         assert_eq!(GeminiSettings::default().max_tokens, None);
 
+        for model in [
+            "gemini-4-argon",
+            "gemini-4-carbon",
+            "gemini-4-flash",
+            "gemini-5-pro",
+            "Gemini-Argon-Preview",
+            "publishers/google/models/gemini-4-carbon",
+        ] {
+            assert_eq!(
+                default_gemini_max_tokens_for_model(model),
+                131_072,
+                "{model} should default to 131_072 max_tokens"
+            );
+        }
+        for legacy in [
+            "gemini-3.1-pro-preview",
+            "gemini-3-flash-preview",
+            "gemini-2.5-pro",
+            "gemini-1.5-pro",
+            "gemini-pro",
+            "gemini-flash-latest",
+            "claude-sonnet-4-6",
+        ] {
+            assert_eq!(
+                default_gemini_max_tokens_for_model(legacy),
+                0,
+                "{legacy} should omit default max_tokens"
+            );
+        }
         assert_eq!(
-            default_gemini_max_tokens_for_model("gemini-4-argon"),
+            default_gemini_provider_max_tokens("custom-gemini-alias"),
             131_072
         );
         assert_eq!(
-            default_gemini_max_tokens_for_model("gemini-3.1-pro-preview"),
+            default_gemini_provider_max_tokens("gemini-3.1-pro-preview"),
             0
         );
-        assert_eq!(default_gemini_max_tokens_for_model("gemini-2.5-pro"), 0);
 
         let capped: GeminiSettings = toml::from_str("max_tokens = 65536").unwrap();
         assert_eq!(capped.max_tokens, Some(65_536));
@@ -2265,14 +2722,20 @@ mod tests {
         assert_eq!(default_bug.max_attempts, 3);
         assert_eq!(default_bug.fix_check_interval_seconds, 21_600);
         assert_eq!(default_bug.fix_check_batch_size, 50);
+        assert!(default_bug.security_eval_enabled);
+        assert_eq!(default_bug.security_eval_interval_seconds, 60);
+        assert_eq!(default_bug.security_eval_batch_size, 25);
 
         let settings = Settings::new().unwrap();
         assert!(!settings.linux_bug.enabled);
         assert_eq!(settings.linux_bug.concurrency, 4);
         assert!(!settings.linux_bug.fix_check_enabled);
+        assert!(settings.linux_bug.security_eval_enabled);
+        assert_eq!(settings.linux_bug.security_eval_interval_seconds, 60);
+        assert_eq!(settings.linux_bug.security_eval_batch_size, 25);
 
         let custom: LinuxBugSettings = toml::from_str(
-            "enabled = true\nconcurrency = 8\nfix_check_enabled = true\nfix_check_interval_seconds = 3600\nfix_check_batch_size = 20\n",
+            "enabled = true\nconcurrency = 8\nfix_check_enabled = true\nfix_check_interval_seconds = 3600\nfix_check_batch_size = 20\nsecurity_eval_enabled = false\nsecurity_eval_interval_seconds = 120\nsecurity_eval_batch_size = 10\n",
         )
         .unwrap();
         assert!(custom.enabled);
@@ -2280,39 +2743,54 @@ mod tests {
         assert!(custom.fix_check_enabled);
         assert_eq!(custom.fix_check_interval_seconds, 3600);
         assert_eq!(custom.fix_check_batch_size, 20);
+        assert!(!custom.security_eval_enabled);
+        assert_eq!(custom.security_eval_interval_seconds, 120);
+        assert_eq!(custom.security_eval_batch_size, 10);
     }
 
     #[test]
-    fn test_effort_mode_is_gated_on_model_and_defaults_to_mid_for_argon() {
+    fn test_effort_mode_is_gated_on_model_and_defaults_to_mid_for_gemini4_plus() {
         let mut review: ReviewSettings = toml::from_str("concurrency = 1").unwrap();
         assert_eq!(review.effort, None);
 
-        // Non-Argon models do not support configurable effort levels.
+        // Pre-Gemini-4 and non-Gemini models do not default to EffortMode when unset.
         assert_eq!(review.effective_effort("gemini-3.1-pro-preview"), None);
+        assert_eq!(review.effective_effort("gemini-3-flash-preview"), None);
+        assert_eq!(review.effective_effort("gemini-2.5-pro"), None);
         assert_eq!(review.effective_effort("claude-sonnet-4-6"), None);
 
-        // Argon models default to EffortMode::Mid when effort is unset.
-        assert_eq!(
-            review.effective_effort("gemini-4-argon"),
-            Some(EffortMode::Mid)
-        );
-        assert_eq!(
-            review.effective_effort("Gemini-Argon-Preview"),
-            Some(EffortMode::Mid)
-        );
+        // Gemini 4+ models default to EffortMode::Mid when effort is unset across codenames.
+        for model in [
+            "gemini-4-argon",
+            "gemini-4-carbon",
+            "gemini-4-flash",
+            "gemini-5-pro",
+            "Gemini-Argon-Preview",
+            "Gemini-Carbon-Preview",
+        ] {
+            assert_eq!(
+                review.effective_effort(model),
+                Some(EffortMode::Mid),
+                "{model} should default to Mid effort"
+            );
+        }
 
-        // Explicit "high" and "dynamic" are respected on Argon and ignored on non-Argon.
+        // Explicit effort is honored on any Gemini model and ignored on non-Gemini models.
         review.effort = Some(EffortMode::High);
         assert_eq!(
-            review.effective_effort("gemini-4-argon"),
+            review.effective_effort("gemini-4-carbon"),
             Some(EffortMode::High)
         );
-        assert_eq!(review.effective_effort("gemini-3.1-pro-preview"), None);
+        assert_eq!(
+            review.effective_effort("gemini-3.1-pro-preview"),
+            Some(EffortMode::High)
+        );
+        assert_eq!(review.effective_effort("claude-sonnet-4-6"), None);
 
         let dynamic: ReviewSettings =
             toml::from_str("concurrency = 1\neffort = \"dynamic\"").unwrap();
         assert_eq!(
-            dynamic.effective_effort("gemini-4-argon"),
+            dynamic.effective_effort("gemini-4-carbon"),
             Some(EffortMode::Dynamic)
         );
 
@@ -2320,12 +2798,18 @@ mod tests {
             toml::from_str("concurrency = 1\neffort = \"medium\"").unwrap();
         assert_eq!(mid_alias.effort, Some(EffortMode::Mid));
 
-        // Settings::effective_effort delegates to review.effective_effort(&ai.model).
+        // Settings::effective_effort incorporates both provider and model.
         let mut settings = Settings::new().unwrap();
-        settings.ai.model = "gemini-4-argon".to_string();
+        settings.ai.provider = "gemini".to_string();
+        settings.ai.model = "gemini-4-carbon".to_string();
         settings.review.effort = None;
         assert_eq!(settings.effective_effort(), Some(EffortMode::Mid));
 
+        // Bare model aliases under provider = "gemini" also default to Mid.
+        settings.ai.model = "custom-gemini-alias".to_string();
+        assert_eq!(settings.effective_effort(), Some(EffortMode::Mid));
+
+        settings.ai.model = "gemini-4-argon".to_string();
         settings.review.effort = Some(EffortMode::Dynamic);
         assert_eq!(settings.effective_effort(), Some(EffortMode::Dynamic));
 
@@ -2335,6 +2819,50 @@ mod tests {
         settings.review.effort = Some(EffortMode::Low);
         assert_eq!(settings.effective_effort(), Some(EffortMode::Low));
 
+        // Explicit effort is honored even on Gemini 3 models, but ignored on non-Gemini providers
+        // (including non-Gemini daemon workers routed over the stdio-gemini IPC transport).
+        settings.ai.model = "gemini-3.1-pro-preview".to_string();
+        assert_eq!(settings.effective_effort(), Some(EffortMode::Low));
+        settings.ai.provider = "claude".to_string();
+        settings.ai.model = "claude-sonnet-4-6".to_string();
+        assert_eq!(settings.effective_effort(), None);
+        settings.ai.provider = "stdio-gemini".to_string();
+        settings.ai.model = "gpt-5.4".to_string();
+        assert_eq!(settings.effective_effort(), None);
+        settings.review.effort = None;
+        assert_eq!(settings.effective_effort(), None);
+        settings.ai.model = "gemini-4-carbon".to_string();
+        assert_eq!(settings.effective_effort(), Some(EffortMode::Mid));
+
+        // Worker subprocesses spawned with --ai-provider stdio-gemini treat the parent's
+        // --effort flag as authoritative, preserving bare Gemini aliases while keeping
+        // non-Gemini daemon workers (even with effort set in Settings.toml) at None.
+        let mut bare_worker = Settings::new().unwrap();
+        bare_worker.ai.provider = "gemini".to_string();
+        bare_worker.ai.model = "custom-gemini-alias".to_string();
+        let parent_effort = bare_worker.effective_effort();
+        assert_eq!(parent_effort, Some(EffortMode::Mid));
+        bare_worker.apply_overrides(Overrides {
+            ai_provider: Some("stdio-gemini".to_string()),
+            effort: parent_effort,
+            ..Default::default()
+        });
+        assert_eq!(bare_worker.effective_effort(), Some(EffortMode::Mid));
+
+        let mut openai_worker = Settings::new().unwrap();
+        openai_worker.ai.provider = "openai".to_string();
+        openai_worker.ai.model = "gpt-5.4".to_string();
+        openai_worker.review.effort = Some(EffortMode::Dynamic);
+        assert_eq!(openai_worker.effective_effort(), None);
+        openai_worker.apply_overrides(Overrides {
+            ai_provider: Some("stdio-gemini".to_string()),
+            effort: None,
+            ..Default::default()
+        });
+        assert_eq!(openai_worker.effective_effort(), None);
+
+        settings.ai.provider = "gemini".to_string();
+        settings.ai.model = "gemini-4-carbon".to_string();
         settings.review.effort = None;
         settings.ai.gemini = Some(GeminiSettings {
             thinking_level: Some("LOW".to_string()),
@@ -2426,5 +2954,276 @@ mod tests {
         std::fs::write(&path, toml).unwrap();
         let err = Settings::from_file(&path).unwrap_err();
         assert!(err.to_string().contains("invalid ai.max_rps"));
+    }
+
+    #[test]
+    fn test_priority_rules_and_batch_tiers_deserialization() {
+        let toml_str = r#"
+            concurrency = 4
+            default_priority = 600
+            batch_window_secs = 60
+            [[batch_tiers]]
+            min_size = 5
+            priority = 450
+            [[batch_tiers]]
+            min_size = 20
+            priority = 250
+            [[priority_rules]]
+            regex = "(?i)^(\\[PATCH[^\\]]*\\]\\s*)?CRITICAL:"
+            priority = 950
+        "#;
+        let review: ReviewSettings = toml::from_str(toml_str).unwrap();
+        assert_eq!(review.default_priority, 600);
+        assert_eq!(review.batch_window_secs, 60);
+        assert_eq!(review.batch_tiers.len(), 2);
+        assert_eq!(review.batch_tiers[0].min_size, 5);
+        assert_eq!(review.batch_tiers[0].priority, 450);
+        assert_eq!(review.batch_tiers[1].min_size, 20);
+        assert_eq!(review.batch_tiers[1].priority, 250);
+        assert_eq!(review.priority_rules.len(), 1);
+        assert_eq!(review.priority_rules[0].priority, 950);
+    }
+
+    #[test]
+    fn test_priority_calculation_matching_and_fallbacks() {
+        let toml_str = r#"
+            concurrency = 4
+            default_priority = 500
+            [[priority_rules]]
+            regex = "(?i)^(\\[PATCH[^\\]]*\\]\\s*)?CRITICAL:"
+            priority = 900
+            [[priority_rules]]
+            regex = "(?i)^(\\[PATCH[^\\]]*\\]\\s*)?FIX:"
+            priority = 800
+        "#;
+        let review: ReviewSettings = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(
+            review.calculate_priority("[PATCH] CRITICAL: kernel panic on boot"),
+            900
+        );
+        assert_eq!(
+            review.calculate_priority("[PATCH v2] critical: null pointer dereference"),
+            900
+        );
+        assert_eq!(
+            review.calculate_priority("[PATCH 1/2] fix: off by one in buffer bounds"),
+            800
+        );
+        assert_eq!(
+            review.calculate_priority("[PATCH] net: add new ethtool stats"),
+            500
+        );
+    }
+
+    #[test]
+    fn test_priority_rules_validation_rejects_bad_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Settings.toml");
+        let toml = r#"
+            [ai]
+            provider = "gemini"
+            model = "gemini-2.5-pro"
+            [review]
+            concurrency = 1
+            worktree_dir = "review_trees"
+            [[review.priority_rules]]
+            regex = "(?i)[unclosed bracket"
+            priority = 900
+            [database]
+            url = "sashiko.db"
+            [git]
+            repository_path = "linux"
+        "#;
+        std::fs::write(&path, toml).unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        let err = settings.validate_for_daemon().unwrap_err();
+        assert!(err.contains("[review.priority_rules] invalid regex"));
+    }
+
+    #[test]
+    fn test_deprecated_settings_load_cleanly_and_report_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sashiko.toml");
+        // Exact shape produced by `sashiko init` in v0.2.0..v0.6.3, plus
+        // retired `[review]` keys from pre-v0.8 configurations.
+        let legacy_toml = r#"
+[ai]
+provider = "gemini"
+model = "gemini-4-argon"
+max_input_tokens = 950000
+temperature = 1.0
+
+[ai.gemini]
+explicit_prompt_caching = false
+
+[review]
+concurrency = 4
+series_review_enabled = true
+code_notes_bytes = 65536
+"#;
+        std::fs::write(&path, legacy_toml).unwrap();
+        let settings =
+            Settings::load(Some(&path)).expect("legacy configuration must load on upgrade");
+        let warnings = settings.deprecated_setting_warnings();
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings[0].contains("[ai.gemini] explicit_prompt_caching"));
+        assert!(warnings[1].contains("[review] series_review_enabled"));
+        assert!(warnings[2].contains("[review] code_notes_bytes"));
+
+        // Clean modern configurations emit zero deprecation warnings.
+        let modern = Settings::load(Some(Path::new("docs/examples/Settings.example.toml")))
+            .expect("modern init template must load");
+        assert!(modern.deprecated_setting_warnings().is_empty());
+
+        // Genuine typos under `[ai.gemini]` and `[review]` still fail fast.
+        let typo_toml = r#"
+[ai]
+provider = "gemini"
+model = "gemini-4-argon"
+
+[ai.gemini]
+explicit_prompt_cachng = false
+
+[review]
+concurrency = 4
+"#;
+        std::fs::write(&path, typo_toml).unwrap();
+        let err = Settings::load(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("unknown field `explicit_prompt_cachng`"));
+    }
+
+    #[test]
+    fn test_custom_remote_branch_patterns_deserialization() {
+        let toml = r#"
+            repository_path = "/tmp/linux"
+            [[custom_remotes]]
+            name = "net-next"
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git"
+            check_all_branches = true
+            branch_patterns = ["linux-*.y", "net-*"]
+            only_branches = ["main"]
+        "#;
+        let git: GitSettings = toml::from_str(toml).unwrap();
+        let remotes = git.custom_remotes.unwrap();
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].name, "net-next");
+        assert_eq!(
+            remotes[0].branch_patterns,
+            Some(vec!["linux-*.y".to_string(), "net-*".to_string(),])
+        );
+
+        let refspecs = remotes[0].refspecs().unwrap();
+        assert_eq!(
+            refspecs,
+            vec![
+                "+refs/heads/linux-*.y:refs/remotes/net-next/linux-*.y",
+                "+refs/heads/net-*:refs/remotes/net-next/net-*",
+                "+refs/heads/main:refs/remotes/net-next/main",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_custom_remote_refspecs_empty_when_branch_patterns_unset() {
+        let toml = r#"
+            repository_path = "/tmp/linux"
+            [[custom_remotes]]
+            name = "cel"
+            url = "git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"
+            check_all_branches = false
+            only_branches = ["nfsd-next", "nfsd-testing"]
+        "#;
+        let git: GitSettings = toml::from_str(toml).unwrap();
+        let remotes = git.custom_remotes.unwrap();
+        assert_eq!(remotes[0].refspecs(), Some(vec![]));
+    }
+
+    #[test]
+    fn test_custom_remote_branch_patterns_validation_rejects_invalid_refspec() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Settings.toml");
+        let toml = r#"
+            [ai]
+            provider = "gemini"
+            model = "gemini-2.5-pro"
+            [review]
+            concurrency = 1
+            worktree_dir = "review_trees"
+            [database]
+            url = "sashiko.db"
+            [git]
+            repository_path = "linux"
+            [[git.custom_remotes]]
+            name = "invalid-remote"
+            url = "https://git.kernel.org/repo.git"
+            check_all_branches = true
+            branch_patterns = ["valid-branch", "feat-?"]
+        "#;
+        std::fs::write(&path, toml).unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        let err = settings.validate_for_daemon().unwrap_err();
+        assert!(err.contains("[git.custom_remotes] invalid branch_pattern"));
+    }
+
+    #[test]
+    fn test_custom_remote_only_branches_validation_rejects_invalid_refspec() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Settings.toml");
+        let toml = r#"
+            [ai]
+            provider = "gemini"
+            model = "gemini-2.5-pro"
+            [review]
+            concurrency = 1
+            worktree_dir = "review_trees"
+            [database]
+            url = "sashiko.db"
+            [git]
+            repository_path = "linux"
+            [[git.custom_remotes]]
+            name = "invalid-remote"
+            url = "https://git.kernel.org/repo.git"
+            check_all_branches = false
+            only_branches = ["valid-branch", "bad branch with spaces"]
+        "#;
+        std::fs::write(&path, toml).unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        let err = settings.validate_for_daemon().unwrap_err();
+        assert!(err.contains("[git.custom_remotes] invalid only_branches entry"));
+    }
+
+    #[test]
+    fn test_review_design_setting_defaults_false_and_accepts_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Settings.toml");
+        let toml = r#"
+            [ai]
+            provider = "gemini"
+            model = "gemini-4-argon"
+            [review]
+            concurrency = 2
+        "#;
+        std::fs::write(&path, toml).unwrap();
+        let mut settings = Settings::load(Some(&path)).unwrap();
+        assert!(!settings.review.design);
+
+        settings.apply_overrides(Overrides {
+            design: true,
+            ..Default::default()
+        });
+        assert!(settings.review.design);
+
+        let toml_enabled = r#"
+            [ai]
+            provider = "gemini"
+            model = "gemini-4-argon"
+            [review]
+            concurrency = 2
+            design = true
+        "#;
+        std::fs::write(&path, toml_enabled).unwrap();
+        let loaded = Settings::load(Some(&path)).unwrap();
+        assert!(loaded.review.design);
     }
 }

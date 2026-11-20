@@ -16,7 +16,7 @@ use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
 use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
-use crate::toolbox::utils::validate_path;
+use crate::toolbox::utils::{format_numbered_slice, validate_path};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -65,9 +65,6 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
             }
             if !obj.contains_key("paths") {
                 obj.insert("paths".to_string(), Value::Null);
-            }
-            if !obj.contains_key("mode") {
-                obj.insert("mode".to_string(), json!("raw"));
             }
         }
         normalized
@@ -160,108 +157,31 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
         };
 
         let is_file = object.contains(':') && !object.starts_with(':');
-        if start_line.is_some() || end_line.is_some() {
-            let lines: Vec<&str> = content.lines().collect();
-            let total_lines = lines.len();
-
-            // Default page limit of 100 lines if end_line is missing but start_line is present
+        if is_file || start_line.is_some() || end_line.is_some() {
+            // Default page limit of 100 lines when start_line is specified without end_line.
             let resolved_end_line = match (start_line, end_line) {
-                (Some(s), None) => Some(s + 100),
+                (Some(s), None) => Some(s.saturating_add(100)),
                 (_, e) => e,
             };
-
-            let (start, end) = match (start_line, resolved_end_line) {
-                (Some(s), Some(e)) => (s.max(1) - 1, e.min(total_lines)),
-                (Some(s), None) => (s.max(1) - 1, total_lines),
-                (None, Some(e)) => (0, e.min(total_lines)),
-                (None, None) => (0, total_lines),
-            };
-
-            let start = start.min(total_lines);
-            let end = end.clamp(start, total_lines);
-
-            if start >= total_lines {
-                return Ok(json!({
-                    "content": "",
-                    "truncated": false,
-                    "metadata": {
-                        "total_items": total_lines,
-                        "returned_items": 0,
-                        "start_index": start + 1,
-                        "end_index": end
-                    },
-                    "lines_read": 0,
-                    "total_lines": total_lines
-                }));
-            }
-
-            let slice = &lines[start..end];
-            let result = slice.join("\n");
-
-            let (truncated, lines_kept, is_truncated_content) = if is_file {
-                let res = Truncator::truncate_sequential(&result, 20_000);
-                (res.content, res.lines_kept, res.truncated)
-            } else {
-                let res = Truncator::truncate_diff(&result, 10_000, "Commit");
-                (res.content, 0, res.truncated)
-            };
-
-            let is_truncated = is_truncated_content;
-
-            let end_idx = if is_truncated_content && lines_kept > 0 {
-                start + lines_kept
-            } else {
-                end
-            };
-
-            let returned_items = if is_truncated_content && lines_kept > 0 {
-                lines_kept
-            } else {
-                slice.len()
-            };
-
-            return Ok(json!({
-                "content": truncated,
-                "truncated": is_truncated,
-                "metadata": {
-                    "total_items": total_lines,
-                    "returned_items": returned_items,
-                    "start_index": start + 1,
-                    "end_index": end_idx
-                },
-                "next_page_hint": if is_truncated {
-                    Some(format!("Only lines {}-{} of {} are shown. To read more, call git_show with start_line={}.", start + 1, end_idx, total_lines, end_idx + 1))
-                } else {
-                    None
-                },
-                "total_lines": total_lines,
-                "start_line": start + 1,
-                "end_line": end
-            }));
+            let max_tokens = if is_file { 20_000 } else { 10_000 };
+            let formatted = format_numbered_slice(
+                object,
+                "git_show",
+                &content,
+                start_line,
+                resolved_end_line,
+                max_tokens,
+            )?;
+            return Ok(Value::String(formatted));
         }
 
-        let total_lines = content.lines().count();
-        let (truncated, is_truncated) = if is_file {
-            let res = Truncator::truncate_sequential(&content, 20_000);
-            (res.content, res.truncated)
-        } else {
-            let res = Truncator::truncate_diff(&content, 10_000, "Commit");
-            (res.content, res.truncated)
-        };
-        let returned_lines = truncated.lines().count();
-
-        Ok(json!({
-            "content": truncated,
-            "truncated": is_truncated,
-            "metadata": {
-                "total_items": total_lines,
-                "returned_items": returned_lines
-            },
-            "next_page_hint": if is_truncated {
-                Some("This content was truncated due to token budget. Specify a start_line range to fetch the next slice.".to_string())
-            } else {
-                None
-            }
-        }))
+        let res = Truncator::truncate_diff(&content, 10_000, "Commit");
+        let mut out = res.content;
+        if res.truncated {
+            out.push_str(
+                "\n[Truncated due to token budget. Specify paths or a start_line range to inspect further.]",
+            );
+        }
+        Ok(Value::String(out))
     }
 }

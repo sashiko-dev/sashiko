@@ -1,0 +1,12 @@
+# Per-mailing-list configuration for Zephyr (--project zephyr).
+# Zephyr patches go through GitHub pull requests, and this initial support
+# covers local review only, so no list is tracked and nothing is mailed.
+
+[defaults]
+track = false
+embargo_hours = 0
+reply_to = []
+positive_review = "none"
+mute_all = true
+cc = []
+ignored_emails = []

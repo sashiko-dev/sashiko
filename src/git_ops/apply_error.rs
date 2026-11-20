@@ -51,7 +51,9 @@ impl PatchApplyFailure {
 
     fn classify(stdout: &str, stderr: &str) -> Self {
         // Git emits this standalone marker on stdout before echoing a subject.
-        let mut kind = (stdout == "Patch is empty.").then_some(Self::EmptyPatch);
+        // Older git (2.39) follows it with resolve/skip advice on stdout too.
+        let mut kind =
+            (stdout.lines().next() == Some("Patch is empty.")).then_some(Self::EmptyPatch);
         for line in stderr.lines() {
             if let Some(detected) = Self::from_diagnostic(line) {
                 if kind.is_some_and(|previous| previous != detected) {
@@ -227,6 +229,17 @@ mod tests {
     fn only_the_standalone_empty_patch_marker_is_recognized_on_stdout() {
         assert_eq!(
             PatchApplyFailure::classify("Patch is empty.", "hint: resolve the failure"),
+            PatchApplyFailure::EmptyPatch
+        );
+        assert_eq!(
+            PatchApplyFailure::classify(
+                "Patch is empty.\n\
+                 When you have resolved this problem, run \"git am --continue\".\n\
+                 If you prefer to skip this patch, run \"git am --skip\" instead.\n\
+                 To record the empty patch as an empty commit, run \"git am --allow-empty\".\n\
+                 To restore the original branch and stop patching, run \"git am --abort\".",
+                ""
+            ),
             PatchApplyFailure::EmptyPatch
         );
         for stdout in [

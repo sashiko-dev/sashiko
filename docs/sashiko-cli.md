@@ -125,7 +125,9 @@ sashiko-cli show [OPTIONS] [ID]
 
 ### rerun
 
-Request a re-review of a completed patchset.
+Request a re-review of a completed patchset. When the daemon runs with
+`review.auto_review = false`, this is also how an operator starts the first
+review of a patchset sitting in the `Awaiting Review` status.
 
 ```
 sashiko-cli rerun <ID>
@@ -222,6 +224,130 @@ sashiko-cli local HEAD --custom-prompt "Focus on locking correctness" \
 
 # Output as JSON (for scripting)
 sashiko-cli --format json local HEAD --force-local
+```
+
+### bugs
+
+Query, inspect, and triage canonical bugs on a running Sashiko daemon (requires
+an API or session token via `--token` or `SASHIKO_API_TOKEN` for restricted
+views and mutations).
+
+```
+sashiko-cli bugs list [OPTIONS]
+sashiko-cli bugs show <ID>
+sashiko-cli bugs action <ID> --action <ACTION> [OPTIONS]
+```
+
+**`bugs list` options:**
+
+| Flag | Description |
+|------|-------------|
+| `--subsystem <NAME>` | Filter by MAINTAINERS subsystem title. |
+| `--severity <LEVEL>` | Filter by minimum engineering severity (`low`, `medium`, `high`, `critical`). |
+| `--min-security-score <SCORE>` | Filter by minimum CVSS v4.0 security score (`0.0` to `10.0`). |
+| `--security-class <CLASS>` | Filter by security classification (`vulnerability`, `hardening`, `not_security`; comma-separated). |
+| `--status <STATUS>` | Filter by lifecycle status (`new`, `open`, `fixed`, `closed`, `dismissed`, `duplicate`). |
+| `-q, --query <TEXT>` | Full-text search query. |
+| `--sort-by <FIELD>` | Sort field (`severity`, `security_score`, `created_at`, `discoveries`, `status`, `assignee`, `problem`). |
+| `--sort-order <ORDER>` | Sort direction (`asc`, `desc`). |
+| `--page <N>` | Page number (default: 1). |
+| `--per-page <N>` | Items per page (default: 20). |
+
+**`bugs action` options:**
+
+| Flag | Description |
+|------|-------------|
+| `--action <ACTION>` | Action to perform: `comment`, `close`, `dismiss`, `assign`, `mark_duplicate`, or `evaluate_security`. |
+| `--comment <TEXT>` | Comment body (for `comment`) or optional reason (for `close`, `dismiss`, `assign`, `mark_duplicate`, `evaluate_security`). |
+| `--comment-file <PATH>` | Read comment/reproducer/patch body from `<PATH>` (or `-` for stdin; mutually exclusive with `--comment`). |
+| `--kind <KIND>` | Comment type for `comment`: `comment` (default), `proposed_fix`, or `reproducer` (reproducers require login to view). |
+| `--assignee <EMAIL>` | Assignee email address for `assign` (or `""` to unassign). |
+| `--duplicate-of <ID>` | Canonical `<project>-<uuid>` or numeric ID for `mark_duplicate`. |
+
+### Offline Bug Security Evaluation (`sashiko bugs evaluate-security`)
+
+Evaluate or backfill CVSS v4.0 security importance directly against the local
+SQLite database and repository without starting the full daemon:
+
+```
+sashiko bugs evaluate-security [OPTIONS]
+```
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--bug <ID>` | Evaluate a specific canonical bug (`<project>-<uuid>` or numeric ID), forcing evaluation even if already scored. |
+| `--limit <N>` | Maximum number of canonical bugs to evaluate in this sweep (`0` exits after migrations/queuing). |
+| `--re-evaluate` | Queue existing canonical bugs (`open`, `fixed`, `closed`) for fresh security re-evaluation before running. |
+| `--concurrency <N>` | Number of concurrent security evaluation workers (overrides `linux_bug.concurrency`). |
+| `--db <PATH>` | Override SQLite database path. |
+| `-r, --repo <PATH>` | Override git repository path. |
+| `--settings <PATH>` | Override `Settings.toml` path. |
+| `--ai-provider <PROVIDER>` | AI provider override. |
+| `-m, --model <MODEL>` | AI model override (alias: `--ai-model`). |
+| `--effort <MODE>` | Reasoning effort override (`low`, `mid`, `high`, or `dynamic`). |
+
+### Active Codebase Scanning (`sashiko scan`)
+
+In addition to patch review, the `sashiko` binary provides an active codebase
+scanner (`--project linux`) that audits Linux kernel source files or subsystem
+directories for pre-existing defects (`Medium`, `High`, and `Critical` by
+default, configurable via `--min-severity`) using structure-aware chunking and
+a two-phase map-reduce workflow.
+
+```
+sashiko scan [OPTIONS] <PATHS>...
+```
+
+**Arguments:**
+
+- `<PATHS>...` -- One or more repository-relative file or directory paths to
+  scan (e.g. `fs/smb/server/` or `net/core/dev.c`).
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--ref <REV>` | Git revision to scan (defaults to mainline or `HEAD`). |
+| `-r, --repo <PATH>` | Path to the git repository (defaults to current checkout or `Settings.toml`). |
+| `--concurrency <N>` | Maximum number of source chunks to scan concurrently (default: 4). |
+| `--max-files <N>` | Maximum number of source files to expand (default: 200). |
+| `--max-chunks <N>` | Optional upper bound on total source chunks to scan. |
+| `--exclude <PATTERN>` | Exclude files matching substring/prefix pattern (may be repeated). |
+| `--min-severity <SEVERITY>` | Lowest verified bug severity to report: `low`, `medium` (default), `high`, or `critical`. |
+| `--submit-bugs` | Submit verified findings at or above `--min-severity` directly to the bug repository (`bugs`) for deduplication. |
+| `--custom-prompt <TEXT>` | Append custom focus instructions to the scan workflow. |
+| `--ai-provider <PROVIDER>` | AI provider override. |
+| `-m, --model <MODEL>` | AI model override (alias: `--ai-model`). |
+| `--effort <MODE>` | Reasoning effort override (`low`, `mid`, `high`, or `dynamic`). |
+| `--format <FORMAT>` | Output format: `text` (default) or `json`. |
+
+Candidate defects discovered across source chunks are passed through the
+`linux_bug` pipeline (`NormalizeSession` -> `VerifySession` -> `TracingSession` ->
+`SeveritySession`) so every reported finding is ground-truth verified,
+calibrated against `<kernel_threat_model>` and `--min-severity`, and traced to
+its introducing commit. When `--submit-bugs` is passed, candidate bugs are
+atomically claimed, verified, and deduplicated against the bug repository
+(`bugs`).
+
+**Exit codes:**
+
+- `0` -- All chunks and candidate verifications completed with zero findings at or above `--min-severity`.
+- `1` -- One or more verified findings were reported (and no chunk or candidate verification failed).
+- `3` -- Incomplete scan: one or more chunk analyses or Phase 2 candidate bug verifications failed.
+
+**Examples:**
+
+```bash
+# Scan a kernel subsystem directory at HEAD
+sashiko scan fs/smb/server/
+
+# Scan specific files and submit verified bugs to the bug repository
+sashiko scan fs/smb/server/smb2pdu.c --submit-bugs
+
+# Scan at a specific tag with JSON output
+sashiko scan --ref v6.12 --format json net/sched/
 ```
 
 ## Review Modes Compared

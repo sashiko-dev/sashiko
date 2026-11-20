@@ -11,13 +11,18 @@ ground-truth descriptions.
 
 - `Settings.toml` (or `~/.config/sashiko.toml`) with a configured LLM provider
   and git repository path
-- A benchmark JSON file (Linux suites are provided in `projects/linux/benchmarks/`)
+- A benchmark JSON file (primary Linux kernel suites live in
+  `projects/linux/benchmarks/`, and GCC pilot suites live in
+  `projects/gcc/benchmarks/`)
 
 ## Quick start
 
 ```bash
-# Run a benchmark suite (creates an isolated database and run directory automatically)
+# Run a Linux kernel benchmark suite (creates an isolated database and run directory automatically)
 sashiko benchmark projects/linux/benchmarks/benchmark_tiny.json
+
+# Run a GCC benchmark suite
+sashiko --project gcc benchmark projects/gcc/benchmarks/benchmark_10.json
 
 # Or via cargo
 cargo run --bin sashiko -- benchmark projects/linux/benchmarks/benchmark_tiny.json
@@ -25,26 +30,191 @@ cargo run --bin sashiko -- benchmark projects/linux/benchmarks/benchmark_tiny.js
 
 ## Benchmark files
 
+### Linux kernel (`projects/linux/benchmarks/`)
+
 | File | Description |
 |------|-------------|
 | `projects/linux/benchmarks/benchmark_tiny.json` | Minimal set for quick iteration (9 entries). |
 | `projects/linux/benchmarks/benchmark_small.json` | Standard set for development iteration (99 entries). |
 | `projects/linux/benchmarks/benchmark.json` | Full benchmark suite (999 entries). |
 | `projects/linux/benchmarks/benchmark_missed.json` | Upstream fixes for bugs missed by Sashiko after public launch. |
+| `projects/linux/benchmarks/benchmark_kvm_arm64.json` | KVM/arm64 bugs fixed in 2026, each checked to be a real defect visible in the buggy commit's own diff (97 entries). |
+| `projects/linux/benchmarks/benchmark_arm64.json` | arm64 core (non-KVM) bugs fixed in 2026, checked the same way (62 entries). |
+| `projects/linux/benchmarks/benchmark_performance.json` | Balanced Linux performance regression and soak-verified `expect_clean` neutral suite (40 entries: 20 positive + 20 neutral). |
 | `projects/linux/benchmarks/benchmark_preexisting.json` | Tests detection of pre-existing bugs. |
+| `projects/linux/benchmarks/benchmark_versioned.json` | Multi-version LKML patchset stories (`v1..vN`) testing prior-feedback verification, reviewer attribution, and false-positive suppression. |
 
-Each file contains entries with a `Commit` hash, an optional `Fixed-by`
-reference, an optional `Subsystem`, and a `problem_description` that the AI
-judge uses to evaluate whether Sashiko detected the issue.
+### GCC pilot (`projects/gcc/benchmarks/`, run with `--project gcc`)
+
+| File | Description |
+|------|-------------|
+| `projects/gcc/benchmarks/benchmark_10.json` | Minimal GCC set for quick iteration (10 entries). |
+| `projects/gcc/benchmarks/benchmark_100.json` | Standard GCC set for development iteration (100 entries). |
+| `projects/gcc/benchmarks/benchmark.json` | Full GCC benchmark suite. |
+
+Each file contains entries with a `Commit` hash (or target patch `Message-ID` for
+versioned mbox entries), an optional `Fixed-by` reference, an optional
+`Subsystem`, and a `problem_description` that the AI judge uses to evaluate
+whether Sashiko detected (or properly suppressed) the issue.
+
+Versioned benchmark entries may additionally specify `mbox_archive` (a
+`.jsonl.gz` fixture bundle), `ancestor_mboxes` (`v1..v(N-1)` mbox threads with
+optional `patchset_status` and seeded `prior_findings`), `target_mbox` (`vN`),
+`baseline_commit`, `expected_behavior` (`detect_bug`, `detect_with_attribution`,
+`detect_regression`, `suppress_false_positive`, or `expect_clean`), `expected_reviewer`,
+`expected_prior_version`, `expected_prior_message_ids`,
+`expected_co_reviewers`, and `acceptable_attributions`.
+
+### Attribution ground truth
+
+Attribution labels describe who first raised an issue that is still present
+in the target version. They are checked when the suite is loaded, and the
+load fails if they are inconsistent:
+
+- `detect_with_attribution` requires `expected_reviewer` (`"Name <email>"`
+  exactly as in the `From:` header), `expected_prior_version` (the
+  **earliest** ancestor version in which that reviewer raised the issue), and
+  `expected_prior_message_ids`. The Message-IDs (without angle brackets) list
+  every message in that version in which the reviewer raised the issue.
+  Reviews never credit Sashiko, so `"Sashiko"` is rejected as a reviewer
+  everywhere; an issue raised earlier only by a prior Sashiko review is a
+  `detect_bug` entry. `expected_co_reviewers` lists other reviewers who
+  raised the same issue independently in the same version. Their messages
+  are added to `expected_prior_message_ids`.
+- `detect_bug` means that no earlier reviewer raised the issue. It must not
+  set `expected_reviewer`, `expected_prior_version`, or
+  `expected_prior_message_ids`.
+- `acceptable_attributions` (only on `detect_bug` and
+  `detect_with_attribution`) lists optional credit: `{reviewer, version,
+  message_ids}` items for earlier messages that arguably raised the issue,
+  where crediting them is acceptable but not required. Each item's reviewer,
+  version, and Message-IDs follow the same rules as the required credit.
+- For `detect_regression` and `suppress_false_positive`, `expected_reviewer`
+  and `expected_prior_version` are informational only. They name the reviewer
+  whose advice or claim the entry is about, and the scorer never uses them for
+  credit.
+
+### Scoring rules
+
+The judge only decides whether a reported finding matches the description
+(`DETECTED`, `PARTIALLY_DETECTED`, or `MISSED`). It does not decide
+attribution. For suppression entries, the judge is told that the description
+is a refuted claim which must not be reported. A match on a suppression entry
+is scored as `FALSE_POSITIVE`.
+
+Attribution is scored deterministically from the structured
+`prior_attribution` object of the matched finding. No free text, name tokens,
+or judge opinion is used:
+
+- **Correct**: `raised_by_identities` contains the expected reviewer's email
+  (or a co-reviewer's email), `originally_raised_in_version`
+  equals `expected_prior_version`, and at least one `evidence[].message_id` is
+  in `expected_prior_message_ids`.
+- **Acceptable**: the attribution matches the entry's
+  `acceptable_attributions`. Every identity in `raised_by_identities` must be
+  covered by an item whose `version` equals `originally_raised_in_version`.
+  If the attribution has evidence, at least one `evidence[].message_id` must
+  be among those items' `message_ids`. An acceptable attribution is neither
+  correct nor wrong. It is reported separately, and it is left out of the
+  attribution rate and precision denominators. On a `detect_bug` entry, an
+  exact detection with acceptable credit still passes.
+- **Wrong**: an attribution is present but is neither correct nor acceptable.
+  This includes older outputs that have no identities or evidence. It also
+  includes any other attribution on the matched finding of a `detect_bug` or
+  `detect_regression` entry, because no earlier reviewer raised those issues.
+  The summary reports these separately as "unexpected attributions".
+- **Missing**: an attribution was expected, but the matched finding has none,
+  or no finding matched.
+
+An attribution that only links the finding to earlier Sashiko reviews
+(`origin_kind` `sashiko_review`, or `sashiko` as the only identity in older
+outputs) is not credit and is scored as if the finding had no attribution.
+
+The summary reports correct, wrong, missing, and acceptable attributions
+separately. The attribution rate is correct attributions divided by the
+attribution-expected entries that did not score acceptable. Attribution
+precision is correct attributions divided by all correct, wrong, and
+unexpected attributions emitted on matched findings.
+
+Versioned entries (those with `target_mbox` or `ancestor_mboxes`) use strict
+denominators. Classic commit suites (`benchmark.json`, `benchmark_small.json`,
+`benchmark_tiny.json`, `benchmark_missed.json`, `benchmark_preexisting.json`)
+keep their original metric definitions. Those definitions score only judged
+outcomes, and count `PARTIALLY_DETECTED` toward the total detection rate. For
+versioned entries:
+
+- Entries without a completed review (`NOT_REVIEWED`, `NOT_FOUND_IN_DB`) and
+  failed judge evaluations (`UNKNOWN`) count as failures in the detection and
+  suppression denominators. Only entries without a description (`SKIPPED`) are
+  excluded.
+- `PARTIALLY_DETECTED` is reported separately. It counts toward the total
+  detection rate but never toward the exact rate or a category pass.
+- A category pass is strict. A detection entry passes only on exact
+  `DETECTED` with the expected attribution outcome: correct when credit is
+  expected, and none when it is not. A suppression entry passes only on
+  `SUPPRESSED`.
+- A review that reports no findings at all passes every suppression entry
+  vacuously. Such passes are counted as "suppressed with zero findings", so
+  they are visible next to the suppression rate.
+
+### Versioned suite contents
+
+`benchmark_versioned.json` contains 53 entries built from real LKML
+multi-version series:
+
+| Category | Entries | `detect_with_attribution` | `detect_bug` | `detect_regression` | `suppress_false_positive` |
+|---|---:|---:|---:|---:|---:|
+| `ignored_prior_bug` | 15 | 11 | 4 | 0 | 0 |
+| `bad_advice_regression` | 8 | 0 | 0 | 8 | 0 |
+| `wrong_claim_rejected` | 11 | 0 | 0 | 0 | 11 |
+| `authority_unverifiable` | 10 | 3 | 3 | 0 | 4 |
+| `multihop_or_routing` | 9 | 1 | 4 | 0 | 4 |
+| **Total** | **53** | **15** | **11** | **8** | **19** |
+
+- **Ancestor chains:** 35 entries have one ancestor version and 16 have two.
+  `cat5_5b_pci_dwc_suspend_v4` has three, and
+  `cat5_new_clk_qcom_gdsc_subdomain_rollback` has nine (v1 to v9). In that
+  case the reviewer replied to v8 patch 3/3, and the same logical patch is
+  4/4 in the v10 target.
+- **Optional credit:** three `detect_bug` entries carry
+  `acceptable_attributions` for borderline earlier comments:
+  `ext4_journal_destroy_race` (Jan Kara, v1), `virtio_net_rss_key_align`
+  (Xuan Zhuo, v1), and `cat5_5a_ufs_threaded_irq_v3` (Bart Van Assche, v2).
+- **Synthetic cancellations:** in three entries (`cat5_5a_ufs_threaded_irq_v3`,
+  `cat5_5a_drm_gpuvm_vmbo_defer_v3`, and `cat5_5a_pmic_glink_races_v3`), the
+  intermediate v2 ancestor is marked `Cancelled`. This simulates a revision
+  that was superseded before Sashiko finished reviewing it; the real v2 was
+  reviewed upstream. The human replies to v2 are still in the fixture.
+- **Seeded Sashiko findings:** four entries seed a synthetic prior Sashiko
+  finding on v1 through `prior_findings`: `can_gs_usb_urb_anchor`,
+  `seeded_pci_pwrctrl_endpoint_leak`, `seeded_spi_stm32_ospi_dma_leak`, and
+  `usb_tcpm_role_sw_errptr`. The first three are `detect_bug` entries: the
+  issue must still be detected, but no credit is expected because reviews
+  never credit Sashiko. In the two `seeded_*` entries, the seed text is
+  written independently of the ground-truth description. In
+  `can_gs_usb_urb_anchor`, the seed text is close to the description. In
+  `usb_tcpm_role_sw_errptr`, the seed is a refuted claim (upstream reverted the
+  change it asks for), and the entry tests that Sashiko does not repeat its own
+  wrong finding.
+- **Archive format:** mboxes are stored as lore threads, with transport
+  headers stripped and duplicate Message-IDs removed. Messages in legacy 8-bit
+  charsets are re-encoded as UTF-8. Target mboxes contain only the cover letter
+  and the patches, never review replies.
+
+A unit test checks every `expected_prior_message_ids` entry, and every
+`acceptable_attributions` Message-ID, against the bundled mbox for the
+credited version. The message must exist, and its `From:` address must be the
+credited reviewer or a listed co-reviewer.
 
 ## Command-line options
 
 ```
-sashiko benchmark [OPTIONS] <FILE>
+sashiko [--project <PROJECT>] benchmark [OPTIONS] <FILE>
 ```
 
 | Argument / Flag | Description |
 |-----------------|-------------|
+| `--project <PROJECT>` | Project profile to benchmark (`linux` default, `gcc`, `sashiko`, `qemu`, `zephyr`). |
 | `<FILE>` / `-f, --file <FILE>` | Path to the benchmark JSON file (required). |
 | `-r, --repo <PATH_OR_URL>` | Override the target git repository path or URL. |
 | `--db <PATH>` | Explicit SQLite database path to create or re-analyze. |

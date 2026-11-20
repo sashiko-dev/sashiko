@@ -39,6 +39,8 @@ pub struct StageOutcome {
     pub tokens_cached: u32,
     pub history: Vec<AiMessage>,
     pub skipped: bool,
+    /// Why the stage failed.
+    pub error: Option<String>,
 }
 
 impl StageOutcome {
@@ -53,69 +55,6 @@ impl StageOutcome {
             .iter()
             .filter(|m| m.role == crate::ai::AiRole::Assistant)
             .count()
-    }
-
-    /// Extracts deduplicated prompt file names requested via `read_prompt` tool calls in this stage's history.
-    pub fn read_prompts(&self) -> Vec<String> {
-        let mut prompts = Vec::new();
-        let mut idx = 0;
-        while idx < self.history.len() {
-            let msg = &self.history[idx];
-            let Some(ref calls) = msg.tool_calls else {
-                idx += 1;
-                continue;
-            };
-
-            // Pair each tool call with its corresponding AiRole::Tool response in the
-            // immediately following contiguous block of tool messages for this turn.
-            // Matching within the turn in positional order handles both providers with
-            // unique tool_call_id values and Gemini (which uses the function name as
-            // the ID for all parallel calls in a turn).
-            let tool_start = idx + 1;
-            let mut tool_end = tool_start;
-            while tool_end < self.history.len()
-                && self.history[tool_end].role == crate::ai::AiRole::Tool
-            {
-                tool_end += 1;
-            }
-            let tool_msgs = &self.history[tool_start..tool_end];
-            let mut used_tool_msg = vec![false; tool_msgs.len()];
-
-            for call in calls {
-                let matched_tool = tool_msgs
-                    .iter()
-                    .enumerate()
-                    .find(|(t_idx, t_msg)| {
-                        !used_tool_msg[*t_idx]
-                            && t_msg.tool_call_id.as_deref() == Some(call.id.as_str())
-                    })
-                    .map(|(t_idx, t_msg)| {
-                        used_tool_msg[t_idx] = true;
-                        t_msg
-                    });
-
-                let succeeded = matched_tool
-                    .and_then(|t_msg| t_msg.content.as_deref())
-                    .and_then(|content| serde_json::from_str::<Value>(content).ok())
-                    .is_some_and(|v| v.get("error").is_none());
-
-                if succeeded
-                    && call
-                        .function_name
-                        .trim()
-                        .eq_ignore_ascii_case("read_prompt")
-                    && let Some(name) = call.arguments.get("name").and_then(Value::as_str)
-                {
-                    let trimmed = crate::workflows::guard::normalize_prompt_relpath(name);
-                    if !trimmed.is_empty() && !prompts.iter().any(|p| p == trimmed) {
-                        prompts.push(trimmed.to_string());
-                    }
-                }
-            }
-
-            idx = tool_end;
-        }
-        prompts
     }
 }
 
@@ -135,6 +74,12 @@ pub type StateMutation<S> = Box<dyn FnOnce(&mut S) + Send>;
 pub trait ExecutableStage<S: Send + Sync>: Send + Sync {
     /// Returns the human-readable name of the stage.
     fn name(&self) -> &'static str;
+
+    /// Whether a failure of this stage must abort its parallel batch even
+    /// under `ParallelPolicy::BestEffort`.
+    fn is_required(&self) -> bool {
+        false
+    }
 
     /// Executes the stage in isolation against immutable state `&S`, returning
     /// execution metrics and a deferred reducer mutation to apply to `&mut S`.
@@ -161,9 +106,6 @@ pub trait ExecutableStage<S: Send + Sync>: Send + Sync {
 /// Reducer function applying stage output `T` to mutable workflow state `S`.
 pub type StageReducer<S, T> = Arc<dyn Fn(&mut S, T) + Send + Sync>;
 
-/// Reducer function applying stage output `T` and [`StageOutcome`] to mutable workflow state `S`.
-pub type StageOutcomeReducer<S, T> = Arc<dyn Fn(&mut S, T, &StageOutcome) + Send + Sync>;
-
 /// Conditional predicate determining whether a stage should be evaluated.
 pub type StageCondition<S> = Arc<dyn Fn(&S) -> bool + Send + Sync>;
 
@@ -175,8 +117,10 @@ pub struct Stage<S, T> {
     pub output_format: OutputFormat<S, T>,
     pub policy: StagePolicy,
     pub reducer: StageReducer<S, T>,
-    pub outcome_reducer: Option<StageOutcomeReducer<S, T>>,
     pub skip_if: Option<StageCondition<S>>,
+    /// A required stage aborts its parallel batch on failure even under
+    /// `ParallelPolicy::BestEffort`, so its output is never silently lost.
+    pub required: bool,
 }
 
 impl<S: 'static, T: 'static> Stage<S, T> {
@@ -194,8 +138,8 @@ pub struct StageBuilder<S, T> {
     output_format: Option<OutputFormat<S, T>>,
     policy: StagePolicy,
     reducer: Option<StageReducer<S, T>>,
-    outcome_reducer: Option<StageOutcomeReducer<S, T>>,
     skip_if: Option<StageCondition<S>>,
+    required: bool,
 }
 
 impl<S: 'static, T: 'static> StageBuilder<S, T> {
@@ -207,8 +151,8 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
             output_format: None,
             policy: StagePolicy::default(),
             reducer: None,
-            outcome_reducer: None,
             skip_if: None,
+            required: false,
         }
     }
 
@@ -272,22 +216,6 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
         F: Fn(&mut S, T) + Send + Sync + 'static,
     {
         self.reducer = Some(Arc::new(reducer));
-        self.outcome_reducer = None;
-        self
-    }
-
-    /// Defines how the stage output `T` and [`StageOutcome`] mutate the workflow state `&mut S`.
-    pub fn reduce_with_outcome<F>(mut self, reducer: F) -> Self
-    where
-        F: Fn(&mut S, T, &StageOutcome) + Send + Sync + 'static,
-    {
-        let shared = Arc::new(reducer);
-        let shared_for_plain = shared.clone();
-        self.reducer = Some(Arc::new(move |state, out| {
-            let empty_outcome = StageOutcome::default();
-            shared_for_plain(state, out, &empty_outcome);
-        }));
-        self.outcome_reducer = Some(shared);
         self
     }
 
@@ -297,6 +225,13 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
         F: Fn(&S) -> bool + Send + Sync + 'static,
     {
         self.skip_if = Some(Arc::new(predicate));
+        self
+    }
+
+    /// Marks the stage as required: its failure aborts the enclosing parallel
+    /// batch regardless of the batch's `ParallelPolicy`.
+    pub fn required(mut self) -> Self {
+        self.required = true;
         self
     }
 
@@ -317,8 +252,8 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
             output_format,
             policy: self.policy,
             reducer,
-            outcome_reducer: self.outcome_reducer,
             skip_if: self.skip_if,
+            required: self.required,
         }
     }
 }
@@ -511,6 +446,10 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         self.name
     }
 
+    fn is_required(&self) -> bool {
+        self.required
+    }
+
     async fn execute_isolated(
         &self,
         env: &WorkflowEnv<'_>,
@@ -532,6 +471,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                     tokens_out: 0,
                     tokens_cached: 0,
                     skipped: true,
+                    error: None,
                 },
                 Box::new(|_| {}),
             ));
@@ -605,20 +545,13 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             tokens_cached,
             history: result.history,
             skipped: false,
+            error: None,
         };
 
-        let mutation: StateMutation<S> = if let Some(ref outcome_reducer) = self.outcome_reducer {
-            let outcome_reducer = outcome_reducer.clone();
-            let outcome_clone = outcome.clone();
-            Box::new(move |s: &mut S| {
-                outcome_reducer(s, result.output, &outcome_clone);
-            })
-        } else {
-            let reducer = self.reducer.clone();
-            Box::new(move |s: &mut S| {
-                reducer(s, result.output);
-            })
-        };
+        let reducer = self.reducer.clone();
+        let mutation: StateMutation<S> = Box::new(move |s: &mut S| {
+            reducer(s, result.output);
+        });
 
         Ok((outcome, mutation))
     }
@@ -760,7 +693,7 @@ mod tests {
     async fn test_a_batch_of_tool_calls_runs_concurrently() {
         let tmp = tempfile::tempdir().unwrap();
         let provider = Arc::new(ToolCallingProvider::probing(3));
-        let mut toolbox = ToolBox::new(tmp.path().to_path_buf(), None);
+        let mut toolbox = ToolBox::new(tmp.path().to_path_buf());
         toolbox.register_tool(ConcurrencyProbe {
             barrier: Arc::new(tokio::sync::Barrier::new(3)),
         });
@@ -792,7 +725,7 @@ mod tests {
         let provider = Arc::new(ToolCallingProvider::rejecting(&["a", "a"]));
         let env = WorkflowEnv {
             provider: provider.clone(),
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -836,7 +769,7 @@ mod tests {
         let provider = Arc::new(ToolCallingProvider::rejecting(&["a"]).repeated_next_turn());
         let env = WorkflowEnv {
             provider: provider.clone(),
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -880,7 +813,7 @@ mod tests {
         let provider = Arc::new(ToolCallingProvider::rejecting(&["a", "b", "a"]));
         let env = WorkflowEnv {
             provider: provider.clone(),
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -922,7 +855,7 @@ mod tests {
         let provider = Arc::new(ToolCallingProvider::rejecting(&["a", "b", "c"]));
         let env = WorkflowEnv {
             provider: provider.clone(),
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -954,7 +887,7 @@ mod tests {
         let provider = Arc::new(ToolCallingProvider::rejecting(&["x"]));
         let env = WorkflowEnv {
             provider: provider.clone(),
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -1027,7 +960,7 @@ mod tests {
         });
         let env = WorkflowEnv {
             provider,
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -1057,28 +990,6 @@ mod tests {
             .execute_isolated(&env, &EmptyState, None)
             .await
             .expect("recitation fallback should accept non-quoted text response");
-    }
-
-    #[test]
-    fn test_stage_builder_reduce_clears_outcome_reducer() {
-        let stage: Stage<String, String> = Stage::builder("override_reduce")
-            .user_prompt(PromptTemplate::new("go"))
-            .output_format(OutputFormat::text())
-            .reduce_with_outcome(|state: &mut String, out: String, _outcome: &StageOutcome| {
-                *state = format!("outcome:{out}");
-            })
-            .reduce(|state: &mut String, out: String| {
-                *state = format!("plain:{out}");
-            })
-            .build();
-
-        assert!(
-            stage.outcome_reducer.is_none(),
-            "calling .reduce(...) after .reduce_with_outcome(...) must clear outcome_reducer"
-        );
-        let mut state = String::new();
-        (stage.reducer)(&mut state, "ok".to_string());
-        assert_eq!(state, "plain:ok");
     }
 
     struct MalformedToolCallThenTextProvider {
@@ -1123,7 +1034,7 @@ mod tests {
         });
         let env = WorkflowEnv {
             provider: provider.clone(),
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };
@@ -1178,7 +1089,7 @@ mod tests {
         });
         let bad_env = WorkflowEnv {
             provider: bad_provider,
-            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf())),
             base_dir: tmp.path(),
             context_tag: None,
         };

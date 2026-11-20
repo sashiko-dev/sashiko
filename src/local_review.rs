@@ -31,7 +31,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// What a worker is asked to do: only what the settings have no notion of, such
 /// as which patch, which baseline, and where the prompts are.
@@ -52,6 +52,7 @@ pub struct WorkerOptions {
     pub current_tree: bool,
     pub agent: bool,
     pub report_preexisting: bool,
+    pub related_preexisting: crate::related_preexisting::RelatedPreexistingMode,
 }
 
 impl Default for WorkerOptions {
@@ -68,6 +69,7 @@ impl Default for WorkerOptions {
             current_tree: false,
             agent: false,
             report_preexisting: false,
+            related_preexisting: Default::default(),
         }
     }
 }
@@ -82,6 +84,7 @@ pub struct ReviewOptions {
     pub custom_prompt: Option<String>,
     pub agent: bool,
     pub report_preexisting: bool,
+    pub related_preexisting: crate::related_preexisting::RelatedPreexistingMode,
 }
 
 impl Default for ReviewOptions {
@@ -93,6 +96,7 @@ impl Default for ReviewOptions {
             custom_prompt: None,
             agent: false,
             report_preexisting: false,
+            related_preexisting: Default::default(),
         }
     }
 }
@@ -165,6 +169,26 @@ pub enum ProgressEvent {
     AiReviewFailed {
         patch_index: i64,
     },
+    DesignReviewQueued {
+        subject: String,
+    },
+    DesignReviewStageStarted {
+        stage: String,
+    },
+    DesignReviewStageTurn {
+        stage: String,
+        turn: usize,
+        max_turns: usize,
+    },
+    DesignReviewStageFinished {
+        stage: String,
+    },
+    DesignReviewAttempt {
+        attempt: usize,
+        max_attempts: usize,
+    },
+    DesignReviewFinished,
+    DesignReviewFailed,
     ReviewComplete {
         partial: bool,
     },
@@ -240,6 +264,7 @@ pub async fn build_review_input_from_git(
             date: Some(meta.timestamp),
             message_id: None,
             commit_id: Some(sha),
+            prior_version_context: None,
         });
     }
 
@@ -257,6 +282,8 @@ pub async fn build_review_input_from_git(
             id: 0,
             subject,
             patches,
+            known_disclosures: Vec::new(),
+            candidate_bugs: Vec::new(),
         },
         shas,
     ))
@@ -285,6 +312,7 @@ pub async fn run_git_review(
             current_tree: true,
             agent: options.agent,
             report_preexisting: options.report_preexisting,
+            related_preexisting: options.related_preexisting,
             ..WorkerOptions::default()
         },
         settings,
@@ -308,6 +336,8 @@ pub async fn run_worker(
     let patchset_id = input.id;
     let subject = input.subject;
     let patches = input.patches;
+    let known_disclosures = input.known_disclosures;
+    let candidate_bugs = input.candidate_bugs;
     let baseline_arg = if options.current_tree {
         options.baseline.clone().unwrap_or_default()
     } else {
@@ -344,7 +374,7 @@ pub async fn run_worker(
                 sha: short_sha(&baseline_sha),
             },
         );
-        info!("Reusing existing worktree at {:?}", path);
+        debug!("Reusing existing worktree at {:?}", path);
         (
             GitWorktree::from_path(path.clone(), repo_path.clone()),
             baseline_sha,
@@ -394,6 +424,8 @@ pub async fn run_worker(
         patchset_id,
         subject,
         patches,
+        &known_disclosures,
+        &candidate_bugs,
         &baseline_arg,
         &baseline_sha,
         &options,
@@ -409,7 +441,7 @@ pub async fn run_worker(
     emit(
         progress,
         ProgressEvent::ReviewComplete {
-            partial: result.as_ref().map_or(true, result_has_error),
+            partial: result.as_ref().map_or(true, result_is_incomplete),
         },
     );
 
@@ -497,7 +529,12 @@ fn extract_inline_review(patch_index: i64, output: Option<&Value>) -> Result<Opt
         .and_then(|f| f.as_array())
         .is_some_and(|findings| !findings.is_empty());
 
-    if has_findings && inline_content.is_none() {
+    let has_related_preexisting = output
+        .and_then(|out| out.get("related_preexisting"))
+        .and_then(|f| f.as_array())
+        .is_some_and(|items| !items.is_empty());
+
+    if (has_findings || has_related_preexisting) && inline_content.is_none() {
         return Err(anyhow!(
             "Review failure on patch {}: Findings detected but review_inline field was missing or empty.",
             patch_index
@@ -525,6 +562,8 @@ async fn review_single_patch(
     p: &PatchInput,
     all_patches: &[PatchInput],
     rich_patches: &[Value],
+    known_disclosures: &[crate::related_preexisting::BugKey],
+    candidate_bugs: &[Value],
     patch_shas: &HashMap<i64, String>,
     options: &WorkerOptions,
     baseline_sha: &str,
@@ -569,9 +608,6 @@ async fn review_single_patch(
             .await
             .context("Failed to create AI provider")?;
         let provider = decorate_provider(provider, ai, llm_semaphore, quota, &retry_budget);
-        // The directory itself: read_prompt resolves a name against it.
-        let prompts_tool_path = Some(options.prompts.clone());
-
         let mut patch_files = Vec::new();
         if let Some(sha) = patch_shas.get(&p.index).filter(|s| is_safe_git_rev(s)) {
             let output = crate::git_cmd::in_dir_async(&worktree.path)
@@ -597,16 +633,16 @@ async fn review_single_patch(
                 }
             }
         }
-        info!(
+        debug!(
             "Active patch files gathered for patch {}: {:?}",
             p.index, patch_files
         );
 
-        let mut tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
+        let mut tools = ToolBox::new(worktree.path.clone());
         tools.set_active_patch_files(patch_files);
 
         if let Some(sha) = patch_shas.get(&p.index) {
-            info!("Setting virtual HEAD to {} for patch {}", sha, p.index);
+            debug!("Setting virtual HEAD to {} for patch {}", sha, p.index);
             tools.set_virtual_head(sha.clone());
         }
 
@@ -631,8 +667,10 @@ async fn review_single_patch(
                 series_range,
                 baseline_sha: Some(baseline_sha.to_string()),
                 stages: stages.clone(),
+                cheap: settings.review.cheap,
                 skip_report: options.agent,
                 report_preexisting: options.report_preexisting,
+                related_preexisting: options.related_preexisting,
                 effort: settings.effective_effort(),
                 use_code_notes: settings.review.use_code_notes,
                 code_notes_scope: settings.review.code_notes_scope,
@@ -690,7 +728,9 @@ async fn review_single_patch(
             "subject": subject,
             "patches": rich_patches,
             "patch_index": Some(p.index),
-            "baseline": baseline_sha
+            "baseline": baseline_sha,
+            "known_disclosures": known_disclosures,
+            "candidate_bugs": candidate_bugs,
         });
 
         match worker
@@ -741,7 +781,11 @@ async fn review_single_patch(
                     "AI review for patch {} failed with exception: {}",
                     p.index, e
                 );
+                let stop_retrying = crate::ai::is_non_retryable_review_error(&e);
                 last_error = Some(e);
+                if stop_retrying {
+                    break;
+                }
             }
         }
     }
@@ -755,14 +799,285 @@ async fn review_single_patch(
     Err(last_error.unwrap_or_else(|| anyhow!("Patch review failed")))
 }
 
-/// Lists the failed patches in series order.
+/// Formats an `anyhow::Error` chain on a single human-readable line, omitting
+/// redundant inner causes whose text is already contained in an outer wrapper
+/// (such as `WorkflowFailure` and `SessionFailure`, which embed `err.to_string()`
+/// in their own display messages).
+fn format_error_chain(err: &anyhow::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for cause in err.chain() {
+        let msg = cause.to_string();
+        let trimmed = msg.trim();
+        if !trimmed.is_empty() && parts.last().is_none_or(|prev| !prev.contains(trimmed)) {
+            parts.push(trimmed.to_string());
+        }
+    }
+    parts.join(": ")
+}
+
+/// Lists the failed patches (and any failed series design assessment) in order.
 fn combined_review_error(mut errors: Vec<(i64, String)>) -> String {
     errors.sort_by_key(|(patch_index, _)| *patch_index);
     errors
         .iter()
-        .map(|(patch_index, err)| format!("patch {patch_index}: {err}"))
+        .map(|(patch_index, err)| {
+            if *patch_index == i64::MAX {
+                format!("design assessment: {err}")
+            } else {
+                format!("patch {patch_index}: {err}")
+            }
+        })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn collect_touched_files_from_patches(patches: &[PatchInput]) -> Vec<String> {
+    let mut touched = std::collections::BTreeSet::new();
+    for p in patches {
+        for path in crate::prior_context::extract_patch_touched_files(&p.diff) {
+            touched.insert(path);
+        }
+    }
+    touched.into_iter().collect()
+}
+
+fn format_series_text_for_design(
+    patches: &[PatchInput],
+    patch_messages: &HashMap<i64, String>,
+) -> String {
+    let total = patches.len();
+    let mut out = String::new();
+    for p in patches {
+        let subj = p.subject.as_deref().unwrap_or("(no subject)");
+        let author = p.author.as_deref().unwrap_or("(unknown)");
+        let body = patch_messages
+            .get(&p.index)
+            .map(String::as_str)
+            .unwrap_or(subj);
+        out.push_str(&format!(
+            "=== Patch {}/{}: {} ===\nAuthor: {}\n\n{}\n\n{}\n\n",
+            p.index,
+            total,
+            subj,
+            author,
+            body.trim(),
+            p.diff.trim_end()
+        ));
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_local_design_assessment(
+    worktree: &GitWorktree,
+    settings: &Settings,
+    subject: &str,
+    patches: &[PatchInput],
+    patch_shas: &HashMap<i64, String>,
+    patch_messages: &HashMap<i64, String>,
+    options: &WorkerOptions,
+    baseline_sha: &str,
+    llm_semaphore: &Arc<Semaphore>,
+    quota: &Arc<crate::ai::quota::QuotaManager>,
+    timeout_seconds: u64,
+    progress: Option<&ProgressCallback<'_>>,
+) -> Result<crate::workflows::design_assessment::DesignAssessmentExecution> {
+    use crate::toolbox::design_tools::DesignToolState;
+    use crate::workflow::WorkflowEvent;
+    use crate::workflows::design_assessment::{
+        DesignAssessmentRunInput, run_design_assessment_pipeline,
+    };
+
+    let resolved_baseline_sha = get_commit_hash(&worktree.path, baseline_sha)
+        .await
+        .with_context(|| {
+            format!("design assessment requires a resolvable baseline commit ({baseline_sha})")
+        })?;
+
+    let mut series_shas = Vec::with_capacity(patches.len());
+    for p in patches {
+        if let Some(sha) = patch_shas.get(&p.index).or(p.commit_id.as_ref()) {
+            series_shas.push(sha.clone());
+        }
+    }
+    let excluded_commits =
+        DesignToolState::collect_excluded_descendants(&worktree.path, &series_shas).await;
+    let series_roots: Vec<String> = series_shas.first().cloned().into_iter().collect();
+
+    let cutoff_ts = patches
+        .iter()
+        .filter_map(|p| p.date)
+        .filter(|&d| d > 0)
+        .min()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let posted_date_ymd = chrono::DateTime::<chrono::Utc>::from_timestamp(cutoff_ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| cutoff_ts.to_string());
+
+    let touched_files = collect_touched_files_from_patches(patches);
+    let sections = if options.project.uses_maintainers()
+        && let Some(maint) = crate::maintainers::get_global_maintainers()
+    {
+        maint.match_files(&touched_files)
+    } else {
+        Vec::new()
+    };
+
+    let notes_candidate = options.prompts.join("maintainers");
+    let maintainer_notes_dir = tokio::fs::metadata(&notes_candidate)
+        .await
+        .is_ok_and(|m| m.is_dir())
+        .then_some(notes_candidate);
+
+    let series_text = Arc::new(format_series_text_for_design(patches, patch_messages));
+    let prior_parts: Vec<String> = patches
+        .iter()
+        .filter_map(|p| {
+            p.prior_version_context
+                .as_ref()
+                .filter(|ctx| !ctx.is_empty_for_audit())
+                .and_then(|ctx| serde_json::to_string_pretty(ctx).ok())
+        })
+        .collect();
+    let prior_context_markdown = if prior_parts.is_empty() {
+        "(none)".to_string()
+    } else {
+        prior_parts.join("\n\n")
+    };
+
+    let tool_state = Arc::new(DesignToolState {
+        repo_path: worktree.path.clone(),
+        baseline_sha: resolved_baseline_sha,
+        cutoff_ts,
+        excluded_commits,
+        series_roots,
+        maintainer_notes_dir,
+        series_text,
+    });
+
+    let ai = &settings.ai;
+    let deadline_budget = (timeout_seconds > 0).then(|| {
+        let deadline = Arc::new(std::sync::Mutex::new(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds),
+        ));
+        Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(deadline))
+    });
+    let retry_budget: Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>> = deadline_budget
+        .as_ref()
+        .map(|b| Arc::clone(b) as Arc<dyn crate::ai::backoff_provider::RetryBudget>);
+
+    let reasoning_effort = settings
+        .effective_effort()
+        .map(crate::ai::EffortMode::verification_stage_effort);
+    let max_attempts = worker_max_attempts(ai);
+    let mut last_error = None;
+
+    for attempt in 1..=max_attempts {
+        emit(
+            progress,
+            ProgressEvent::DesignReviewAttempt {
+                attempt,
+                max_attempts,
+            },
+        );
+        if attempt > 1 {
+            info!(
+                "Restarting series design assessment (attempt {}/{})...",
+                attempt, max_attempts
+            );
+        }
+
+        let provider = crate::ai::create_provider_cached(ai, None)
+            .await
+            .context("Failed to create AI provider")?;
+        let provider = decorate_provider(provider, ai, llm_semaphore, quota, &retry_budget);
+
+        let wf_cb = progress.map(|cb| {
+            move |ev: WorkflowEvent| match ev {
+                WorkflowEvent::StageStarted { stage_name } => {
+                    cb(ProgressEvent::DesignReviewStageStarted {
+                        stage: stage_name.to_string(),
+                    });
+                }
+                WorkflowEvent::StageTurn {
+                    stage_name,
+                    turn,
+                    max_turns,
+                } => {
+                    cb(ProgressEvent::DesignReviewStageTurn {
+                        stage: stage_name.to_string(),
+                        turn,
+                        max_turns,
+                    });
+                }
+                WorkflowEvent::StageFinished { stage_name, .. }
+                | WorkflowEvent::StageSkipped { stage_name } => {
+                    cb(ProgressEvent::DesignReviewStageFinished {
+                        stage: stage_name.to_string(),
+                    });
+                }
+                _ => {}
+            }
+        });
+
+        let run_input = DesignAssessmentRunInput {
+            subject: subject.to_string(),
+            posted_date_ymd: posted_date_ymd.clone(),
+            sections: sections.clone(),
+            num_patches: patches.len(),
+            prior_context_markdown: prior_context_markdown.clone(),
+            custom_prompt: options.custom_prompt.clone(),
+            tool_state: Arc::clone(&tool_state),
+            reasoning_effort,
+        };
+
+        let fut = run_design_assessment_pipeline(
+            provider,
+            run_input,
+            wf_cb
+                .as_ref()
+                .map(|f| f as &(dyn Fn(WorkflowEvent) + Send + Sync)),
+        );
+        let outcome = if let Some(ref budget) = deadline_budget {
+            // Poll via `DeadlineBudget::current_deadline_at` with a 100ms
+            // minimum sleep floor so ongoing idle waits on `llm_semaphore` or
+            // `quota` always exceed the 1ms credit threshold without spinning.
+            tokio::pin!(fut);
+            let min_poll = std::time::Duration::from_millis(100);
+            loop {
+                let now = tokio::time::Instant::now();
+                let target = budget.current_deadline_at(now).max(now + min_poll);
+                tokio::select! {
+                    res = &mut fut => break res,
+                    () = tokio::time::sleep_until(target) => {
+                        let check_now = tokio::time::Instant::now();
+                        if budget.current_deadline_at(check_now) <= check_now {
+                            break Err(anyhow!("Design assessment timed out after {}s", timeout_seconds));
+                        }
+                    }
+                }
+            }
+        } else {
+            fut.await
+        };
+
+        match outcome {
+            Ok(exec) => {
+                info!("Series design assessment completed.");
+                return Ok(exec);
+            }
+            Err(e) => {
+                error!("Series design assessment failed: {}", e);
+                let stop_retrying = crate::ai::is_non_retryable_review_error(&e);
+                last_error = Some(e);
+                if stop_retrying {
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("Design assessment failed")))
 }
 
 /// Records a patch whose review failed, so the report does not present it as
@@ -841,11 +1156,13 @@ fn append_patch_inline_review(
 /// Pre-existing concerns are preserved in the payload so that daemon-spawned
 /// worker reviews can hand them to the standalone Linux bug pipeline for
 /// verification, deduplication, and database tracking.
+#[allow(clippy::too_many_arguments)]
 fn build_review_output(
     summary: String,
     findings: Vec<Value>,
     concerns: Vec<Value>,
     dismissed_concerns: Vec<Value>,
+    prior_resolutions: Vec<Value>,
     concerns_count: u64,
     dismissed_concerns_count: u64,
     review_map: Option<Value>,
@@ -855,6 +1172,7 @@ fn build_review_output(
         "findings": findings,
         "concerns": concerns,
         "dismissed_concerns": dismissed_concerns,
+        "prior_resolutions": prior_resolutions,
         "concerns_count": concerns_count,
         "dismissed_concerns_count": dismissed_concerns_count
     });
@@ -866,6 +1184,142 @@ fn build_review_output(
     out
 }
 
+/// Deduplicates related pre-existing bugs in `res` against bugs already
+/// reported by earlier patches in `already_reported`, removing any duplicate's
+/// inlined comment block from `res["inline_review"]` and
+/// `res["review"]["review_inline"]`. When `strip_placeholders` is true
+/// (standalone CLI mode where no database footnote links are composed), also
+/// strips any remaining `[BUG_REF]` placeholders from the inline review text.
+fn dedup_series_related_preexisting(
+    res: &mut Value,
+    already_reported: &[Value],
+    strip_placeholders: bool,
+) {
+    let mut dropped_indices = Vec::new();
+    let mut kept_indices = Vec::new();
+    let mut all_dropped = false;
+    let mut has_any_findings = false;
+
+    if let Some(review_obj) = res.get_mut("review").and_then(Value::as_object_mut) {
+        has_any_findings = review_obj
+            .get("findings")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| !arr.is_empty());
+        if let Some(items) = review_obj
+            .get_mut("related_preexisting")
+            .and_then(Value::as_array_mut)
+            && !items.is_empty()
+        {
+            let mut kept = Vec::with_capacity(items.len());
+            let mut dropped = Vec::new();
+            for (old_idx, mut item) in std::mem::take(items).into_iter().enumerate() {
+                let key = crate::related_preexisting::BugKey::from_item(&item);
+                let bug_id = item.get("bug_id").and_then(Value::as_i64);
+                let is_dup = already_reported.iter().any(|prev| {
+                    let prev_key = crate::related_preexisting::BugKey::from_item(prev);
+                    let prev_bug_id = prev.get("bug_id").and_then(Value::as_i64);
+                    prev_key.is_same_bug(&key) || (bug_id.is_some() && bug_id == prev_bug_id)
+                });
+                if is_dup {
+                    if let Some(map) = item.as_object_mut() {
+                        map.insert(
+                            "dismissed_by".to_string(),
+                            Value::String("series_dedup".to_string()),
+                        );
+                        map.insert(
+                            "dismissed_reason".to_string(),
+                            Value::String(
+                                "Already reported on an earlier patch in this series.".to_string(),
+                            ),
+                        );
+                    }
+                    dropped_indices.push(old_idx);
+                    dropped.push(item);
+                } else {
+                    kept_indices.push(old_idx);
+                    kept.push(item);
+                }
+            }
+            all_dropped = kept.is_empty() && !dropped.is_empty();
+            *items = kept;
+            if !dropped.is_empty() {
+                let dismissed = review_obj
+                    .entry("related_preexisting_dismissed")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Some(arr) = dismissed.as_array_mut() {
+                    arr.extend(dropped);
+                }
+            }
+        }
+    }
+
+    let rewrite_inline = |text: &str| -> String {
+        let mut s = if all_dropped && !has_any_findings {
+            "No issues found.".to_string()
+        } else {
+            let mut cur = text.to_string();
+            for &d_idx in &dropped_indices {
+                let ph = crate::related_preexisting::bug_ref_placeholder(d_idx);
+                cur = crate::related_preexisting::remove_inline_comment_with_placeholder(&cur, &ph);
+            }
+            for (new_idx, &old_idx) in kept_indices.iter().enumerate() {
+                if new_idx != old_idx {
+                    let old_ph = crate::related_preexisting::bug_ref_placeholder(old_idx);
+                    let new_ph = crate::related_preexisting::bug_ref_placeholder(new_idx);
+                    cur = cur.replace(&old_ph, &new_ph);
+                }
+            }
+            cur
+        };
+        if strip_placeholders && s.contains("[BUG_REF") {
+            s = crate::related_preexisting::strip_all_bug_ref_placeholders(&s);
+        }
+        s
+    };
+
+    if (!dropped_indices.is_empty() || strip_placeholders)
+        && let Some(inline_str) = res
+            .get("inline_review")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    {
+        let updated = rewrite_inline(&inline_str);
+        res["inline_review"] = Value::String(updated.clone());
+        if let Some(review_obj) = res.get_mut("review").and_then(Value::as_object_mut)
+            && review_obj.contains_key("review_inline")
+        {
+            review_obj.insert("review_inline".to_string(), Value::String(updated));
+        }
+    }
+}
+
+/// Appends one patch's related pre-existing bugs (reported and dismissed)
+/// to the series-wide lists, tagged with the patch they belong to.
+fn merge_related_preexisting(
+    review: &Value,
+    patch_index: i64,
+    patch_subject: &str,
+    reported: &mut Vec<Value>,
+    dismissed: &mut Vec<Value>,
+) {
+    for (key, combined) in [
+        ("related_preexisting", reported),
+        ("related_preexisting_dismissed", dismissed),
+    ] {
+        for item in review
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let mut item_val = item.clone();
+            item_val["patch_index"] = json!(patch_index);
+            item_val["patch_subject"] = json!(patch_subject);
+            combined.push(item_val);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_worker_in_worktree(
     worktree: &GitWorktree,
@@ -875,13 +1329,15 @@ async fn run_worker_in_worktree(
     patchset_id: i64,
     subject: String,
     patches: Vec<PatchInput>,
+    known_disclosures: &[crate::related_preexisting::BugKey],
+    candidate_bugs: &[Value],
     baseline_arg: &str,
     baseline_sha: &str,
     options: &WorkerOptions,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
-    info!("Worktree at {:?}", worktree.path);
-    info!("Found {} patches total", patches.len());
+    debug!("Worktree at {:?}", worktree.path);
+    debug!("Found {} patches total", patches.len());
 
     let mut patch_results = Vec::new();
     let mut patch_shas = HashMap::new();
@@ -908,7 +1364,7 @@ async fn run_worker_in_worktree(
         }
         true
     } else if let Some(commit_hash) = &options.review_commit {
-        info!("Directly reviewing commit {}", commit_hash);
+        debug!("Directly reviewing commit {}", commit_hash);
         for p in &patches {
             if let Some(sha) = &p.commit_id {
                 patch_shas.insert(p.index, sha.clone());
@@ -1020,10 +1476,25 @@ async fn run_worker_in_worktree(
         }));
     }
 
+    let run_design = options.current_tree && settings.review.design;
+
     info!(
-        "Patches applied. Starting AI reviews for {} patches...",
-        patches_to_review.len()
+        "Patches applied. Starting AI reviews for {} patches{}...",
+        patches_to_review.len(),
+        if run_design {
+            " + series design assessment"
+        } else {
+            ""
+        }
     );
+    if run_design {
+        emit(
+            progress,
+            ProgressEvent::DesignReviewQueued {
+                subject: subject.clone(),
+            },
+        );
+    }
     emit(
         progress,
         ProgressEvent::AiReviewStarted {
@@ -1051,7 +1522,8 @@ async fn run_worker_in_worktree(
                 "diff": p.diff,
                 "commit_id": patch_shas.get(&p.index).cloned().or_else(|| p.commit_id.clone()),
                 "git_show": patch_shows.get(&p.index).cloned(),
-                "commit_message_full": patch_messages.get(&p.index).cloned()
+                "commit_message_full": patch_messages.get(&p.index).cloned(),
+                "prior_version_context": p.prior_version_context,
             })
         })
         .collect();
@@ -1069,55 +1541,108 @@ async fn run_worker_in_worktree(
         settings.ai.max_tpm,
     ));
     // Execute patch reviews concurrently with a limit
-    let futures_stream = futures_util::stream::iter(patches_to_review.iter().map(|p| {
-        let rich_patches = rich_patches.clone();
-        let patch_shas = &patch_shas;
-        let options = &options;
-        let subject_clone = subject.clone();
-        let all_patches = &patches;
-        let llm_semaphore = &llm_semaphore;
-        let quota = &quota;
-        async move {
-            let result = review_single_patch(
-                worktree,
-                settings,
-                patchset_id,
-                &subject_clone,
-                p,
-                all_patches,
-                &rich_patches,
-                patch_shas,
-                options,
-                baseline_sha,
-                llm_semaphore,
-                quota,
-                timeout_seconds,
-                progress,
-            )
-            .await;
-            (p.index, result)
-        }
-    }));
+    let review_futures: Vec<_> = patches_to_review
+        .iter()
+        .map(|p| {
+            let rich_patches = &rich_patches;
+            let patch_shas = &patch_shas;
+            let options = &options;
+            let subject = &subject;
+            let all_patches = &patches;
+            let llm_semaphore = &llm_semaphore;
+            let quota = &quota;
+            async move {
+                let result = review_single_patch(
+                    worktree,
+                    settings,
+                    patchset_id,
+                    subject,
+                    p,
+                    all_patches,
+                    rich_patches,
+                    known_disclosures,
+                    candidate_bugs,
+                    patch_shas,
+                    options,
+                    baseline_sha,
+                    llm_semaphore,
+                    quota,
+                    timeout_seconds,
+                    progress,
+                )
+                .await;
+                (p.index, result)
+            }
+        })
+        .collect();
+    let futures_stream = futures_util::stream::iter(review_futures);
 
     // A failed patch must not discard the reviews of the other patches, so
     // collect every result and report the failures alongside them.
-    let mut buffered = futures_stream.buffer_unordered(concurrency);
     let mut results = Vec::new();
     let mut review_errors = Vec::new();
     let mut failed_outcomes = Vec::new();
-    while let Some((patch_index, result)) = buffered.next().await {
-        match result {
-            Ok(res) => results.push(res),
+    let mut patch_results_local = std::mem::take(&mut patch_results);
+
+    let patch_reviews_fut = async {
+        let mut buffered = futures_stream.buffer_unordered(concurrency);
+        while let Some((patch_index, result)) = buffered.next().await {
+            match result {
+                Ok(res) => results.push(res),
+                Err(err) => {
+                    if let Some(wf) = err.downcast_ref::<crate::workflow::WorkflowFailure>() {
+                        failed_outcomes.push((patch_index, wf.outcome.clone()));
+                    }
+                    let err = format_error_chain(&err);
+                    mark_patch_review_incomplete(&mut patch_results_local, patch_index, &err);
+                    review_errors.push((patch_index, err));
+                }
+            }
+        }
+    };
+
+    let design_fut = async {
+        if !run_design {
+            return None;
+        }
+        let res = run_local_design_assessment(
+            worktree,
+            settings,
+            &subject,
+            &patches,
+            &patch_shas,
+            &patch_messages,
+            options,
+            baseline_sha,
+            &llm_semaphore,
+            &quota,
+            timeout_seconds,
+            progress,
+        )
+        .await;
+        match &res {
+            Ok(_) => emit(progress, ProgressEvent::DesignReviewFinished),
+            Err(_) => emit(progress, ProgressEvent::DesignReviewFailed),
+        }
+        Some(res)
+    };
+
+    let (_, design_outcome) = tokio::join!(patch_reviews_fut, design_fut);
+    let mut patch_results = patch_results_local;
+
+    let mut design_exec = None;
+    if let Some(res) = design_outcome {
+        match res {
+            Ok(exec) => design_exec = Some(exec),
             Err(err) => {
                 if let Some(wf) = err.downcast_ref::<crate::workflow::WorkflowFailure>() {
-                    failed_outcomes.push((patch_index, wf.outcome.clone()));
+                    failed_outcomes.push((i64::MAX, wf.outcome.clone()));
                 }
-                let err = format!("{:?}", err);
-                mark_patch_review_incomplete(&mut patch_results, patch_index, &err);
-                review_errors.push((patch_index, err));
+                review_errors.push((i64::MAX, format_error_chain(&err)));
             }
         }
     }
+
     results.sort_by_key(|res| res["patch_index"].as_i64().unwrap_or(0));
     failed_outcomes.sort_by_key(|(idx, _)| *idx);
 
@@ -1126,6 +1651,10 @@ async fn run_worker_in_worktree(
     let mut combined_findings = Vec::new();
     let mut combined_concerns = Vec::new();
     let mut combined_dismissed_concerns = Vec::new();
+    let mut combined_failed_stages = Vec::new();
+    let mut combined_related = Vec::new();
+    let mut combined_related_dismissed = Vec::new();
+    let mut combined_prior_resolutions = Vec::new();
     let mut combined_inline = String::new();
     let mut combined_history = Vec::new();
     let mut combined_input_context = String::new();
@@ -1147,7 +1676,7 @@ async fn run_worker_in_worktree(
         }
     }
 
-    for res in results {
+    for mut res in results {
         let p_idx = res["patch_index"].as_i64().unwrap_or(0);
         let history_offset = combined_history.len();
         let patch_subject = patches_to_review
@@ -1156,6 +1685,8 @@ async fn run_worker_in_worktree(
             .and_then(|p| p.subject.as_ref())
             .cloned()
             .unwrap_or_default();
+
+        dedup_series_related_preexisting(&mut res, &combined_related, patchset_id == 0);
 
         if let Some(review) = res.get("review") {
             if let Some(summary) = review.get("summary").and_then(|v| v.as_str())
@@ -1188,6 +1719,29 @@ async fn run_worker_in_worktree(
             }
             if let Some(dismissed) = review.get("dismissed_concerns").and_then(|v| v.as_array()) {
                 combined_dismissed_concerns.extend(dismissed.clone());
+            }
+            if let Some(failed) = review.get("failed_stages").and_then(|v| v.as_array()) {
+                for f in failed {
+                    let mut failed_val = f.clone();
+                    failed_val["patch_index"] = json!(p_idx);
+                    failed_val["patch_subject"] = json!(patch_subject);
+                    combined_failed_stages.push(failed_val);
+                }
+            }
+            merge_related_preexisting(
+                review,
+                p_idx,
+                &patch_subject,
+                &mut combined_related,
+                &mut combined_related_dismissed,
+            );
+            if let Some(resolutions) = review.get("prior_resolutions").and_then(|v| v.as_array()) {
+                for r in resolutions {
+                    let mut r_val = r.clone();
+                    r_val["patch_index"] = json!(p_idx);
+                    r_val["patch_subject"] = json!(patch_subject);
+                    combined_prior_resolutions.push(r_val);
+                }
             }
 
             if let Some(cc) = review.get("concerns_count").and_then(|v| v.as_u64()) {
@@ -1235,15 +1789,35 @@ async fn run_worker_in_worktree(
             total_tokens_cached.saturating_add(res["tokens_cached"].as_u64().unwrap_or(0));
     }
 
-    let review_output = build_review_output(
+    let mut review_output = build_review_output(
         combined_summary,
         combined_findings,
         combined_concerns,
         combined_dismissed_concerns,
+        combined_prior_resolutions,
         total_concerns_count,
         total_dismissed_concerns_count,
         single_review_map,
     );
+    // The daemon reserves and mails the related bugs from here, so they must
+    // survive the merge of the per-patch outputs.
+    if let Some(obj) = review_output.as_object_mut() {
+        obj.insert("related_preexisting".to_string(), json!(combined_related));
+        obj.insert(
+            "related_preexisting_dismissed".to_string(),
+            json!(combined_related_dismissed),
+        );
+        obj.insert("failed_stages".to_string(), json!(combined_failed_stages));
+        if let Some(exec) = design_exec {
+            total_tokens_in = total_tokens_in.saturating_add(exec.tokens_in);
+            total_tokens_out = total_tokens_out.saturating_add(exec.tokens_out);
+            total_tokens_cached = total_tokens_cached.saturating_add(exec.tokens_cached);
+            combined_history.extend(exec.history);
+            if let Ok(val) = serde_json::to_value(&exec.result) {
+                obj.insert("design_assessment".to_string(), val);
+            }
+        }
+    }
 
     let mut combined_result = json!({
         "patchset_id": patchset_id,
@@ -1335,6 +1909,19 @@ pub fn progress_line(event: ProgressEvent) -> Option<String> {
         } if attempt > 1 => format!("patch {patch_index}: retry {attempt}/{max_attempts}"),
         ProgressEvent::AiReviewFinished { patch_index } => format!("patch {patch_index}: done"),
         ProgressEvent::AiReviewFailed { patch_index } => format!("patch {patch_index}: incomplete"),
+        ProgressEvent::DesignReviewStageStarted { stage } => format!("design: {stage} started"),
+        ProgressEvent::DesignReviewStageTurn {
+            stage,
+            turn,
+            max_turns,
+        } => format!("design: {stage} turn {turn}/{max_turns}"),
+        ProgressEvent::DesignReviewStageFinished { stage } => format!("design: {stage} finished"),
+        ProgressEvent::DesignReviewAttempt {
+            attempt,
+            max_attempts,
+        } if attempt > 1 => format!("design: retry {attempt}/{max_attempts}"),
+        ProgressEvent::DesignReviewFinished => "design: done".to_string(),
+        ProgressEvent::DesignReviewFailed => "design: incomplete".to_string(),
         _ => return None,
     };
     Some(line)
@@ -1346,6 +1933,20 @@ pub fn result_has_error(result: &Value) -> bool {
         .and_then(|e| e.as_str())
         .map(|e| !e.is_empty())
         .unwrap_or(false)
+}
+
+/// The failed stages of every patch review, each stamped with its patch.
+pub fn result_failed_stages(result: &Value) -> &[Value] {
+    result
+        .get("review")
+        .and_then(|review| review.get("failed_stages"))
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// True when a patch's review failed or had a failed stage.
+pub fn result_is_incomplete(result: &Value) -> bool {
+    result_has_error(result) || !result_failed_stages(result).is_empty()
 }
 
 pub fn result_has_high_or_critical_findings(result: &Value) -> bool {
@@ -1390,6 +1991,8 @@ pub fn format_agent_review_output(result: &Value) -> Value {
 
     let status = if result_has_error(result) {
         "error"
+    } else if result_is_incomplete(result) {
+        "incomplete"
     } else if !findings.is_empty() {
         "issues_found"
     } else {
@@ -1424,8 +2027,30 @@ pub fn format_agent_review_output(result: &Value) -> Value {
     });
 
     if let Some(obj) = out.as_object_mut() {
+        if let Some(related) = result
+            .get("review")
+            .and_then(|r| r.get("related_preexisting"))
+            .filter(|v| v.as_array().is_some_and(|items| !items.is_empty()))
+        {
+            obj.insert("related_preexisting".into(), related.clone());
+        }
+        if let Some(design_val) = result
+            .get("review")
+            .and_then(|r| r.get("design_assessment"))
+        {
+            let concise = serde_json::from_value::<
+                crate::workflows::design_assessment::DesignAssessmentResult,
+            >(design_val.clone())
+            .map(|da| da.to_agent_value())
+            .unwrap_or_else(|_| design_val.clone());
+            obj.insert("design_assessment".into(), concise);
+        }
         if let Some(partial) = result.get("partial") {
             obj.insert("partial".into(), partial.clone());
+        }
+        let failed_stages = result_failed_stages(result);
+        if !failed_stages.is_empty() {
+            obj.insert("failed_stages".into(), json!(failed_stages));
         }
         if let Some(err) = result.get("error")
             && !err.is_null()
@@ -1446,7 +2071,7 @@ async fn apply_single_patch(
     patch_results: &mut Vec<Value>,
 ) -> bool {
     if let Some(sha) = &p.commit_id {
-        info!(
+        debug!(
             "Patch {} is identified by commit ID {}, attempting direct checkout...",
             p.index, sha
         );
@@ -1467,7 +2092,7 @@ async fn apply_single_patch(
         && sha.len() == 40
         && sha.chars().all(|c| c.is_ascii_hexdigit())
     {
-        info!(
+        debug!(
             "Patch {} message_id looks like a SHA {}, checking out...",
             p.index, sha
         );
@@ -1607,6 +2232,23 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
 
+    /// Callers may run a review on a multi-threaded executor, which needs
+    /// the review futures to be Send. The compiler checks that when it
+    /// type-checks the closures below, so they are never called.
+    #[test]
+    fn review_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let _ = |input: ReviewInput, options: WorkerOptions, settings: &Settings| {
+            assert_send(&run_worker(input, options, settings, None));
+        };
+        let _ = |repo: PathBuf, input: String, options: ReviewOptions, settings: &Settings| {
+            assert_send(&run_git_review(repo, input, options, settings, None));
+        };
+        let _ = |options: WorkerOptions, settings: &Settings| {
+            assert_send(&run_worker_from_stdin(options, settings));
+        };
+    }
+
     /// A provider that does nothing; the decoration tests only care about
     /// whether it was wrapped, which `Arc::ptr_eq` answers directly.
     struct StubProvider;
@@ -1683,6 +2325,7 @@ mod tests {
             response_format: None,
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         }
     }
 
@@ -1747,6 +2390,23 @@ mod tests {
         // is already past its deadline stops rather than retrying through it.
         assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
         Ok(())
+    }
+
+    #[test]
+    fn test_merge_related_preexisting_keeps_reported_and_dismissed() {
+        let review = json!({
+            "related_preexisting": [{"description": "a", "report_text": "note"}],
+            "related_preexisting_dismissed": [{"description": "b"}],
+        });
+        let (mut reported, mut dismissed) = (Vec::new(), Vec::new());
+        merge_related_preexisting(&review, 2, "mm: fix", &mut reported, &mut dismissed);
+        merge_related_preexisting(&json!({}), 3, "other", &mut reported, &mut dismissed);
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0]["report_text"], "note");
+        assert_eq!(reported[0]["patch_index"], 2);
+        assert_eq!(reported[0]["patch_subject"], "mm: fix");
+        assert_eq!(dismissed.len(), 1);
+        assert_eq!(dismissed[0]["description"], "b");
     }
 
     #[test]
@@ -1962,6 +2622,7 @@ mod tests {
             date: None,
             message_id: Some("some-msg-id".to_string()),
             commit_id: Some(feature_sha),
+            prior_version_context: None,
         };
 
         let mut patch_shas = HashMap::new();
@@ -2000,6 +2661,7 @@ mod tests {
             date: None,
             message_id: Some("some-msg-id".to_string()),
             commit_id: Some("0000000000000000000000000000000000000000".to_string()),
+            prior_version_context: None,
         };
 
         let mut patch_shas = HashMap::new();
@@ -2037,6 +2699,7 @@ mod tests {
             date: None,
             message_id: Some(feature_sha),
             commit_id: None,
+            prior_version_context: None,
         };
 
         let mut patch_shas = HashMap::new();
@@ -2072,6 +2735,7 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: Some("sha1".to_string()),
+            prior_version_context: None,
         };
         let p2 = PatchInput {
             index: 2,
@@ -2081,6 +2745,7 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: Some("sha2".to_string()),
+            prior_version_context: None,
         };
         let all_patches = vec![p1.clone(), p2.clone()];
         let mut patch_shas = HashMap::new();
@@ -2116,6 +2781,7 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: Some("sha1".to_string()),
+            prior_version_context: None,
         };
         let p2 = PatchInput {
             index: 2,
@@ -2125,6 +2791,7 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: Some("sha2".to_string()),
+            prior_version_context: None,
         };
         let all_patches = vec![p1.clone(), p2.clone()];
         let mut patch_shas = HashMap::new();
@@ -2214,11 +2881,11 @@ mod tests {
         let single_map = json!({
             "version": 1,
             "project": "sashiko",
-            "prompts": {"base": ["review-core.md"], "pre_screen": [], "stage_guides": {}, "tool_read": []},
+            "prompts": {"base": ["review-core.md"], "pre_screen": [], "stage_guides": {}},
             "stages": [{"name": "pre-screen", "log_start": 0, "log_end": 2}],
             "raw_concerns": [{"id": "C1"}],
             "raw_dismissed_concerns": [],
-            "verification": {"findings": [], "hard_cases": [], "dismissed_concerns": []},
+            "verification": {"findings": [], "inconclusive_concerns": [], "dismissed_concerns": []},
             "post_verification": {"findings": [], "dismissed_concerns": []},
             "threads": [{"thread_id": "T1"}],
         });
@@ -2227,15 +2894,18 @@ mod tests {
             vec![json!({"problem": "new regression"})],
             vec![json!({"problem": "preexisting bug"})],
             vec![],
+            vec![json!({"item_id": "PF1", "resolution": "addressed_in_vn"})],
             3,
             0,
             Some(offset_review_map_log_bounds(&single_map, 0)),
         );
 
-        // Pre-existing candidates, summary, and review_map must be preserved so daemon-spawned
-        // worker reviews store them in ai_interactions.output.
+        // Pre-existing candidates, summary, prior_resolutions, and review_map must be preserved so
+        // daemon-spawned worker reviews store them in ai_interactions.output.
         assert_eq!(output["summary"], "Adds dev-queue routing heuristic.");
         assert_eq!(output["concerns"].as_array().unwrap().len(), 1);
+        assert_eq!(output["prior_resolutions"].as_array().unwrap().len(), 1);
+        assert_eq!(output["prior_resolutions"][0]["item_id"], "PF1");
         assert_eq!(output["concerns_count"], 3);
         assert_eq!(output["findings"].as_array().unwrap().len(), 1);
         assert_eq!(output["review_map"], single_map);
@@ -2258,6 +2928,36 @@ mod tests {
         assert_eq!(
             combined_review_error(errors),
             "patch 2: output truncated; patch 10: timed out"
+        );
+    }
+
+    #[test]
+    fn format_error_chain_deduplicates_nested_workflow_and_session_messages() {
+        let root: anyhow::Error =
+            crate::ai::gemini::GeminiError::PermissionDenied("missing key".to_string()).into();
+        let session_wrapped = root.context(crate::ai::session::SessionFailure {
+            message: "Permission denied: missing key".to_string(),
+            history: Vec::new(),
+            usage: crate::ai::AiUsage::default(),
+        });
+        let stage_wrapped = session_wrapped.context(
+            "Stage 'pre-screen' failed after 1 turns: Permission denied: missing key".to_string(),
+        );
+        let wf_wrapped = stage_wrapped.context(crate::workflow::WorkflowFailure {
+            message: "Stage 'pre-screen' failed after 1 turns: Permission denied: missing key"
+                .to_string(),
+            outcome: crate::workflow::WorkflowOutcome::default(),
+        });
+        assert_eq!(
+            format_error_chain(&wf_wrapped),
+            "Stage 'pre-screen' failed after 1 turns: Permission denied: missing key"
+        );
+
+        let distinct =
+            anyhow!("Unsupported openai api: foo").context("Failed to create AI provider");
+        assert_eq!(
+            format_error_chain(&distinct),
+            "Failed to create AI provider: Unsupported openai api: foo"
         );
     }
 
@@ -2406,6 +3106,34 @@ mod tests {
         assert_eq!(formatted_err["error"], "patch 1: timed out");
     }
 
+    #[test]
+    fn test_a_review_that_lost_a_stage_is_incomplete() {
+        let lost = json!({
+            "review": {
+                "findings": [{"problem": "missing bounds check", "severity": "High"}],
+                "concerns": [],
+                "failed_stages": [{
+                    "stage": "execution-flow",
+                    "error": "LLM output was truncated by provider (e.g. hit max tokens)",
+                    "patch_index": 1,
+                }],
+            },
+        });
+        assert!(!result_has_error(&lost));
+        assert!(result_is_incomplete(&lost));
+        let formatted = format_agent_review_output(&lost);
+        assert_eq!(formatted["status"], "incomplete");
+        assert_eq!(formatted["failed_stages"][0]["stage"], "execution-flow");
+
+        let whole = json!({"review": {"findings": [], "failed_stages": []}});
+        assert!(!result_is_incomplete(&whole));
+        assert!(
+            format_agent_review_output(&whole)
+                .get("failed_stages")
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn test_build_review_input_from_git_filters_b4_tracker_commit() {
         let dir = tempfile::tempdir().unwrap();
@@ -2479,5 +3207,70 @@ mod tests {
         );
         // The edited tracker commit populates `subject`
         assert_eq!(review_input.subject, "net: foo: series cover title");
+    }
+
+    #[test]
+    fn format_agent_review_output_includes_concise_design_assessment_and_preserves_clean_status() {
+        let raw = json!({
+            "baseline": "abc1234",
+            "patches": [{"index": 1, "status": "present", "subject": "net: drv: add knob"}],
+            "review": {
+                "findings": [],
+                "concerns": [],
+                "design_assessment": {
+                    "verdict": "concerns",
+                    "verdict_reason": "Standing interface concern.",
+                    "problem_statement": "When NAPI polling saturates, packets drop without tunable rx copybreak.",
+                    "comparison_summary": "Ethtool tunable already exists.",
+                    "concerns": [
+                        {
+                            "category": "interface",
+                            "patch_index": 1,
+                            "disposition": "stands",
+                            "significance": "blocking",
+                            "confidence": "high",
+                            "summary": "Adds module_param instead of ethtool knob",
+                            "request": "Use ethtool tunable",
+                            "quote": "module_param(rx, uint, 0644);",
+                            "anchors": [{"kind": "maintainer_note", "ref": "netdev.md", "quote": "no module_param"}],
+                            "reasoning": "Violates subsystem interface rule"
+                        }
+                    ],
+                    "all_candidates": [
+                        {
+                            "category": "necessity",
+                            "disposition": "refuted",
+                            "confidence": "high",
+                            "summary": "Refuted candidate",
+                            "request": "None",
+                            "quote": "int x;",
+                            "anchors": [{"kind": "file", "ref": "drv.c:1", "quote": "int x;"}],
+                            "reasoning": "Refuted"
+                        }
+                    ],
+                    "dismissed_concerns": [{"summary": "Non-issue", "reason": "Checked"}]
+                }
+            },
+            "tokens_in": 500,
+            "tokens_out": 120,
+            "tokens_cached": 300
+        });
+
+        assert!(!result_has_high_or_critical_findings(&raw));
+        let agent = format_agent_review_output(&raw);
+        assert_eq!(agent["status"], "clean");
+        let da = &agent["design_assessment"];
+        assert_eq!(da["verdict"], "concerns");
+        assert_eq!(da["concerns"].as_array().unwrap().len(), 1);
+        assert!(da.get("all_candidates").is_none());
+        assert!(da.get("dismissed_concerns").is_none());
+
+        assert_eq!(
+            combined_review_error(vec![
+                (i64::MAX, "timed out".to_string()),
+                (1, "truncated".to_string()),
+            ]),
+            "patch 1: truncated; design assessment: timed out"
+        );
     }
 }

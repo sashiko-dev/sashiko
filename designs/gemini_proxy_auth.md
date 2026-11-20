@@ -23,7 +23,6 @@ To make Sashiko work seamlessly out of the box with workstation Gemini quota wit
 ### `Settings.toml` (`[ai.gemini]`)
 ```toml
 [ai.gemini]
-explicit_prompt_caching = false
 # Optional custom base URL (overrides default https://generativelanguage.googleapis.com)
 # base_url = "http://localhost:8000"
 

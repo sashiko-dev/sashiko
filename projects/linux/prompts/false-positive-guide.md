@@ -62,7 +62,7 @@ Do not confuse **mandatory kernel API error-handling** with "defensive programmi
   - An actual calling path exists in the patch series or kernel tree that triggers the issue
   - The function naming/documentation doesn't clearly indicate usage constraints
   - Similar kernel APIs validate the same preconditions
-- **No speculative driver/caller footguns**: Do not report that a new or refactored internal helper could fail if a hypothetical or out-of-tree caller passes an invalid argument (e.g., a stack-allocated array where a persistent array is required, a tail page where an order-0 page or head page is required, `nr_pages = 0` or an overflowing `nr_pages`, or a current-EL syndrome to a lower-EL trap helper) unless a caller in the patch series actually violates the contract.
+- **No speculative driver/caller footguns (new, modified, pre-existing, or `EXPORT_SYMBOL*` functions)**: For any internal kernel function — new, modified, pre-existing, or exported via `EXPORT_SYMBOL` / `EXPORT_SYMBOL_GPL` — never report that the function malfunctions when passed hypothetical invalid, unaligned, `NULL`, zero-sized, or out-of-contract arguments (for example, a stack-allocated array where a persistent array is required, a tail page where an order-0 or head page is required, `nr_pages = 0` or an overflowing `nr_pages`, a current-EL syndrome passed to a lower-EL trap helper, or `migrate_vma_setup()` computing `(end - start) >> PAGE_SHIFT` before `PAGE_MASK` under hypothetical unaligned `start`/`end`) unless **either** (a) untrusted external input (userspace, network, hardware/DMA/firmware, guest VM, or untrusted filesystem image) can reach that argument without validation/alignment, **or** (b) you cite at least one concrete in-tree caller (`file:function:line`) in the patch series or repository that actually violates the contract. Never invoke hypothetical future callers or out-of-tree modules (`EXPORT_SYMBOL*`) to justify a caller-argument bug.
 - **Internal API contract `WARN_ON_ONCE` / `VM_WARN_ON_ONCE`**: Do not report `WARN_ON_ONCE()` or `VM_WARN_ON_ONCE()` checks that enforce kernel driver API contracts as user-triggerable `panic_on_warn` Denial-of-Service bugs unless you can prove an actual in-tree driver violates the contract on a user-reachable path.
 
 ### 3. Unverifiable Assumptions
@@ -208,18 +208,21 @@ the dismissal is invalid. Report the race.
 
 ### 8.2. Race reference budget (MANDATORY)
 For any suspected use-after-free where the other side is asynchronous work, an
-RCU callback or a workqueue item, apply "Step 5: Check Object Lifetime" in
-`locking.md`, loading it if it is not already loaded.
+RCU callback or a workqueue item, list what keeps the object alive on each
+side (references, held locks, RCU read-side sections) up to the free. Report
+only if the free can run while the using side still holds a pointer with no
+pin. When `locking.md` is in context, apply its "Step 5: Check Object
+Lifetime".
 
-Required output: the `budget:` line defined there. If analysis already
-produced one, check it against the code again rather than copying it.
+Required output: the `budget:` line defined in `locking.md` when it is in
+context, otherwise the pins held on each side and the free point. If analysis
+already produced one, check it against the code again rather than copying it.
 
 ### 9. Performance Tradeoffs
 **Not a regression if**:
-- Lower performance was an intentional tradeoff explicitly documented in the commit message or code comments
-- Commit message explains the performance impact
-- Simplicity/maintainability was explicitly prioritized by the author in the commit message or comments (never invent an unstated "simplicity tradeoff" to excuse operating on unmodified ranges/entries when the code tracks modified sub-ranges, or to excuse narrowing an existing Kconfig/UAPI feature)
-- It's optimizing for a different use case
+- The commit message or code comments explicitly acknowledge and accept the specific workload performance degradation as a deliberate tradeoff (IMPORTANT: merely describing the correctness mechanism added by the patch—such as adding `vfs_fsync()`, `tlb_remove_table_sync_one()` broadcast IPIs, a hot-path `spin_lock_irqsave`, delegating a high-IOPS completion ISR to a threaded IRQ, clamping `filemap_fault` readahead to VMA boundaries, or flushing all global slab caches on a single `kmem_cache_destroy()`—is **NOT** an accepted performance tradeoff when the author did not recognize the severe throughput, latency, or IPI cliff on real workloads; report such regressions!)
+- Simplicity/maintainability was explicitly prioritized by the author in the commit message or comments for a genuinely cold path (never invent an unstated "simplicity", "short critical section", "benign extra workqueue wakeup", or "cold teardown" rationalization to excuse operating on unmodified ranges/all global caches, shifting hot embedding-struct cachelines such as `struct mem_cgroup` or `struct netns_*`, reducing block `wake_batch`/async depth, or narrowing large-folio/readahead/offload support)
+- **No speculative micro-optimizations or zero-delta lock nitpicks**: Never report `likely()`/`unlikely()`, manual `inline`, extra function parameters, static-key plumbing, small fixed-bound loops ($\le 16$ entries), converting an existing lock to `guard(mutex)` / `scoped_guard`, or taking a local `mutex` on a one-shot control, `probe`, `resume`, `open`, or sensor mode-switch path that has no hot runtime caller, no $O(N)$ multi-instance fan-out, and no `synchronize_rcu*` / `fsync` / broadcast-IPI stall. Confirming a performance finding requires concrete code proof of hot-path execution frequency, $O(N)$/$O(N^2)$ scaling, hot-struct cacheline false sharing, asymmetric unbatched high-order page teardown, or silent fast-path/offload/readahead/priority demotion.
 
 ### 9.1 Documented API Guarantees
 **Never report** that an API fails to provide something its own documentation
@@ -286,7 +289,10 @@ to them before reading them
 ### 13. Implicit Guard Conditions
 
 **Before reporting NULL dereference**:
-- Load and fully analyze pointer-guards.md for EVERY NULL pointer
+- Trace every condition on the path to the dereference (loop filters,
+  early returns, helper checks) and show that none of them rules out
+  NULL, including guards on other state that is set together with the
+  pointer
 
 ### 14. Patch series false positive removal
 
@@ -373,8 +379,9 @@ Do not skip steps. Do not claim completion without producing the output.
 
 Before reporting ANY regression, verify:
 
-0. For NULL pointer dereferences, load pointer-guards.md
-   - Output: "reviewed" or "not applicable - not a NULL dereference issue"
+0. For NULL pointer dereferences, check the guards on the path (section 13)
+   - Output: each guard and why it does not rule out NULL, or "not
+     applicable - not a NULL dereference issue"
 1. **Can I prove this path executes?**
    - Find calling code that reaches here
      - Output: quote the call chain with locations (e.g., "caller@file:line → target@file:line")
@@ -486,9 +493,15 @@ Before reporting ANY regression, verify:
 - NEVER invent other methods to look forward in git history.
 - If the prompt included a range of git commits to check, look forward
   through that range for later patches that might resolve the bug you found.
-- Never search backwards in commit history.
+- Never search backwards in commit history when checking for series fixes.
 
 ## Special Cases
+
+### Fixes: Trailers
+- Suggesting `Fixes:` on new features, hardware enablement, refactorings, cleanups, documentation, or style/warning fixes → Do NOT report
+- Suggesting `Fixes:` pointing to an unmerged commit in the same patch series → Do NOT report (amend into the earlier patch instead)
+- Suggesting `Fixes:` when no single introducing commit in repository history can be proven by inspecting its diff with `git_show` → Do NOT report
+- Genuine bug fix missing `Fixes:` where `<fixes_context>`, `git_blame`, or `git_show` proves the exact introducing commit, or an existing `Fixes:` trailer with a malformed format, unresolvable SHA, wrong quoted subject, or wrong commit → Report at `Low` severity
 
 ### Test Code
 - Memory leaks in one-shot test programs at process exit → Usually OK
@@ -512,6 +525,10 @@ Before reporting ANY regression, verify:
 - When reviewing reverts, focus on new issues
 - Assume the original bug is known/handled
 - Don't re-report the original problem
+
+### Stable Backports (-stable)
+- When reviewing a stable backport patch (for example `[PATCH 5.10 / 6.1.y / 6.6.y / 6.12.y / 6.18.y]` or a commit carrying `commit <sha> upstream`, `[ Upstream commit <sha> ]`, or `(cherry picked from commit <sha>)`), report only backport adaptation defects: missing prerequisite commits, broken surrounding context, API/locking/struct differences in the target stable tree, or bugs newly introduced while adapting the patch
+- Do NOT flag pre-existing limitations, minor stats inaccuracies, or edge cases that behave identically in the upstream mainline commit, because `-stable` backports intentionally preserve upstream commit semantics
 
 ### Subsystem Exclusions
 - fs/bcachefs → Skip all issues

@@ -66,6 +66,11 @@ impl<C> ToolRegistry<C> {
         self.tools.insert(tool.name(), Arc::from(tool));
     }
 
+    /// Returns true when a tool with `name` is registered.
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
     /// Returns the list of tool declarations in a format suitable for the LLM API.
     ///
     /// The output is a vector of JSON objects, each containing:

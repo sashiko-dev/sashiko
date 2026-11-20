@@ -163,9 +163,12 @@ impl NntpClient {
         timeout(DEFAULT_TIMEOUT, reader.read_until(b'\n', &mut buf))
             .await
             .map_err(|_| anyhow!("Timeout reading welcome message"))??;
+        if !buf.ends_with(b"\n") {
+            return Err(anyhow!("Unexpected EOF reading welcome message"));
+        }
         let response = String::from_utf8_lossy(&buf).trim().to_string();
 
-        if !response.starts_with("200") && !response.starts_with("201") {
+        if !matches!(Self::status_code(&response), Some("200" | "201")) {
             return Err(anyhow!("Unexpected welcome message: {}", response));
         }
 
@@ -176,12 +179,33 @@ impl NntpClient {
         })
     }
 
+    fn status_code(response: &str) -> Option<&str> {
+        let code = response.get(..3)?;
+        if code.bytes().all(|b| b.is_ascii_digit())
+            && response.as_bytes().get(3).is_none_or(|&b| b == b' ')
+        {
+            Some(code)
+        } else {
+            None
+        }
+    }
+
+    /// True while the underlying socket has not been dropped by an I/O
+    /// error, unexpected EOF, protocol/server error, timeout, or `QUIT`.
+    pub fn is_connected(&self) -> bool {
+        self.stream.is_some()
+    }
+
     async fn read_line_with_timeout(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
         let mut stream = self
             .stream
             .take()
             .ok_or_else(|| anyhow!("NNTP connection closed after prior I/O error or timeout"))?;
         match timeout(self.timeout, stream.read_until(b'\n', buf)).await {
+            Ok(Ok(0)) => Err(anyhow!("Unexpected EOF from NNTP server")),
+            Ok(Ok(_)) if !buf.ends_with(b"\n") => {
+                Err(anyhow!("Unexpected mid-line EOF from NNTP server"))
+            }
             Ok(Ok(n)) => {
                 self.stream = Some(stream);
                 Ok(n)
@@ -224,17 +248,15 @@ impl NntpClient {
         self.send_command("LIST").await?;
         let response = self.read_response().await?;
 
-        if !response.starts_with("215") {
+        if Self::status_code(&response) != Some("215") {
+            self.stream = None;
             return Err(anyhow!("Failed to retrieve list: {}", response));
         }
 
         let mut groups = Vec::new();
         loop {
             let mut buf = Vec::new();
-            let n = self.read_line_with_timeout(&mut buf).await?;
-            if n == 0 {
-                break; // EOF
-            }
+            self.read_line_with_timeout(&mut buf).await?;
 
             let line_raw = String::from_utf8_lossy(&buf);
             let line = line_raw.trim_end_matches(['\r', '\n']);
@@ -255,7 +277,10 @@ impl NntpClient {
         self.send_command(&format!("GROUP {}", group_name)).await?;
         let response = self.read_response().await?;
 
-        if !response.starts_with("211") {
+        if Self::status_code(&response) != Some("211") {
+            if Self::status_code(&response) != Some("411") {
+                self.stream = None;
+            }
             return Err(anyhow!(
                 "Failed to select group {}: {}",
                 group_name,
@@ -265,10 +290,12 @@ impl NntpClient {
 
         let parts: Vec<&str> = response.split_whitespace().collect();
         if parts.len() < 5 {
+            self.stream = None;
             return Err(anyhow!("Invalid GROUP response format: {}", response));
         }
 
         if parts[4] != group_name {
+            self.stream = None;
             return Err(anyhow!(
                 "Mismatched GROUP response: expected {}, got {}",
                 group_name,
@@ -288,17 +315,17 @@ impl NntpClient {
         self.send_command(&format!("ARTICLE {}", id)).await?;
         let response = self.read_response().await?;
 
-        if !response.starts_with("220") {
+        if Self::status_code(&response) != Some("220") {
+            if !matches!(Self::status_code(&response), Some("423" | "430")) {
+                self.stream = None;
+            }
             return Err(anyhow!("Failed to retrieve article {}: {}", id, response));
         }
 
         let mut lines = Vec::new();
         loop {
             let mut buf = Vec::new();
-            let n = self.read_line_with_timeout(&mut buf).await?;
-            if n == 0 {
-                break; // EOF
-            }
+            self.read_line_with_timeout(&mut buf).await?;
 
             // Convert to string (lossy)
             let line_raw = String::from_utf8_lossy(&buf);
@@ -544,5 +571,146 @@ lf-only \t\n\
 
         assert_eq!(client.article("1").await.unwrap(), ARTICLE_LINES);
         client.quit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unexpected_eof_mid_article_errors_and_marks_disconnected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"200 mock server ready\r\n")
+                .await
+                .unwrap();
+
+            let mut reader = BufReader::new(&mut stream);
+            let mut command = Vec::new();
+            reader.read_until(b'\n', &mut command).await.unwrap();
+            assert_eq!(command, b"ARTICLE 7\r\n");
+
+            // Drop socket mid-body without terminating ".\r\n".
+            stream
+                .write_all(b"220 7 <partial@example.test> article\r\npartial line\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut client = NntpClient::connect("127.0.0.1", address.port(), false)
+            .await
+            .unwrap();
+        assert!(client.is_connected());
+
+        let err = client.article("7").await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(
+            err.to_string().contains("Unexpected EOF"),
+            "unexpected error: {err}"
+        );
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn mid_line_eof_after_dot_errors_and_marks_disconnected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"200 mock server ready\r\n")
+                .await
+                .unwrap();
+
+            let mut reader = BufReader::new(&mut stream);
+            let mut command = Vec::new();
+            reader.read_until(b'\n', &mut command).await.unwrap();
+            assert_eq!(command, b"ARTICLE 8\r\n");
+
+            // Drop socket right after a bare dot without trailing CRLF/LF.
+            stream
+                .write_all(b"220 8 <dot-eof@example.test> article\r\nbody line\r\n.")
+                .await
+                .unwrap();
+        });
+
+        let mut client = NntpClient::connect("127.0.0.1", address.port(), false)
+            .await
+            .unwrap();
+        let err = client.article("8").await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(
+            err.to_string().contains("EOF"),
+            "expected mid-line EOF error, got: {err}"
+        );
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn benign_4xx_keeps_stream_while_protocol_or_server_errors_drop_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"200 mock server ready\r\n")
+                .await
+                .unwrap();
+
+            let mut reader = BufReader::new(&mut stream);
+            let mut cmd = Vec::new();
+
+            reader.read_until(b'\n', &mut cmd).await.unwrap();
+            assert_eq!(cmd, b"GROUP missing.group\r\n");
+            reader
+                .get_mut()
+                .write_all(b"411 no such news group\r\n")
+                .await
+                .unwrap();
+
+            cmd.clear();
+            reader.read_until(b'\n', &mut cmd).await.unwrap();
+            assert_eq!(cmd, b"ARTICLE 99\r\n");
+            reader
+                .get_mut()
+                .write_all(b"423 no such article number\r\n")
+                .await
+                .unwrap();
+
+            cmd.clear();
+            reader.read_until(b'\n', &mut cmd).await.unwrap();
+            assert_eq!(cmd, b"GROUP closing.group\r\n");
+            reader
+                .get_mut()
+                .write_all(b"400 service discontinued\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut client = NntpClient::connect("127.0.0.1", address.port(), false)
+            .await
+            .unwrap();
+        assert!(client.group("missing.group").await.is_err());
+        assert!(
+            client.is_connected(),
+            "411 must preserve healthy NNTP connection"
+        );
+
+        assert!(client.article("99").await.is_err());
+        assert!(
+            client.is_connected(),
+            "423 must preserve healthy NNTP connection"
+        );
+
+        assert!(client.group("closing.group").await.is_err());
+        assert!(
+            !client.is_connected(),
+            "400 service discontinued must drop stream so next group reconnects"
+        );
+        server.await.unwrap();
     }
 }

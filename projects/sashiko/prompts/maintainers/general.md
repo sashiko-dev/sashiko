@@ -18,12 +18,12 @@ symbols = []
   compiler/log lines; only flag genuinely unwrapped prose lines that exceed ~85
   characters.
 - Only standard git trailers (`Signed-off-by`, `Fixes`, human `Co-authored-by`,
-  `Reviewed-by`, `Acked-by`, `Tested-by`, `Reported-by`, `Link`) are permitted.
-  Reject any `Assisted-by:`, `Generated-by:`, `AI-assisted-by:`, or AI/LLM
-  `Co-authored-by:` trailers.
+  `Reviewed-by`, `Acked-by`, `Tested-by`, `Reported-by`, `Closes`, `Link`) are
+  permitted. Reject any `Assisted-by:`, `Generated-by:`, `AI-assisted-by:`, or
+  AI/LLM `Co-authored-by:` trailers.
 - When a commit repairs a defect introduced by an identifiable earlier commit
   already in repository history (prior to `Baseline SHA`), require a
-  `Fixes: <12-char sha> ("<subject>")` trailer immediately before
+  `Fixes: <12-char sha> ("<subject>")` trailer in the trailer block before
   `Signed-off-by:` (and `Fixes: <project>-<uuid>` on a separate line when
   fixing a tracked Sashiko bug). Do not demand `Fixes:` on new features,
   refactorings, documentation/prompt/config changes, or commits where no

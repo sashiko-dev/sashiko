@@ -81,6 +81,9 @@ auditable.
       unbounded child processes, or retry storms).
     - Breaking a public configuration (`Settings`), CLI flag, or API contract
       without a compatibility path.
+    - Missing or clearly broken `Signed-off-by` trailer in the commit message
+      (such as a missing DCO sign-off, missing or placeholder email address, bot
+      identity, or handle/username instead of a real human name).
     - Missing validation evidence in the commit message (neither benchmark suite
       results nor targeted patch re-review results for false-positive prompt
       refinements) for a change that can meaningfully affect overall Linux AI
@@ -108,7 +111,7 @@ auditable.
     - Resource leaks on rare error paths that clear on restart, or non-fatal
       error-handling omissions (`let _ = ...` where failure should be logged or
       propagated).
-    - Commit hygiene and test gaps: missing `Signed-off-by`, forbidden
+    - Commit hygiene and test gaps: forbidden
       `Assisted-by:` or AI/LLM attribution/co-authorship trailers (which
       improperly share or delegate DCO sign-off responsibility to an LLM),
       missing commit rationale on non-trivial code changes (note:

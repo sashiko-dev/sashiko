@@ -1669,7 +1669,7 @@
       "agenda_version": "06c177517b14bb3c",
       "model": "gemini-4-argon",
       "built_at": "2026-10-26T21:21:30Z",
-      "note_bytes": 15515,
+      "note_bytes": 15551,
       "confirmed_facts": 58,
       "files": [
         {
@@ -1748,7 +1748,7 @@
         "analysis_stage",
         "apply_planning_stage_output",
         "apply_post_verification_stage_output",
-        "batch_hard_cases_by_severity",
+        "batch_inconclusive_concerns_by_severity",
         "build_commit_range_index",
         "build_linux_patch_review_workflow_with_effort",
         "build_review_map",

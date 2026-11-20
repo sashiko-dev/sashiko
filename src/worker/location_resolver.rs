@@ -1628,6 +1628,55 @@ fn try_strip_diff_markers(raw: &str) -> Option<(String, bool)> {
     }
 }
 
+struct SnippetCandidate {
+    match_text: String,
+    prefer_parent: bool,
+    cleaned_snippet: Option<String>,
+}
+
+fn build_snippet_candidates(raw_snippet: &str, is_parent_hint: bool) -> Vec<SnippetCandidate> {
+    let mut out = vec![SnippetCandidate {
+        match_text: raw_snippet.to_string(),
+        prefer_parent: is_parent_hint,
+        cleaned_snippet: None,
+    }];
+
+    if let Some((stripped, is_minus)) = try_strip_diff_markers(raw_snippet) {
+        let trimmed = stripped.trim();
+        if !trimmed.is_empty() {
+            out.push(SnippetCandidate {
+                match_text: trimmed.to_string(),
+                prefer_parent: is_parent_hint || is_minus,
+                cleaned_snippet: None,
+            });
+        }
+    }
+
+    if let Some(unnumbered) = crate::toolbox::utils::strip_tool_line_numbers(raw_snippet) {
+        let clean = unnumbered.trim_matches(['\r', '\n']).to_string();
+        if !clean.trim().is_empty() {
+            let diff_after = try_strip_diff_markers(&clean);
+            out.push(SnippetCandidate {
+                match_text: clean.clone(),
+                prefer_parent: is_parent_hint,
+                cleaned_snippet: Some(clean.clone()),
+            });
+            if let Some((diff_stripped, is_minus)) = diff_after {
+                let diff_trimmed = diff_stripped.trim();
+                if !diff_trimmed.is_empty() {
+                    out.push(SnippetCandidate {
+                        match_text: diff_trimmed.to_string(),
+                        prefer_parent: is_parent_hint || is_minus,
+                        cleaned_snippet: Some(clean),
+                    });
+                }
+            }
+        }
+    }
+
+    out
+}
+
 /// Resolves a single finding location against post-image, pre-image, and two-sided diff hunks.
 pub fn resolve_single_location_two_sided(
     worktree_path: &Path,
@@ -1807,35 +1856,25 @@ pub fn resolve_single_location_two_sided(
     };
 
     if !raw_snippet.is_empty() {
-        let stripped_info = try_strip_diff_markers(raw_snippet);
+        let candidates = build_snippet_candidates(raw_snippet, is_parent_hint);
 
-        // Phase 1: Try exact matching across all candidate sources
-        if let Some(resolved) = try_resolve_exact(raw_snippet, is_parent_hint) {
-            return Some(resolved);
-        }
-
-        if let Some((ref stripped, is_minus)) = stripped_info {
-            let stripped_trimmed = stripped.trim();
-            if !stripped_trimmed.is_empty() {
-                let prefer_parent = is_parent_hint || is_minus;
-                if let Some(resolved) = try_resolve_exact(stripped_trimmed, prefer_parent) {
-                    return Some(resolved);
+        // Phase 1: Try exact matching across all candidate sources.
+        for cand in &candidates {
+            if let Some(mut resolved) = try_resolve_exact(&cand.match_text, cand.prefer_parent) {
+                if resolved.code_snippet.is_none() {
+                    resolved.code_snippet = cand.cleaned_snippet.clone();
                 }
+                return Some(resolved);
             }
         }
 
-        // Phase 2: If exact matching across all sources returned None, fall back to partial line matching
-        if let Some(resolved) = try_resolve_fallback(raw_snippet, is_parent_hint) {
-            return Some(resolved);
-        }
-
-        if let Some((ref stripped, is_minus)) = stripped_info {
-            let stripped_trimmed = stripped.trim();
-            if !stripped_trimmed.is_empty() {
-                let prefer_parent = is_parent_hint || is_minus;
-                if let Some(resolved) = try_resolve_fallback(stripped_trimmed, prefer_parent) {
-                    return Some(resolved);
+        // Phase 2: Fall back to partial line matching when exact matching finds nothing.
+        for cand in &candidates {
+            if let Some(mut resolved) = try_resolve_fallback(&cand.match_text, cand.prefer_parent) {
+                if resolved.code_snippet.is_none() {
+                    resolved.code_snippet = cand.cleaned_snippet.clone();
                 }
+                return Some(resolved);
             }
         }
     }
@@ -3421,5 +3460,83 @@ rename to new_dir/worker.c
         assert_eq!(resolved_added.line, 3);
         assert_eq!(resolved_added.side, Some("REVISION".to_string()));
         assert!(resolved_added.in_diff);
+    }
+
+    #[test]
+    fn test_resolve_location_strips_tool_line_number_prefixes() {
+        let dir = tempdir().unwrap();
+        let dev_path = dir.path().join("net/core/dev.c");
+        std::fs::create_dir_all(dev_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &dev_path,
+            "// header\nint dev_queue(void) {\n    new_call();\n    cleanup();\n    return 0;\n}\n",
+        )
+        .unwrap();
+
+        let asm_path = dir.path().join("arch/arm64/entry.S");
+        std::fs::create_dir_all(asm_path.parent().unwrap()).unwrap();
+        std::fs::write(&asm_path, "1: bne 1b\n2: ret\n").unwrap();
+
+        let diff = r#"diff --git a/net/core/dev.c b/net/core/dev.c
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2,4 +2,5 @@
+ int dev_queue(void) {
+-    old_call();
++    new_call();
++    cleanup();
+     return 0;
+ }
+"#;
+
+        let mut findings = vec![
+            json!({
+                "problem": "reviewer: multi-line numbered git_read_files snippet",
+                "locations": [{
+                    "file": "net/core/dev.c",
+                    "code_snippet": "3:     new_call();\n4:     cleanup();",
+                    "line": 1
+                }]
+            }),
+            json!({
+                "problem": "reviewer: numbered diff deletion from git_show",
+                "locations": [{
+                    "file": "net/core/dev.c",
+                    "code_snippet": "21: -    old_call();",
+                    "line": 3
+                }]
+            }),
+            json!({
+                "problem": "reviewer: verbatim assembly labels preserved",
+                "locations": [{
+                    "file": "arch/arm64/entry.S",
+                    "code_snippet": "1: bne 1b\n2: ret",
+                    "line": 1
+                }]
+            }),
+        ];
+
+        resolve_finding_locations(dir.path(), diff, &mut findings);
+
+        let loc0 = &findings[0]["locations"][0];
+        assert_eq!(loc0["line"], 3);
+        assert_eq!(loc0["end_line"], 4);
+        assert_eq!(loc0["line_range"], "3-4");
+        assert_eq!(loc0["side"], "REVISION");
+        assert_eq!(loc0["in_diff"], true);
+        assert_eq!(loc0["code_snippet"], "    new_call();\n    cleanup();");
+
+        let loc1 = &findings[1]["locations"][0];
+        assert_eq!(loc1["line"], 3);
+        assert_eq!(loc1["side"], "PARENT");
+        assert_eq!(loc1["in_diff"], true);
+        assert_eq!(loc1["code_snippet"], "-    old_call();");
+
+        let loc2 = &findings[2]["locations"][0];
+        assert_eq!(loc2["line"], 1);
+        assert_eq!(loc2["end_line"], 2);
+        assert_eq!(loc2["side"], "REVISION");
+        // Verbatim pass matched directly so assembly labels remain untouched.
+        assert_eq!(loc2["code_snippet"], "1: bne 1b\n2: ret");
     }
 }

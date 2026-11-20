@@ -6,10 +6,13 @@
 *.db.bak
 .cargo/config.toml
 target/
+dist/
 archives/
 third_party/linux/
 third_party/sashiko/
 third_party/gcc/
+third_party/qemu/
+third_party/e2fsprogs/
 benchmarks/runs/
 review_trees/
 sashiko.log

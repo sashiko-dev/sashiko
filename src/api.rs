@@ -142,12 +142,15 @@ pub struct BugListQuery {
     pub subsystems: Option<String>,
     pub min_severity: Option<String>,
     pub severity: Option<String>,
+    pub min_security_score: Option<String>,
+    pub security_class: Option<String>,
     /// Triage state. Also accepts the historical `status` spelling.
     #[serde(alias = "status")]
     pub lifecycle_status: Option<String>,
     /// Analysis execution state.
     pub pipeline_state: Option<String>,
-    /// Filters by assignee. The literal `none` selects unassigned bugs.
+    /// Filters by assignee. `none` selects unassigned bugs; `me` selects bugs
+    /// assigned to the authenticated caller.
     pub assignee: Option<String>,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
@@ -232,6 +235,8 @@ pub struct BugInput {
     pub baseline_sha: Option<String>,
     #[serde(default)]
     pub review_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_severity: Option<crate::db::SeverityFloor>,
 }
 
 /// The result of processing a candidate Linux kernel bug through the pipeline.
@@ -338,11 +343,44 @@ pub struct BugActionPayload {
     pub action: BugAction,
 }
 
+/// Allowed comment types attached to a bug via `BugAction::Comment`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BugCommentKind {
+    #[default]
+    Comment,
+    ProposedFix,
+    Reproducer,
+}
+
+impl BugCommentKind {
+    /// Returns the canonical `bug_enrichments.kind` string for this comment type.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Comment => "comment",
+            Self::ProposedFix => "proposed_fix",
+            Self::Reproducer => "reproducer",
+        }
+    }
+
+    /// Parses a comment kind string from CLI or HTTP inputs.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "comment" => Some(Self::Comment),
+            "proposed_fix" => Some(Self::ProposedFix),
+            "reproducer" => Some(Self::Reproducer),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum BugAction {
     Comment {
         content: String,
+        #[serde(default)]
+        kind: BugCommentKind,
     },
     Close {
         reason: Option<String>,
@@ -359,6 +397,10 @@ pub enum BugAction {
     /// absent, empty, or null.
     Assign {
         assignee: Option<String>,
+        reason: Option<String>,
+    },
+    /// Queues a canonical verified bug for security evaluation or re-evaluation.
+    EvaluateSecurity {
         reason: Option<String>,
     },
 }

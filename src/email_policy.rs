@@ -1,3 +1,4 @@
+use crate::db::SeverityFloor;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -102,8 +103,121 @@ pub enum PositiveReviewPolicy {
     All,
 }
 
+/// Who receives an opt-in notification email when a patchset fails to apply
+/// or fails review after exhausting all retries. Shares the same scopes as
+/// [`PositiveReviewPolicy`]: `"none"` (default), `"author"`, or `"all"`.
+pub type FailedReviewPolicy = PositiveReviewPolicy;
+
 fn default_true() -> bool {
     true
+}
+
+/// Whether reviews mention pre-existing bugs that relate to the patch, and
+/// how severe such a bug must be. See
+/// designs/DESIGN_RELATED_PREEXISTING_BUGS.md.
+///
+/// Configured via `report_preexisting_bugs = true | false | "none" | "low" |
+/// "medium" | "high" | "critical"`, or via the legacy `related_preexisting`
+/// table (`{ enabled = ..., min_severity = ... }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelatedPreexistingPolicy {
+    pub enabled: bool,
+    pub min_severity: SeverityFloor,
+}
+
+fn default_related_preexisting_min_severity() -> SeverityFloor {
+    SeverityFloor::High
+}
+
+impl Default for RelatedPreexistingPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_severity: default_related_preexisting_min_severity(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RelatedPreexistingPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let over = RelatedPreexistingOverride::deserialize(deserializer)?;
+        let defaults = Self::default();
+        Ok(Self {
+            enabled: over.enabled.unwrap_or(defaults.enabled),
+            min_severity: over.min_severity.unwrap_or(defaults.min_severity),
+        })
+    }
+}
+
+/// Per-list override of [`RelatedPreexistingPolicy`]; unset fields fall back
+/// to `defaults.report_preexisting_bugs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelatedPreexistingOverride {
+    pub enabled: Option<bool>,
+    pub min_severity: Option<SeverityFloor>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRelatedPreexistingTable {
+    enabled: Option<bool>,
+    min_severity: Option<SeverityFloor>,
+}
+
+impl<'de> Deserialize<'de> for RelatedPreexistingOverride {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PreexistingVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PreexistingVisitor {
+            type Value = RelatedPreexistingOverride;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "a boolean, \"none\", a severity floor (\"low\", \"medium\", \"high\", \"critical\"), or a table",
+                )
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(RelatedPreexistingOverride {
+                    enabled: Some(v),
+                    min_severity: None,
+                })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<Self::Value, E> {
+                if raw.trim().eq_ignore_ascii_case("none") {
+                    return Ok(RelatedPreexistingOverride {
+                        enabled: Some(false),
+                        min_severity: None,
+                    });
+                }
+                let floor = raw.parse::<SeverityFloor>().map_err(|_| {
+                    E::custom(format!(
+                        "invalid severity {raw:?}: expected true, false, \"none\", \"low\", \"medium\", \"high\", or \"critical\""
+                    ))
+                })?;
+                Ok(RelatedPreexistingOverride {
+                    enabled: Some(true),
+                    min_severity: Some(floor),
+                })
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let raw = RawRelatedPreexistingTable::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(RelatedPreexistingOverride {
+                    enabled: raw.enabled,
+                    min_severity: raw.min_severity,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(PreexistingVisitor)
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -116,6 +230,8 @@ pub struct DefaultListPolicy {
     #[serde(default)]
     pub positive_review: PositiveReviewPolicy,
     #[serde(default)]
+    pub failed_review: FailedReviewPolicy,
+    #[serde(default)]
     pub mute_all: bool,
     #[serde(default)]
     pub cc: Vec<String>,
@@ -125,6 +241,8 @@ pub struct DefaultListPolicy {
     pub patchwork: PatchworkPolicy,
     #[serde(default)]
     pub embargo_hours: u32,
+    #[serde(default, alias = "related_preexisting")]
+    pub report_preexisting_bugs: RelatedPreexistingPolicy,
 }
 
 impl Default for DefaultListPolicy {
@@ -133,12 +251,179 @@ impl Default for DefaultListPolicy {
             track: true,
             reply_to: Vec::new(),
             positive_review: PositiveReviewPolicy::None,
+            failed_review: FailedReviewPolicy::None,
             mute_all: false,
             cc: Vec::new(),
             ignored_emails: Vec::new(),
             patchwork: PatchworkPolicy::default(),
             embargo_hours: 0,
+            report_preexisting_bugs: RelatedPreexistingPolicy::default(),
         }
+    }
+}
+
+/// Per-mailing-list filter applied during NNTP ingestion so shared lists
+/// carrying patches for multiple trees only create patchsets for submissions
+/// belonging to the configured project.
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IngestFilterPolicy {
+    #[serde(default)]
+    pub allowed_subject_prefixes: Vec<String>,
+    #[serde(default)]
+    pub ignored_subject_prefixes: Vec<String>,
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+    #[serde(default)]
+    pub ignored_paths: Vec<String>,
+}
+
+pub(crate) fn path_matches_pattern(path: &str, pattern: &str) -> bool {
+    let norm_path = path.trim_start_matches("./").trim_start_matches('/');
+    let norm_pat = pattern
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches('/');
+    if norm_pat.is_empty() {
+        return false;
+    }
+    if norm_pat.ends_with('/') {
+        norm_path.starts_with(norm_pat)
+    } else if let Some(stem) = norm_pat.strip_suffix('*') {
+        norm_path.starts_with(stem)
+    } else {
+        norm_path == norm_pat
+    }
+}
+
+impl IngestFilterPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.allowed_subject_prefixes.is_empty()
+            && self.ignored_subject_prefixes.is_empty()
+            && self.allowed_paths.is_empty()
+            && self.ignored_paths.is_empty()
+    }
+
+    pub fn validate(&self, list_key: &str) -> Result<(), String> {
+        for (field, items) in [
+            ("allowed_subject_prefixes", &self.allowed_subject_prefixes),
+            ("ignored_subject_prefixes", &self.ignored_subject_prefixes),
+            ("allowed_paths", &self.allowed_paths),
+            ("ignored_paths", &self.ignored_paths),
+        ] {
+            if items.iter().any(|s| s.trim().is_empty()) {
+                return Err(format!(
+                    "Mailing list {:?} has an empty entry in `ingest_filter.{}`",
+                    list_key, field
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluates whether an NNTP submission with `subject_prefixes` and
+    /// `touched_paths` (from a unified diff or cover-letter diffstat) belongs
+    /// to this project.
+    pub fn allows_submission(&self, subject_prefixes: &[String], touched_paths: &[String]) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+        if subject_prefixes.iter().any(|prefix| {
+            self.ignored_subject_prefixes
+                .iter()
+                .any(|ignored| prefix.eq_ignore_ascii_case(ignored.trim()))
+        }) {
+            return false;
+        }
+        if touched_paths.iter().any(|path| {
+            self.ignored_paths
+                .iter()
+                .any(|pat| path_matches_pattern(path, pat))
+        }) {
+            return false;
+        }
+        if subject_prefixes.iter().any(|prefix| {
+            self.allowed_subject_prefixes
+                .iter()
+                .any(|allowed| prefix.eq_ignore_ascii_case(allowed.trim()))
+        }) {
+            return true;
+        }
+        if !self.allowed_paths.is_empty() {
+            return !touched_paths.is_empty()
+                && touched_paths.iter().any(|path| {
+                    self.allowed_paths
+                        .iter()
+                        .any(|pat| path_matches_pattern(path, pat))
+                });
+        }
+        self.allowed_subject_prefixes.is_empty()
+    }
+}
+
+/// Per-mailing-list baseline rule selecting which git tree(s) and branch(es)
+/// Sashiko should try first when applying patchsets sent to that list.
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineRule {
+    pub url: String,
+    #[serde(default)]
+    pub branches: Vec<String>,
+    #[serde(default)]
+    pub subject_prefixes: Vec<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+impl BaselineRule {
+    pub fn validate(&self, list_key: &str) -> Result<(), String> {
+        let url = self.url.trim();
+        let valid_scheme = ["https://", "http://", "git://", "ssh://", "file://"]
+            .iter()
+            .any(|scheme| url.starts_with(scheme));
+        if url.is_empty()
+            || !valid_scheme
+            || url.starts_with('-')
+            || url.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(format!(
+                "Mailing list {:?} has an invalid `baselines.url` ({:?}): expected an \
+                 https://, http://, git://, ssh://, or file:// URL without whitespace",
+                list_key, self.url
+            ));
+        }
+
+        for branch in &self.branches {
+            let trimmed = branch.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with('-')
+                || trimmed.contains("..")
+                || trimmed.contains('*')
+                || trimmed.contains('?')
+                || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
+                return Err(format!(
+                    "Mailing list {:?} has an invalid branch {:?} in `baselines.branches`",
+                    list_key, branch
+                ));
+            }
+        }
+
+        if self.subject_prefixes.iter().any(|s| s.trim().is_empty()) {
+            return Err(format!(
+                "Mailing list {:?} has an empty entry in `baselines.subject_prefixes`",
+                list_key
+            ));
+        }
+
+        if self.paths.iter().any(|s| s.trim().is_empty()) {
+            return Err(format!(
+                "Mailing list {:?} has an empty entry in `baselines.paths`",
+                list_key
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -149,6 +434,7 @@ pub struct MailingListPolicy {
     pub nntp_group: Option<String>,
     pub reply_to: Option<Vec<ReplyTarget>>,
     pub positive_review: Option<PositiveReviewPolicy>,
+    pub failed_review: Option<FailedReviewPolicy>,
     pub mute_all: Option<bool>,
     #[serde(default)]
     pub cc: Vec<String>,
@@ -159,6 +445,12 @@ pub struct MailingListPolicy {
     #[serde(default)]
     pub patchwork: PatchworkPolicy,
     pub embargo_hours: Option<u32>,
+    #[serde(default, alias = "related_preexisting")]
+    pub report_preexisting_bugs: RelatedPreexistingOverride,
+    #[serde(default)]
+    pub ingest_filter: IngestFilterPolicy,
+    #[serde(default)]
+    pub baselines: Vec<BaselineRule>,
 }
 
 pub type SubsystemPolicy = MailingListPolicy;
@@ -279,8 +571,28 @@ impl EmailPolicyConfig {
                     ));
                 }
             }
+            policy.ingest_filter.validate(key)?;
+            for rule in &policy.baselines {
+                rule.validate(key)?;
+            }
         }
         Ok(())
+    }
+
+    /// Returns the NNTP ingestion filter configured for `nntp_group`, when the
+    /// group maps to a list with a non-empty `ingest_filter`.
+    pub fn ingest_filter_for_nntp_group(&self, nntp_group: &str) -> Option<&IngestFilterPolicy> {
+        self.lists.iter().find_map(|(email, policy)| {
+            if policy.ingest_filter.is_empty() {
+                return None;
+            }
+            let effective_group = policy
+                .nntp_group
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| derive_nntp_group(email));
+            (effective_group == nntp_group).then_some(&policy.ingest_filter)
+        })
     }
 
     /// Returns `(short_name, nntp_group)` pairs for all lists in this config
@@ -301,6 +613,42 @@ impl EmailPolicyConfig {
             .collect();
         groups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         groups
+    }
+
+    /// Resolves the related pre-existing bug policy for a patch addressed to
+    /// `addresses` (its To and Cc entries, bare or display-name form).
+    ///
+    /// When no configured list matches, the defaults apply. Otherwise each
+    /// matched list contributes its override (falling back to the defaults
+    /// field by field): any list that disables the feature disables it, and
+    /// the strictest severity floor wins.
+    pub fn related_preexisting_for<'a>(
+        &self,
+        addresses: impl IntoIterator<Item = &'a str>,
+    ) -> RelatedPreexistingPolicy {
+        let defaults = self.defaults.report_preexisting_bugs;
+        let addresses: Vec<String> = addresses.into_iter().map(extract_bare_email).collect();
+        let mut resolved: Option<RelatedPreexistingPolicy> = None;
+        for (list_key, list_policy) in &self.lists {
+            let list_bare = extract_bare_email(list_key);
+            if !addresses.contains(&list_bare) {
+                continue;
+            }
+            let over = list_policy.report_preexisting_bugs;
+            let enabled = over.enabled.unwrap_or(defaults.enabled);
+            let min_severity = over.min_severity.unwrap_or(defaults.min_severity);
+            resolved = Some(match resolved {
+                None => RelatedPreexistingPolicy {
+                    enabled,
+                    min_severity,
+                },
+                Some(acc) => RelatedPreexistingPolicy {
+                    enabled: acc.enabled && enabled,
+                    min_severity: acc.min_severity.max(min_severity),
+                },
+            });
+        }
+        resolved.unwrap_or(defaults)
     }
 
     /// Apply a fallback patchwork token to any enabled patchwork policy
@@ -455,6 +803,177 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("repeats its own address in `cc`"), "{err}");
+    }
+
+    #[test]
+    fn test_related_preexisting_defaults_when_unconfigured() {
+        let config = EmailPolicyConfig::parse_content("").unwrap();
+        let resolved = config.related_preexisting_for(["Dev <dev@example.org>"]);
+        assert_eq!(resolved, RelatedPreexistingPolicy::default());
+        assert!(resolved.enabled);
+        assert_eq!(resolved.min_severity, SeverityFloor::High);
+    }
+
+    #[test]
+    fn test_related_preexisting_resolution_across_lists() {
+        let config = EmailPolicyConfig::parse_content(
+            r#"
+            [defaults.related_preexisting]
+            min_severity = "Medium"
+
+            ["linux-mm@kvack.org".related_preexisting]
+            min_severity = "critical"
+
+            ["bpf@vger.kernel.org"]
+            reply_to = ["author"]
+
+            ["netdev@vger.kernel.org".related_preexisting]
+            enabled = false
+            "#,
+        )
+        .unwrap();
+
+        // No configured list matches: defaults.
+        let none = config.related_preexisting_for(["other@example.org"]);
+        assert!(none.enabled);
+        assert_eq!(none.min_severity, SeverityFloor::Medium);
+
+        // A list without an override inherits the defaults field by field.
+        let bpf = config.related_preexisting_for(["bpf@vger.kernel.org"]);
+        assert!(bpf.enabled);
+        assert_eq!(bpf.min_severity, SeverityFloor::Medium);
+
+        // The strictest floor wins, matched in display-name form.
+        let mm_bpf =
+            config.related_preexisting_for(["<bpf@vger.kernel.org>", "MM <LINUX-MM@kvack.org>"]);
+        assert!(mm_bpf.enabled);
+        assert_eq!(mm_bpf.min_severity, SeverityFloor::Critical);
+
+        // Any matched list that disables the feature disables it.
+        let net_bpf =
+            config.related_preexisting_for(["bpf@vger.kernel.org", "netdev@vger.kernel.org"]);
+        assert!(!net_bpf.enabled);
+    }
+
+    #[test]
+    fn test_report_preexisting_bugs_flat_key() {
+        let config = EmailPolicyConfig::parse_content(
+            r#"
+            [defaults]
+            report_preexisting_bugs = "medium"
+
+            ["linux-mm@kvack.org"]
+            report_preexisting_bugs = false
+
+            ["netdev@vger.kernel.org"]
+            report_preexisting_bugs = "none"
+
+            ["bpf@vger.kernel.org"]
+            report_preexisting_bugs = "critical"
+
+            ["damon@lists.linux.dev"]
+            report_preexisting_bugs = true
+            "#,
+        )
+        .unwrap();
+
+        let other = config.related_preexisting_for(["other@example.org"]);
+        assert!(other.enabled);
+        assert_eq!(other.min_severity, SeverityFloor::Medium);
+
+        let mm = config.related_preexisting_for(["linux-mm@kvack.org"]);
+        assert!(!mm.enabled);
+
+        let net = config.related_preexisting_for(["netdev@vger.kernel.org"]);
+        assert!(!net.enabled);
+
+        // `true` enables reporting while preserving the configured default floor.
+        let damon = config.related_preexisting_for(["damon@lists.linux.dev"]);
+        assert!(damon.enabled);
+        assert_eq!(damon.min_severity, SeverityFloor::Medium);
+
+        let bpf_damon =
+            config.related_preexisting_for(["bpf@vger.kernel.org", "damon@lists.linux.dev"]);
+        assert!(bpf_damon.enabled);
+        assert_eq!(bpf_damon.min_severity, SeverityFloor::Critical);
+
+        let mm_bpf = config.related_preexisting_for(["linux-mm@kvack.org", "bpf@vger.kernel.org"]);
+        assert!(!mm_bpf.enabled);
+
+        // Opt-in list when defaults disable reporting.
+        let opt_in = EmailPolicyConfig::parse_content(
+            r#"
+            [defaults]
+            report_preexisting_bugs = false
+
+            ["bpf@vger.kernel.org"]
+            report_preexisting_bugs = true
+            "#,
+        )
+        .unwrap();
+        assert!(
+            !opt_in
+                .related_preexisting_for(["other@example.org"])
+                .enabled
+        );
+        let bpf_opt_in = opt_in.related_preexisting_for(["bpf@vger.kernel.org"]);
+        assert!(bpf_opt_in.enabled);
+        assert_eq!(bpf_opt_in.min_severity, SeverityFloor::High);
+    }
+
+    #[test]
+    fn test_related_preexisting_rejects_invalid_config() {
+        let err = EmailPolicyConfig::parse_content(
+            r#"
+            [defaults.related_preexisting]
+            min_severity = "unknown"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid severity"), "{err}");
+
+        let err = EmailPolicyConfig::parse_content(
+            r#"
+            ["bpf@vger.kernel.org"]
+            report_preexisting_bugs = "no"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid severity"), "{err}");
+
+        let err = EmailPolicyConfig::parse_content(
+            r#"
+            ["bpf@vger.kernel.org"]
+            report_preexisting_bugs = 42
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("boolean"), "{err}");
+
+        let err = EmailPolicyConfig::parse_content(
+            r#"
+            ["bpf@vger.kernel.org"]
+            report_preexisting_bugs = false
+            ["bpf@vger.kernel.org".related_preexisting]
+            enabled = true
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate field"), "{err}");
+
+        let err = EmailPolicyConfig::parse_content(
+            r#"
+            ["bpf@vger.kernel.org".related_preexisting]
+            enable = false
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field"), "{err}");
     }
 
     #[test]
@@ -666,10 +1185,29 @@ mod tests {
                 .lists
                 .contains_key("devicetree@vger.kernel.org")
         );
+        assert!(crate::email_router::EmailRouter::is_ignored_author(
+            &linux_config,
+            "\"tip-bot2 for Peter Zijlstra\" <tip-bot2@linutronix.de>"
+        ));
 
         let sashiko_config = EmailPolicyConfig::load("projects/sashiko/mailing_lists.toml")
             .expect("Production projects/sashiko/mailing_lists.toml failed to parse");
         assert!(sashiko_config.tracked_nntp_groups().is_empty());
+
+        let e2fsprogs_config = EmailPolicyConfig::load("projects/e2fsprogs/mailing_lists.toml")
+            .expect("projects/e2fsprogs/mailing_lists.toml failed to parse");
+        assert_eq!(
+            e2fsprogs_config.tracked_nntp_groups(),
+            vec![(
+                "linux-ext4".to_string(),
+                "org.kernel.vger.linux-ext4".to_string(),
+            )]
+        );
+        assert!(
+            e2fsprogs_config
+                .ingest_filter_for_nntp_group("org.kernel.vger.linux-ext4")
+                .is_some()
+        );
     }
 
     /// The documented example parses, and so does every commented-out
@@ -698,5 +1236,181 @@ mod tests {
             .await
             .expect("Async load of missing policy file should return default");
         assert!(missing.lists.is_empty());
+    }
+
+    #[test]
+    fn test_ingest_filter_allows_and_rejects_shared_list_traffic() {
+        let toml_content = r#"
+            [defaults]
+            track = true
+
+            ["linux-ext4@vger.kernel.org"]
+            reply_to = ["author", "list"]
+            positive_review = "all"
+
+            ["linux-ext4@vger.kernel.org".ingest_filter]
+            allowed_subject_prefixes = ["e2fsprogs"]
+            ignored_subject_prefixes = ["fstests", "xfstests", "kernel", "linux"]
+            allowed_paths = [
+                "lib/ext2fs/",
+                "lib/e2p/",
+                "lib/Makefile*",
+                "e2fsck/",
+                "misc/",
+                "tests/",
+                "configure.ac",
+            ]
+            ignored_paths = [
+                "fs/",
+                "include/",
+                "tests/ext4/",
+                "tests/generic/",
+                "common/",
+            ]
+        "#;
+
+        let config = EmailPolicyConfig::parse_content(toml_content).unwrap();
+        let filter = config
+            .ingest_filter_for_nntp_group("org.kernel.vger.linux-ext4")
+            .expect("filter resolved for linux-ext4 NNTP group");
+        let bpf_filter = config.ingest_filter_for_nntp_group("org.kernel.vger.bpf");
+        assert!(bpf_filter.is_none());
+
+        let allows = |prefs: &[&str], paths: &[&str]| {
+            let pref_vec: Vec<String> = prefs.iter().map(|s| (*s).to_string()).collect();
+            let path_vec: Vec<String> = paths.iter().map(|s| (*s).to_string()).collect();
+            filter.allows_submission(&pref_vec, &path_vec)
+        };
+
+        // e2fsprogs patch touching e2fsck/ and e2fsprogs test dir is accepted.
+        assert!(allows(
+            &[],
+            &["e2fsck/pass1.c", "tests/f_bad_extent/expect.1"],
+        ));
+        // Glob pattern lib/Makefile* matches e2fsprogs shared-lib makefiles
+        // without matching Linux kernel lib/crc32.c.
+        assert!(allows(&[], &["lib/Makefile.elf-lib"]));
+        assert!(!allows(&[], &["lib/crc32.c"]));
+
+        // Linux kernel ext4 patch is rejected.
+        assert!(!allows(&[], &["fs/ext4/mballoc.c"]));
+
+        // xfstests patches (tagged [PATCH fstests] or touching tests/ext4/) are rejected.
+        assert!(!allows(&["fstests"], &["tests/f_something"]));
+        assert!(!allows(&[], &["tests/ext4/059"]));
+
+        // Cover letter with [PATCH e2fsprogs 0/3] and no diffstat is accepted,
+        // whereas an untagged cover letter with no diffstat is rejected.
+        assert!(allows(&["e2fsprogs"], &[]));
+        assert!(!allows(&[], &[]));
+
+        // Empty filter entry fails validation.
+        let invalid = r#"
+            ["linux-ext4@vger.kernel.org".ingest_filter]
+            allowed_paths = [""]
+        "#;
+        assert!(EmailPolicyConfig::parse_content(invalid).is_err());
+    }
+    #[test]
+    fn test_failed_review_policy_defaults_and_overrides() {
+        let default_cfg = EmailPolicyConfig::parse_content("").unwrap();
+        assert_eq!(default_cfg.defaults.failed_review, FailedReviewPolicy::None);
+
+        let cfg = EmailPolicyConfig::parse_content(
+            r#"
+            [defaults]
+            failed_review = "author"
+
+            ["bpf@vger.kernel.org"]
+            failed_review = "all"
+
+            ["netdev@vger.kernel.org"]
+            failed_review = "none"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.defaults.failed_review, FailedReviewPolicy::Author);
+        assert_eq!(
+            cfg.lists["bpf@vger.kernel.org"].failed_review,
+            Some(FailedReviewPolicy::All)
+        );
+        assert_eq!(
+            cfg.lists["netdev@vger.kernel.org"].failed_review,
+            Some(FailedReviewPolicy::None)
+        );
+    }
+
+    #[test]
+    fn test_baseline_rule_parsing_and_validation() {
+        let valid = r#"
+            ["bpf@vger.kernel.org"]
+            reply_to = ["author", "list"]
+
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git"
+            subject_prefixes = ["bpf-next"]
+
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf.git"
+            branches = ["master"]
+            subject_prefixes = ["bpf"]
+            paths = ["kernel/bpf/", "net/core/filter.c"]
+        "#;
+        let cfg = EmailPolicyConfig::parse_content(valid).expect("valid baselines parse");
+        let rules = &cfg.lists["bpf@vger.kernel.org"].baselines;
+        assert_eq!(rules.len(), 2);
+        assert!(rules[0].branches.is_empty());
+        assert_eq!(rules[1].branches, vec!["master"]);
+
+        for bad in [
+            // Invalid URL scheme
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "/etc/passwd"
+            "#,
+            // URL with whitespace
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git --upload-pack=sh"
+            "#,
+            // Invalid branch name
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git"
+            branches = ["-bad"]
+            "#,
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git"
+            branches = ["net-*"]
+            "#,
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git"
+            branches = ["a..b"]
+            "#,
+            // Empty subject_prefixes or paths
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git"
+            subject_prefixes = ["  "]
+            "#,
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git"
+            paths = [""]
+            "#,
+            // Unknown field rejected
+            r#"
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://example.org/repo.git"
+            branch = "master"
+            "#,
+        ] {
+            assert!(
+                EmailPolicyConfig::parse_content(bad).is_err(),
+                "expected validation error for:\n{bad}"
+            );
+        }
     }
 }

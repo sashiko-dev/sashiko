@@ -51,11 +51,10 @@ Know these before changing anything near them.
   `@include(...)` and the `@includes` marker from the *template*, never from
   substituted values. See `src/workflow/prompt.rs` and its tests.
 
-- **Pre-screen and `read_prompt` guide names** — the pre-screen stage and
-  per-stage `read_prompt` tool calls let the model choose which guide files are
-  inlined into downstream prompts (`sanitize_guide_path` for top-level
-  pre-screen guides and `sanitize_prompt_relpath` for top-level, `subsystem/`,
-  or `patterns/` prompt guides in `src/workflows/guard.rs`). Both sanitizers
+- **Pre-screen guide names** — the pre-screen stage lets the model choose
+  which guide files are inlined into downstream prompts (`sanitize_guide_path`
+  for top-level pre-screen guides and `sanitize_prompt_relpath` for top-level,
+  `subsystem/`, or `patterns/` prompt guides in `src/workflows/guard.rs`). Both sanitizers
   reject any path containing `..`, `\`, leading `/`, or subdirectories outside
   `subsystem/` and `patterns/` before it becomes a path. These are the places
   model output legitimately becomes a prompt filename, and the sanitizers in
@@ -73,6 +72,18 @@ Know these before changing anything near them.
   a shell string, and applies `GIT_PROTOCOL_RESTRICTIONS`. A ref or path from a
   patch must not be concatenated into a command, and must not be able to be
   read as an option.
+
+- **Prior-version discussions (`<untrusted_prior_discussions>`)** — when
+  reviewing `v2+` of a series or pull request, prior mailing-list replies,
+  pull-request review comments, changelogs, and earlier findings are serialized
+  through `render_untrusted_prior_discussions_block` in
+  `src/workflows/prior_feedback.rs`. That helper neutralizes XML/framing-tag
+  lookalikes via `sanitize_untrusted_discussion_text` in `src/prior_context.rs`
+  and injects the block exclusively via `PromptTemplate::with_var` (never as an
+  `@include` target or template string). Programmatic `ContributorAuthority`
+  scores never confer instruction authority, and `derive_prior_attribution_for_concern`
+  stamps attribution in Rust from ingested metadata rather than trusting
+  LLM-emitted speaker names or URLs.
 
 - **Repository URLs** — `is_safe_repo_url` in `src/forge.rs` blocks the obvious
   SSRF targets by host. It is best-effort and host-based; it does not survive
@@ -96,10 +107,12 @@ control:
   somewhere the template later interprets.
 - Moves include resolution, or any directive parsing, to **after** variable
   substitution.
-- Adds **PR or email prose** — a title, body, or comment — into a prompt. Today
-  only the diff and the commit message enter the model context for forge
-  reviews. Widening that is a deliberate decision that needs its own fencing,
-  not an incidental one.
+- Adds **PR or email prose** — a title, body, or comment — into a prompt
+  without neutralizing framing tags (`sanitize_untrusted_discussion_text`),
+  injecting it strictly via `PromptTemplate::with_var`, and fencing it inside an
+  explicit untrusted boundary such as `<untrusted_prior_discussions>`. Widening
+  where external prose enters model context needs explicit fencing and
+  tag-escape sanitization, not raw template interpolation.
 - Loosens the **prompt path sanitizers** (`sanitize_guide_path` /
   `sanitize_prompt_relpath`), or adds another place where model output becomes a
   filename, an identifier, or a lookup key without going through those prompt

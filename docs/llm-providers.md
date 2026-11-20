@@ -65,6 +65,18 @@ cp docs/examples/Settings.claude.toml Settings.toml
 - Adaptive thinking and effort via the `thinking` and `effort` settings
   in `[ai.claude]`
 
+**Gateways:** to reach Claude through an Anthropic-compatible gateway,
+point `base_url` at its Messages endpoint. Set `client_cert` when the
+gateway authenticates callers with mutual TLS rather than an API key,
+and pass any headers it requires in `ANTHROPIC_CUSTOM_HEADERS`, one
+`Name: value` per line:
+
+```toml
+[ai.claude]
+base_url = "https://gateway.example.com/v1/messages"
+client_cert = "/path/to/cert-and-key.pem"
+```
+
 ## Claude Code CLI
 
 Uses a local [Claude Code](https://claude.com/claude-code) installation as
@@ -103,6 +115,10 @@ Context window sizes:
   instruction files and automatic memory) are disabled explicitly. Each call
   runs in a fresh temporary working directory with no session reuse.
   This invocation was validated with Claude Code 2.1.170.
+- Requests that offer Sashiko tools also pass `--json-schema`, so the model
+  replies with a `tool_calls` or `content` object through Claude Code's
+  StructuredOutput tool instead of free text. This needs a Claude Code version
+  with `--json-schema`; it was validated with 2.1.308.
 - Earlier claude-cli response-cache entries are not reused with this restricted
   completion profile; responses are regenerated on the next request.
 - User/project settings are not loaded. CLI subscription credentials and
@@ -158,9 +174,10 @@ cp docs/examples/Settings.copilot-cli.toml Settings.toml
 
 ## AWS Bedrock
 
-Uses AWS Bedrock via the Converse API. Works with any Bedrock-hosted
-model (Claude, Llama, Mistral, etc.). Requires building with
-`--features bedrock`.
+Uses AWS Bedrock via the Converse API, or the OpenAI Responses API on the
+`bedrock-mantle` endpoint for OpenAI models (see below). Works with any
+Bedrock-hosted model (Claude, GPT, Llama, Mistral, etc.). Requires building
+with `--features bedrock`.
 
 **Prerequisites:** Enable model access in the
 [AWS Bedrock console](https://console.aws.amazon.com/bedrock/) for your
@@ -191,18 +208,61 @@ cp docs/examples/Settings.claude-bedrock.toml Settings.toml
 - Cross-region inference profiles (e.g. `us.anthropic.claude-*`)
 - Full tool/function calling support
 
-Some models (e.g. OpenAI reasoning models) reject the `temperature`
-field. Sashiko retries an explicit unsupported-temperature
-`ValidationException` without the field and omits it on later requests
-to the same model.
-
 **Non-Claude models:** `prompt_caching` and `thinking` under
-`[ai.bedrock]` are Anthropic-specific; set `prompt_caching = false` and
-leave `thinking` unset. For model IDs containing `openai.`, `effort` is
-sent as `reasoning.effort` instead of `output_config.effort` (GPT-6
-Astra accepts `low`, `medium`, `high`, `xhigh`, `max`); for
-other non-Claude models leave it unset. Application inference profile
-ARNs carry no model name and always get the Anthropic fields.
+`[ai.bedrock]` are Anthropic-specific on the Converse API; set
+`prompt_caching = false` and leave `thinking` unset. Application inference
+profile ARNs carry no model name and always get the Anthropic fields.
+
+### OpenAI models (bedrock-mantle)
+
+OpenAI foundation model IDs (starting with `openai.`, such as
+`openai.gpt-5.6-sol`) are sent to the OpenAI Responses API on the
+`bedrock-mantle` endpoint (`https://bedrock-mantle.<region>.api.aws/v1`)
+instead of the Converse API. Mantle does not accept inference profile IDs
+(`global.openai.*`, `us.openai.*`) or ARNs, so those stay on the Converse
+API; the model ID is always sent as configured.
+
+```bash
+cp docs/examples/Settings.gpt-bedrock.toml Settings.toml
+```
+
+- **Authentication:** Mantle takes Amazon Bedrock API keys. Sashiko derives a
+  short-term key (valid up to 12 hours, and no longer than the AWS
+  credentials it is signed with) from the standard AWS credential chain and
+  renews it before it expires, so no extra secret is needed. Set
+  `AWS_BEARER_TOKEN_BEDROCK` to use a long-term key instead. IAM needs
+  `bedrock-mantle:CreateInference`.
+- **Region:** `[ai.bedrock] region`, else the AWS default chain
+  (`AWS_REGION`, profile). Mantle is available in a subset of Bedrock
+  regions.
+- **Endpoint:** some models are served under `/openai/v1` rather than `/v1`
+  (the request then fails with ``model `<id>` isn't supported on this
+  route``). Set `mantle_base_url = "https://bedrock-mantle.<region>.api.aws/openai/v1"`
+  for those, as listed on the model card's Programmatic Access table.
+- **Reasoning:** `effort` is sent as `reasoning.effort`. `temperature` is
+  never sent, since OpenAI reasoning models reject it, and `thinking` is
+  ignored. Requests are stateless (`store: false`); encrypted reasoning is
+  returned with each response and replayed on the next tool-call turn.
+- **Output limit:** `max_tokens` becomes `max_output_tokens`, which includes
+  hidden reasoning tokens. Raise it well above the default `8192` for high
+  effort levels, or answers come back truncated.
+- **Prompt caching:** with `prompt_caching = true` (the default) requests
+  carry `prompt_cache_options` in `implicit` mode, plus explicit breakpoints
+  on the system prompt and the last user message. Implicit mode lets Bedrock
+  add an automatic breakpoint on the latest message, which covers the
+  growing tool-call history; Bedrock allows four cache writes per request
+  and Sashiko places at most two. `prompt_cache_ttl` (e.g. `"30m"`) sets the
+  TTL. Cache writes are billed above the input rate and reads below it;
+  `RUST_LOG=sashiko::ai::bedrock_mantle=info` logs `cache_read` and
+  `cache_write` per response. Set `prompt_caching = false` for a model that
+  rejects `prompt_cache_options`.
+
+Set `openai_api = "converse"` under `[ai.bedrock]` to keep OpenAI
+foundation models on the Converse API, where inference profile IDs always
+run. There, `effort` is sent as `reasoning.effort` in
+`additionalModelRequestFields`, and a model that rejects `temperature` with
+an explicit unsupported-temperature `ValidationException` is retried
+without it, which is then omitted on later requests to the same model.
 
 ## Google Cloud Vertex AI
 
@@ -548,3 +608,110 @@ default because an endpoint that does not know the field may reject the
 request. OpenRouter's structured `reasoning_details` are not read, so
 encrypted reasoning from OpenAI and Gemini models routed through it is
 lost between turns.
+
+Assistant messages that only carry tool calls are sent without a
+`content` field, as the OpenAI API allows. Some compatible endpoints
+reject them, and some chat templates (GLM models served by vLLM, for
+example) render the missing field as a literal `None` in the prompt. Set
+`send_empty_tool_call_content = true` under `[ai.openai_compat]` to send
+an empty string instead.
+
+**Gateways that require extra request fields:**
+
+Enterprise gateways in front of an OpenAI-compatible endpoint often
+authenticate clients with a key sent in a header next to the bearer
+token, such as `x-api-key`. AI providers behind AWS are a common example.
+That key differs from the endpoint's `LLM_API_KEY`, so it needs a variable
+with a different name. Header values are credentials or auth keys, so they
+are read from the environment rather than from settings.
+Name each header and the variable under `[ai.openai_compat.extra_headers]`.
+The headers are sent with every request and an unset variable
+fails at startup.
+
+```toml
+[ai.openai_compat]
+base_url = "https://llm-gateway.example.com/v1"
+
+[ai.openai_compat.extra_headers]
+"x-api-key" = "LLM_CLIENT_API_KEY"
+```
+
+```bash
+export LLM_CLIENT_API_KEY=...
+```
+
+Some gateways also expect client metadata in the request body. Add it
+under `[ai.openai_compat.extra_body]`; its fields are merged into the top
+level of every request. Fields Sashiko sets itself, such as `model` or
+`messages`, are rejected at startup:
+
+```toml
+[ai.openai_compat.extra_body]
+extraData = { clientName = "sashiko", sessionId = "review" }
+```
+
+Unlike header values, body fields are read from the settings file, so
+do not put credentials in them.
+
+**Services that cache prompts per replica:**
+
+Each turn of a review stage resends the previous turn's input, so a
+service with prompt caching can serve most of it from cache. Some
+services keep that cache on each replica, and they route requests that
+share a value in a client-supplied header to the same replica. If your
+provider documents such a header, name it under `[ai.openai_compat]`:
+
+```toml
+[ai.openai_compat]
+session_affinity_header = "x-session-affinity"
+```
+
+Each stage conversation then sends its own random ID in that header,
+in the form `sashiko-conversation-<uuid>`. The ID stays the same for
+every turn and retry of the conversation. It never appears in the prompt
+or in the response cache key, so enabling the setting keeps cached
+responses valid.
+
+`api` in the same table picks the endpoint. It defaults to `"chat"`,
+which is `/v1/chat/completions` and the only endpoint a third-party
+compatible provider serves. Set it to `"responses"` to reach OpenAI's
+`/v1/responses` instead, as `docs/examples/Settings.openai-responses.toml`
+does:
+
+```toml
+[ai]
+provider = "openai"
+model = "gpt-5.4"
+
+[ai.openai_compat]
+api = "responses"
+max_tokens = 65536
+effort = "medium"
+```
+
+Two things need that endpoint. A gpt-5.6 model rejects any chat
+completion carrying function tools unless `effort` is `"none"`, so the
+review stages that explore the code run without reasoning; the same
+request over `/v1/responses` is accepted. And model access is granted
+per endpoint, so a project can be told it has no access to the gpt-5.4
+family on chat completions while `/v1/responses` answers normally.
+Everything else in `[ai.openai_compat]` applies to both, except
+`send_reasoning_content`, `send_empty_tool_call_content`,
+`extra_headers`, `session_affinity_header`, and `extra_body`, which shape
+a chat completion only.
+Setting any of them with `api = "responses"` is refused at startup
+rather than ignored.
+
+`service_tier` picks the processing tier and is sent on both endpoints,
+omitted when unset. `"flex"` halves the per-token price in exchange
+for slower responses and a higher rate of 429s, which the usual retry
+absorbs. Most of a review's cost is uncached input, so on an expensive
+model this is the one setting that moves the bill. Two things go with
+it. Raise `api_timeout_secs` to at least 900: a flex response can
+outlast the default 300 seconds, and a request the client gives up on
+is resent in full and billed again; Sashiko warns at startup when it is
+lower. A request the account could not run on flex comes back on the
+`default` tier at full price. The first such response logs a warning,
+and the debug-level "OpenAI response received" line reports the tier
+of every response in its `tier=` field. Only OpenAI's own API accepts
+the field, so `provider = "openai-compatible"` refuses it at startup.

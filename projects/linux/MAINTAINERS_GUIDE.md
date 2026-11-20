@@ -17,6 +17,43 @@ To request tracking for a new lore or NNTP mailing list, you can either:
 1.  **Submit a Pull Request:** Add a `["<list-email>"]` section to [`projects/linux/mailing_lists.toml`](mailing_lists.toml). Sashiko automatically derives the Lore NNTP group name by reversing the domain components and appending the list's local part (e.g., `bpf@vger.kernel.org` becomes `org.kernel.vger.bpf`). If the NNTP group name on `nntp.lore.kernel.org` does not follow this convention, set `nntp_group = "..."` explicitly in the section.
 2.  **Send an Email:** Contact the Sashiko development mailing list (`sashiko@lists.linux.dev`) and `Cc: Roman Gushchin <roman.gushchin@linux.dev>` with your request.
 
+## Bug and Embargo Access (`bugs_access.toml`)
+
+Sashiko shows bugs, embargoed review results, and review transcripts to the
+maintainers (`M:` and `R:`) of the `MAINTAINERS` sections that cover the changed
+files. When `MAINTAINERS` alone does not match how your subsystem works, send a
+pull request updating [`projects/linux/bugs_access.toml`](bugs_access.toml) to
+extend or override access without changing `MAINTAINERS` or `get_maintainer.pl`
+patch recipients:
+
+*   **Subsystem developer groups (`read` and `read_write`):** Grant developers
+    who are not listed in `MAINTAINERS` read-only (`read = [...]`) or full
+    maintainer (`read_write = [...]`) access to your section's **Bugs** tab and
+    embargoed reviews:
+    ```toml
+    [[grant]]
+    section = "BTRFS FILE SYSTEM"
+    read = ["dev1@example.org", "Developer Two <dev2@example.org>"]
+    read_write = ["co-maintainer@example.org"]
+    ```
+*   **Upstream pull-request receivers (`paths`):** If you receive pull requests
+    for a subtree that `MAINTAINERS` does not list under your section (such as
+    the SoC group for platform device trees and SoC drivers), grant your
+    section's `M:` and `R:` maintainers access to those paths (optionally with
+    `access = "read"` for read-only visibility):
+    ```toml
+    [[grant]]
+    section = "ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)"
+    paths = ["arch/*/boot/dts/", "drivers/soc/", "drivers/firmware/"]
+    ```
+*   **Custom sub-sections and overrides:** Define standalone path-scoped grants
+    (`paths` + `read` / `read_write`) or override inherited `MAINTAINERS` emails
+    and paths (`exclude_emails`, `replace_emails`, `exclude_paths`,
+    `replace_paths`).
+
+See [docs/configuration.md](../../docs/configuration.md#projectsprojectbugs_accesstoml)
+for the complete schema.
+
 ## Adding and Updating Maintainer Notes
 
 Sashiko separates objective codebase facts from human maintainer guidance:
@@ -102,6 +139,7 @@ All per-mailing-list ingestion, embargo, email delivery, and Patchwork settings 
 *   **`ignored_emails`:** Author email addresses whose submissions will be muted.
 *   **`embargo_hours`:** Hours to wait before publishing a review with findings (default: `0`). Clean reviews are released immediately after the complete patchset review succeeds.
 *   **`subject_prefixes`:** Optional subject prefix tags (e.g. `["net", "net-next"]`) used to disambiguate `embargo_hours` when a patch is cross-posted to multiple mailing lists.
+*   **`report_preexisting_bugs`:** Controls whether reviews of the first non-RFC posting of a series mention closely related, non-security-sensitive pre-existing bugs (`true` by default, using a `"high"` minimum severity; at most one bug on small patches and two on larger patches, and each bug is mentioned at most once across all reviews). Set `report_preexisting_bugs = false` (or `"none"`) to disable related pre-existing bug mentions for your list (for cross-posted series, any matched list with `false` disables them), or set `"low"`, `"medium"`, `"high"`, or `"critical"` to adjust the minimum severity floor (the strictest matched floor wins).
 
 **Web UI tracking only (default):** Adding an empty section `["amd-gfx@lists.freedesktop.org"]` tracks and reviews patches from the list for the Web UI without sending outbound emails (`reply_to = []`):
 
@@ -123,6 +161,15 @@ reply_to = ["author"]
 embargo_hours = 0
 subject_prefixes = ["bpf", "bpf-next"]
 reply_to = ["author", "list", "recipients"]
+```
+
+**Disabling related pre-existing bug mentions:**
+
+```toml
+["linux-mm@kvack.org"]
+reply_to = ["author", "list", "recipients"]
+embargo_hours = 24
+report_preexisting_bugs = false
 ```
 
 **Configuration:** To request a change to your mailing list configuration in [`projects/linux/mailing_lists.toml`](mailing_lists.toml), please open a GitHub Pull Request or Issue, or email the development mailing list (`sashiko@lists.linux.dev`).

@@ -1,0 +1,318 @@
+[
+  {
+    "case_id": "perf_pos_01",
+    "Commit": "efa03dab7ce4ed786b131f412440e2fd45fba11f",
+    "subsystem": "iommu",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Unmap operations suffer from performance degradation due to unnecessary CPU cache flushing of unmodified memory ranges."
+  },
+  {
+    "case_id": "perf_pos_02",
+    "Commit": "1013af4f585fccc4d3e5c5824d174de2257f7d6d",
+    "subsystem": "mm/hugetlb",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Excessive IPI broadcasts occur when unsharing multiple hugetlb PMD tables during operations like exit or munmap, causing severe performance regressions.",
+    "Fixed-by": "8ce720d5bd91e9dc16db3604aa4b1bf76770a9a1"
+  },
+  {
+    "case_id": "perf_pos_03",
+    "Commit": "89e1fb7ceffd898505ad7fa57acec0585bfaa2cc",
+    "subsystem": "block",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Calling synchronize_rcu_expedited during queue cleanup causes a 15-second boot stall when probing virtio-scsi disks.",
+    "Fixed-by": "9670db22e7ab4aefe2b2619589a47fef9d3e0c7e"
+  },
+  {
+    "case_id": "perf_pos_04",
+    "Commit": "b07c26511e94ab856f3700c56d582c0da36d5b4d",
+    "subsystem": "openvswitch",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Unnecessary RTNL lock acquisition during vport destruction causes lock contention and 'waiting for ... to become free' stalls."
+  },
+  {
+    "case_id": "perf_pos_05",
+    "Commit": "20df21a482aa1cf730ea68adbf49ed5bc4c3ba14",
+    "subsystem": "crypto",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Library-based AES encryption modes override architecture-optimized SIMD implementations due to crypto API template cra_priority handling, causing performance regressions.",
+    "Fixed-by": "572af6872e520c7102e58362ef7cd7c2ed4342be"
+  },
+  {
+    "case_id": "perf_pos_06",
+    "Commit": "ea928e9e18da682e9a5bc40aa862bff7ce5ae42e",
+    "subsystem": "mm/memcontrol",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Shrinking struct vmpressure inadvertently shifts memory event counters and the hot vmstats_percpu pointer onto the same cacheline in struct mem_cgroup, causing false sharing and a performance regression."
+  },
+  {
+    "case_id": "perf_pos_07",
+    "Commit": "ef7607ab1c8adc6258fb1b27d08e26aecdc18a58",
+    "subsystem": "sound/core",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "The commit introduces a spinlock acquisition at every MIDI output event in a hot path instead of RCU, causing a significant performance regression."
+  },
+  {
+    "case_id": "perf_pos_08",
+    "Commit": "7b32f64bc512b40b268776c5ac4d354b325b3197",
+    "subsystem": "mm/filemap",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Limiting filemap_fault readahead to VMA boundaries causes a significant I/O and page-fault performance regression.",
+    "Fixed-by": "13a1e1a618858407fa12c391f664ea750651f6b2"
+  },
+  {
+    "case_id": "perf_pos_09",
+    "Commit": "b056b4cd9178f7a1d5d57f7b48b073c29729ddaa",
+    "subsystem": "net/ipv4",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Moving icmp_global credit and stamp fields into per-netns storage places frequently updated rate-limit fields on the same cacheline as read-mostly netns fields, causing false sharing under high ICMP rates.",
+    "Fixed-by": "87b08913a9ae82082e276d237ece08fc8ee24380"
+  },
+  {
+    "case_id": "perf_pos_10",
+    "Commit": "c22d70a162d3cc177282c4487be4d54876ca55c8",
+    "subsystem": "writeback",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "cleanup_offline_cgwb() walks wb->b_attached and wb->b_dirty_time from the same list end on every bounded batch without rotating already-scanned inodes, causing repeated O(N^2) rescans when draining dying cgroup writebacks.",
+    "Fixed-by": "f6988c90671e83db79df1b7b9d6fdb0e5947fd84"
+  },
+  {
+    "case_id": "perf_pos_11",
+    "Commit": "527ba26e50ec2ca2be9c7c82f3ad42998a75d0db",
+    "subsystem": "drm/radeon",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Removing radeon_fence_process() hardware polling from radeon_fence_is_signaled() delays fence completion detection and causes a severe performance regression.",
+    "Fixed-by": "5f08eee9c3fb1a5a70966612e0ff249900f8e77b"
+  },
+  {
+    "case_id": "perf_pos_12",
+    "Commit": "3c7ac40d732232fec0ba31d0a5e3cc9c112fc2e7",
+    "subsystem": "scsi/ufs",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Delegating the UFS interrupt service routine to a threaded IRQ handler adds wakeup and scheduling latency on the storage completion hot path, causing significant I/O performance regressions.",
+    "Fixed-by": "8a309036f557d3ff4efb2beea5132ba91172d934"
+  },
+  {
+    "case_id": "perf_pos_13",
+    "Commit": "5a90c155defa684f3a21f68c3f8e40c056e6114c",
+    "subsystem": "mm/shmem",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Checking only sbinfo->huge when deciding whether tmpfs/shmem supports large folios inadvertently disables large folios for anonymous shmem mappings, causing a performance regression.",
+    "Fixed-by": "eb92d97f7e6a325607b9c3981131067c0469bfcf"
+  },
+  {
+    "case_id": "perf_pos_14",
+    "Commit": "7d6899fb69d25e1bc6f4700b7c1d92e6b608593d",
+    "subsystem": "ovl",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Unconditionally calling vfs_fsync() after every overlayfs metadata copy-up causes severe latency and throughput regressions on upper filesystems that do not need it.",
+    "Fixed-by": "1f6ee9be92f8df85a8c9a5a78c20fd39c0c21a95"
+  },
+  {
+    "case_id": "perf_pos_15",
+    "Commit": "39823b47bbd40502632ffba90ebb34fff7c8b5e8",
+    "subsystem": "block",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Changing mq-deadline tag reservation depth calculation overly restricts async write queue depth, causing a significant random-write IOPS performance regression.",
+    "Fixed-by": "988bb1b9ededab9aed83df8c1f5be0232b71ded3"
+  },
+  {
+    "case_id": "perf_pos_16",
+    "Commit": "bd18bffca35397214ae68d85cf7203aca25c3c1d",
+    "subsystem": "kvm/x86",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Missing break in the inner host-MSR unwind loop in nested_vmx_vmexit() continues scanning the entire MSR list on every entry even after finding the matching MSR.",
+    "Fixed-by": "c33ef9d334059f7cb167569ed7b4779752fe4425"
+  },
+  {
+    "case_id": "perf_pos_17",
+    "Commit": "79632e9ba38671215fb193346ef6fb8db582744d",
+    "subsystem": "net/bnxt",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Clamping bp->max_tpa to low firmware-reported values on P5 chips with older firmware drastically reduces TPA aggregation rings and causes RX throughput regressions.",
+    "Fixed-by": "54c28fab2fa5afd681c9c4b10f4f6da1efdd397a"
+  },
+  {
+    "case_id": "perf_pos_18",
+    "Commit": "7b8da4c7f0777489f8690115b5fd7704ac0abb8f",
+    "subsystem": "mm/vmstat",
+    "category": "positive_stealth_regression",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Using delayed_work_pending() in vmstat_shepherd only checks WORK_STRUCT_PENDING_BIT (cleared as soon as the work starts executing), double-scheduling vmstat_update work while it is already running.",
+    "Fixed-by": "2b19bf05719b73f7d04d7d27ec423b459b868852"
+  },
+  {
+    "case_id": "perf_pos_19",
+    "Commit": "a0615780439938e8e61343f1f92a4c54a71dc6a5",
+    "subsystem": "mm/vmalloc",
+    "category": "positive_missed_optimization",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Splitting high-order vmalloc pages to order-0 pages leaves vfree() freeing pages one by one instead of batching via free_pages_bulk(), missing bulk page-free batching on teardown.",
+    "Fixed-by": "60ced5818f64ac356620d1ad3e0d473c457dbf5b"
+  },
+  {
+    "case_id": "perf_pos_20",
+    "Commit": "ec66e0d599520ab414db745544e25d80d0ac5054",
+    "subsystem": "mm/slab",
+    "category": "positive_missed_optimization",
+    "expected_behavior": "detect_bug",
+    "problem_description": "Destroying a single slab cache invokes global kvfree_rcu_barrier(), unnecessarily flushing RCU sheaves across all slab caches system-wide instead of only the cache being destroyed.",
+    "Fixed-by": "0f35040de59371ad542b915d7b91176c9910dadc"
+  },
+  {
+    "case_id": "perf_neu_01",
+    "Commit": "594ca8ced1b380309f3a23e2a77d8846ec5fd025",
+    "subsystem": "iio",
+    "category": "neutral_lookalike_cold_or_bounded",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_02",
+    "Commit": "2f0e110735a4e59e71e44d04b4f70e58f06c61c9",
+    "subsystem": "drm/v3d",
+    "category": "neutral_lookalike_cold_or_bounded",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_03",
+    "Commit": "08dc30de1a402fe88fd80592cf6c72c4c2ebbcbc",
+    "subsystem": "net",
+    "category": "neutral_lookalike_cold_or_bounded",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_04",
+    "Commit": "e38bdd30708b8bad577b07de5fdb2baa1cae8527",
+    "subsystem": "sound/hda",
+    "category": "neutral_lookalike_cold_or_bounded",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_05",
+    "Commit": "520886a1a6ca16862a0437b4a8fae133a895a9b8",
+    "subsystem": "mtd",
+    "category": "neutral_lookalike_cold_or_bounded",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_06",
+    "Commit": "b0b49c77bddac75db79f7c2c6ec0b07d61864f2f",
+    "subsystem": "ASoC",
+    "category": "neutral_lookalike_cold_or_bounded",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_07",
+    "Commit": "3a594bb454ba1ecb005f753007fa1bb5c5e68bae",
+    "subsystem": "media",
+    "category": "neutral_lookalike_cold_or_bounded",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_08",
+    "Commit": "045f977dd4ebdd3ad8e96cf684917adfc5805adb",
+    "subsystem": "net",
+    "category": "neutral_hot_path_change",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_09",
+    "Commit": "14ce9a47c5b7497193cb4fdf9980b847482bd289",
+    "subsystem": "udp",
+    "category": "neutral_hot_path_change",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_10",
+    "Commit": "3229ac4a5ef5a838e82a784226432c92d3db90a8",
+    "subsystem": "sched_ext",
+    "category": "neutral_hot_path_change",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_11",
+    "Commit": "cf8771ca4cdbd78232338652b98a7c5c9e0a6184",
+    "subsystem": "mm/page_table_check",
+    "category": "neutral_hot_path_change",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_12",
+    "Commit": "6f459eda8b60382efa0da2ca025c26a2018adc87",
+    "subsystem": "tcp",
+    "category": "neutral_hot_path_change",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_13",
+    "Commit": "94a4b1f959989de9c54d43c3a102fb1ee92e1414",
+    "subsystem": "ipv6",
+    "category": "neutral_hot_path_change",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_14",
+    "Commit": "7aba71dbc41641e43a79fb9f6fac91719094b4fb",
+    "subsystem": "mm/mmu_notifier",
+    "category": "neutral_hot_path_change",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_15",
+    "Commit": "25b23d82831870b8581abe6a24970ffd95675bc7",
+    "subsystem": "net",
+    "category": "neutral_routine_driver_subsys",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_16",
+    "Commit": "79ac1c945ab885369a840da014ebc6fcde8e2ae2",
+    "subsystem": "drm/sun4i",
+    "category": "neutral_routine_driver_subsys",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_17",
+    "Commit": "879cace976671eea235d283bf5109a4e09d73a14",
+    "subsystem": "bpf",
+    "category": "neutral_routine_driver_subsys",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_18",
+    "Commit": "192cb1f5cb1694c45b7cac14519d7bad65ba22f6",
+    "subsystem": "drm/pagemap",
+    "category": "neutral_routine_driver_subsys",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_19",
+    "Commit": "9a9d960dce05b45b2a7dacd2c98d602480812a13",
+    "subsystem": "drm/xe/uc",
+    "category": "neutral_routine_driver_subsys",
+    "expected_behavior": "expect_clean"
+  },
+  {
+    "case_id": "perf_neu_20",
+    "Commit": "520a1347faf46c2c00c3499de05fdecc6d254c2e",
+    "subsystem": "KVM",
+    "category": "neutral_routine_driver_subsys",
+    "expected_behavior": "expect_clean"
+  }
+]

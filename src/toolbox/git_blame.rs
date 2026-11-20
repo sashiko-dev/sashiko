@@ -101,38 +101,33 @@ impl LlmTool<SashikoToolContext> for GitBlameTool {
 
         let content = String::from_utf8_lossy(&output.stdout).to_string();
         let total_blame_lines = content.lines().count();
+        if total_blame_lines == 0 {
+            return Ok(Value::String(format!(
+                "=== {path_str} blame (empty, 0 lines) ==="
+            )));
+        }
+
         let res = Truncator::truncate_sequential(&content, 10_000);
-        let truncated_content = res.content;
-        let lines_kept = res.lines_kept;
-        let is_truncated = res.truncated;
-
         let start = start_line.unwrap_or(1);
-        let end_idx = if is_truncated && lines_kept > 0 {
-            start + lines_kept as u64 - 1
-        } else {
-            start + total_blame_lines as u64 - 1
-        };
-
-        let returned_items = if is_truncated && lines_kept > 0 {
-            lines_kept
+        let returned_items = if res.truncated {
+            res.lines_kept.max(1)
         } else {
             total_blame_lines
         };
+        let end_idx = start + returned_items as u64 - 1;
+        let total_end = start + total_blame_lines as u64 - 1;
 
-        Ok(json!({
-            "content": truncated_content,
-            "truncated": is_truncated,
-            "metadata": {
-                "total_items": total_blame_lines,
-                "returned_items": returned_items,
-                "start_index": start,
-                "end_index": end_idx
-            },
-            "next_page_hint": if is_truncated {
-                Some(format!("Only the first {} lines of blame are shown. To view the remaining blame lines, use start_line={}.", returned_items, start + returned_items as u64))
-            } else {
-                None
-            }
-        }))
+        let mut out = format!(
+            "=== {path_str} blame (lines {start}-{end_idx} of {total_end}) ===\n{}",
+            res.content.trim_end_matches('\n')
+        );
+        if res.truncated {
+            out.push_str(&format!(
+                "\n[Truncated: {returned_items} of {total_blame_lines} blame lines shown. Call git_blame with start_line={} to read more.]",
+                end_idx + 1
+            ));
+        }
+
+        Ok(Value::String(out))
     }
 }

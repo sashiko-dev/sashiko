@@ -107,6 +107,84 @@ pub fn has_unquoted_diff(text: &str) -> bool {
     false
 }
 
+fn is_diffstat_summary_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some((count, rest)) = trimmed.split_once(' ') else {
+        return false;
+    };
+    !count.is_empty()
+        && count.bytes().all(|b| b.is_ascii_digit())
+        && (rest.starts_with("file changed") || rest.starts_with("files changed"))
+}
+
+fn normalize_diffstat_path(raw: &str) -> Option<String> {
+    let unquoted = raw.trim().trim_matches('"');
+    let expanded = if let Some(open) = unquoted.find('{')
+        && let Some(close_rel) = unquoted[open + 1..].find('}')
+        && let inner = &unquoted[open + 1..open + 1 + close_rel]
+        && let Some((_, new_part)) = inner.split_once(" => ")
+    {
+        let suffix = &unquoted[open + 1 + close_rel + 1..];
+        let joined = format!("{}{}{}", &unquoted[..open], new_part.trim(), suffix);
+        joined.replace("//", "/")
+    } else if let Some((_, new_part)) = unquoted.split_once(" => ") {
+        new_part.trim().to_string()
+    } else {
+        unquoted.to_string()
+    };
+    let normalized = expanded
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .trim();
+    (!normalized.is_empty()).then(|| normalized.to_string())
+}
+
+fn parse_diffstat_entry_path(line: &str) -> Option<String> {
+    if !line.starts_with(' ') {
+        return None;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('|') {
+        return None;
+    }
+    let idx = line.rfind(" | ")?;
+    let (before, after) = (&line[..idx], &line[idx + 3..]);
+    let rhs = after.trim();
+    let looks_like_stat = rhs.bytes().next().is_some_and(|b| b.is_ascii_digit())
+        || rhs.starts_with("Bin ")
+        || rhs.starts_with("Unmerged");
+    if !looks_like_stat {
+        return None;
+    }
+    normalize_diffstat_path(before)
+}
+
+/// Extracts touched file paths from a `git diff --stat` block in an email body
+/// (such as a `git format-patch --cover-letter` message that carries no unified
+/// diff). Anchors on the trailing `<N> file(s) changed` summary line so prose
+/// pipes or Markdown tables are ignored.
+pub fn extract_files_from_diffstat(body: &str) -> Vec<String> {
+    let lines: Vec<&str> = body.lines().map(|l| l.trim_end_matches('\r')).collect();
+    let mut paths = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if !is_diffstat_summary_line(line) {
+            continue;
+        }
+        let mut cursor = idx;
+        while cursor > 0 {
+            if let Some(path) = parse_diffstat_entry_path(lines[cursor - 1]) {
+                paths.push(path);
+                cursor -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 /// Returns true if `line` is a `git format-patch` mbox separator line of the
 /// form `From <hex-sha> <ctime-timestamp>` (e.g.
 /// `From 0123456789abcdef0123456789abcdef01234567 Mon Sep 17 00:00:00 2001`).
@@ -206,6 +284,42 @@ fn is_ping_subject(subject: &str) -> bool {
     subject_prefix_tokens(subject).any(|tok| tok.to_ascii_lowercase().starts_with("ping"))
 }
 
+/// Whether the leading bracketed subject prefixes declare a `git request-pull`
+/// email (`[GIT pull]`, `[GIT PULL]`, `[git-pull]`) rather than a patch or RFC.
+/// Bare `[PULL M/N]` tags without `GIT` are intentionally not matched so
+/// submaintainer pull series in projects such as QEMU continue to ingest.
+fn is_git_pull_subject(subject: &str) -> bool {
+    if is_rfc_subject(subject) {
+        return false;
+    }
+    let mut has_git = false;
+    let mut has_pull = false;
+    let mut has_git_pull = false;
+    let mut rest = subject.trim_start();
+    while let Some(after_open) = rest.strip_prefix('[') {
+        let Some((group, after_close)) = after_open.split_once(']') else {
+            break;
+        };
+        for tok in group
+            .split(|c: char| !c.is_alphanumeric() && c != '-')
+            .filter(|t| !t.is_empty())
+        {
+            if tok.eq_ignore_ascii_case("patch") || tok.eq_ignore_ascii_case("rfc") {
+                return false;
+            }
+            if tok.eq_ignore_ascii_case("git-pull") {
+                has_git_pull = true;
+            } else if tok.eq_ignore_ascii_case("git") {
+                has_git = true;
+            } else if tok.eq_ignore_ascii_case("pull") {
+                has_pull = true;
+            }
+        }
+        rest = after_close.trim_start();
+    }
+    has_git_pull || (has_git && has_pull)
+}
+
 pub fn is_promotable_reply_patch_subject(subject: &str) -> bool {
     let lower = subject.trim().to_lowercase();
     let starts_with_reply = lower.starts_with("re:")
@@ -226,9 +340,13 @@ pub fn is_promotable_reply_patch_subject(subject: &str) -> bool {
     {
         return false;
     }
-    let has_patch_tag = subject_prefix_tokens(subject)
-        .any(|tok| tok.eq_ignore_ascii_case("patch") || tok.eq_ignore_ascii_case("rfc"));
-    has_patch_tag && !clean_subject(subject).is_empty()
+    has_patch_or_rfc_tag(subject) && !clean_subject(subject).is_empty()
+}
+
+/// Whether a bracketed subject tag contains a `PATCH` or `RFC` token.
+pub fn has_patch_or_rfc_tag(subject: &str) -> bool {
+    subject_prefix_tokens(subject)
+        .any(|tok| tok.eq_ignore_ascii_case("patch") || tok.eq_ignore_ascii_case("rfc"))
 }
 
 pub fn promote_reply_patch_subject(subject: &str, version: u32) -> String {
@@ -255,17 +373,20 @@ pub fn promote_reply_patch_subject(subject: &str, version: u32) -> String {
         return stripped.to_string();
     }
 
-    static RE_BRACKET_VER: OnceLock<Regex> = OnceLock::new();
-    let re_ver =
-        RE_BRACKET_VER.get_or_init(|| Regex::new(r"(?i)\[([^\]]*?)\bv\d+\b([^\]]*?)\]").unwrap());
-    if let Some(caps) = re_ver.captures(stripped)
-        && let Some(m) = caps.get(0)
-    {
-        let mut out = String::with_capacity(stripped.len() + 4);
-        out.push_str(&stripped[..m.start()]);
-        out.push_str(&format!("[{}v{}{}]", &caps[1], version, &caps[2]));
-        out.push_str(&stripped[m.end()..]);
-        return out;
+    static RE_BRACKETS: OnceLock<Regex> = OnceLock::new();
+    let re_brackets = RE_BRACKETS.get_or_init(|| Regex::new(r"\[([^\]]*)\]").unwrap());
+    for caps in re_brackets.captures_iter(stripped) {
+        if let Some(content) = caps.get(1)
+            && let Some((v_start, v_end, _)) = find_bracket_version_span(content.as_str())
+        {
+            let abs_start = content.start() + v_start;
+            let abs_end = content.start() + v_end;
+            let mut out = String::with_capacity(stripped.len() + 4);
+            out.push_str(&stripped[..abs_start]);
+            out.push_str(&format!("v{version}"));
+            out.push_str(&stripped[abs_end..]);
+            return out;
+        }
     }
 
     static RE_BRACKET_TAG: OnceLock<Regex> = OnceLock::new();
@@ -401,30 +522,41 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
         .unwrap_or_default();
 
     let in_reply_to = match message.in_reply_to() {
-        HeaderValue::Text(t) => Some(clean_display_name(t)).filter(|s| !s.is_empty()),
+        HeaderValue::Text(t) => {
+            Some(clean_display_name(t.trim_matches(['<', '>']))).filter(|s| !s.is_empty())
+        }
         HeaderValue::TextList(l) => l
             .iter()
-            .map(|s| clean_display_name(s))
+            .map(|s| clean_display_name(s.trim_matches(['<', '>'])))
             .find(|s| !s.is_empty()),
         _ => None,
     };
 
-    let references = match message.references() {
-        HeaderValue::Text(t) => {
-            let cleaned = clean_display_name(t);
-            if cleaned.is_empty() {
-                vec![]
-            } else {
-                vec![cleaned]
-            }
-        }
+    let references: Vec<String> = match message.references() {
+        HeaderValue::Text(t) => t
+            .split_whitespace()
+            .map(|s| clean_display_name(s.trim_matches(['<', '>'])))
+            .filter(|s| !s.is_empty())
+            .collect(),
         HeaderValue::TextList(l) => l
             .iter()
-            .map(|s| clean_display_name(s))
+            .flat_map(|s| s.split_whitespace())
+            .map(|s| clean_display_name(s.trim_matches(['<', '>'])))
             .filter(|s| !s.is_empty())
             .collect(),
         _ => vec![],
     };
+
+    // Mailers such as quilt mail omit In-Reply-To and record the parent
+    // message ID only in References (RFC 5322 section 3.6.4, where the final
+    // entry names the immediate parent). Ignore self-references.
+    let in_reply_to = in_reply_to.or_else(|| {
+        references
+            .iter()
+            .rev()
+            .find(|r| r.as_str() != message_id)
+            .cloned()
+    });
 
     let (index, total) = parse_subject_index(&subject);
     let version = parse_subject_version(&subject);
@@ -500,9 +632,11 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
     let is_series_metadata = total > 1 || index == 0;
 
     // It is a patch or cover letter if:
-    // 1. It is NOT a reply (Re: ...)
+    // 1. It is NOT a reply (Re: ...) or a [GIT pull] request-pull email
     // 2. AND (It has [PATCH]/[RFC] tag OR it has a diff OR it looks like a series cover letter/part)
-    let is_patch_or_cover = !is_reply && (has_patch_tag || has_diff || is_series_metadata);
+    let is_patch_or_cover = !is_reply
+        && !is_git_pull_subject(&subject)
+        && (has_patch_tag || has_diff || is_series_metadata);
 
     let metadata = PatchsetMetadata {
         message_id: message_id.clone(),
@@ -580,28 +714,169 @@ pub fn parse_subject_index(subject: &str) -> (u32, u32) {
     (1, 1)
 }
 
-pub fn parse_subject_version(subject: &str) -> Option<u32> {
-    static RE_VER: OnceLock<Regex> = OnceLock::new();
-    // Strategy:
-    // 1. Inside [...] blocks: find vN preceded by word boundary (e.g. [PATCH v2], [v2])
-    // 2. Start of string: ^vN followed by word boundary
-    // 3. Following PATCH: PATCH followed by non-word chars and vN (e.g. PATCHv2, [PATCH] v2)
-    let re = RE_VER.get_or_init(|| {
-        Regex::new(r"(?i)(?:\[[^\]]*?\bv(\d+)\b[^\]]*?\]|^\s*v(\d+)\b|PATCH\W*v(\d+)\b)").unwrap()
-    });
+/// Locate an integer revision token `v<N>` / `V<N>` inside a single bracketed
+/// group, skipping dotted tokens such as `V1.1`, `v6.6`, or `foo.v2`.
+fn find_bracket_version_span(group: &str) -> Option<(usize, usize, u32)> {
+    let bytes = group.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].eq_ignore_ascii_case(&b'v') {
+            let digits_start = i + 1;
+            let mut digits_end = digits_start;
+            while digits_end < bytes.len() && bytes[digits_end].is_ascii_digit() {
+                digits_end += 1;
+            }
+            if digits_end > digits_start {
+                let before = &group[..i];
+                let valid_before = before.is_empty()
+                    || before
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| !c.is_alphanumeric() && c != '.' && c != '_')
+                    || ["patch", "rfc"].iter().any(|kw| {
+                        before
+                            .len()
+                            .checked_sub(kw.len())
+                            .and_then(|split| {
+                                let head = before.get(..split)?;
+                                let tail = before.get(split..)?;
+                                Some((head, tail))
+                            })
+                            .is_some_and(|(head, tail)| {
+                                tail.eq_ignore_ascii_case(kw)
+                                    && head.chars().next_back().is_none_or(|c| {
+                                        !c.is_alphanumeric() && c != '.' && c != '_'
+                                    })
+                            })
+                    });
+                let after = &group[digits_end..];
+                let valid_after = after
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '.' && c != '_');
+                if valid_before
+                    && valid_after
+                    && let Ok(ver) = group[digits_start..digits_end].parse::<u32>()
+                {
+                    return Some((i, digits_end, ver));
+                }
+                i = digits_end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
 
-    if let Some(caps) = re.captures(subject) {
-        if let Some(m) = caps.get(1) {
-            return m.as_str().parse().ok();
+pub fn parse_subject_version(subject: &str) -> Option<u32> {
+    // 1. Inside [...] blocks: scan tokens so dotted kernel/revision numbers
+    //    (e.g. [STABLE v6.6 v2], [patch V1.1 02/38]) do not shadow or
+    //    impersonate integer patch revisions.
+    static RE_BRACKETS: OnceLock<Regex> = OnceLock::new();
+    let re_brackets = RE_BRACKETS.get_or_init(|| Regex::new(r"\[([^\]]*)\]").unwrap());
+    for caps in re_brackets.captures_iter(subject) {
+        if let Some(content) = caps.get(1)
+            && let Some((_, _, ver)) = find_bracket_version_span(content.as_str())
+        {
+            return Some(ver);
         }
-        if let Some(m) = caps.get(2) {
-            return m.as_str().parse().ok();
-        }
-        if let Some(m) = caps.get(3) {
-            return m.as_str().parse().ok();
+    }
+
+    // 2. Start of string (^vN) or following PATCH (PATCHv2, [PATCH] v2: ...),
+    //    provided the token is neither preceded nor followed by a dot.
+    static RE_OUTSIDE: OnceLock<Regex> = OnceLock::new();
+    let re_outside =
+        RE_OUTSIDE.get_or_init(|| Regex::new(r"(?i)(?:^\s*v(\d+)|PATCH([^\w.]*)v(\d+))").unwrap());
+    for caps in re_outside.captures_iter(subject) {
+        let Some(digits) = caps.get(1).or_else(|| caps.get(3)) else {
+            continue;
+        };
+        let after = &subject[digits.end()..];
+        if after
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '.' && c != '_')
+            && let Ok(ver) = digits.as_str().parse::<u32>()
+        {
+            return Some(ver);
         }
     }
     None
+}
+
+/// Stage of a posting as declared by its subject tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SeriesStage {
+    /// A bracketed `RFC` token is present (`[RFC PATCH]`, `[PATCH RFC v2]`).
+    Rfc,
+    /// Any other posting.
+    Patch,
+}
+
+/// How a newer posting's subject tag relates to an older posting's tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionStep {
+    /// The version number grows, or an RFC posting is followed by a
+    /// non-RFC one (`v1 -> v2`, `RFC v2 -> v1`, `v1 -> RFC v2`).
+    Advances,
+    /// The same number without an RFC to non-RFC step (`v2 -> v2`,
+    /// `[PATCH] -> [PATCH]`, `v1 -> RFC v1`).
+    SameLabel,
+    /// The number shrinks without an RFC to non-RFC step (`v3 -> v2`).
+    Regresses,
+}
+
+/// The revision an author declared in a subject: an ordering hint only.
+/// Authors restart numbering after RFC rounds and forget to bump tags, so
+/// chronology decides the actual order of postings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubjectRevision {
+    pub stage: SeriesStage,
+    /// `vN` from the subject, 1 when the subject carries no version tag.
+    pub number: u32,
+}
+
+impl SubjectRevision {
+    pub fn parse(subject: &str) -> Self {
+        Self::with_number(subject, parse_subject_version(subject).unwrap_or(1))
+    }
+
+    /// The stage parsed from `subject` with an already known version
+    /// number (for example the stored `patchsets.version`).
+    pub fn with_number(subject: &str, number: u32) -> Self {
+        let stage = if subject_prefix_tokens(subject).any(|tok| tok.eq_ignore_ascii_case("rfc")) {
+            SeriesStage::Rfc
+        } else {
+            SeriesStage::Patch
+        };
+        Self {
+            stage,
+            number: number.max(1),
+        }
+    }
+
+    /// Classifies `self` (older posting) followed by `next` (newer posting).
+    pub fn step_to(self, next: Self) -> RevisionStep {
+        if self.stage == SeriesStage::Rfc && next.stage == SeriesStage::Patch {
+            return RevisionStep::Advances;
+        }
+        match next.number.cmp(&self.number) {
+            std::cmp::Ordering::Greater => RevisionStep::Advances,
+            std::cmp::Ordering::Equal => RevisionStep::SameLabel,
+            std::cmp::Ordering::Less => RevisionStep::Regresses,
+        }
+    }
+
+    /// The public label: `vN`, or `RFC` / `RFC vN`, matching
+    /// `versionLabel()` in the web UI.
+    pub fn label(self) -> String {
+        match (self.stage, self.number) {
+            (SeriesStage::Rfc, 1) => "RFC".to_string(),
+            (SeriesStage::Rfc, n) => format!("RFC v{n}"),
+            (SeriesStage::Patch, n) => format!("v{n}"),
+        }
+    }
 }
 
 /// Returns bracketed subject tokens in order, including standard patch tags.
@@ -617,6 +892,42 @@ pub(crate) fn subject_prefix_tokens(subject: &str) -> impl Iterator<Item = &str>
                 .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '.' && c != '_')
         })
         .filter(|token| !token.is_empty())
+}
+
+/// Whether a subject marks its series as a request for comments.
+///
+/// Inside the leading bracketed groups, where submitters spell the tag many
+/// ways, a token counts when it is `RFC` optionally followed by a version
+/// (`[RFC PATCH v2 1/3]`, `[PATCH RFC]`, `[RFCv2 PATCH]`, `[RFC2]`). Outside
+/// them only an exact leading `RFC` word counts (`RFC: mm: ...`). Brackets
+/// after the first non-bracketed text are ignored, so a title that merely
+/// mentions an RFC document is not an RFC, and words that only start with the
+/// letters (`RFCOMM:`, `[PATCH RFCOMM]`) do not match. Matching ignores case.
+pub fn is_rfc_subject(subject: &str) -> bool {
+    let is_tag_token = |token: &str| {
+        let lower = token.to_ascii_lowercase();
+        let Some(rest) = lower.strip_prefix("rfc") else {
+            return false;
+        };
+        let digits = rest.strip_prefix('v').unwrap_or(rest);
+        rest.is_empty() || (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let mut rest = subject.trim_start();
+    while let Some(after_open) = rest.strip_prefix('[') {
+        let Some((group, after_close)) = after_open.split_once(']') else {
+            break;
+        };
+        if group
+            .split(|c: char| !c.is_alphanumeric())
+            .any(is_tag_token)
+        {
+            return true;
+        }
+        rest = after_close.trim_start();
+    }
+    rest.split(|c: char| !c.is_alphanumeric())
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("rfc"))
 }
 
 pub fn get_subject_prefixes(subject: &str) -> Vec<String> {
@@ -1023,10 +1334,13 @@ fn version_link_line_regex() -> &'static Regex {
             (?:
                 (?:\[\s*v\d+\s*\]|v\d+)(?:\s+links?)?(?:\s*\([^()]*\))?
               | links?\s*(?:to\s+)?(?:\[\s*v\d+\s*\]|v\d+)
+              | (?:\[\s*)?rfc(?:[\s-]*v\d+)?(?:\s*\])?(?:\s+links?)?(?:\s*\([^()]*\))?
+              | links?\s*(?:to\s+)?(?:the\s+)?rfc(?:[\s-]*v\d+)?
               | (?:previous|prior|earlier|last)\s+(?:version|revision|posting|iteration)
                 (?:\s*\([^()]*\))?
               | version\s+\d+
               | changes\s+(?:since|from)\s+(?:\[\s*v\d+\s*\]|v\d+)
+              | changes\s+(?:since|from)\s+(?:the\s+)?rfc(?:[\s-]*v\d+)?
             )
             (?:
                 (?:\s*[:=]|\s*-+>?|\s+at\b|\s)\s*[(<\[]?\s*
@@ -1381,6 +1695,47 @@ Body";
     }
 
     #[test]
+    fn test_is_rfc_subject() {
+        for subject in [
+            "[RFC] mm: add a knob",
+            "[RFC PATCH 1/3] mm: add a knob",
+            "[PATCH RFC v2 8/8] mm: add a knob",
+            "[rfc patch] mm: add a knob",
+            "[RFC] [PATCH v3] mm: add a knob",
+            "[PATCH] [RFC] mm: add a knob",
+            "[RFC v4] mm: add a knob",
+            "  [PATCH RFC net-next] net: add a knob",
+            "[RFC-PATCH] mm: add a knob",
+            "[RFC_v2] mm: add a knob",
+            "[RFCv2 PATCH 0/4] mm: add a knob",
+            "[PATCH RFCv3 1/4] mm: add a knob",
+            "[rfcV10] mm: add a knob",
+            "[RFC2] mm: add a knob",
+            "RFC: mm: add a knob",
+            "RFC PATCH mm: add a knob",
+        ] {
+            assert!(is_rfc_subject(subject), "{subject:?} should be an RFC");
+        }
+        for subject in [
+            "[PATCH] mm: add a knob",
+            "[PATCH v1] mm: add a knob",
+            "[PATCH v5 2/3] mm: add a knob",
+            "[PATCH] Bluetooth: RFCOMM: fix a leak",
+            "[PATCH RFCOMM] fix a leak",
+            "[RFCv] mm: add a knob",
+            "RFCOMM: fix a leak",
+            "RFCv2: mm: add a knob",
+            "[PATCH] doc: describe [RFC 1234] compliance",
+            "[PATCH] net: follow RFC 9000 on retries",
+            "[PATCH-RFCish] mm: add a knob",
+            "[RFC unterminated mm: add a knob",
+            "",
+        ] {
+            assert!(!is_rfc_subject(subject), "{subject:?} should not be an RFC");
+        }
+    }
+
+    #[test]
     fn test_version_parsing() {
         assert_eq!(parse_subject_version("[PATCH v2] subject"), Some(2));
         assert_eq!(parse_subject_version("[PATCH v3 1/2] subject"), Some(3));
@@ -1402,6 +1757,100 @@ Body";
 
         // Edge case: [PATCH] v3: ...
         assert_eq!(parse_subject_version("[PATCH] v3: subject"), Some(3));
+
+        // Dotted revision tags and kernel target versions are not integer revisions
+        assert_eq!(
+            parse_subject_version("[patch V1.1 02/38] x86/paravirt"),
+            None
+        );
+        assert_eq!(parse_subject_version("[PATCH v6.6] net: fix"), None);
+        assert_eq!(parse_subject_version("[STABLE v6.12 1/4] net: fix"), None);
+        assert_eq!(
+            parse_subject_version("[STABLE v6.6 v2 1/2] net: fix"),
+            Some(2)
+        );
+        assert_eq!(
+            promote_reply_patch_subject("Re: [PATCH v6.6] net: fix", 2),
+            "[PATCH v2 v6.6] net: fix"
+        );
+    }
+
+    #[test]
+    fn test_subject_revision_parses_stage_number_and_label() {
+        let cases = [
+            ("[PATCH] mm: fix", SeriesStage::Patch, 1, "v1"),
+            ("[PATCH v1] mm: fix", SeriesStage::Patch, 1, "v1"),
+            ("[PATCH v3 0/4] mm: fix", SeriesStage::Patch, 3, "v3"),
+            ("[RFC PATCH] mm: fix", SeriesStage::Rfc, 1, "RFC"),
+            ("[PATCH RFC v2 0/3] mm: fix", SeriesStage::Rfc, 2, "RFC v2"),
+            ("[RFC net-next v4] mm: fix", SeriesStage::Rfc, 4, "RFC v4"),
+            (
+                "[uL RFC PATCH v3 0/8] i2c: omap",
+                SeriesStage::Rfc,
+                3,
+                "RFC v3",
+            ),
+            // "rfc" outside the brackets is part of the summary.
+            (
+                "[PATCH] net: document RFC 8200 handling",
+                SeriesStage::Patch,
+                1,
+                "v1",
+            ),
+        ];
+        for (subject, stage, number, label) in cases {
+            let rev = SubjectRevision::parse(subject);
+            assert_eq!(rev, SubjectRevision { stage, number }, "{subject}");
+            assert_eq!(rev.label(), label, "{subject}");
+        }
+        assert_eq!(SubjectRevision::with_number("[RFC] x", 0).number, 1);
+    }
+
+    #[test]
+    fn test_subject_revision_steps() {
+        let step = |a: &str, b: &str| SubjectRevision::parse(a).step_to(SubjectRevision::parse(b));
+        assert_eq!(step("[PATCH] x", "[PATCH v2] x"), RevisionStep::Advances);
+        assert_eq!(step("[RFC PATCH] x", "[PATCH] x"), RevisionStep::Advances);
+        assert_eq!(
+            step("[RFC PATCH v3] x", "[PATCH v1] x"),
+            RevisionStep::Advances
+        );
+        assert_eq!(
+            step("[RFC PATCH v2] x", "[PATCH v2] x"),
+            RevisionStep::Advances
+        );
+        assert_eq!(
+            step("[PATCH] x", "[RFC PATCH v2] x"),
+            RevisionStep::Advances
+        );
+        assert_eq!(step("[RFC] x", "[RFC v2] x"), RevisionStep::Advances);
+        assert_eq!(step("[PATCH] x", "[PATCH] x"), RevisionStep::SameLabel);
+        assert_eq!(
+            step("[PATCH v2] x", "[PATCH v2 RESEND] x"),
+            RevisionStep::SameLabel
+        );
+        assert_eq!(step("[PATCH] x", "[RFC PATCH] x"), RevisionStep::SameLabel);
+        assert_eq!(
+            step("[PATCH v3] x", "[PATCH v2] x"),
+            RevisionStep::Regresses
+        );
+        assert_eq!(
+            step("[PATCH v2] x", "[RFC PATCH] x"),
+            RevisionStep::Regresses
+        );
+    }
+
+    #[test]
+    fn test_has_patch_or_rfc_tag() {
+        assert!(has_patch_or_rfc_tag("[PATCH v2 1/3] x"));
+        assert!(has_patch_or_rfc_tag("[RFC] x"));
+        assert!(has_patch_or_rfc_tag("[net-next,PATCH] x"));
+        assert!(!has_patch_or_rfc_tag(
+            "linux-next: manual merge of the drm tree"
+        ));
+        assert!(!has_patch_or_rfc_tag(
+            "[Openvpn-devel] [S] Change in openvpn[master]: x"
+        ));
     }
 
     #[test]
@@ -1533,6 +1982,33 @@ Body";
             vec!["bpf", "net-next"]
         ); // sorted
         assert_eq!(get_subject_prefixes("[PATCH]"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_extract_files_from_diffstat() {
+        let cover = "\
+Hi all,
+
+This series cleans up extent handling in e2fsprogs:
+  foo | bar in prose should not match
+| col1 | 42 |
+
+ e2fsck/pass1.c                | 24 ++++++++++++++++--------
+ lib/ext2fs/{old_ext.c => ext.c} |  6 +++---
+ tests/f_bad_ext/image.gz      | Bin 0 -> 2048 bytes
+ 3 files changed, 19 insertions(+), 11 deletions(-)
+";
+        assert_eq!(
+            extract_files_from_diffstat(cover),
+            vec![
+                "e2fsck/pass1.c",
+                "lib/ext2fs/ext.c",
+                "tests/f_bad_ext/image.gz",
+            ]
+        );
+
+        let no_stat = "Cover letter without diffstat\n| table | 10 |\n";
+        assert!(extract_files_from_diffstat(no_stat).is_empty());
     }
 
     #[test]
@@ -1783,6 +2259,41 @@ v1 was discussed at https://lore.kernel.org/r/20260108-discussed@kernel.org\n";
     }
 
     #[test]
+    fn test_extract_version_reference_msgids_rfc_markers() {
+        // Forms observed in production cover letters of the non-RFC
+        // posting that follows an RFC.
+        let body = "RFC: https://lore.kernel.org/linux-wireless/20261003-rfc-a@pobox.sk/\n\
+- RFC: https://lore.kernel.org/20261028051104.154232-1-sj@kernel.org\n\
+RFC v2: https://lore.kernel.org/all/20260914-rfc-v2-0-bf6645bb2f65@oss.qualcomm.com/\n\
+RFC-v4: https://lore.kernel.org/all/20250104101224.873926-1-zengheng4@huawei.com/\n\
+- Link to RFC: https://lore.kernel.org/bpf/20260902070534.2141812-1-tangyazhou@zju.edu.cn/\n\
+- Link to RFC v3: https://lore.kernel.org/all/20261013131309.2790253-1-ridong.chen@linux.dev/\n\
+rfc: https://lore.kernel.org/kexec/20260901180713.4185641-1-dmatlack@google.com/\n\
+[RFC] https://lore.kernel.org/r/20260801-bracketed-rfc@kernel.org\n\
+Changes since RFC: https://lore.kernel.org/r/20260802-changes-since-rfc@kernel.org\n";
+        assert_eq!(
+            extract_version_reference_msgids(body),
+            vec![
+                "20261003-rfc-a@pobox.sk",
+                "20261028051104.154232-1-sj@kernel.org",
+                "20260914-rfc-v2-0-bf6645bb2f65@oss.qualcomm.com",
+                "20250104101224.873926-1-zengheng4@huawei.com",
+                "20260902070534.2141812-1-tangyazhou@zju.edu.cn",
+                "20261013131309.2790253-1-ridong.chen@linux.dev",
+                "20260901180713.4185641-1-dmatlack@google.com",
+                "20260801-bracketed-rfc@kernel.org",
+                "20260802-changes-since-rfc@kernel.org",
+            ]
+        );
+
+        // IETF RFC references and RFC prose are not previous-version markers.
+        let ietf = "RFC 8200: https://lore.kernel.org/r/20260110-ietf@kernel.org\n\
+RFC 9110 https://lore.kernel.org/r/20260111-ietf-space@kernel.org\n\
+The RFC was discussed at https://lore.kernel.org/r/20260112-discussed@kernel.org\n";
+        assert!(extract_version_reference_msgids(ietf).is_empty());
+    }
+
+    #[test]
     fn test_extract_prerequisite_message_and_patch_ids() {
         let body = "Cover letter\n---\nBased-on: <20260925-prereq-series@kernel.org>\nBased-on: https://lore.kernel.org/r/20260925-prereq-url%40kernel.org/\nprerequisite-message-id: 20260920-b4-prereq@kernel.org\nprerequisite-patch-id: 0123456789abcdef0123456789abcdef01234567\n";
         let (msgids, patch_ids) = extract_prerequisite_message_and_patch_ids(body);
@@ -1939,5 +2450,116 @@ On Thu, Oct 22, Author wrote:\r\n\
             ),
             "[PATCH v3] lra: Handle subregs in get_dependent_filter."
         );
+    }
+
+    #[test]
+    fn test_references_fallback_populates_in_reply_to() {
+        // quilt mail omits In-Reply-To and sets References to the cover letter.
+        let quilt_patch = b"Message-Id: <20261105170157.453569788@infradead.org>\r\n\
+From: Peter Zijlstra <peterz@infradead.org>\r\n\
+Subject: [PATCH 1/3] sched/fair: Use guard in sched_group_set_idle()\r\n\
+References: <20261105165525.011876858@infradead.org>\r\n\
+\r\n\
+--- a/kernel/sched/fair.c\r\n\
++++ b/kernel/sched/fair.c\r\n\
+@@ -1 +1 @@\r\n\
+-old\r\n\
++new\r\n";
+        let (meta, patch) = parse_email(quilt_patch).unwrap();
+        assert_eq!(
+            meta.in_reply_to.as_deref(),
+            Some("20261105165525.011876858@infradead.org")
+        );
+        assert_eq!(
+            meta.references,
+            vec!["20261105165525.011876858@infradead.org"]
+        );
+        assert!(patch.is_some());
+
+        // Multiple References entries pick the immediate parent (last non-self entry).
+        let multi_ref = b"Message-ID: <leaf@example.com>\r\n\
+From: Thomas Gleixner <tglx@kernel.org>\r\n\
+Subject: [patch 2/2] timers: cleanup\r\n\
+References: <root@example.com> <parent@example.com> <leaf@example.com>\r\n\
+\r\n\
+--- a/kernel/time/timer.c\r\n\
++++ b/kernel/time/timer.c\r\n\
+@@ -1 +1 @@\r\n\
+-old\r\n\
++new\r\n";
+        let (meta_multi, _) = parse_email(multi_ref).unwrap();
+        assert_eq!(
+            meta_multi.in_reply_to.as_deref(),
+            Some("parent@example.com")
+        );
+
+        // Explicit In-Reply-To always takes precedence over References.
+        let explicit = b"Message-ID: <child@example.com>\r\n\
+From: Author <a@example.com>\r\n\
+Subject: [PATCH 1/2] part\r\n\
+In-Reply-To: <direct-parent@example.com>\r\n\
+References: <root@example.com> <other@example.com>\r\n\
+\r\n\
+diff --git a/f.c b/f.c\r\n";
+        let (meta_explicit, _) = parse_email(explicit).unwrap();
+        assert_eq!(
+            meta_explicit.in_reply_to.as_deref(),
+            Some("direct-parent@example.com")
+        );
+    }
+
+    #[test]
+    fn test_git_pull_request_is_not_ingested_as_patchset() {
+        for subject in [
+            "[GIT pull] timers/vdso for v7.4-rc1",
+            "[GIT PULL] x86/urgent: dispatch fixes for v7.3-rc5",
+            "[git-pull] irq/core for v7.4-rc1",
+            "[GIT][PULL] locking/core for v7.4-rc1",
+        ] {
+            let raw = format!(
+                "Message-ID: <pull@linutronix.de>\r\n\
+                 From: Thomas Gleixner <tglx@linutronix.de>\r\n\
+                 Subject: {subject}\r\n\
+                 \r\n\
+                 The following changes since commit 1234567890ab:\r\n\
+                 \r\n\
+                 diff --git a/kernel/time/timer.c b/kernel/time/timer.c\r\n\
+                 --- a/kernel/time/timer.c\r\n\
+                 +++ b/kernel/time/timer.c\r\n\
+                 @@ -1 +1 @@\r\n\
+                 -old\r\n\
+                 +new\r\n"
+            );
+            let (meta, _) = parse_email(raw.as_bytes()).unwrap();
+            assert!(
+                !meta.is_patch_or_cover,
+                "{subject:?} must not be classified as a patch or cover letter"
+            );
+        }
+
+        for subject in [
+            "[PATCH] git: fix pull request handling",
+            "[PATCH] doc: document [GIT pull] workflow",
+            "[RFC GIT pull] experimental change",
+            "[PULL 01/15] target/arm: implement feature",
+        ] {
+            let raw = format!(
+                "Message-ID: <patch@example.com>\r\n\
+                 From: Author <a@example.com>\r\n\
+                 Subject: {subject}\r\n\
+                 \r\n\
+                 diff --git a/f.c b/f.c\r\n\
+                 --- a/f.c\r\n\
+                 +++ b/f.c\r\n\
+                 @@ -1 +1 @@\r\n\
+                 -old\r\n\
+                 +new\r\n"
+            );
+            let (meta, _) = parse_email(raw.as_bytes()).unwrap();
+            assert!(
+                meta.is_patch_or_cover,
+                "{subject:?} must still be classified as a patch"
+            );
+        }
     }
 }

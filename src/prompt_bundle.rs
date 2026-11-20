@@ -72,12 +72,42 @@ pub fn gcc_severity_guide() -> &'static str {
         .expect("gcc/severity.md must exist in prompt bundle")
 }
 
+/// Returns the compiled-in content of `qemu/severity.md`.
+pub fn qemu_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "qemu/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("qemu/severity.md must exist in prompt bundle")
+}
+
+/// Returns the compiled-in content of `zephyr/severity.md`.
+pub fn zephyr_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "zephyr/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("zephyr/severity.md must exist in prompt bundle")
+}
+
+/// Returns the compiled-in content of `e2fsprogs/severity.md`.
+pub fn e2fsprogs_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "e2fsprogs/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("e2fsprogs/severity.md must exist in prompt bundle")
+}
+
 /// Returns the compiled-in severity guide for `project`.
 pub fn severity_guide(project: ProjectId) -> &'static str {
     match project {
         ProjectId::Linux => kernel_severity_guide(),
         ProjectId::Sashiko => sashiko_severity_guide(),
         ProjectId::Gcc => gcc_severity_guide(),
+        ProjectId::Qemu => qemu_severity_guide(),
+        ProjectId::Zephyr => zephyr_severity_guide(),
+        ProjectId::E2fsprogs => e2fsprogs_severity_guide(),
     }
 }
 
@@ -152,6 +182,9 @@ mod tests {
         assert!(guide.contains("# Severity Levels"));
         assert!(guide.contains("## Critical"));
         assert!(guide.contains("## High"));
+        assert!(guide.contains("Documentation/process/threat-model.rst"));
+        assert!(guide.contains("kselftests"));
+        assert!(guide.contains("debugfs"));
     }
 
     #[test]
@@ -223,7 +256,7 @@ mod tests {
             "kernel/inline-template.md",
             "kernel/callstack.md",
             "kernel/locking.md",
-            "kernel/pointer-guards.md",
+            "kernel/performance.md",
         ] {
             assert!(
                 PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
@@ -251,6 +284,72 @@ mod tests {
             assert!(
                 PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
                 "missing GCC framing file in bundle: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_qemu_prompt_bundle_integrity() {
+        let required_framing = [
+            "qemu/review-core.md",
+            "qemu/severity.md",
+            "qemu/false-positive-guide.md",
+            "qemu/report-template.md",
+            "qemu/maintainers/general.md",
+        ];
+        for path in required_framing {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing QEMU framing file in bundle: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_zephyr_prompt_bundle_integrity() {
+        let required_framing = [
+            "zephyr/review-core.md",
+            "zephyr/severity.md",
+            "zephyr/false-positive-guide.md",
+            "zephyr/report-template.md",
+            "zephyr/maintainers/general.md",
+        ];
+        for path in required_framing {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing Zephyr framing file in bundle: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2fsprogs_prompt_bundle_integrity() {
+        let guide = e2fsprogs_severity_guide();
+        assert!(guide.contains("# Severity Levels"));
+        assert!(guide.contains("e2fsprogs"));
+        assert_eq!(
+            severity_guide(ProjectId::E2fsprogs),
+            e2fsprogs_severity_guide()
+        );
+
+        let required_framing = [
+            "e2fsprogs/review-core.md",
+            "e2fsprogs/severity.md",
+            "e2fsprogs/false-positive-guide.md",
+            "e2fsprogs/inline-template.md",
+            "e2fsprogs/maintainers/general.md",
+            "e2fsprogs/maintainers/libext2fs.md",
+            "e2fsprogs/maintainers/e2fsck.md",
+            "e2fsprogs/maintainers/tools.md",
+            "e2fsprogs/maintainers/fuse.md",
+            "e2fsprogs/maintainers/support-libs.md",
+            "e2fsprogs/maintainers/tests.md",
+            "e2fsprogs/notes/profile.toml",
+        ];
+        for path in required_framing {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing e2fsprogs framing file in bundle: {path}"
             );
         }
     }

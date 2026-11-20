@@ -101,10 +101,13 @@ Every commit message must meet Sashiko's repository standards:
   by an identifiable earlier commit already in repository history (prior to
   `Baseline SHA`), it must include a Linux-style `Fixes: <12-char sha> ("<subject>")`
   trailer in the trailer block immediately before `Signed-off-by:` (plus
-  `Fixes: <project>-<uuid>` when fixing a tracked Sashiko bug). Verify with
-  `git_blame` or `git_log` before reporting a missing `Fixes:` trailer, and use
-  `git_show` to verify any existing `Fixes:` commit SHA (at least 12 hex
-  characters) and quoted subject. Do **not** demand `Fixes:` on new features,
+  `Fixes: <project>-<uuid>` when fixing a tracked Sashiko bug). Inspect
+  `<fixes_context>` and verify with `git_blame`, `git_log`, or `git_show` before
+  reporting a missing `Fixes:` trailer at `Low` severity, and use `<fixes_context>`
+  and `git_show` to verify any existing `Fixes:` commit SHA (at least 12 hex
+  characters) and quoted subject (if a SHA is not found in the local repository
+  or via subject search, report at `Low` severity noting it may live in an
+  unindexed tree). Do **not** demand `Fixes:` on new features,
   refactorings, documentation/prompt/config additions, or commits where no
   specific introducing commit prior to `Baseline SHA` can be identified with
   confidence, and **never** ask for a `Fixes:` trailer pointing to an unmerged

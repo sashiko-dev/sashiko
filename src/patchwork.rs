@@ -23,6 +23,18 @@ struct SeverityCounts {
 }
 
 impl PatchworkCheckResult {
+    /// The check for a patch whose clean verdict was inherited from an
+    /// earlier review of the same diff rather than produced by a model run
+    /// on this copy.
+    pub fn inherited_clean() -> Self {
+        Self {
+            state: "success".to_string(),
+            description:
+                "Sashiko AI review found no regressions (unchanged since an earlier review)"
+                    .to_string(),
+        }
+    }
+
     /// Build a check result from a patchwork policy and raw findings.
     ///
     /// Applies min_severity filtering, splits by preexisting flag,

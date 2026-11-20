@@ -19,10 +19,10 @@ Analysis of the 99-entry Linux kernel benchmark (`benchmarks/benchmark_small.jso
    When multiple specialist stages independently identify the same defect with concrete code proof and no stage attempts to dismiss it, passing that concern through three separate sequential LLM stages (`deduplication`, `conflict-resolution`, and monolithic `verification`) adds latency and token overhead while risking accidental attrition.
 
 ### 1.3 Design Goals
-1. **Unified `verification` Stage (Deduplication + Classification + Fast-Path Verification):** Combine deduplication, signal classification, and initial verification into a single `verification` stage that immediately finalizes well-justified concerns, immediately drops well-justified dismissals, and isolates speculative or contested "hard cases".
+1. **Unified `verification` Stage (Deduplication + Classification + Fast-Path Verification):** Combine deduplication, signal classification, and initial verification into a single `verification` stage that immediately finalizes well-justified concerns, immediately drops well-justified dismissals, and isolates speculative or contested "inconclusive concerns".
 2. **Audit Speculative Dismissals:** Treat both `concerns` and `dismissed_concerns` symmetrically during classification so standalone `dismissed_concerns` relying on unproven assumptions or vague arguments are classified as `SpeculativeOrContested` and sent to `post-verification`.
-3. **Parallel Per-Finding `post-verification` Stage:** Verify each `SpeculativeOrContested` hard case in its own isolated parallel stage with dedicated tool turns (`WorkflowStep::DynamicParallel`), preventing attention dilution and silent drops.
-4. **Severity-Ordered Batching Above 10 Hard Cases:** Cap parallel `post-verification` stages at `10`, keeping the highest-severity candidates in dedicated 1-item stages and batching the lowest-severity candidates together.
+3. **Parallel Per-Finding `post-verification` Stage:** Verify each inconclusive concern in its own isolated parallel stage with dedicated tool turns (`WorkflowStep::DynamicParallel`), preventing attention dilution and silent drops.
+4. **Severity-Ordered Batching Above 10 Inconclusive Concerns:** Cap parallel `post-verification` stages at `10`, keeping the highest-severity candidates in dedicated 1-item stages and batching the lowest-severity candidates together.
 
 ---
 
@@ -38,9 +38,9 @@ flowchart TD
 
     V -->|"Category 1b: Well-Justified Dismissals\n(Concrete disproving code, no concerns)"| Drop["Drop Immediately\n(Recorded in deduplicated_dismissed_concerns)"]
     V -->|"Category 1a: Well-Justified Concerns\n(Concrete code proof, no dismissals)"| Validated["Direct Validated Findings\n(state.findings / state.concerns)"]
-    V -->|"Category 2: Speculative or Contested Hard Cases\n(Mixed signals, vague arguments, or unproven assumptions)"| FanOut{"DynamicParallel Fan-Out\n(Cap <= 10 Stages, Batch Lowest Severity First)"}
+    V -->|"Category 2: Inconclusive Concerns\n(Mixed signals, vague arguments, or unproven assumptions)"| FanOut{"DynamicParallel Fan-Out\n(Cap <= 10 Stages, Batch Lowest Severity First)"}
 
-    subgraph PostVerify ["3. Parallel post-verification Stages (Hard Cases Only)"]
+    subgraph PostVerify ["3. Parallel post-verification Stages (Inconclusive Concerns Only)"]
         PV1["post-verification-1 (Highest Severity, 1 item)"]
         PV2["post-verification-2 ..."]
         PV10["post-verification-N (Lowest Severity Batch)"]
@@ -89,12 +89,12 @@ The `verification` stage serves as the `planner` of a `WorkflowStep::DynamicPara
        - Multiple identical/overlapping dismissed concerns backed by concrete disproving code with **no** attempts to justify the issue as a concern; OR
        - A single dismissed concern backed by a concrete disproving `code_snippet` in `locations`, with **no** competing concern and **no** unverified assumptions about unseen code.
      - **Action:** Recorded in `dismissed_concerns[]` for observability and dropped from further verification.
-   - **Category 2 — Speculative or Contested (`hard_cases[]`):**
+   - **Category 2 — Inconclusive: Speculative or Contested (`inconclusive_concerns[]`):**
      - **Strong Signals:**
        - **Mixed Signals:** Both one or more `concerns` and one or more `dismissed_concerns` address the same root cause, function, or code path.
        - **Speculative or Vague Concern (Single or Multiple):** One or more overlapping `concerns` whose argument is vague, relies on assumptions not backed by specific code in the diff/context (even if multiple stages repeated the same unproven concern), or may be resolved by a follow-up patch in `follow_up_series_context`.
        - **Speculative or Assumption-Based Dismissal (Single or Multiple):** One or more standalone `dismissed_concerns` (even when multiple stages repeated the same dismissal and no stage raised a matching `concern`) whose dismissal relies on assumptions not proven by the cited `code_snippet` (e.g., assuming an unseen caller frees a pointer on error, assuming an internal queue spinlock protects socket state against concurrent teardown, assuming configuration/architecture constraints without proof).
-     - **Action:** Emitted into `hard_cases[]` for deep tool-assisted verification in `post-verification`.
+     - **Action:** Emitted into `inconclusive_concerns[]` for deep tool-assisted verification in `post-verification`.
 
 #### `VerificationOutput` Schema
 ```json
@@ -116,7 +116,7 @@ The `verification` stage serves as the `planner` of a `WorkflowStep::DynamicPara
       ]
     }
   ],
-  "hard_cases": [
+  "inconclusive_concerns": [
     {
       "type": "Category of the candidate defect",
       "description": "Detailed description of the candidate bug and failure mechanism",
@@ -152,22 +152,22 @@ The `verification` stage serves as the `planner` of a `WorkflowStep::DynamicPara
 - Validated items in `output.findings` with `preexisting == false` are pushed to `state.findings`.
 - Validated items in `output.findings` with `preexisting == true` are converted and pushed to `state.concerns` (for the standalone pre-existing bug pipeline).
 - `output.dismissed_concerns` are stored in `state.deduplicated_dismissed_concerns`.
-- `output.hard_cases` are stored in `state.hard_cases` (`Vec<Value>`) to drive the `DynamicParallel` resolver for `post-verification`.
+- `output.inconclusive_concerns` are stored in `state.inconclusive_concerns` (`Vec<Value>`) to drive the `DynamicParallel` resolver for `post-verification`.
 
 ---
 
-### 3.2 Stage 2: `post-verification` (Parallel Per-Finding Verification for Hard Cases)
+### 3.2 Stage 2: `post-verification` (Parallel Per-Finding Verification for Inconclusive Concerns)
 
 #### Dynamic Fan-Out and Severity-Ordered Batching (`MAX_POST_VERIFICATION_STAGES = 10`)
 When the `DynamicParallel` resolver (`resolve_post_verification_stages_with_options`) runs after `verification`:
-1. If `state.hard_cases` is empty, `batch_hard_cases_by_severity` returns an empty `Vec`, skipping `post-verification` completely with zero LLM calls.
-2. Otherwise, `state.hard_cases` is sorted by `estimated_severity` descending (`Critical` > `High` > `Medium` > `Low`), preserving relative order within each severity tier.
+1. If `state.inconclusive_concerns` is empty, `batch_inconclusive_concerns_by_severity` returns an empty `Vec`, skipping `post-verification` completely with zero LLM calls.
+2. Otherwise, `state.inconclusive_concerns` is sorted by `estimated_severity` descending (`Critical` > `High` > `Medium` > `Low`), preserving relative order within each severity tier.
 3. Let $N = \text{hard\_cases.len()}$ and $M = 10$ (`MAX_POST_VERIFICATION_STAGES`):
-   - **When $N \le 10$:** Each hard case is assigned to its own 1-item batch, producing $N$ parallel `post-verification` stages (`post-verification-1` .. `post-verification-N`).
+   - **When $N \le 10$:** Each inconclusive concern is assigned to its own 1-item batch, producing $N$ parallel `post-verification` stages (`post-verification-1` .. `post-verification-N`).
    - **When $N > 10$:** Let $\text{extra} = N - 10$, $\text{tail\_stages} = \min(\text{extra}, 10)$, and $\text{solo\_stages} = 10 - \text{tail\_stages}$:
      - The first $\text{solo\_stages}$ highest-severity items each receive a dedicated 1-item parallel stage.
      - The remaining $N - \text{solo\_stages}$ lowest-severity items are partitioned evenly across the last $\text{tail\_stages}$ stages (`base_size = rem_len / tail_stages`, with the last `rem_len % tail_stages` stages receiving one extra item).
-     - **Example ($N = 12$):** `extra = 2`, `tail_stages = 2`, `solo_stages = 8`, batch sizes = `[1, 1, 1, 1, 1, 1, 1, 1, 2, 2]`. The 8 highest-severity hard cases each get a dedicated 1-item parallel stage (`post-verification-1` .. `post-verification-8`), while the 4 lowest-severity hard cases are paired into 2 batches of 2 (`post-verification-9`, `post-verification-10`).
+     - **Example ($N = 12$):** `extra = 2`, `tail_stages = 2`, `solo_stages = 8`, batch sizes = `[1, 1, 1, 1, 1, 1, 1, 1, 2, 2]`. The 8 highest-severity inconclusive concerns each get a dedicated 1-item parallel stage (`post-verification-1` .. `post-verification-8`), while the 4 lowest-severity inconclusive concerns are paired into 2 batches of 2 (`post-verification-9`, `post-verification-10`).
 
 ```rust
 pub const MAX_POST_VERIFICATION_STAGES: usize = 10;
@@ -189,7 +189,7 @@ pub static POST_VERIFICATION_STAGE_NAMES: [&str; MAX_POST_VERIFICATION_STAGES] =
 #### Per-Batch Execution & Prompt Design
 - **Tool Scope:** `ToolScope::All` (`git_read_files`, `git_grep`, `git_diff`, `git_show`, `git_blame`), `wants_series_context: true`.
 - **Included Guides:** `false-positive-guide.md`, `severity.md`.
-- **Minimal, Focused Input:** Each `post-verification-K` stage receives *only* its assigned hard case (or small batch of low-severity hard cases), including:
+- **Minimal, Focused Input:** Each `post-verification-K` stage receives *only* its assigned inconclusive concern (or small batch of low-severity inconclusive concerns), including:
   - `concern_arguments` and `dismissal_arguments`
   - `signal_reason` and `verification_question`
   - `locations`
@@ -204,7 +204,7 @@ pub static POST_VERIFICATION_STAGE_NAMES: [&str; MAX_POST_VERIFICATION_STAGES] =
 Each parallel `post-verification-K` stage reduces its `PostVerificationOutput` (`{"findings": Vec<Value>, "dismissed_concerns": Vec<Value>}`) sequentially into `LinuxPatchReviewState`:
 - Items in `findings` with `preexisting == false` are appended to `state.findings` via `record_verified_findings`.
 - Items in `findings` with `preexisting == true` are appended to `state.concerns` via `record_verified_findings`.
-- Items in `dismissed_concerns` are appended to `state.deduplicated_dismissed_concerns` so disproved hard cases are preserved in the review's exported `dismissed_concerns` output.
+- Items in `dismissed_concerns` are appended to `state.deduplicated_dismissed_concerns` so disproved inconclusive concerns are preserved in the review's exported `dismissed_concerns` output.
 
 ---
 
@@ -223,8 +223,8 @@ Each parallel `post-verification-K` stage reduces its `PostVerificationOutput` (
 ## 4. Implementation & Benchmark Validation
 
 1. **State, Schemas, and Batching Helpers (`src/workflows/linux_patch_review.rs`):**
-   - Added `hard_cases: Vec<Value>` to `LinuxPatchReviewState`, required `hard_cases` / `dismissed_concerns` fields to `VerificationOutput`, and a dedicated `PostVerificationOutput` (`findings: Vec<Value>`, `dismissed_concerns: Vec<Value>`) for `post-verification`.
-   - Implemented `batch_hard_cases_by_severity`, `validate_verification_stage_output`, and `validate_post_verification_output` with unit tests covering $N = 0$, $N \le 10$, $10 < N \le 20$, and $N > 20$.
+   - Added `inconclusive_concerns: Vec<Value>` to `LinuxPatchReviewState`, required `inconclusive_concerns` / `dismissed_concerns` fields to `VerificationOutput`, and a dedicated `PostVerificationOutput` (`findings: Vec<Value>`, `dismissed_concerns: Vec<Value>`) for `post-verification`.
+   - Implemented `batch_inconclusive_concerns_by_severity`, `validate_verification_stage_output`, and `validate_post_verification_output` with unit tests covering $N = 0$, $N \le 10$, $10 < N \le 20$, and $N > 20$.
 2. **Unified `verification_stage` and Parallel `post_verification_stage_for_batch` (`src/workflows/linux_patch_review.rs` & `src/workflows/sashiko_patch_review.rs`):**
    - Replaced `deduplication_stage` + `conflict_resolution_stage` + monolithic `verification_stage` with unified `verification_stage` and `DynamicParallel` `post-verification` fan-out, propagating stage and prompt provenance across all consolidation stages.
 3. **99-Entry Benchmark Evaluation (`benchmarks/benchmark_small.json`):**
@@ -237,4 +237,4 @@ Each parallel `post-verification-K` stage reduces its `PostVerificationOutput` (
    - **Partially Detected:** **61 / 986 (6.2%)**, up `+3` from **58 / 987 (5.9%)**.
    - **Total Detected + Partial:** **528 / 986 reviewed entries (53.5%)**, up `+16` from **512 / 987 (51.9%)**, with **458 Missed** (down `-17` from 475).
    - **Final Findings (Signal-to-Noise):** **3,889 total findings** (`3.94` findings/patch), down **`-275` (`-6.6%`)** from **4,164 total findings** (`4.22` findings/patch) in the baseline.
-   - **Fast-Path & Parallel Fan-Out Behavior:** Across 882 completed patch reviews on the 999-entry suite, `verification` finalized **2,445 direct findings** (Category 1a, `62.9%` of all final findings), dropped **2,880 well-justified dismissals** (Category 1b), and routed **1,366 hard cases** (Category 2, avg `1.55`/review) to parallel `post-verification`, skipping `post-verification` entirely in **33.4% (295/882)** of reviews. Parallel `post-verification` validated **1,444 findings** (`37.1%` of all final findings) and disproved **353 hard cases** with concrete code snippets.
+   - **Fast-Path & Parallel Fan-Out Behavior:** Across 882 completed patch reviews on the 999-entry suite, `verification` finalized **2,445 direct findings** (Category 1a, `62.9%` of all final findings), dropped **2,880 well-justified dismissals** (Category 1b), and routed **1,366 inconclusive concerns** (Category 2, avg `1.55`/review) to parallel `post-verification`, skipping `post-verification` entirely in **33.4% (295/882)** of reviews. Parallel `post-verification` validated **1,444 findings** (`37.1%` of all final findings) and disproved **353 inconclusive concerns** with concrete code snippets.

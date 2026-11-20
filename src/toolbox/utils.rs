@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Context, Result, anyhow};
+use crate::ai::truncator::Truncator;
+use anyhow::{Context, Result, anyhow, ensure};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -118,7 +119,68 @@ pub fn glob_to_regex(glob: &str) -> Result<regex::Regex> {
 
 fn get_grep_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"^([a-zA-Z0-9_./-]+)(:|-)([0-9]+)(:|-)(.*)$").unwrap())
+    RE.get_or_init(|| regex::Regex::new(r"^([a-zA-Z0-9_./-]+)(:|-|=)([0-9]+)(:|-|=)(.*)$").unwrap())
+}
+
+const MAX_GREP_HUNK_LINES: usize = 200;
+const GREP_ANCHOR_RADIUS: usize = 25;
+
+#[derive(Default)]
+struct FileGrepBlock {
+    hunks: Vec<Vec<(bool, String)>>,
+    match_count: usize,
+}
+
+impl FileGrepBlock {
+    fn current_hunk_mut(&mut self) -> &mut Vec<(bool, String)> {
+        if self.hunks.is_empty() {
+            self.hunks.push(Vec::new());
+        }
+        self.hunks.last_mut().expect("non-empty hunks")
+    }
+
+    fn split_hunk(&mut self) {
+        if self.hunks.last().is_some_and(|h| !h.is_empty()) {
+            self.hunks.push(Vec::new());
+        }
+    }
+}
+
+fn cap_grep_hunk(hunk: &[(bool, String)]) -> Vec<String> {
+    if hunk.len() <= MAX_GREP_HUNK_LINES {
+        return hunk.iter().map(|(_, text)| text.clone()).collect();
+    }
+
+    let mut keep = vec![false; hunk.len()];
+    keep[0] = true;
+    for (idx, (anchor, _)) in hunk.iter().enumerate() {
+        if *anchor {
+            let lo = idx.saturating_sub(GREP_ANCHOR_RADIUS);
+            let hi = (idx + GREP_ANCHOR_RADIUS).min(hunk.len() - 1);
+            for slot in &mut keep[lo..=hi] {
+                *slot = true;
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while idx < hunk.len() {
+        if keep[idx] {
+            out.push(hunk[idx].1.clone());
+            idx += 1;
+        } else {
+            let start = idx;
+            while idx < hunk.len() && !keep[idx] {
+                idx += 1;
+            }
+            out.push(format!(
+                "  ... [{} lines of enclosing block omitted] ...",
+                idx - start
+            ));
+        }
+    }
+    out
 }
 
 /// Formats raw git grep output into a clean, grouped structure, sorting findings
@@ -128,24 +190,20 @@ pub fn format_git_grep_output(stdout: &str, revision: &str, active_files: &[Stri
     let re = get_grep_regex();
 
     use std::collections::BTreeMap;
-    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, FileGrepBlock> = BTreeMap::new();
     let mut current_file: Option<String> = None;
 
     for line in stdout.lines() {
         if line == "--" {
             if let Some(ref cur) = current_file
-                && let Some(list) = grouped.get_mut(cur)
+                && let Some(block) = grouped.get_mut(cur)
             {
-                list.push("  --".to_string());
+                block.split_hunk();
             }
             continue;
         }
 
-        let stripped = if line.starts_with(&prefix) {
-            &line[prefix.len()..]
-        } else {
-            line
-        };
+        let stripped = line.strip_prefix(&prefix).unwrap_or(line);
 
         if let Some(caps) = re.captures(stripped) {
             let path = &caps[1];
@@ -155,40 +213,45 @@ pub fn format_git_grep_output(stdout: &str, revision: &str, active_files: &[Stri
             let content = &caps[5];
 
             if sep1 == sep2 {
+                let is_match = sep1 == ":";
+                let is_anchor = is_match || sep1 == "=";
                 let formatted_line = format!("  {}{}{}", line_num, sep1, content);
                 let path_str = path.to_string();
                 current_file = Some(path_str.clone());
-                grouped.entry(path_str).or_default().push(formatted_line);
+                let block = grouped.entry(path_str).or_default();
+                if is_match {
+                    block.match_count += 1;
+                }
+                block.current_hunk_mut().push((is_anchor, formatted_line));
             } else if let Some(ref cur) = current_file {
                 grouped
                     .entry(cur.clone())
                     .or_default()
-                    .push(stripped.to_string());
+                    .current_hunk_mut()
+                    .push((false, stripped.to_string()));
             }
         } else if let Some(ref cur) = current_file {
             grouped
                 .entry(cur.clone())
                 .or_default()
-                .push(stripped.to_string());
+                .current_hunk_mut()
+                .push((false, stripped.to_string()));
         }
     }
 
-    // Proximity Ranking: sort matching files so that files closest to modified files appear first
-    let mut blocks: Vec<(String, Vec<String>)> = grouped.into_iter().collect();
+    // Proximity Ranking: sort matching files so that files closest to modified files appear first.
+    let mut blocks: Vec<(String, FileGrepBlock)> = grouped.into_iter().collect();
     blocks.sort_by_key(|(path, _)| (get_priority_score(path, active_files), path.clone()));
 
     let total_files = blocks.len();
-    let total_matches: usize = blocks
-        .iter()
-        .map(|(_, lines)| lines.iter().filter(|l| l.trim() != "--").count())
-        .sum();
+    let total_matches: usize = blocks.iter().map(|(_, b)| b.match_count.max(1)).sum();
 
     const MAX_SUMMARY_FILES: usize = 10;
     let file_summaries: Vec<String> = blocks
         .iter()
         .take(MAX_SUMMARY_FILES)
-        .map(|(path, lines)| {
-            let count = lines.iter().filter(|l| l.trim() != "--").count();
+        .map(|(path, b)| {
+            let count = b.match_count.max(1);
             format!(
                 "{} ({} {})",
                 path,
@@ -222,11 +285,18 @@ pub fn format_git_grep_output(stdout: &str, revision: &str, active_files: &[Stri
         ));
     }
 
-    for (path, lines) in blocks {
+    for (path, block) in blocks {
         result.push_str(&format!("[file: {}]\n", path));
-        for l in lines {
-            result.push_str(&l);
-            result.push('\n');
+        let non_empty_hunks: Vec<&Vec<(bool, String)>> =
+            block.hunks.iter().filter(|h| !h.is_empty()).collect();
+        for (h_idx, hunk) in non_empty_hunks.iter().enumerate() {
+            if h_idx > 0 {
+                result.push_str("  --\n");
+            }
+            for l in cap_grep_hunk(hunk) {
+                result.push_str(&l);
+                result.push('\n');
+            }
         }
         result.push('\n');
     }
@@ -304,6 +374,181 @@ pub fn normalize_json_numbers(val: serde_json::Value) -> serde_json::Value {
         ),
         other => other,
     }
+}
+
+/// Formats a slice of source text with 1-based line numbers, a section header,
+/// and sequential token-budget truncation.
+///
+/// Line numbers are prepended prior to calling [`Truncator::truncate_sequential`]
+/// so the byte budget accounts for the line-number prefixes and `lines_kept`
+/// tracks the exact count of source lines retained.
+pub fn format_numbered_slice(
+    label: &str,
+    tool_name: &str,
+    content: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    max_tokens: usize,
+) -> Result<String> {
+    if let (Some(s), Some(e)) = (start_line, end_line) {
+        ensure!(s <= e, "Invalid range: start_line ({s}) > end_line ({e})");
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    if total_lines == 0 {
+        return Ok(format!("=== {label} (empty, 0 lines) ==="));
+    }
+
+    // Empty files return early above, so 0-based start/end bounds are safe without clamp.
+    let (start, end) = match (start_line, end_line) {
+        (Some(s), Some(e)) => (s.max(1) - 1, e.min(total_lines)),
+        (Some(s), None) => (s.max(1) - 1, total_lines),
+        (None, Some(e)) => (0, e.min(total_lines)),
+        (None, None) => (0, total_lines),
+    };
+
+    if start >= total_lines {
+        return Ok(format!("=== {label} (0 lines shown of {total_lines}) ==="));
+    }
+    let end = end.clamp(start, total_lines);
+
+    let numbered = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| format!("{}: {}", start + idx + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let res = Truncator::truncate_sequential(&numbered, max_tokens);
+    let start_idx = start + 1;
+    let end_idx = if res.truncated {
+        start + res.lines_kept.max(1)
+    } else {
+        end
+    };
+
+    let mut out = format!(
+        "=== {label} (lines {start_idx}-{end_idx} of {total_lines}) ===\n{}",
+        res.content.trim_end_matches('\n')
+    );
+    if res.truncated {
+        out.push_str(&format!(
+            "\n[Truncated: lines {start_idx}-{end_idx} of {total_lines} shown. Call {tool_name} with start_line={} to read more.]",
+            end_idx + 1
+        ));
+    }
+    Ok(out)
+}
+
+const SNIPPET_ELISIONS: &[&str] = &["...", "…", "// ...", "/* ... */", "--"];
+
+enum ParsedSnippetLine<'a> {
+    Passthrough(&'a str),
+    Numbered {
+        line_no: usize,
+        sep: char,
+        rest: &'a str,
+    },
+}
+
+fn parse_numbered_tool_line(line: &str) -> Option<ParsedSnippetLine<'_>> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return Some(ParsedSnippetLine::Passthrough(""));
+    }
+    if SNIPPET_ELISIONS.contains(&trimmed) {
+        return Some(ParsedSnippetLine::Passthrough(trimmed));
+    }
+    if trimmed.starts_with("... [") && trimmed.ends_with("] ...") {
+        return Some(ParsedSnippetLine::Passthrough("..."));
+    }
+
+    let digit_len = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if !(1..=7).contains(&digit_len) {
+        return None;
+    }
+    let line_no: usize = trimmed[..digit_len].parse().ok()?;
+    if line_no == 0 {
+        return None;
+    }
+
+    let after = &trimmed[digit_len..];
+    if let Some(rest) = after.strip_prefix(':') {
+        if rest.starts_with(':') {
+            return None;
+        }
+        Some(ParsedSnippetLine::Numbered {
+            line_no,
+            sep: ':',
+            rest,
+        })
+    } else if let Some(rest) = after.strip_prefix('-') {
+        if rest.starts_with(['-', '>', '=']) {
+            return None;
+        }
+        Some(ParsedSnippetLine::Numbered {
+            line_no,
+            sep: '-',
+            rest,
+        })
+    } else if let Some(rest) = after.strip_prefix('=') {
+        if rest.starts_with(['=', '>']) {
+            return None;
+        }
+        Some(ParsedSnippetLine::Numbered {
+            line_no,
+            sep: '=',
+            rest,
+        })
+    } else {
+        None
+    }
+}
+
+/// Strips 1-based tool line-number prefixes (from `git_read_files`, `git_show`,
+/// or `git_grep`) when every non-empty, non-elision line carries a strictly
+/// increasing line number.
+pub fn strip_tool_line_numbers(raw: &str) -> Option<String> {
+    let mut parsed = Vec::new();
+    let mut prev_line_no: Option<usize> = None;
+    let mut numbered_count = 0usize;
+    let mut has_grep_context_sep = false;
+
+    for line in raw.lines() {
+        let item = parse_numbered_tool_line(line)?;
+        if let ParsedSnippetLine::Numbered { line_no, sep, .. } = item {
+            if prev_line_no.is_some_and(|prev| line_no <= prev) {
+                return None;
+            }
+            prev_line_no = Some(line_no);
+            numbered_count += 1;
+            if sep != ':' {
+                has_grep_context_sep = true;
+            }
+        }
+        parsed.push(item);
+    }
+
+    if numbered_count == 0 {
+        return None;
+    }
+
+    let stripped: Vec<&str> = parsed
+        .into_iter()
+        .map(|item| match item {
+            ParsedSnippetLine::Passthrough(text) => text,
+            ParsedSnippetLine::Numbered { sep, rest, .. } => {
+                if sep == ':' && !has_grep_context_sep {
+                    rest.strip_prefix(' ').unwrap_or(rest)
+                } else {
+                    rest
+                }
+            }
+        })
+        .collect();
+
+    Some(stripped.join("\n"))
 }
 
 #[cfg(test)]
@@ -501,5 +746,86 @@ mod tests {
             assert!(validate_path("dangling_link", &base).is_err());
             assert!(validate_path("dangling_link/sub/file.c", &base).is_err());
         }
+    }
+
+    #[test]
+    fn test_format_numbered_slice_basic_and_edge_cases() {
+        let src = "alpha\n\ngamma\ndelta\n";
+        let out = format_numbered_slice("foo.c", "git_read_files", src, Some(1), Some(3), 20_000)
+            .unwrap();
+        assert_eq!(
+            out,
+            "=== foo.c (lines 1-3 of 4) ===\n1: alpha\n2: \n3: gamma"
+        );
+
+        let empty =
+            format_numbered_slice("empty.c", "git_read_files", "", Some(1), Some(5), 20_000)
+                .unwrap();
+        assert_eq!(empty, "=== empty.c (empty, 0 lines) ===");
+
+        let past_eof =
+            format_numbered_slice("foo.c", "git_read_files", src, Some(10), Some(20), 20_000)
+                .unwrap();
+        assert_eq!(past_eof, "=== foo.c (0 lines shown of 4) ===");
+
+        assert!(
+            format_numbered_slice("foo.c", "git_read_files", src, Some(5), Some(2), 20_000)
+                .is_err()
+        );
+    }
+    #[test]
+    fn test_strip_tool_line_numbers() {
+        // Multi-line git_read_files / git_show output preserves source indentation and blank lines.
+        let read_snip = "10: pub fn get(m: &Mutex<u8>) -> u8 {\n11:\n12:     let guard = m.lock().unwrap();\n...\n15:     *guard";
+        assert_eq!(
+            strip_tool_line_numbers(read_snip).as_deref(),
+            Some(
+                "pub fn get(m: &Mutex<u8>) -> u8 {\n\n    let guard = m.lock().unwrap();\n...\n    *guard"
+            )
+        );
+
+        // git_grep output with '=', '-', and ':' prefixes preserves relative indentation.
+        let grep_snip = "  100=static void shrink_node(pg_data_t *pgdat)\n  ... [50 lines of enclosing block omitted] ...\n  151-    int x = 1;\n  152:    target_call(pgdat);";
+        assert_eq!(
+            strip_tool_line_numbers(grep_snip).as_deref(),
+            Some(
+                "static void shrink_node(pg_data_t *pgdat)\n...\n    int x = 1;\n    target_call(pgdat);"
+            )
+        );
+
+        // Non-increasing line numbers, 0-based tuple fields, and plain code return None.
+        assert_eq!(
+            strip_tool_line_numbers("10: first();\n10: duplicate();"),
+            None
+        );
+        assert_eq!(strip_tool_line_numbers("12: later();\n9: earlier();"), None);
+        assert_eq!(strip_tool_line_numbers("0: tuple_field"), None);
+        assert_eq!(strip_tool_line_numbers("let guard = m.lock();"), None);
+        assert_eq!(strip_tool_line_numbers("..."), None);
+    }
+
+    #[test]
+    fn test_format_git_grep_function_context_and_hunk_cap() {
+        let mut raw = Vec::new();
+        raw.push("HEAD:mm/vmscan.c=100=static void shrink_node(pg_data_t *pgdat)".to_string());
+        for line_no in 101..=360 {
+            if line_no == 250 {
+                raw.push(format!(
+                    "HEAD:mm/vmscan.c:{line_no}:    target_call(pgdat);"
+                ));
+            } else {
+                raw.push(format!("HEAD:mm/vmscan.c-{line_no}-    step({line_no});"));
+            }
+        }
+        let formatted = format_git_grep_output(&raw.join("\n"), "HEAD", &[]);
+        // Summary counts the 1 actual ':' match rather than 261 context lines.
+        assert!(
+            formatted
+                .starts_with("Matches found across 1 file (1 total match): mm/vmscan.c (1 match)")
+        );
+        // Both the '=' function signature and ':' match line survive hunk capping.
+        assert!(formatted.contains("  100=static void shrink_node(pg_data_t *pgdat)"));
+        assert!(formatted.contains("  250:    target_call(pgdat);"));
+        assert!(formatted.contains("lines of enclosing block omitted"));
     }
 }

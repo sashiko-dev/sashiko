@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::project::ProjectId;
 use crate::settings::CustomRemoteSettings;
 use anyhow::Result;
 use regex::Regex;
@@ -19,10 +20,12 @@ use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::OnceLock;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 pub const LINUX_NEXT_URL: &str =
     "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
+const STABLE_LINUX_URL: &str = "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git";
+const MAX_ACTIVE_STABLE_BRANCHES: usize = 8;
 
 /// Limit on waiting for each git command of the ancestry check; the check
 /// runs two. With a commit-graph each takes milliseconds even on a kernel
@@ -124,6 +127,8 @@ pub struct BaselineRegistry {
     remote_map: HashMap<String, String>, // URL -> Local Remote Name
     pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
     pub repo_path: std::path::PathBuf,
+    project: Option<ProjectId>,
+    fetch_remotes: Vec<(String, String)>, // (fetch URL, remote name), including shared URLs
     mainline_remote: Option<(String, String)>, // (URL, local remote name)
 }
 
@@ -131,24 +136,23 @@ impl BaselineRegistry {
     pub fn new(
         repo_path: &Path,
         custom_remotes: Option<Vec<CustomRemoteSettings>>,
+        project: Option<ProjectId>,
     ) -> Result<Self> {
-        let remote_map = Self::load_git_remotes(repo_path).unwrap_or_default();
+        let fetch_remotes = Self::load_git_remotes(repo_path).unwrap_or_default();
+        let mut remote_map = HashMap::new();
+        for (url, name) in &fetch_remotes {
+            remote_map.insert(url.clone(), name.clone());
+            if let Some(stripped) = url.strip_suffix(".git") {
+                remote_map.insert(stripped.to_string(), name.clone());
+            }
+        }
 
-        // Identify Linus's tree by URL, falling back to whatever is named "origin".
-        let mainline_remote = remote_map
-            .iter()
-            .find(|(url, _)| url.contains("torvalds/linux.git"))
-            .or_else(|| {
-                remote_map
-                    .iter()
-                    .filter(|(_, name)| name.as_str() == "origin")
-                    .find(|(url, _)| url.ends_with(".git"))
-                    .or_else(|| {
-                        remote_map
-                            .iter()
-                            .find(|(_, name)| name.as_str() == "origin")
-                    })
-            })
+        // Prefer the configured project's upstream, even when origin is a
+        // contributor fork. Unconfigured repositories retain Linux-first
+        // URL inference.
+        let mainline_remote = ordered_mainline_remotes(&fetch_remotes, project)
+            .into_iter()
+            .next()
             .map(|(url, name)| (url.clone(), name.clone()));
 
         let mainline_name = mainline_remote
@@ -156,8 +160,9 @@ impl BaselineRegistry {
             .map(|(_, name)| name.as_str())
             .unwrap_or("origin");
 
-        let ref_name = format!("{}/master", mainline_name);
-        info!(
+        let branch = mainline_branch(project);
+        let ref_name = format!("{}/{}", mainline_name, branch);
+        debug!(
             "Attempting to load MAINTAINERS from {}:MAINTAINERS",
             ref_name
         );
@@ -175,7 +180,7 @@ impl BaselineRegistry {
                 );
                 let maintainers_path = repo_path.join("MAINTAINERS");
                 if maintainers_path.exists() {
-                    info!("Loading MAINTAINERS from local file {:?}", maintainers_path);
+                    debug!("Loading MAINTAINERS from local file {:?}", maintainers_path);
                     let file = std::fs::File::open(&maintainers_path)?;
                     let reader = std::io::BufReader::new(file);
                     Self::parse_maintainers(reader)?
@@ -192,10 +197,18 @@ impl BaselineRegistry {
         Ok(Self {
             entries,
             remote_map,
+            fetch_remotes,
             custom_remotes,
             repo_path: repo_path.to_path_buf(),
+            project,
             mainline_remote,
         })
+    }
+
+    /// The remote-tracking ref of the mainline branch, such as `origin/master`.
+    pub fn mainline_ref(&self) -> String {
+        let branch = mainline_branch(self.project);
+        format!("{}/{}", self.mainline_remote_name(), branch)
     }
 
     /// Name of the identified mainline remote (Linus tree or origin), for
@@ -234,7 +247,7 @@ impl BaselineRegistry {
             _ => return false,
         }
 
-        let mainline_ref = format!("{}/master^{{commit}}", self.mainline_remote_name());
+        let mainline_ref = format!("{}^{{commit}}", self.mainline_ref());
         let tip = match run_offline_git(
             &self.repo_path,
             &[
@@ -336,31 +349,28 @@ impl BaselineRegistry {
             });
         }
 
-        info!("Parsed {} MAINTAINERS entries", entries.len());
+        debug!("Parsed {} MAINTAINERS entries", entries.len());
         Ok(entries)
     }
 
-    fn load_git_remotes(repo_path: &Path) -> Result<HashMap<String, String>> {
+    fn load_git_remotes(repo_path: &Path) -> Result<Vec<(String, String)>> {
         let output = crate::git_cmd::in_dir(repo_path)
             .args(["remote", "-v"])
             .output()?;
-
-        let mut map = HashMap::new();
+        let mut remotes = Vec::new();
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let name = parts[0];
-                    let url = parts[1];
-                    map.insert(url.to_string(), name.to_string());
-                    if let Some(stripped) = url.strip_suffix(".git") {
-                        map.insert(stripped.to_string(), name.to_string());
-                    }
+                let mut parts = line.split_whitespace();
+                // Fetch state and refspecs belong to the name, not the URL.
+                if let (Some(name), Some(url), Some("(fetch)")) =
+                    (parts.next(), parts.next(), parts.next())
+                {
+                    remotes.push((url.to_string(), name.to_string()));
                 }
             }
         }
-        Ok(map)
+        Ok(remotes)
     }
 
     pub async fn resolve_candidates(
@@ -368,6 +378,36 @@ impl BaselineRegistry {
         files: &[String],
         subject: &str,
         body: Option<&str>,
+    ) -> Vec<BaselineResolution> {
+        self.resolve_candidates_inner(files, subject, body, Vec::new())
+            .await
+    }
+
+    /// Resolves baseline candidates incorporating per-mailing-list baseline
+    /// rules from `mailing_lists.toml` ahead of the generic `MAINTAINERS`
+    /// heuristic.
+    #[cfg(feature = "server")]
+    pub async fn resolve_candidates_with_policy(
+        &self,
+        files: &[String],
+        subject: &str,
+        body: Option<&str>,
+        policy: Option<&crate::email_policy::EmailPolicyConfig>,
+        recipients: &[String],
+    ) -> Vec<BaselineResolution> {
+        let configured = policy
+            .map(|p| self.resolve_mailing_list_baselines(p, recipients, files, subject))
+            .unwrap_or_default();
+        self.resolve_candidates_inner(files, subject, body, configured)
+            .await
+    }
+
+    async fn resolve_candidates_inner(
+        &self,
+        files: &[String],
+        subject: &str,
+        body: Option<&str>,
+        configured_list_candidates: Vec<BaselineResolution>,
     ) -> Vec<BaselineResolution> {
         let mut candidates = Vec::new();
 
@@ -380,13 +420,38 @@ impl BaselineRegistry {
 
         // When a non-Linux mainline remote (such as GCC or Sashiko) was explicitly
         // identified, skip Linux-specific stable and linux-next candidate remotes.
-        let has_non_linux_mainline = self
-            .mainline_remote
-            .as_ref()
-            .is_some_and(|(url, _)| is_non_linux_project_url(url));
+        let has_non_linux_mainline = self.project.map_or_else(
+            || {
+                self.mainline_remote
+                    .as_ref()
+                    .is_some_and(|(url, _)| is_non_linux_project_url(url))
+            },
+            |project| project != ProjectId::Linux,
+        );
 
         // 1.5 Version Tag from Subject
-        candidates.extend(subject_version_candidates(subject, has_non_linux_mainline));
+        let subject_candidates = subject_version_candidates(subject, has_non_linux_mainline);
+        let has_subject_version = !subject_candidates.is_empty();
+        candidates.extend(subject_candidates);
+
+        // 1.6 Explicit baseline version tag stated in cover letter or changelog
+        if let Some(body_text) = body
+            && let Some(tag) = extract_body_version_tag(body_text)
+        {
+            candidates.push(BaselineResolution::LocalRef(format!("v{tag}")));
+        }
+
+        // 1.7 Unversioned Linux stable backports ([PATCH stable backport] or
+        //     leading "commit <sha> upstream." without an explicit X.Y tag)
+        if !has_non_linux_mainline
+            && !has_subject_version
+            && is_unversioned_stable_backport(subject, body)
+        {
+            candidates.extend(self.active_stable_branch_candidates().await);
+        }
+
+        // 1.8 Configured Per-Mailing-List Baselines
+        candidates.extend(configured_list_candidates);
 
         // 2. Subsystem Heuristic
         let heuristic_candidates = self.resolve_subsystem_heuristic(files, subject);
@@ -399,10 +464,16 @@ impl BaselineRegistry {
         // with the topic branch once the maintainer rebases.
         if let Some(custom_remotes) = &self.custom_remotes {
             for remote in custom_remotes {
-                // Fetch to ensure we have the latest branches (Issue 1)
-                if let Err(e) =
-                    crate::git_ops::ensure_remote(&self.repo_path, &remote.name, &remote.url, false)
-                        .await
+                let refspecs = remote.refspecs();
+
+                // Ensure remote is configured without blocking review dispatch on routine sync
+                if let Err(e) = crate::git_ops::ensure_remote_if_missing(
+                    &self.repo_path,
+                    &remote.name,
+                    &remote.url,
+                    refspecs.as_deref(),
+                )
+                .await
                 {
                     warn!(
                         "Failed to ensure custom remote {}: {}. Using local branches.",
@@ -410,10 +481,37 @@ impl BaselineRegistry {
                     );
                 }
 
-                if remote.check_all_branches {
+                let branch_patterns = remote.branch_patterns.as_deref().filter(|p| !p.is_empty());
+                let only_branches = remote.only_branches.as_deref().filter(|b| !b.is_empty());
+
+                let mut matched_any = false;
+                if let Some(patterns) = branch_patterns {
+                    match crate::git_ops::get_remote_branches(&self.repo_path, &remote.name).await {
+                        Ok(branches) => {
+                            let filtered = branches
+                                .into_iter()
+                                .filter(|b| crate::git_ops::matches_branch_pattern(b, patterns));
+                            for branch in filtered {
+                                matched_any = true;
+                                candidates.push(BaselineResolution::RemoteTarget {
+                                    url: remote.url.clone(),
+                                    name: remote.name.clone(),
+                                    branch: Some(branch),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to get remote branches for {}: {}. Continuing.",
+                                remote.name, e
+                            );
+                        }
+                    }
+                } else if remote.check_all_branches {
                     match crate::git_ops::get_remote_branches(&self.repo_path, &remote.name).await {
                         Ok(branches) => {
                             for branch in branches {
+                                matched_any = true;
                                 candidates.push(BaselineResolution::RemoteTarget {
                                     url: remote.url.clone(),
                                     name: remote.name.clone(),
@@ -430,8 +528,8 @@ impl BaselineRegistry {
                     }
                 }
 
-                // Change else if to if (Issue 3)
-                if let Some(branches) = &remote.only_branches {
+                // only_branches is additive: append explicitly configured branches
+                if let Some(branches) = only_branches {
                     for branch in branches {
                         candidates.push(BaselineResolution::RemoteTarget {
                             url: remote.url.clone(),
@@ -439,6 +537,12 @@ impl BaselineRegistry {
                             branch: Some(branch.clone()),
                         });
                     }
+                } else if !matched_any && !remote.check_all_branches && branch_patterns.is_none() {
+                    candidates.push(BaselineResolution::RemoteTarget {
+                        url: remote.url.clone(),
+                        name: remote.name.clone(),
+                        branch: None,
+                    });
                 }
             }
         }
@@ -454,26 +558,159 @@ impl BaselineRegistry {
         // LocalRef("HEAD") would resolve to the local checkout, which nothing
         // in Sashiko ever advances after fetching.
         if let Some((url, name)) = &self.mainline_remote {
-            candidates.push(BaselineResolution::RemoteTarget {
-                url: url.clone(),
-                name: name.clone(),
-                branch: Some("master".to_string()),
-            });
+            let is_e2fsprogs = self.project == Some(ProjectId::E2fsprogs)
+                || (self.project.is_none() && is_e2fsprogs_project_url(url));
+            let branches: Vec<&str> = if is_e2fsprogs {
+                e2fsprogs_branch_order(subject).to_vec()
+            } else {
+                vec![mainline_branch(self.project)]
+            };
+            for branch in &branches {
+                candidates.push(BaselineResolution::RemoteTarget {
+                    url: url.clone(),
+                    name: name.clone(),
+                    branch: Some((*branch).to_string()),
+                });
+            }
+            // A failed fetch or missing ref must not hide a usable mirror.
+            for (mirror_url, mirror_name) in
+                ordered_mainline_remotes(&self.fetch_remotes, self.project)
+            {
+                if mirror_name != name {
+                    for branch in &branches {
+                        candidates.push(BaselineResolution::RemoteTarget {
+                            url: mirror_url.clone(),
+                            name: mirror_name.clone(),
+                            branch: Some((*branch).to_string()),
+                        });
+                    }
+                }
+            }
         } else {
             candidates.push(BaselineResolution::LocalRef("HEAD".to_string()));
         }
 
-        // Deduplicate
-        // Simple deduplication based on string representation or enum equality
-        // Since we implement PartialEq, dedup works if consecutive. We need unique.
-        let mut unique_candidates = Vec::new();
+        // Deduplicate preserving first occurrence, collapsing scheme-only URL
+        // differences (e.g. https:// vs git://) targeting the same remote and branch.
+        let mut unique_candidates: Vec<BaselineResolution> = Vec::new();
         for c in candidates {
-            if !unique_candidates.contains(&c) {
+            let duplicate = unique_candidates
+                .iter()
+                .any(|existing| match (existing, &c) {
+                    (
+                        BaselineResolution::RemoteTarget {
+                            url: u1,
+                            name: n1,
+                            branch: b1,
+                        },
+                        BaselineResolution::RemoteTarget {
+                            url: u2,
+                            name: n2,
+                            branch: b2,
+                        },
+                    ) => n1 == n2 && b1 == b2 && crate::git_ops::are_git_urls_equivalent(u1, u2),
+                    _ => existing == &c,
+                });
+            if !duplicate {
                 unique_candidates.push(c);
             }
         }
 
         unique_candidates
+    }
+
+    /// Resolves per-mailing-list baseline candidates from `policy`, ordered by
+    /// rule specificity (prefix+path > prefix > path > unconditional default >
+    /// sibling fallback) while excluding rules whose explicit `paths` filter
+    /// does not match any touched file.
+    #[cfg(feature = "server")]
+    fn resolve_mailing_list_baselines(
+        &self,
+        policy: &crate::email_policy::EmailPolicyConfig,
+        recipients: &[String],
+        files: &[String],
+        subject: &str,
+    ) -> Vec<BaselineResolution> {
+        let recipient_bare: std::collections::HashSet<String> = recipients
+            .iter()
+            .map(|r| crate::email_policy::extract_bare_email(r))
+            .filter(|r| !r.is_empty())
+            .collect();
+        if recipient_bare.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matched_lists: Vec<(&String, &crate::email_policy::MailingListPolicy)> = policy
+            .lists
+            .iter()
+            .filter(|(list_email, list_policy)| {
+                !list_policy.baselines.is_empty()
+                    && recipient_bare.contains(&crate::email_policy::extract_bare_email(list_email))
+            })
+            .collect();
+        if matched_lists.is_empty() {
+            return Vec::new();
+        }
+        matched_lists.sort_by(|a, b| {
+            crate::email_policy::extract_bare_email(a.0)
+                .cmp(&crate::email_policy::extract_bare_email(b.0))
+        });
+
+        let subject_tokens: Vec<&str> = crate::patch::subject_prefix_tokens(subject).collect();
+        let mut ranked: Vec<(i32, usize, usize, &crate::email_policy::BaselineRule)> = Vec::new();
+
+        for (list_idx, (_, list_policy)) in matched_lists.iter().enumerate() {
+            for (rule_idx, rule) in list_policy.baselines.iter().enumerate() {
+                let path_match = !rule.paths.is_empty()
+                    && files.iter().any(|file| {
+                        rule.paths
+                            .iter()
+                            .any(|pat| crate::email_policy::path_matches_pattern(file, pat))
+                    });
+                if !rule.paths.is_empty() && !path_match {
+                    continue;
+                }
+
+                let prefix_match = !rule.subject_prefixes.is_empty()
+                    && subject_tokens.iter().any(|tok| {
+                        rule.subject_prefixes
+                            .iter()
+                            .any(|pref| tok.eq_ignore_ascii_case(pref.trim()))
+                    });
+
+                let tier = if prefix_match && path_match {
+                    3
+                } else if prefix_match {
+                    2
+                } else if path_match {
+                    1
+                } else if rule.subject_prefixes.is_empty() {
+                    0
+                } else {
+                    -1
+                };
+                ranked.push((tier, list_idx, rule_idx, rule));
+            }
+        }
+
+        ranked.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+
+        let mut resolved = Vec::new();
+        for (_, _, _, rule) in ranked {
+            let url = rule.url.trim();
+            if rule.branches.is_empty() {
+                resolved.push(self.resolve_url(url, None));
+            } else {
+                for branch in &rule.branches {
+                    resolved.push(self.resolve_url(url, Some(branch.trim().to_string())));
+                }
+            }
+        }
+        resolved
     }
 
     fn resolve_subsystem_heuristic(
@@ -512,6 +749,29 @@ impl BaselineRegistry {
                     }
                 }
             }
+        }
+
+        // OBJTOOL in Linux MAINTAINERS points at maintainer-tip.rst via P:
+        // without a T: line, while patches land on tip.git objtool/core and
+        // objtool/urgent.
+        let objtool_count = files.iter().filter(|f| is_objtool_file(f)).count();
+        if objtool_count > 0
+            && !tree_counts
+                .keys()
+                .any(|(u, b)| is_tip_tree_url(u) && b.as_deref() == Some("objtool/core"))
+            && let Some(tip_url) = self
+                .entries
+                .iter()
+                .flat_map(|e| &e.trees)
+                .map(|(url, _)| url)
+                .find(|url| is_tip_tree_url(url))
+                .cloned()
+        {
+            let key = (tip_url, Some("objtool/core".to_string()));
+            *tree_counts.entry(key.clone()).or_insert(0) += objtool_count;
+            tree_subsystems
+                .entry(key)
+                .or_insert_with(|| "OBJTOOL".to_string());
         }
 
         if tree_counts.is_empty() {
@@ -663,11 +923,48 @@ impl BaselineRegistry {
         // Sort descending by score
         scored_candidates.sort_by_key(|b| std::cmp::Reverse(b.0));
 
+        let prefer_urgent = subject_lower.contains("urgent");
         let mut unique_filtered = Vec::new();
-        for (_, res) in scored_candidates {
-            if !unique_filtered.contains(&res) {
-                unique_filtered.push(res);
+        let mut tip_master_urls: Vec<String> = Vec::new();
+        let push_unique = |list: &mut Vec<BaselineResolution>, item: BaselineResolution| {
+            if !list.contains(&item) {
+                list.push(item);
             }
+        };
+
+        for (_, res) in scored_candidates {
+            if let BaselineResolution::RemoteTarget {
+                ref url,
+                branch: Some(ref branch),
+                ..
+            } = res
+                && is_tip_tree_url(url)
+            {
+                if !tip_master_urls.contains(url) {
+                    tip_master_urls.push(url.clone());
+                }
+                if let Some(subsys) = branch.strip_suffix("/core")
+                    && !subsys.is_empty()
+                {
+                    let urgent = self.resolve_url(url, Some(format!("{subsys}/urgent")));
+                    if prefer_urgent {
+                        push_unique(&mut unique_filtered, urgent);
+                        push_unique(&mut unique_filtered, res);
+                    } else {
+                        push_unique(&mut unique_filtered, res);
+                        push_unique(&mut unique_filtered, urgent);
+                    }
+                    continue;
+                }
+            }
+            push_unique(&mut unique_filtered, res);
+        }
+
+        for tip_url in tip_master_urls {
+            push_unique(
+                &mut unique_filtered,
+                self.resolve_url(&tip_url, Some("master".to_string())),
+            );
         }
 
         unique_filtered
@@ -704,6 +1001,16 @@ impl BaselineRegistry {
                 name: remote_name.clone(),
                 branch,
             }
+        } else if let Some((existing_url, remote_name)) = self
+            .fetch_remotes
+            .iter()
+            .find(|(existing_url, _)| crate::git_ops::are_git_urls_equivalent(existing_url, url))
+        {
+            BaselineResolution::RemoteTarget {
+                url: existing_url.clone(),
+                name: remote_name.clone(),
+                branch,
+            }
         } else {
             let name = self.suggest_remote_name(url);
             BaselineResolution::RemoteTarget {
@@ -727,6 +1034,84 @@ impl BaselineRegistry {
         }
         name.to_string()
     }
+
+    async fn active_stable_branch_candidates(&self) -> Vec<BaselineResolution> {
+        let stable_remote = self
+            .remote_map
+            .get(STABLE_LINUX_URL)
+            .map(String::as_str)
+            .unwrap_or("stable");
+        if stable_remote.is_empty() || stable_remote.starts_with('-') {
+            return Vec::new();
+        }
+        let count_arg = format!("--count={MAX_ACTIVE_STABLE_BRANCHES}");
+        let pattern = format!("refs/remotes/{stable_remote}/linux-*.y");
+        let Some(output) = run_offline_git(
+            &self.repo_path,
+            &[
+                "for-each-ref",
+                "--sort=-version:refname",
+                "--sort=-committerdate",
+                &count_arg,
+                "--format=%(refname:short)",
+                &pattern,
+            ],
+        )
+        .await
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let prefix = format!("{stable_remote}/");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(&prefix))
+            .filter(|branch| is_valid_stable_branch_name(branch))
+            .map(|branch| BaselineResolution::RemoteTarget {
+                url: STABLE_LINUX_URL.to_string(),
+                name: stable_remote.to_string(),
+                branch: Some(branch.to_string()),
+            })
+            .collect()
+    }
+}
+
+fn ordered_mainline_remotes(
+    fetch_remotes: &[(String, String)],
+    project: Option<ProjectId>,
+) -> Vec<(&String, &String)> {
+    let mut remotes: Vec<_> = fetch_remotes
+        .iter()
+        .map(|(url, name)| (url, name))
+        .filter(|(url, _)| project.unwrap_or_default().matches_upstream_url(url))
+        .collect();
+    // Match the bug resolver's remote-name order without collapsing shared URLs.
+    remotes.sort_by_key(|(_, name)| *name);
+    remotes.dedup_by_key(|(_, name)| *name);
+    if !remotes.iter().any(|(_, name)| name.as_str() == "origin")
+        && let Some((url, name)) = fetch_remotes.iter().find(|(_, name)| name == "origin")
+    {
+        remotes.push((url, name));
+    }
+    remotes
+}
+
+fn is_e2fsprogs_project_url(url: &str) -> bool {
+    url.to_ascii_lowercase().contains("e2fsprogs")
+}
+
+fn e2fsprogs_branch_order(subject: &str) -> [&'static str; 3] {
+    for token in crate::patch::subject_prefix_tokens(subject) {
+        if token.eq_ignore_ascii_case("next") || token.eq_ignore_ascii_case("e2fsprogs-next") {
+            return ["next", "master", "maint"];
+        }
+        if token.eq_ignore_ascii_case("maint") || token.eq_ignore_ascii_case("e2fsprogs-maint") {
+            return ["maint", "master", "next"];
+        }
+    }
+    ["master", "next", "maint"]
 }
 
 fn is_non_linux_project_url(url: &str) -> bool {
@@ -734,17 +1119,129 @@ fn is_non_linux_project_url(url: &str) -> bool {
     lower.contains("gcc.gnu.org")
         || lower.contains("gnutools/gcc")
         || lower.contains("gcc-mirror/gcc")
+        || lower.contains("qemu-project/qemu")
+        || lower.contains("qemu.org")
+        || lower.contains("qemu/qemu")
+        || lower.contains("zephyrproject-rtos/zephyr")
+        || lower.contains("e2fsprogs")
         || lower.contains("sashiko")
 }
 
+/// The branch a mainline remote develops on.
+fn mainline_branch(project: Option<ProjectId>) -> &'static str {
+    project.map_or("master", ProjectId::mainline_branch)
+}
+
+fn is_tip_tree_url(url: &str) -> bool {
+    let lower = url.trim_end_matches('/').to_ascii_lowercase();
+    lower.ends_with("/tip/tip.git") || lower.ends_with("/tip.git")
+}
+
+fn is_objtool_file(file: &str) -> bool {
+    file.starts_with("tools/objtool/")
+        || file.starts_with("include/linux/objtool")
+        || file == "Documentation/tools/objtool.txt"
+}
+
+fn sanitize_diff_path(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim().trim_start_matches("./");
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('-')
+        || trimmed.chars().any(char::is_control)
+        || trimmed
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn parse_unified_header_path<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(prefix)?;
+    let path = rest.split('\t').next()?.trim();
+    let path = path
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(path);
+    Some(path)
+}
+
+fn strip_p1_single_side(raw: &str) -> &str {
+    if let Some(rel) = raw.strip_prefix("b/").or_else(|| raw.strip_prefix("a/")) {
+        return rel;
+    }
+    if let Some((root, rel)) = raw.split_once('/')
+        && (root == "linux" || root.starts_with("linux-") || root.ends_with(".orig"))
+    {
+        return rel;
+    }
+    raw
+}
+
+fn extract_unified_pair_path<'a>(old_raw: &'a str, new_raw: &'a str) -> Option<&'a str> {
+    if old_raw == "/dev/null" && new_raw == "/dev/null" {
+        return None;
+    }
+    if old_raw == "/dev/null" {
+        return sanitize_diff_path(strip_p1_single_side(new_raw));
+    }
+    if new_raw == "/dev/null" {
+        return sanitize_diff_path(strip_p1_single_side(old_raw));
+    }
+    if let Some(rel) = new_raw
+        .strip_prefix("b/")
+        .or_else(|| old_raw.strip_prefix("a/"))
+    {
+        return sanitize_diff_path(rel);
+    }
+    if old_raw != new_raw
+        && let (Some((_, old_rel)), Some((_, new_rel))) =
+            (old_raw.split_once('/'), new_raw.split_once('/'))
+        && old_rel == new_rel
+    {
+        return sanitize_diff_path(new_rel);
+    }
+    sanitize_diff_path(new_raw)
+}
+
 pub fn extract_files_from_diff(diff: &str) -> Vec<String> {
+    let lines: Vec<&str> = diff.lines().collect();
     let mut files = Vec::new();
-    for line in diff.lines() {
+    let mut in_git_header = false;
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
         if let Some(path) = line.strip_prefix("diff --git a/")
             && let Some((a, _)) = path.split_once(' ')
         {
-            files.push(a.to_string());
+            if let Some(clean) = sanitize_diff_path(a) {
+                files.push(clean.to_string());
+            }
+            in_git_header = true;
+            i += 1;
+            continue;
         }
+        if line.starts_with("@@ ") {
+            in_git_header = false;
+            i += 1;
+            continue;
+        }
+        if !in_git_header
+            && i + 2 < lines.len()
+            && lines[i + 2].starts_with("@@ -")
+            && let Some(old_raw) = parse_unified_header_path(line, "--- ")
+            && let Some(new_raw) = parse_unified_header_path(lines[i + 1], "+++ ")
+        {
+            if let Some(clean) = extract_unified_pair_path(old_raw, new_raw) {
+                files.push(clean.to_string());
+            }
+            i += 3;
+            continue;
+        }
+        i += 1;
     }
     files
 }
@@ -758,12 +1255,87 @@ pub fn extract_base_commit(body: &str) -> Option<CommitId> {
         .find_map(|caps| CommitId::parse(caps.get(1)?.as_str()))
 }
 
+/// Returns true when a late-arriving cover letter introduces baseline or
+/// prerequisite metadata that was unavailable when the series was attempted
+/// without its cover letter.
+#[cfg(feature = "server")]
+pub(crate) fn cover_letter_adds_baseline_metadata(
+    previous_subject: &str,
+    cover_subject: &str,
+    cover_body: Option<&str>,
+) -> bool {
+    if extract_version_tag(cover_subject)
+        .is_some_and(|v| extract_version_tag(previous_subject).as_deref() != Some(v.as_str()))
+    {
+        return true;
+    }
+    let Some(body) = cover_body else {
+        return false;
+    };
+    extract_base_commit(body).is_some()
+        || extract_body_version_tag(body).is_some()
+        || crate::prerequisites::has_prerequisite_metadata(body)
+        || (is_unversioned_stable_backport(cover_subject, Some(body))
+            && !is_unversioned_stable_backport(previous_subject, None))
+}
+
 pub fn extract_version_tag(subject: &str) -> Option<String> {
     static VERSION_TAG_RE: OnceLock<Regex> = OnceLock::new();
     let re = VERSION_TAG_RE
         .get_or_init(|| Regex::new(r"(?i)\bv?(\d+\.\d+(?:\.\d+)?(?:-rc\d+)?(?:\.y)?)\b").unwrap());
-    re.captures(subject)
-        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_lowercase()))
+    for caps in re.captures_iter(subject) {
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        let Some(ver_match) = caps.get(1) else {
+            continue;
+        };
+        let ver = ver_match.as_str().to_lowercase();
+        if is_bracketed_patch_revision_tag(subject, full.start(), full.end(), &ver) {
+            continue;
+        }
+        return Some(ver);
+    }
+    None
+}
+
+/// Returns true when a matched `X.Y` token sits inside a non-stable `[...]`
+/// subject prefix and represents a dotted patch revision (`[patch V1.1 02/38]`,
+/// `[PATCH v2.1 1/3]`) rather than a baseline release tag.
+fn is_bracketed_patch_revision_tag(subject: &str, start: usize, end: usize, ver: &str) -> bool {
+    let Some(open) = subject[..start].rfind('[') else {
+        return false;
+    };
+    if subject[open..start].contains(']') {
+        return false;
+    }
+    let Some(rel_close) = subject[end..].find(']') else {
+        return false;
+    };
+    let group = &subject[open + 1..end + rel_close];
+    let mut has_patch_or_rfc = false;
+    for tok in group.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '.' && c != '_') {
+        if tok.eq_ignore_ascii_case("stable") {
+            return false;
+        }
+        if tok.eq_ignore_ascii_case("patch")
+            || tok.eq_ignore_ascii_case("rfc")
+            || tok.eq_ignore_ascii_case("resend")
+        {
+            has_patch_or_rfc = true;
+        }
+    }
+    let Some((maj_s, min_s)) = ver.split_once('.') else {
+        return false;
+    };
+    if !maj_s.bytes().all(|b| b.is_ascii_digit()) || !min_s.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let (Ok(major), Ok(minor)) = (maj_s.parse::<u32>(), min_s.parse::<u32>()) else {
+        return false;
+    };
+    let starts_with_v = subject.as_bytes()[start].eq_ignore_ascii_case(&b'v');
+    major < 3 && (major, minor) != (2, 6) && (starts_with_v || has_patch_or_rfc)
 }
 
 pub fn extract_gcc_release_branch(subject: &str) -> Option<u32> {
@@ -799,7 +1371,7 @@ fn subject_version_candidates(
     if !has_non_linux_mainline && let Some((first, last)) = stable_versions {
         for version in std::iter::once(first).chain(last) {
             candidates.push(BaselineResolution::RemoteTarget {
-                url: "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git".to_string(),
+                url: STABLE_LINUX_URL.to_string(),
                 name: "stable".to_string(),
                 branch: Some(format!("linux-{version}.y")),
             });
@@ -810,6 +1382,108 @@ fn subject_version_candidates(
         candidates.push(BaselineResolution::LocalRef(format!("v{version}")));
     }
     candidates
+}
+
+/// Extract an explicit `vX.Y[.Z][-rcN]` baseline tag declared in non-quoted
+/// pre-diff cover-letter or changelog prose (for example `"The series applies
+/// on top of v7.0-rc3"` or `"- Rebase on v7.2-rc1"`).
+pub fn extract_body_version_tag(body: &str) -> Option<String> {
+    static BODY_TAG_RE: OnceLock<Regex> = OnceLock::new();
+    let re = BODY_TAG_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(?:applies(?:\s+cleanly)?\s+(?:on(?:\s+top\s+of)?|to|against)|(?:re)?based?\s+(?:on(?:\s+top\s+of)?|onto|against))\s+v(\d+\.\d+(?:\.\d+)?(?:-rc\d+)?)\b",
+        )
+        .unwrap()
+    });
+
+    for line in body.lines() {
+        if line.starts_with("diff --git ")
+            || line.starts_with("--- a/")
+            || line.starts_with("--- /dev/null")
+            || line.starts_with("@@ -")
+        {
+            break;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('>') {
+            continue;
+        }
+        if let Some(caps) = re.captures(trimmed)
+            && let Some(m) = caps.get(1)
+        {
+            let ver = m.as_str().to_lowercase();
+            let base = ver.split('-').next().unwrap_or(&ver);
+            let mut parts = base.split('.');
+            if let (Some(maj_s), Some(min_s)) = (parts.next(), parts.next())
+                && let (Ok(major), Ok(minor)) = (maj_s.parse::<u32>(), min_s.parse::<u32>())
+                && (major >= 3 || (major == 2 && minor == 6))
+            {
+                return Some(ver);
+            }
+        }
+    }
+    None
+}
+
+fn is_valid_stable_branch_name(branch: &str) -> bool {
+    let Some(ver) = branch
+        .strip_prefix("linux-")
+        .and_then(|s| s.strip_suffix(".y"))
+    else {
+        return false;
+    };
+    let Some((major, minor)) = ver.split_once('.') else {
+        return false;
+    };
+    !major.is_empty()
+        && !minor.is_empty()
+        && major.bytes().all(|b| b.is_ascii_digit())
+        && minor.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn has_upstream_backport_marker(body: &str) -> bool {
+    for line in body.lines().take(40) {
+        let trimmed = line.trim();
+        if trimmed == "---"
+            || trimmed.starts_with("diff --git ")
+            || trimmed.starts_with("--- a/")
+            || trimmed.starts_with("@@ -")
+        {
+            break;
+        }
+        if trimmed.starts_with('>') {
+            continue;
+        }
+        if let Some(rest) = trimmed
+            .strip_prefix("commit ")
+            .or_else(|| trimmed.strip_prefix("Commit "))
+        {
+            let rest = rest.strip_suffix('.').unwrap_or(rest);
+            if let Some(sha) = rest
+                .strip_suffix(" upstream")
+                .or_else(|| rest.strip_suffix(" UPSTREAM"))
+                && CommitId::parse(sha.trim()).is_some()
+            {
+                return true;
+            }
+        }
+        if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            let inner = inner.trim();
+            if let Some(sha) = inner
+                .strip_prefix("Upstream commit ")
+                .or_else(|| inner.strip_prefix("upstream commit "))
+                && CommitId::parse(sha.trim()).is_some()
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_unversioned_stable_backport(subject: &str, body: Option<&str>) -> bool {
+    crate::patch::subject_prefix_tokens(subject).any(|tok| tok.eq_ignore_ascii_case("stable"))
+        || body.is_some_and(has_upstream_backport_marker)
 }
 
 fn explicit_stable_versions(subject: &str) -> Option<(&str, Option<&str>)> {
@@ -907,6 +1581,8 @@ mod tests {
             remote_map,
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: None,
         }
     }
@@ -1124,6 +1800,25 @@ mod tests {
                 "{subject}"
             );
         }
+
+        // Dotted patch revision tags (such as [patch V1.1 02/38]) must not
+        // synthesize bogus LocalRef("v1.1") baseline candidates.
+        for subject in [
+            "[patch V1.1 02/38] x86/paravirt: cleanup",
+            "[PATCH v2.1 1/3] sched/fair: fix",
+            "[RFC PATCH v1.2] timers: prototype",
+        ] {
+            assert_eq!(extract_version_tag(subject), None, "{subject}");
+            assert_eq!(
+                registry.resolve_candidates(&files, subject, None).await,
+                fallback,
+                "{subject}"
+            );
+        }
+        assert_eq!(
+            extract_version_tag("[patch V1.1 02/38] x86: fix regression in v6.12"),
+            Some("6.12".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1138,6 +1833,8 @@ mod tests {
             remote_map,
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: Some((
                 "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git".to_string(),
                 "origin".to_string(),
@@ -1173,6 +1870,8 @@ mod tests {
             remote_map: HashMap::new(),
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: None,
         };
 
@@ -1222,6 +1921,8 @@ F: patterns/
             remote_map,
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: None,
         };
 
@@ -1281,6 +1982,8 @@ F: patterns/
             remote_map: HashMap::new(),
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: None,
         }
     }
@@ -1348,6 +2051,8 @@ F: patterns/
             remote_map,
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: None,
         };
 
@@ -1397,6 +2102,8 @@ F: patterns/
             remote_map: HashMap::new(),
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: None,
         };
 
@@ -1460,6 +2167,8 @@ F: patterns/
             remote_map,
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: None,
         };
 
@@ -1506,6 +2215,8 @@ F: patterns/
             remote_map,
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: None,
         };
 
@@ -1564,8 +2275,11 @@ F: patterns/
                 url: dummy_url,
                 check_all_branches: false,
                 only_branches: Some(vec!["master".to_string()]),
+                branch_patterns: None,
             }]),
             repo_path: repo_path.to_path_buf(),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: None,
         };
 
@@ -1594,6 +2308,213 @@ F: patterns/
             pos_next,
             candidate_names
         );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_custom_remotes_branch_patterns() {
+        use crate::settings::CustomRemoteSettings;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        crate::git_cmd::in_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .unwrap();
+        std::fs::write(repo_path.join("file.txt"), "hello").unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["add", "file.txt"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["commit", "-m", "init"])
+            .output()
+            .unwrap();
+
+        for branch in &["6.18/dev", "6.18/prod", "other/feature"] {
+            crate::git_cmd::in_dir(repo_path)
+                .args(["branch", branch])
+                .output()
+                .unwrap();
+        }
+
+        let client_dir = tempfile::tempdir().unwrap();
+        let client_path = client_dir.path();
+        crate::git_cmd::in_dir(client_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(client_path)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(client_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .unwrap();
+
+        let dummy_url = repo_path.to_str().unwrap().to_string();
+        let mut remote_map = HashMap::new();
+        remote_map.insert(dummy_url.clone(), "custom".to_string());
+
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map,
+            custom_remotes: Some(vec![CustomRemoteSettings {
+                name: "custom".to_string(),
+                url: dummy_url,
+                check_all_branches: true,
+                only_branches: None,
+                branch_patterns: Some(vec!["6.18/*".to_string()]),
+            }]),
+            repo_path: client_path.to_path_buf(),
+            project: None,
+            fetch_remotes: Vec::new(),
+            mainline_remote: None,
+        };
+
+        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let candidate_branches: Vec<String> = candidates
+            .iter()
+            .filter_map(|c| match c {
+                BaselineResolution::RemoteTarget { name, branch, .. } if name == "custom" => {
+                    branch.clone()
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(candidate_branches.contains(&"6.18/dev".to_string()));
+        assert!(candidate_branches.contains(&"6.18/prod".to_string()));
+        assert!(!candidate_branches.contains(&"other/feature".to_string()));
+        assert!(!candidate_branches.contains(&"main".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_custom_remotes_additive_only_branches() {
+        use crate::settings::CustomRemoteSettings;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        crate::git_cmd::in_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .unwrap();
+        std::fs::write(repo_path.join("file.txt"), "hello").unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["add", "file.txt"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(repo_path)
+            .args(["commit", "-m", "init"])
+            .output()
+            .unwrap();
+
+        for branch in &["6.18/dev", "explicit-topic", "other/feature"] {
+            crate::git_cmd::in_dir(repo_path)
+                .args(["branch", branch])
+                .output()
+                .unwrap();
+        }
+
+        let client_dir = tempfile::tempdir().unwrap();
+        let client_path = client_dir.path();
+        crate::git_cmd::in_dir(client_path)
+            .args(["-c", "safe.bareRepository=all", "init", "-b", "main"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(client_path)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .unwrap();
+        crate::git_cmd::in_dir(client_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .unwrap();
+
+        let dummy_url = repo_path.to_str().unwrap().to_string();
+        let mut remote_map = HashMap::new();
+        remote_map.insert(dummy_url.clone(), "custom".to_string());
+
+        // branch_patterns matches 6.18/dev, only_branches adds explicit-topic
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map,
+            custom_remotes: Some(vec![CustomRemoteSettings {
+                name: "custom".to_string(),
+                url: dummy_url,
+                check_all_branches: false,
+                only_branches: Some(vec!["explicit-topic".to_string()]),
+                branch_patterns: Some(vec!["6.18/*".to_string()]),
+            }]),
+            repo_path: client_path.to_path_buf(),
+            project: None,
+            fetch_remotes: Vec::new(),
+            mainline_remote: None,
+        };
+
+        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let candidate_branches: Vec<String> = candidates
+            .iter()
+            .filter_map(|c| match c {
+                BaselineResolution::RemoteTarget { name, branch, .. } if name == "custom" => {
+                    branch.clone()
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(candidate_branches.contains(&"6.18/dev".to_string()));
+        assert!(candidate_branches.contains(&"explicit-topic".to_string()));
+        assert!(!candidate_branches.contains(&"other/feature".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_custom_remotes_empty_lists_fallback_to_default() {
+        use crate::settings::CustomRemoteSettings;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: Some(vec![CustomRemoteSettings {
+                name: "custom".to_string(),
+                url: "https://example.com/repo.git".to_string(),
+                check_all_branches: false,
+                only_branches: Some(vec![]),
+                branch_patterns: Some(vec![]),
+            }]),
+            repo_path: repo_path.to_path_buf(),
+            project: None,
+            fetch_remotes: Vec::new(),
+            mainline_remote: None,
+        };
+
+        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let has_default = candidates.iter().any(|c| match c {
+            BaselineResolution::RemoteTarget { name, branch, .. } => {
+                name == "custom" && branch.is_none()
+            }
+            _ => false,
+        });
+
+        assert!(has_default, "empty lists must fall back to default branch");
     }
 
     /// Runs git in the test repository and returns its trimmed stdout.
@@ -1630,6 +2551,8 @@ F: patterns/
             remote_map: HashMap::new(),
             custom_remotes: None,
             repo_path: dir.to_path_buf(),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: Some((url.to_string(), "origin".to_string())),
         };
         let [old, mid, tip]: [String; 3] = shas.try_into().unwrap();
@@ -1702,6 +2625,116 @@ F: patterns/
             Some(std::ffi::OsStr::new("1"))
         )));
     }
+
+    #[tokio::test]
+    async fn test_fork_origin_uses_configured_project() {
+        for (project, upstream) in [
+            (
+                ProjectId::Sashiko,
+                "https://github.com/sashiko-dev/sashiko.git",
+            ),
+            (
+                ProjectId::Zephyr,
+                "https://github.com/zephyrproject-rtos/zephyr.git",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            git(repo, &["init", "--quiet"]).await;
+            let fork = "https://github.com/contributor/renamed-tree.git";
+            git(repo, &["remote", "add", "origin", fork]).await;
+            git(repo, &["remote", "add", "z-fork", fork]).await;
+            git(repo, &["remote", "set-url", "--push", "origin", upstream]).await;
+            git(
+                repo,
+                &[
+                    "remote",
+                    "add",
+                    "linux",
+                    "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+                ],
+            )
+            .await;
+
+            let registry = BaselineRegistry::new(repo, None, Some(project)).unwrap();
+            assert_eq!(registry.mainline_ref(), "origin/main");
+            assert!(registry.entries.is_empty());
+            assert_eq!(
+                registry
+                    .resolve_candidates(&["src/main.c".to_string()], "[PATCH] fix cleanup", None)
+                    .await,
+                vec![BaselineResolution::RemoteTarget {
+                    url: fork.to_string(),
+                    name: "origin".to_string(),
+                    branch: Some("main".to_string()),
+                }]
+            );
+
+            git(repo, &["remote", "add", "upstream", upstream]).await;
+            let registry = BaselineRegistry::new(repo, None, Some(project)).unwrap();
+            assert_eq!(registry.mainline_ref(), "upstream/main");
+            assert_eq!(
+                registry
+                    .resolve_candidates(&[], "[PATCH] fix cleanup", None)
+                    .await,
+                vec![
+                    BaselineResolution::RemoteTarget {
+                        url: upstream.to_string(),
+                        name: "upstream".to_string(),
+                        branch: Some("main".to_string()),
+                    },
+                    BaselineResolution::RemoteTarget {
+                        url: fork.to_string(),
+                        name: "origin".to_string(),
+                        branch: Some("main".to_string()),
+                    },
+                ]
+            );
+
+            for project in [None, Some(ProjectId::Linux)] {
+                let registry = BaselineRegistry::new(repo, None, project).unwrap();
+                assert_eq!(registry.mainline_ref(), "linux/master");
+                assert!(
+                    registry
+                        .resolve_candidates(&[], "[PATCH] fix cleanup", None)
+                        .await
+                        .iter()
+                        .any(|candidate| matches!(
+                            candidate,
+                            BaselineResolution::RemoteTarget { url, .. } if url == LINUX_NEXT_URL
+                        ))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_linux_overrides_fork_url_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "--quiet"]).await;
+        git(
+            repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/sashiko-dev/linux.git",
+            ],
+        )
+        .await;
+        for (project, expect_linux_next) in [(Some(ProjectId::Linux), true), (None, false)] {
+            let registry = BaselineRegistry::new(repo, None, project).unwrap();
+            let candidates = registry.resolve_candidates(&[], "fix cleanup", None).await;
+            assert_eq!(
+                candidates.iter().any(|candidate| matches!(candidate,
+                    BaselineResolution::RemoteTarget { url, .. } if url == LINUX_NEXT_URL
+                )),
+                expect_linux_next
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_non_linux_mainline_skips_linux_next() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1712,6 +2745,8 @@ F: patterns/
             remote_map: HashMap::new(),
             custom_remotes: None,
             repo_path: repo_path.to_path_buf(),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: Some((
                 "https://gcc.gnu.org/git/gcc.git".to_string(),
                 "origin".to_string(),
@@ -1729,6 +2764,73 @@ F: patterns/
                 branch: Some("master".to_string()),
             }]
         );
+
+        let qemu_registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: repo_path.to_path_buf(),
+            project: None,
+            fetch_remotes: Vec::new(),
+            mainline_remote: Some((
+                "https://gitlab.com/qemu-project/qemu.git".to_string(),
+                "origin".to_string(),
+            )),
+        };
+
+        let qemu_candidates = qemu_registry
+            .resolve_candidates(&[], "[PATCH] target/riscv: fix CSR write", None)
+            .await;
+        assert_eq!(
+            qemu_candidates,
+            vec![BaselineResolution::RemoteTarget {
+                url: "https://gitlab.com/qemu-project/qemu.git".to_string(),
+                name: "origin".to_string(),
+                branch: Some("master".to_string()),
+            }]
+        );
+
+        let e2fs_url = "https://git.kernel.org/pub/scm/fs/ext2/e2fsprogs.git";
+        let e2fs_registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: repo_path.to_path_buf(),
+            project: Some(ProjectId::E2fsprogs),
+            fetch_remotes: Vec::new(),
+            mainline_remote: Some((e2fs_url.to_string(), "origin".to_string())),
+        };
+        let e2fs_default = e2fs_registry
+            .resolve_candidates(&[], "[PATCH] e2fsck: fix extent check", None)
+            .await;
+        assert_eq!(
+            e2fs_default,
+            vec![
+                BaselineResolution::RemoteTarget {
+                    url: e2fs_url.to_string(),
+                    name: "origin".to_string(),
+                    branch: Some("master".to_string()),
+                },
+                BaselineResolution::RemoteTarget {
+                    url: e2fs_url.to_string(),
+                    name: "origin".to_string(),
+                    branch: Some("next".to_string()),
+                },
+                BaselineResolution::RemoteTarget {
+                    url: e2fs_url.to_string(),
+                    name: "origin".to_string(),
+                    branch: Some("maint".to_string()),
+                },
+            ]
+        );
+        let e2fs_next = e2fs_registry
+            .resolve_candidates(&[], "[PATCH next] libext2fs: add helper", None)
+            .await;
+        assert_eq!(e2fs_next[0].as_str(), "origin/next");
+        let e2fs_maint = e2fs_registry
+            .resolve_candidates(&[], "[PATCH maint] mke2fs: backport fix", None)
+            .await;
+        assert_eq!(e2fs_maint[0].as_str(), "origin/maint");
     }
 
     #[tokio::test]
@@ -1739,6 +2841,8 @@ F: patterns/
             remote_map: HashMap::new(),
             custom_remotes: None,
             repo_path: temp_dir.path().to_path_buf(),
+            project: None,
+            fetch_remotes: Vec::new(),
             mainline_remote: Some((
                 "git://gcc.gnu.org/git/gcc.git".to_string(),
                 "origin".to_string(),
@@ -1760,5 +2864,462 @@ F: patterns/
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_extract_files_from_diff_supports_quilt_and_git_formats() {
+        let quilt_diff = "\
+Commit description.
+
+---
+ kernel/sched/fair.c  | 4 ++--
+ kernel/sched/new.c   | 3 +++
+ kernel/sched/old.c   | 3 ---
+ kernel/time/timer.c  | 2 +-
+ 4 files changed, 6 insertions(+), 6 deletions(-)
+
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -10,4 +10,4 @@
+--- inside_hunk_old
++++ inside_hunk_new
+ context
+--- /dev/null
++++ b/kernel/sched/new.c
+@@ -0,0 +1,3 @@
++int x;
+--- a/kernel/sched/old.c
++++ /dev/null
+@@ -1,3 +0,0 @@
+-int y;
+Index: linux/kernel/time/timer.c
+===================================================================
+--- linux.orig/kernel/time/timer.c\t2026-11-05 12:00:00.000000000 +0100
++++ linux/kernel/time/timer.c\t2026-11-05 12:01:00.000000000 +0100
+@@ -5,2 +5,2 @@
+-old
++new
+";
+        assert_eq!(
+            extract_files_from_diff(quilt_diff),
+            vec![
+                "kernel/sched/fair.c",
+                "kernel/sched/new.c",
+                "kernel/sched/old.c",
+                "kernel/time/timer.c",
+            ]
+        );
+
+        // Standard git format-patch headers must not double-count their --- / +++ pair,
+        // and path traversal or option-like paths are rejected.
+        let mixed = "\
+diff --git a/kernel/irq/manage.c b/kernel/irq/manage.c
+index 1111111..2222222 100644
+--- a/kernel/irq/manage.c
++++ b/kernel/irq/manage.c
+@@ -1,2 +1,2 @@
+-a
++b
+--- a/../etc/passwd
++++ b/../etc/passwd
+@@ -1 +1 @@
+-x
++y
+--- a/--option
++++ b/--option
+@@ -1 +1 @@
+-x
++y
+";
+        assert_eq!(extract_files_from_diff(mixed), vec!["kernel/irq/manage.c"]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_tip_urgent_master_and_objtool() {
+        let tip_url = "git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git".to_string();
+        let entries = vec![
+            MaintainersEntry {
+                subsystem: "SCHEDULER".to_string(),
+                trees: vec![(tip_url.clone(), Some("sched/core".to_string()))],
+                patterns: vec!["kernel/sched/".to_string()],
+            },
+            MaintainersEntry {
+                subsystem: "OBJTOOL".to_string(),
+                trees: Vec::new(),
+                patterns: vec!["tools/objtool/".to_string()],
+            },
+        ];
+        let mut remote_map = HashMap::new();
+        remote_map.insert(tip_url.clone(), "tip".to_string());
+        let registry = BaselineRegistry {
+            entries,
+            remote_map,
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
+            project: None,
+            fetch_remotes: Vec::new(),
+            mainline_remote: None,
+        };
+
+        let sched_files = vec!["kernel/sched/fair.c".to_string()];
+        let tip_branches = |cands: &[BaselineResolution]| -> Vec<String> {
+            cands
+                .iter()
+                .filter_map(|c| match c {
+                    BaselineResolution::RemoteTarget {
+                        name,
+                        branch: Some(b),
+                        ..
+                    } if name == "tip" => Some(b.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let normal = registry
+            .resolve_candidates(
+                &sched_files,
+                "[PATCH 0/3] sched/fair: Fix cgroup::idle preemption",
+                None,
+            )
+            .await;
+        assert_eq!(
+            tip_branches(&normal),
+            vec!["sched/core", "sched/urgent", "master"]
+        );
+
+        let urgent = registry
+            .resolve_candidates(&sched_files, "[PATCH sched/urgent] sched/fair: Fix", None)
+            .await;
+        assert_eq!(
+            tip_branches(&urgent),
+            vec!["sched/urgent", "sched/core", "master"]
+        );
+
+        let objtool = registry
+            .resolve_candidates(
+                &["tools/objtool/check.c".to_string()],
+                "[PATCH] objtool: Fix jump table handling",
+                None,
+            )
+            .await;
+        assert_eq!(
+            tip_branches(&objtool),
+            vec!["objtool/core", "objtool/urgent", "master"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_body_version_tag_and_unversioned_stable_backport() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "--quiet"]).await;
+        git(repo, &["config", "user.email", "test@example.com"]).await;
+        git(repo, &["config", "user.name", "Test User"]).await;
+
+        let commit_at = |msg: &'static str, date: &'static str| async move {
+            let out = crate::git_cmd::in_dir_async(repo)
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .args(["commit", "--quiet", "--allow-empty", "-m", msg])
+                .output()
+                .await
+                .unwrap();
+            assert!(out.status.success(), "git commit failed: {:?}", out);
+            git(repo, &["rev-parse", "HEAD"]).await
+        };
+
+        let old_sha = commit_at("old eol", "2025-01-01T00:00:00Z").await;
+        git(
+            repo,
+            &["update-ref", "refs/remotes/stable/linux-6.17.y", &old_sha],
+        )
+        .await;
+
+        let lts_sha = commit_at("lts", "2026-10-01T00:00:00Z").await;
+        git(
+            repo,
+            &["update-ref", "refs/remotes/stable/linux-6.12.y", &lts_sha],
+        )
+        .await;
+        git(
+            repo,
+            &["update-ref", "refs/remotes/stable/linux-6.18.y", &lts_sha],
+        )
+        .await;
+
+        let mut remote_map = HashMap::new();
+        remote_map.insert(STABLE_LINUX_URL.to_string(), "stable".to_string());
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map,
+            custom_remotes: None,
+            repo_path: repo.to_path_buf(),
+            project: Some(ProjectId::Linux),
+            fetch_remotes: Vec::new(),
+            mainline_remote: None,
+        };
+
+        // 1. Cover-letter baseline tag ("applies on top of v7.0-rc3")
+        let cover_body = "Hi!\n\nThe series applies on top of v7.0-rc3 and reworks /proc/interrupts.\n> applies on top of v6.1\n";
+        let cands = registry
+            .resolve_candidates(
+                &[],
+                "[patch V5 00/15] Improve /proc/interrupts further",
+                Some(cover_body),
+            )
+            .await;
+        assert_eq!(
+            cands[0],
+            BaselineResolution::LocalRef("v7.0-rc3".to_string())
+        );
+        assert_eq!(
+            extract_body_version_tag("Commit msg\n---\nChanges in v4:\n- Rebase on v7.2-rc1\n"),
+            Some("7.2-rc1".to_string())
+        );
+        assert_eq!(
+            extract_body_version_tag("Based on v1.1 of the RFC series\n"),
+            None
+        );
+
+        // 2. Unversioned [PATCH stable backport] with "commit <sha> upstream."
+        let backport_body =
+            "commit 4096fd0e8eaea13ebe5206700b33f49635ae18e5 upstream.\n\nFix leak.\n";
+        let backport_cands = registry
+            .resolve_candidates(
+                &[],
+                "[PATCH stable backport] clockevents: Fix resource leak",
+                Some(backport_body),
+            )
+            .await;
+        let stable_branches: Vec<String> = backport_cands
+            .iter()
+            .filter_map(|c| match c {
+                BaselineResolution::RemoteTarget {
+                    name,
+                    branch: Some(b),
+                    ..
+                } if name == "stable" => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stable_branches,
+            vec!["linux-6.18.y", "linux-6.12.y", "linux-6.17.y"]
+        );
+
+        // 3. Normal mainline patch carrying Cc: stable@vger.kernel.org must NOT
+        //    trigger stable branch candidates.
+        let mainline_body =
+            "Fix race.\n\nCc: stable@vger.kernel.org\nSigned-off-by: Dev <d@k.org>\n";
+        let mainline_cands = registry
+            .resolve_candidates(&[], "[PATCH] clockevents: Fix race", Some(mainline_body))
+            .await;
+        assert!(!mainline_cands.iter().any(|c| matches!(
+            c,
+            BaselineResolution::RemoteTarget { name, .. } if name == "stable"
+        )));
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_resolve_mailing_list_baselines_rules_and_priority() {
+        let policy = crate::email_policy::EmailPolicyConfig::parse_content(
+            r#"
+            ["bpf@vger.kernel.org"]
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git"
+            subject_prefixes = ["bpf-next"]
+            [["bpf@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf.git"
+            subject_prefixes = ["bpf"]
+
+            ["netdev@vger.kernel.org"]
+            [["netdev@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git"
+            subject_prefixes = ["net-next"]
+            [["netdev@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net.git"
+            subject_prefixes = ["net"]
+
+            ["intel-wired-lan@lists.osuosl.org"]
+            [["intel-wired-lan@lists.osuosl.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/tnguy/next-queue.git"
+            branches = ["dev-queue"]
+            subject_prefixes = ["iwl-next"]
+            [["intel-wired-lan@lists.osuosl.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/tnguy/net-queue.git"
+            branches = ["dev-queue"]
+            subject_prefixes = ["iwl-net"]
+
+            ["linux-mm@kvack.org"]
+            [["linux-mm@kvack.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/akpm/mm.git"
+            branches = ["mm-new", "mm-unstable", "mm-stable"]
+
+            ["linux-nfs@vger.kernel.org"]
+            [["linux-nfs@vger.kernel.org".baselines]]
+            url = "https://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"
+            branches = ["nfsd-next", "nfsd-testing"]
+            paths = ["fs/nfsd/", "net/sunrpc/"]
+            "#,
+        )
+        .unwrap();
+
+        let registry = BaselineRegistry {
+            entries: vec![MaintainersEntry {
+                subsystem: "BPF".to_string(),
+                trees: vec![
+                    (
+                        "git://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf.git".to_string(),
+                        None,
+                    ),
+                    (
+                        "git://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git"
+                            .to_string(),
+                        None,
+                    ),
+                ],
+                patterns: vec!["kernel/bpf/".to_string()],
+            }],
+            remote_map: HashMap::from([(
+                "git://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git".to_string(),
+                "local-bpf-next".to_string(),
+            )]),
+            fetch_remotes: vec![(
+                "git://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git".to_string(),
+                "local-bpf-next".to_string(),
+            )],
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
+            project: Some(ProjectId::Linux),
+            mainline_remote: None,
+        };
+
+        let refs = |cands: &[BaselineResolution]| -> Vec<String> {
+            cands.iter().map(BaselineResolution::as_str).collect()
+        };
+
+        // 1. Explicit [PATCH bpf-next] prefers bpf-next over bpf, and reuses
+        //    the existing git:// remote name via equivalent-URL matching.
+        let cands = registry
+            .resolve_candidates_with_policy(
+                &["kernel/bpf/verifier.c".to_string()],
+                "[PATCH bpf-next v2 1/2] bpf: tighten check",
+                None,
+                Some(&policy),
+                &["bpf@vger.kernel.org".to_string()],
+            )
+            .await;
+        let r = refs(&cands);
+        assert_eq!(r[0], "local-bpf-next/HEAD");
+        assert_eq!(r[1], "bpf/HEAD");
+        // Equivalent git:// and https:// URLs must deduplicate to one entry each.
+        assert_eq!(r.iter().filter(|x| *x == "local-bpf-next/HEAD").count(), 1);
+        assert_eq!(r.iter().filter(|x| *x == "bpf/HEAD").count(), 1);
+
+        // 2. Explicit [PATCH bpf] prefers bpf over bpf-next.
+        let cands = registry
+            .resolve_candidates_with_policy(
+                &["kernel/bpf/verifier.c".to_string()],
+                "[PATCH bpf] bpf: fix leak",
+                None,
+                Some(&policy),
+                &["bpf@vger.kernel.org".to_string()],
+            )
+            .await;
+        let r = refs(&cands);
+        assert_eq!(r[0], "bpf/HEAD");
+        assert_eq!(r[1], "local-bpf-next/HEAD");
+
+        // 3. Untagged [PATCH] follows TOML declaration order (bpf-next, then bpf).
+        let cands = registry
+            .resolve_candidates_with_policy(
+                &["kernel/bpf/verifier.c".to_string()],
+                "[PATCH] bpf: add new helper",
+                None,
+                Some(&policy),
+                &["bpf@vger.kernel.org".to_string()],
+            )
+            .await;
+        let r = refs(&cands);
+        assert_eq!(r[0], "local-bpf-next/HEAD");
+        assert_eq!(r[1], "bpf/HEAD");
+
+        // 4. Cross-posted [PATCH iwl-next] to netdev + intel-wired-lan picks next-queue/dev-queue first.
+        let cands = registry
+            .resolve_candidates_with_policy(
+                &["drivers/net/ethernet/intel/ice/ice_main.c".to_string()],
+                "[PATCH iwl-next 1/3] ice: refactor queue",
+                None,
+                Some(&policy),
+                &[
+                    "netdev@vger.kernel.org".to_string(),
+                    "intel-wired-lan@lists.osuosl.org".to_string(),
+                ],
+            )
+            .await;
+        let r = refs(&cands);
+        assert_eq!(r[0], "next-queue/dev-queue");
+        assert!(r.contains(&"net-next/HEAD".to_string()));
+
+        // 5. Multi-branch ordering for linux-mm.
+        let cands = registry
+            .resolve_candidates_with_policy(
+                &["mm/slub.c".to_string()],
+                "[PATCH] mm/slub: optimize fastpath",
+                None,
+                Some(&policy),
+                &["Linux MM <linux-mm@kvack.org>".to_string()],
+            )
+            .await;
+        let r = refs(&cands);
+        assert_eq!(&r[0..3], &["mm/mm-new", "mm/mm-unstable", "mm/mm-stable"]);
+
+        // 6. Path-scoped rule applies to fs/nfsd/ but is skipped for fs/nfs/.
+        let nfsd_cands = registry
+            .resolve_candidates_with_policy(
+                &["fs/nfsd/nfs4state.c".to_string()],
+                "[PATCH] nfsd: fix lease",
+                None,
+                Some(&policy),
+                &["linux-nfs@vger.kernel.org".to_string()],
+            )
+            .await;
+        let nfsd_refs = refs(&nfsd_cands);
+        assert_eq!(&nfsd_refs[0..2], &["cel/nfsd-next", "cel/nfsd-testing"]);
+
+        let nfs_client_cands = registry
+            .resolve_candidates_with_policy(
+                &["fs/nfs/client.c".to_string()],
+                "[PATCH] NFS: fix mount",
+                None,
+                Some(&policy),
+                &["linux-nfs@vger.kernel.org".to_string()],
+            )
+            .await;
+        assert!(
+            !refs(&nfs_client_cands)
+                .iter()
+                .any(|x| x.starts_with("cel/")),
+            "path-scoped NFSD rule must not apply to fs/nfs/ client patches"
+        );
+
+        // 7. Explicit base-commit stays ahead of configured subsystem baselines.
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let base_cands = registry
+            .resolve_candidates_with_policy(
+                &["mm/slub.c".to_string()],
+                "[PATCH] mm/slub: fix",
+                Some(&format!("base-commit: {sha}\n")),
+                Some(&policy),
+                &["linux-mm@kvack.org".to_string()],
+            )
+            .await;
+        assert_eq!(
+            base_cands[0],
+            BaselineResolution::Commit(CommitId::parse(sha).unwrap())
+        );
+        assert_eq!(base_cands[1].as_str(), "mm/mm-new");
     }
 }

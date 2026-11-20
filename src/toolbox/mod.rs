@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 pub mod command;
+pub mod design_tools;
 pub mod framework;
 pub mod utils;
 
@@ -31,7 +32,6 @@ pub mod git_log;
 pub mod git_ls;
 pub mod git_read_files;
 pub mod git_show;
-pub mod read_prompt;
 
 /// The Sashiko-specific context passed to LLM tools.
 ///
@@ -39,7 +39,6 @@ pub mod read_prompt;
 /// and a shared cache to avoid redundant command executions across tool runs.
 pub struct SashikoToolContext {
     pub worktree_path: PathBuf,
-    pub prompts_path: Option<PathBuf>,
     pub active_patch_files: RwLock<Vec<String>>,
     pub virtual_head: RwLock<Option<String>>,
     pub(crate) cache: Arc<RwLock<std::collections::HashMap<String, Value>>>,
@@ -71,13 +70,12 @@ pub struct ToolBox {
 }
 
 impl ToolBox {
-    /// Creates a new `ToolBox` configured for the given worktree and optional prompt registry.
-    pub fn new(worktree_path: PathBuf, prompts_path: Option<PathBuf>) -> Self {
+    /// Creates a new `ToolBox` configured for the given worktree.
+    pub fn new(worktree_path: PathBuf) -> Self {
         let cache = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
         let context = SashikoToolContext {
             worktree_path,
-            prompts_path,
             active_patch_files: RwLock::new(Vec::new()),
             virtual_head: RwLock::new(None),
             cache: cache.clone(),
@@ -93,15 +91,37 @@ impl ToolBox {
         registry.register(git_grep::GitGrepTool);
         registry.register(git_find_files::GitFindFilesTool);
 
-        if context.prompts_path.is_some() {
-            registry.register(read_prompt::ReadPromptTool);
-        }
-
         Self {
             context,
             registry,
             cache,
         }
+    }
+
+    /// Creates `(full_toolbox, blind_toolbox)` for a series design assessment,
+    /// sharing read-only baseline tool cache entries while omitting
+    /// `read_series` from `blind_toolbox` so Stage 2 cannot inspect the patch.
+    pub fn new_design_pair(state: Arc<design_tools::DesignToolState>) -> Result<(Self, Self)> {
+        state.validate()?;
+        let shared_cache = Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let make_one = |allow_series: bool| {
+            let context = SashikoToolContext {
+                worktree_path: state.repo_path.clone(),
+                active_patch_files: RwLock::new(Vec::new()),
+                virtual_head: RwLock::new(Some(state.baseline_sha.clone())),
+                cache: Arc::clone(&shared_cache),
+            };
+            let mut registry = ToolRegistry::new();
+            design_tools::register_design_tools(&mut registry, Arc::clone(&state), allow_series);
+            Self {
+                context,
+                registry,
+                cache: Arc::clone(&shared_cache),
+            }
+        };
+
+        Ok((make_one(true), make_one(false)))
     }
 
     /// Registers an extra tool. Test-only: the review toolbox is fixed, and
@@ -160,37 +180,32 @@ impl ToolBox {
     /// the execution to the corresponding tool struct.
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
         let name_normalized = name.trim().to_lowercase();
-        let should_cache = name_normalized != "todowrite";
+        if !self.registry.contains(&name_normalized) {
+            anyhow::bail!("Tool not found in registry: {}", name_normalized);
+        }
         let args = utils::normalize_json_numbers(args);
 
         let normalized_args = self.registry.normalize_tool_args(&name_normalized, &args);
 
-        let key = if should_cache {
-            let k = format!(
-                "{}:{}",
-                name_normalized,
-                serde_json::to_string(&normalized_args)?
-            );
-            {
-                let cache = self.cache.read().unwrap();
-                if let Some(val) = cache.get(&k) {
-                    return Ok(val.clone());
-                }
+        let key = format!(
+            "{}:{}",
+            name_normalized,
+            serde_json::to_string(&normalized_args)?
+        );
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(val) = cache.get(&key) {
+                return Ok(val.clone());
             }
-            Some(k)
-        } else {
-            None
-        };
+        }
 
         let res = self
             .registry
             .call(&name_normalized, args, &self.context)
             .await?;
 
-        if let Some(k) = key {
-            let mut cache = self.cache.write().unwrap();
-            cache.insert(k, res.clone());
-        }
+        let mut cache = self.cache.write().unwrap();
+        cache.insert(key, res.clone());
 
         Ok(res)
     }

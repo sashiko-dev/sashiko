@@ -1,0 +1,29 @@
+# OpenAI GPT on AWS Bedrock, through the OpenAI Responses API on the
+# bedrock-mantle endpoint. Needs a build with --features bedrock: without
+# it the [ai.bedrock] table below is rejected as an unknown field.
+# Credentials come from the AWS credential chain, from which a short-term
+# Bedrock API key is derived; export AWS_BEARER_TOKEN_BEDROCK to use a
+# long-term key instead.
+# Setup: docs/llm-providers.md, section "OpenAI models (bedrock-mantle)".
+
+[ai]
+provider = "bedrock"
+# A foundation model ID; inference profile IDs stay on the Converse API.
+model = "openai.gpt-5.6-sol"
+max_input_tokens = 100000
+
+[ai.bedrock]
+region = "us-east-1"
+# Output limit; includes hidden reasoning tokens.
+max_tokens = 32768
+effort = "high"   # sent as reasoning.effort
+# Prompt cache breakpoints (default on); the TTL is optional.
+prompt_caching = true
+# prompt_cache_ttl = "30m"
+# OpenAI models use bedrock-mantle by default.
+# openai_api = "converse"
+# Some models are served under /openai/v1; see the model card.
+# mantle_base_url = "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
+
+[review]
+concurrency = 4

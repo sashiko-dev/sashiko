@@ -6,7 +6,7 @@ You're an expert Software Engineer with deep knowledge of Rust, Distributed Syst
 - Sign all commits using the user's git configuration. Every commit **MUST** include a `Signed-off-by` line (e.g., using `git commit -s` which automatically uses the user's `user.name` and `user.email`). **NO EXCEPTIONS.** Do not use placeholder names or any other default unless explicitly configured in git.
 - Make sure no lines in the commit message exceed 72 characters. Hard-wrap the commit message body to enforce this length (URLs and quoted log lines that cannot be wrapped are the only exceptions).
 - **Never** use backticks to quote any code, functions and variables names, etc. in the commit message.
-- Only standard git trailers belong in a commit message (`Signed-off-by`, `Fixes`, human `Co-authored-by`, `Link`); never emit tool-generated metadata tags or `Assisted-by:` / AI attribution trailers (what tools were used does not matter — the human signing off holds full responsibility and must never share or delegate it to an LLM).
+- Only standard git trailers belong in a commit message (`Signed-off-by`, `Fixes`, human `Co-authored-by`, `Closes`, `Link`); never emit tool-generated metadata tags or `Assisted-by:` / AI attribution trailers (what tools were used does not matter — the human signing off holds full responsibility and must never share or delegate it to an LLM).
 - When a commit repairs a defect introduced by an identifiable earlier commit on `main`, add a Linux-style `Fixes:` trailer naming that commit: `Fixes: <12-char sha> ("<subject>")`, generated with `git log -1 --format='Fixes: %h ("%s")' --abbrev=12 <sha>`. Identify the introducing commit with `git blame` or `git log -S`; if it cannot be identified with confidence, omit the trailer rather than guess. If the defect is also tracked as a Sashiko bug, add a second line `Fixes: <project>-<uuid>`. Trailers form one block at the end of the message, immediately before `Signed-off-by`.
 - Never start a new task with a non-clean git status.
 - Make sure to not commit any logs or temporary files. Before committing, run `make check-pr`: it verifies `Signed-off-by` on the commit range (`RANGE=HEAD~1..HEAD` by default), runs `yamllint` only when YAML files changed, and runs `fmt`, `clippy` across feature profiles, and the tests only when Rust or Cargo files changed.
@@ -15,7 +15,7 @@ You're an expert Software Engineer with deep knowledge of Rust, Distributed Syst
 - Each commit should implement one consistent and self-sufficient change. Never create commits like "do X and Y", create 2 commits instead.
 - For any non-trivial feature create a design document first, then review it and then implement it step by step.
 - If not sure, ask the user, don't proceed without confidence. Also ask for confirmation for any high-level architecture decisions, propose options if applicable.
-- Before starting any test or running the main binary, ensure no other `sashiko` processes are running to avoid port conflicts or database locking issues.
+- Before starting a `sashiko` daemon, ensure no other `sashiko` daemon is running: daemons conflict on networking ports. Local reviews (`sashiko review`) do not conflict with daemons or with each other, so run them in parallel as much as needed.
 - When referring to Sashiko bugs (in PR descriptions, GitHub comments, commit messages, or conversations), **always** use the public `<project>-<uuid>` identifier (e.g. `sashiko-<uuid>` or `linux-<uuid>`). **Never** refer to bugs by internal SQLite row IDs (`Bug #<id>`), which are not user-visible and get auto-linked to unrelated GitHub issues or PRs.
 
 # Development Workflow
@@ -57,14 +57,15 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `benchmark.rs`: Built-in benchmark runner, per-run database/artifact preservation, and structured AI judge telemetry (`#[cfg(feature = "server")]`).
 - `worker/`: Background workers (`bug_worker.rs`, `email.rs`, `forge.rs`, `patchwork.rs`, `repack.rs`, `sync.rs`, `prefetch.rs`, `prompts.rs`).
 - `workflow/`: Core state-machine LLM workflow engine.
-- `workflows/`: Declarative review and bug pipelines per project (`linux_patch_review.rs`, `linux_bug.rs`, `sashiko_patch_review.rs`), plus shared security/normalization helpers (`guard.rs`) and the review-map lineage builder (`review_map.rs`).
+- `workflows/`: Declarative review, bug, and scan pipelines per project (`linux_patch_review.rs`, `linux_bug.rs`, `linux_scan.rs`, `sashiko_patch_review.rs`, `gcc_patch_review.rs`, `qemu_patch_review.rs`, `zephyr_patch_review.rs`, `e2fsprogs_patch_review.rs`), prior-version feedback auditing (`prior_feedback.rs`), shared security/normalization helpers (`guard.rs`), and the review-map lineage builder (`review_map.rs`).
+- `authority.rs` & `prior_context.rs`: Programmatic contributor social score engine (`ContributorAuthority`) and transport-agnostic ancestor feedback context (`PriorVersionContext`).
 - `toolbox/`: Agent tools for inspecting git repositories and worktrees.
 - `ai/`: LLM provider integrations, session runner, and response caching.
 - `auth.rs` & `access.rs`: Authentication (`LocalToken`, JWTs) and capability/subsystem bug access control (`Principal`, `BugAccess`).
-- `maintainers.rs`: `MAINTAINERS` file parser and subsystem/maintainer lookup index.
+- `maintainers.rs` & `bugs_access.rs`: `MAINTAINERS` file parser, subsystem/maintainer lookup index, and `projects/<project>/bugs_access.toml` grants and overrides.
 - `ingestor.rs`, `fetcher.rs`, `mbox.rs`, `nntp.rs`, `patchwork.rs`, `backfill.rs`: Mailing list, Lore mbox, NNTP, and Patchwork ingestion pipelines.
 - `reviewer.rs`: Patchset review worker orchestration.
-- `local_review.rs`: Local review execution (`sashiko review`).
+- `local_review.rs` & `scan.rs`: Local review execution (`sashiko review`) and active codebase scanning (`sashiko scan`).
 - `git_cmd.rs` & `git_ops.rs`: Safe git process spawning and repository operations.
 - `repo_sync.rs`: Provisioning of the tree a daemon reviews (`sashiko repo sync`) and the daemon's startup check for it.
 - `patch.rs`, `baseline.rs`, `prerequisites.rs`: Patch parsing, baseline detection, and prerequisite series resolution.
@@ -74,7 +75,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `api.rs`: Shared HTTP protocol request/response types (unconditional).
 - `server.rs`: Axum HTTP API server handlers (`#[cfg(feature = "server")]`).
 - `settings.rs`: Application settings and ACL configuration.
-- `project.rs` & `prompt_bundle.rs`: Target project profiles (`linux`, `sashiko`) and prompt bundle loading.
+- `project.rs` & `prompt_bundle.rs`: Target project profiles (`linux`, `sashiko`, `gcc`, `qemu`, `zephyr`, `e2fsprogs`) and prompt bundle loading.
 - `events.rs`, `metrics.rs`, `logging.rs`, `compression.rs`, `utils.rs`: Internal event bus, metrics, logging, and utilities.
 
 ## Cargo Feature Profiles
@@ -84,23 +85,31 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `--no-default-features`: Minimal build for `sashiko` local review (`sashiko init`, `sashiko review`) and `sashiko-cli` without `libsql`, `axum`, `lettre`, or `jsonwebtoken` (`--features cache` adds the local AI response cache).
 
 ## Configuration, Prompts & Docs
-- `Settings.toml` & `projects/linux/mailing_lists.toml`: Main application and per-mailing-list tracking/delivery policy configuration (see `projects/linux/MAINTAINERS_GUIDE.md` for Linux maintainer onboarding and policy guidance).
-- `projects/sashiko/prompts/`: First-party review prompts for reviewing Sashiko itself (`--project sashiko`): review procedures (`*.md`), maintainer notes (`maintainers/`), and code notes (`notes/`).
-- `projects/linux/prompts/`: The Linux review prompts (bundled as `kernel/`): review procedures, maintainer notes (`maintainers/`) and code notes (`notes/`); its `README.md` describes the layout.
+- `Settings.toml`, `projects/<project>/mailing_lists.toml` & `projects/<project>/bugs_access.toml`: Main application, per-mailing-list tracking/delivery policy, and subsystem bug/embargo access configuration (`projects/linux/mailing_lists.toml` by default; see `projects/linux/MAINTAINERS_GUIDE.md` for Linux maintainer onboarding and policy guidance).
+- `projects/linux/prompts/`: Primary Linux kernel review prompts (bundled as `kernel/`): review procedures, maintainer notes (`maintainers/`), and code notes (`notes/`); its `README.md` describes the layout.
+- `projects/gcc/prompts/`: Official GCC pilot review prompts (`--project gcc`): review procedures (`*.md`), maintainer notes (`maintainers/`), and generated code notes (`notes/`).
+- `projects/sashiko/prompts/`: First-party review prompts for reviewing Sashiko itself (`--project sashiko`): review procedures (`*.md`), maintainer notes (`projects/sashiko/prompts/maintainers/`), and code notes (`notes/`).
+- `projects/qemu/prompts/`: QEMU pilot review prompts (`--project qemu`): review procedures (`*.md`) and maintainer notes (`maintainers/`); generated code notes (`notes/`) are not produced for QEMU yet.
+- `projects/zephyr/prompts/`: Zephyr RTOS pilot review prompts (`--project zephyr`), laid out like the QEMU prompts; each rule cites the Zephyr document or source file it comes from. See `docs/zephyr-review.md`.
+- `projects/e2fsprogs/prompts/`: The e2fsprogs review prompts (`--project e2fsprogs`): review procedures (`*.md`), maintainer notes (`maintainers/`), and code notes profile (`notes/`).
 - `static/`: Web UI assets (`static/index.html`, images).
-- `docs/`: User and operator documentation (`configuration.md`, `daemon.md`, `sashiko-cli.md`, `llm-providers.md`, `benchmarking.md`, forge setup guides).
+- `docs/`: User and operator documentation (`configuration.md`, `daemon.md`, `sashiko-cli.md`, `llm-providers.md`, `benchmarking.md`, `zephyr-review.md`, forge setup guides).
 - `designs/`: Architecture and design documents.
 
 # Benchmarking
 
-**CRITICAL RULE:** Never run the full (`benchmark.json`) or small (`benchmark_small.json`) benchmarks without an explicit human request.
+**CRITICAL RULE:** Never run the full (`benchmark.json`), standard (`benchmark_small.json`, `benchmark_100.json`), or versioned (`benchmark_versioned.json`) benchmarks without an explicit human request.
 
-See `docs/benchmarking.md` for full setup and CLI options (`sashiko benchmark <path>` or `cargo run --bin sashiko -- benchmark <path>`). Available suites in `projects/linux/benchmarks/`:
+See `docs/benchmarking.md` for full setup and CLI options (`sashiko [--project <project>] benchmark <path>` or `cargo run --bin sashiko -- benchmark <path>`). Primary Linux suites live in `projects/linux/benchmarks/` (and GCC pilot suites live in `projects/gcc/benchmarks/`):
 - `benchmark.json` (999 entries, full suite)
 - `benchmark_small.json` (99 entries, standard suite)
 - `benchmark_tiny.json` (9 entries, quick iteration)
 - `benchmark_missed.json` (upstream fixes for bugs missed by Sashiko after public launch)
+- `benchmark_kvm_arm64.json` (97 checked KVM/arm64 bugs fixed in 2026)
+- `benchmark_arm64.json` (62 checked arm64 core bugs fixed in 2026)
+- `benchmark_performance.json` (40 entries: 20 Linux performance regressions + 20 soak-verified `expect_clean` neutral commits)
 - `benchmark_preexisting.json` (known Linux bugs for testing the pre-existing bug pipeline)
+- `benchmark_versioned.json` (53 multi-version LKML patchset stories testing prior-version feedback verification, attribution, and suppression)
 
 # LLM Workflow Design
 

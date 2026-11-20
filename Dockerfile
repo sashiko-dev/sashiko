@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM rust:1.90-bookworm AS builder
+FROM rust:1.93.1-bookworm AS builder
 
 # Install clippy and rustfmt first to allow the persistent cache to cover them
 RUN rustup component add clippy rustfmt
@@ -37,6 +37,7 @@ FROM debian:bookworm-slim
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     procps \
+    tini \
     git \
     libssl3 \
     ca-certificates \
@@ -63,7 +64,6 @@ COPY --from=builder /app /usr/local/bin
 COPY Settings.toml /app/Settings.toml
 COPY projects /app/projects
 RUN ln -s /app/projects/linux/mailing_lists.toml /app/email_policy.toml
-COPY third_party/prompts /app/third_party/prompts
 COPY static /app/static
 
 # Copy entrypoint script
@@ -82,4 +82,4 @@ ENV SASHIKO__DATABASE__URL=/data/db/sashiko.db \
 
 EXPOSE 8080
 
-ENTRYPOINT ["docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]

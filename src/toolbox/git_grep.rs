@@ -41,6 +41,7 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
                 "pattern": { "type": "string", "description": "Regex or literal pattern to search." },
                 "path": { "type": "string", "description": "Relative paths or pathspecs to restrict search (optional). Highly recommended to scope to the modified subsystem directory (e.g. 'net/mptcp/') to avoid extremely expensive tree-wide searches." },
                 "context_lines": { "type": "integer", "description": "Context lines to show. Default: 0." },
+                "function_context": { "type": "boolean", "description": "If true, show the entire enclosing function or block for each match (-W). Eliminates follow-up file reads when inspecting callers. Default: false." },
                 "count_only": { "type": "boolean", "description": "If true, returns file names and match counts only. Recommended for cheap broad searches." },
                 "is_literal": { "type": "boolean", "description": "If true, treats pattern as literal fixed string rather than PCRE regex." }
             },
@@ -54,13 +55,16 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
             if !obj.contains_key("path") {
                 obj.insert("path".to_string(), Value::Null);
             }
-            if !obj.contains_key("context_lines") {
+            if obj.get("context_lines").is_none_or(Value::is_null) {
                 obj.insert("context_lines".to_string(), json!(0));
             }
-            if !obj.contains_key("count_only") {
+            if obj.get("function_context").is_none_or(Value::is_null) {
+                obj.insert("function_context".to_string(), json!(false));
+            }
+            if obj.get("count_only").is_none_or(Value::is_null) {
                 obj.insert("count_only".to_string(), json!(false));
             }
-            if !obj.contains_key("is_literal") {
+            if obj.get("is_literal").is_none_or(Value::is_null) {
                 obj.insert("is_literal".to_string(), json!(false));
             }
         }
@@ -78,6 +82,7 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
             .ok_or_else(|| anyhow!("Missing pattern"))?;
         let path_str = args["path"].as_str();
         let context_lines = args["context_lines"].as_u64().unwrap_or(0) as usize;
+        let function_context = args["function_context"].as_bool().unwrap_or(false);
         let count_only = args["count_only"].as_bool().unwrap_or(false);
         let is_literal = args["is_literal"].as_bool().unwrap_or(false);
 
@@ -90,6 +95,11 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
 
         if count_only {
             cmd.arg("-c");
+        } else if function_context {
+            cmd.arg("-n").arg("-I").arg("-W");
+            if context_lines > 0 {
+                cmd.arg(format!("-C{}", context_lines));
+            }
         } else {
             cmd.arg("-n").arg("-I").arg(format!("-C{}", context_lines));
         }
@@ -122,15 +132,9 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
         if !output.is_usable() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
-                return Ok(json!({
-                    "content": "",
-                    "truncated": false,
-                    "metadata": { "total_items": 0, "returned_items": 0 },
-                    "matches": [],
-                    "message": "No matches found."
-                }));
+                return Ok(Value::String("No matches found.".to_string()));
             }
-            return Ok(json!({ "error": format!("git grep failed: {}", stderr) }));
+            return Ok(Value::String(format!("Error: git grep failed: {}", stderr)));
         }
 
         let content = String::from_utf8_lossy(&output.stdout).to_string();
@@ -152,30 +156,14 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
             format_git_grep_output(&content, revision, &active_files)
         };
 
-        let total_grep_lines = formatted.lines().count();
         let res = Truncator::truncate_sequential(&formatted, 10_000);
-        let truncated_grep = res.content;
-        let lines_kept = res.lines_kept;
-        let is_truncated = res.truncated;
+        let mut out = res.content;
+        if res.truncated {
+            out.push_str(
+                "\n[Truncated: grep matches exceeded token budget. Narrow your search with path or a more specific pattern.]",
+            );
+        }
 
-        let returned_items = if is_truncated && lines_kept > 0 {
-            lines_kept
-        } else {
-            total_grep_lines
-        };
-
-        Ok(json!({
-            "content": truncated_grep,
-            "truncated": is_truncated,
-            "metadata": {
-                "total_items": total_grep_lines,
-                "returned_items": returned_items
-            },
-            "next_page_hint": if is_truncated {
-                Some("Grep matches were truncated. Narrow your search using a pathspec or a more specific regex pattern.".to_string())
-            } else {
-                None
-            }
-        }))
+        Ok(Value::String(out))
     }
 }

@@ -72,11 +72,20 @@ fn add_range(map: &mut LineRangeMap, path: PathBuf, start: usize, end: usize) {
     map.entry(path).or_default().insert((start, end));
 }
 
-/// Immutable Git revision with a blob cache scoped to this repository and commit.
+/// Immutable Git revision with blob and parsed C AST caches scoped to this repository and commit.
 struct SourceSnapshot<'a> {
     repository: &'a Path,
     sha: String,
     blobs: HashMap<PathBuf, Arc<str>>,
+    trees: HashMap<PathBuf, Option<Arc<tree_sitter::Tree>>>,
+}
+
+const SPAWN_BLOCKING_PARSE_BYTES: usize = 64 * 1024;
+
+fn parse_c_tree(source_code: &str) -> Option<tree_sitter::Tree> {
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_c::LANGUAGE.into()).ok()?;
+    parser.parse(source_code, None)
 }
 
 impl<'a> SourceSnapshot<'a> {
@@ -88,6 +97,8 @@ impl<'a> SourceSnapshot<'a> {
         );
         let output = crate::git_cmd::in_dir_async(repository)
             .args([
+                "-c",
+                "safe.bareRepository=all",
                 "rev-parse",
                 "--verify",
                 "--end-of-options",
@@ -105,6 +116,7 @@ impl<'a> SourceSnapshot<'a> {
             repository,
             sha: String::from_utf8(output.stdout)?.trim().to_string(),
             blobs: HashMap::new(),
+            trees: HashMap::new(),
         })
     }
 
@@ -114,7 +126,13 @@ impl<'a> SourceSnapshot<'a> {
         }
         let object = format!("{}:{}", self.sha, path.display());
         let output = crate::git_cmd::in_dir_async(self.repository)
-            .args(["show", &object])
+            .args([
+                "-c",
+                "safe.bareRepository=all",
+                "show",
+                "--end-of-options",
+                &object,
+            ])
             .kill_on_drop(true)
             .output()
             .await
@@ -129,6 +147,29 @@ impl<'a> SourceSnapshot<'a> {
             .into();
         self.blobs.insert(path.to_path_buf(), content.clone());
         Ok(content)
+    }
+
+    async fn read_with_c_tree(
+        &mut self,
+        path: &Path,
+    ) -> Result<(Arc<str>, Option<Arc<tree_sitter::Tree>>)> {
+        let content = self.read(path).await?;
+        if let Some(cached) = self.trees.get(path) {
+            return Ok((content, cached.clone()));
+        }
+        let path_str = path.to_string_lossy();
+        let parsed = if path_str.ends_with(".rs") || is_non_c_dsl_or_table_file(&path_str) {
+            None
+        } else if content.len() >= SPAWN_BLOCKING_PARSE_BYTES {
+            let src = content.clone();
+            tokio::task::spawn_blocking(move || parse_c_tree(&src).map(Arc::new))
+                .await
+                .context("tree-sitter parse task panicked")?
+        } else {
+            parse_c_tree(&content).map(Arc::new)
+        };
+        self.trees.insert(path.to_path_buf(), parsed.clone());
+        Ok((content, parsed))
     }
 }
 
@@ -147,9 +188,12 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
             continue;
         }
         let file_path = PathBuf::from(file);
-        let content = snapshot.read(&file_path).await?;
+        let (content, tree) = snapshot.read_with_c_tree(&file_path).await?;
+        let tree_ref = tree.as_deref();
         for &(start, end) in ranges {
-            let defs = overlapping_definitions(&content, start, end);
+            let defs = tree_ref
+                .map(|t| overlapping_definitions_in_tree(t, start, end))
+                .unwrap_or_default();
             if defs.is_empty() && !file.ends_with(".c") {
                 let total_lines = content.lines().count();
                 if total_lines > 0 {
@@ -163,10 +207,14 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
                     add_range(&mut range_map, file_path.clone(), blk_start, blk_end);
                 }
             }
-            already_extracted.extend(extract_defined_names(&content, start, end));
-            symbols_to_lookup.extend(extract_type_names(&content, start, end));
+            if let Some(t) = tree_ref {
+                already_extracted.extend(extract_defined_names_in_tree(t, &content, start, end));
+                symbols_to_lookup.extend(extract_type_names_in_tree(t, &content, start, end));
+            }
         }
-        called_functions.extend(extract_called_functions(&content, ranges));
+        if let Some(t) = tree_ref {
+            called_functions.extend(extract_called_functions_in_tree(t, &content, ranges));
+        }
     }
 
     // Remove symbols whose definitions are already in context.
@@ -194,19 +242,586 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
     symbols.truncate(50);
 
     // Phase 2: look up referenced symbol definitions via git grep + tree-sitter.
-    if !symbols.is_empty() {
+    let caller_dirs: HashSet<&str> = file_ranges
+        .keys()
+        .filter_map(|f| f.rsplit_once('/').map(|(dir, _)| dir))
+        .collect();
+    let resolved =
+        resolve_symbol_definitions(repository, &mut snapshot, &symbols, &caller_dirs, None).await?;
+    for (_, (path, start, end)) in resolved {
+        add_range(&mut range_map, path, start, end);
+    }
+
+    render_range_map_with_budget(&range_map, &mut snapshot, &file_ranges, MAX_PREFETCH_CHARS).await
+}
+
+/// Prefetches external struct, enum, macro, and helper definitions referenced within
+/// `start_line_1based..=end_line_1based` (1-based inclusive) of `file_path` at `target_sha`,
+/// excluding definitions already located inside `file_path`.
+pub async fn prefetch_external_definitions(
+    repository: &Path,
+    target_sha: &str,
+    file_path: &str,
+    start_line_1based: usize,
+    end_line_1based: usize,
+    max_chars: usize,
+) -> Result<String> {
+    let mut blocks = prefetch_external_definitions_for_chunks(
+        repository,
+        target_sha,
+        file_path,
+        &[(start_line_1based, end_line_1based)],
+        max_chars,
+    )
+    .await?;
+    Ok(blocks.pop().unwrap_or_default())
+}
+
+/// Prefetches external struct, enum, macro, and helper definitions for multiple
+/// 1-based inclusive `(start_line, end_line)` chunks of `file_path` at `target_sha`,
+/// sharing a single [`SourceSnapshot`] and batching `git grep` across all chunks.
+pub async fn prefetch_external_definitions_for_chunks(
+    repository: &Path,
+    target_sha: &str,
+    file_path: &str,
+    chunk_ranges_1based: &[(usize, usize)],
+    max_chars_per_chunk: usize,
+) -> Result<Vec<String>> {
+    if chunk_ranges_1based.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !file_path.ends_with(".c") && !file_path.ends_with(".h") {
+        return Ok(vec![String::new(); chunk_ranges_1based.len()]);
+    }
+
+    let mut snapshot = SourceSnapshot::new(repository, target_sha).await?;
+    let path_buf = PathBuf::from(file_path);
+    let (content, file_tree) = snapshot.read_with_c_tree(&path_buf).await?;
+    let total_lines = content.lines().count();
+    if total_lines == 0 {
+        return Ok(vec![String::new(); chunk_ranges_1based.len()]);
+    }
+
+    let already_extracted = file_tree
+        .as_deref()
+        .map(|t| extract_defined_names_in_tree(t, &content, 0, total_lines.saturating_sub(1)))
+        .unwrap_or_default();
+    let local_struct_member_types = file_tree
+        .as_deref()
+        .map(|t| extract_file_struct_member_types_in_tree(t, &content))
+        .unwrap_or_default();
+    let mut per_chunk_symbols: Vec<Vec<String>> = Vec::with_capacity(chunk_ranges_1based.len());
+    let mut per_chunk_ranges: Vec<HashMap<String, Vec<(usize, usize)>>> =
+        Vec::with_capacity(chunk_ranges_1based.len());
+    let mut union_symbols: BTreeSet<String> = BTreeSet::new();
+
+    for &(start_1, end_1) in chunk_ranges_1based {
+        let start_0 = start_1.saturating_sub(1);
+        let end_0 = end_1.saturating_sub(1).min(total_lines.saturating_sub(1));
+
+        let mut file_ranges = HashMap::new();
+        file_ranges.insert(file_path.to_string(), vec![(start_0, end_0)]);
+
+        let mut symbols_to_lookup = file_tree
+            .as_deref()
+            .map(|t| extract_type_names_in_tree(t, &content, start_0, end_0))
+            .unwrap_or_default();
+        let mut called_functions = file_tree
+            .as_deref()
+            .map(|t| extract_called_functions_in_tree(t, &content, &[(start_0, end_0)]))
+            .unwrap_or_default();
+
+        // Expand file-local struct/union containers to their external member field types
+        // before stripping intra-file names (`already_extracted`). Exempt expanded member
+        // types from `find_opaque_types` because chained expressions (`ctx->member.field`)
+        // do not bind a standalone variable of the member type.
+        let mut expanded_members = HashSet::new();
+        for sym in &symbols_to_lookup {
+            if let Some(members) = local_struct_member_types.get(sym) {
+                expanded_members.extend(members.iter().cloned());
+            }
+        }
+        symbols_to_lookup.extend(expanded_members.iter().cloned());
+
+        for sym in &already_extracted {
+            symbols_to_lookup.remove(sym);
+        }
+
+        let opaque = find_opaque_types(&symbols_to_lookup, &file_ranges, &snapshot);
+        for sym in &opaque {
+            if !expanded_members.contains(sym) {
+                symbols_to_lookup.remove(sym);
+            }
+        }
+
+        called_functions.retain(|f| !already_extracted.contains(f));
+        symbols_to_lookup.extend(called_functions);
+        symbols_to_lookup.retain(|s| !s.ends_with("_ops"));
+
+        let mut chunk_syms: Vec<String> = symbols_to_lookup.into_iter().collect();
+        chunk_syms.sort();
+        chunk_syms.truncate(55);
+        for sym in &chunk_syms {
+            union_symbols.insert(sym.clone());
+        }
+        per_chunk_symbols.push(chunk_syms);
+        per_chunk_ranges.push(file_ranges);
+    }
+
+    let mut caller_dirs = HashSet::new();
+    if let Some((dir, _)) = file_path.rsplit_once('/') {
+        caller_dirs.insert(dir);
+    }
+    let scoped_pathspecs = build_chunk_prefetch_pathspecs(file_path);
+    let scoped_refs: Vec<&str> = scoped_pathspecs.iter().map(String::as_str).collect();
+    let all_symbols: Vec<String> = union_symbols.into_iter().collect();
+    let mut resolved = resolve_symbol_definitions_with_pathspecs(
+        repository,
+        &mut snapshot,
+        &all_symbols,
+        &caller_dirs,
+        Some(&path_buf),
+        &scoped_refs,
+        80,
+    )
+    .await?;
+
+    // 2nd-hop nested struct/enum type resolution for embedded member structs inside Hop-1 headers.
+    let mut hop1_to_hop2: HashMap<String, Vec<String>> = HashMap::new();
+    let mut hop2_union: BTreeSet<String> = BTreeSet::new();
+    for (sym, (def_path, start, end)) in &resolved {
+        if !def_path.to_string_lossy().ends_with(".h") {
+            continue;
+        }
+        if let Ok((def_content, def_tree)) = snapshot.read_with_c_tree(def_path).await {
+            let mut nested = def_tree
+                .as_deref()
+                .map(|t| extract_type_names_in_tree(t, &def_content, *start, *end))
+                .unwrap_or_default();
+            nested.retain(|n| {
+                !already_extracted.contains(n) && !resolved.contains_key(n) && !n.ends_with("_ops")
+            });
+            if !nested.is_empty() {
+                let mut list: Vec<String> = nested.into_iter().collect();
+                list.sort();
+                list.truncate(6);
+                for n in &list {
+                    hop2_union.insert(n.clone());
+                }
+                hop1_to_hop2.insert(sym.clone(), list);
+            }
+        }
+    }
+    if !hop2_union.is_empty() {
+        let hop2_vec: Vec<String> = hop2_union.into_iter().take(24).collect();
+        let header_only_specs: Vec<&str> = scoped_refs
+            .iter()
+            .copied()
+            .filter(|s| *s == "*.h" || s.ends_with('/'))
+            .collect();
+        if let Ok(hop2_resolved) = resolve_symbol_definitions_with_pathspecs(
+            repository,
+            &mut snapshot,
+            &hop2_vec,
+            &caller_dirs,
+            Some(&path_buf),
+            if header_only_specs.is_empty() {
+                &scoped_refs
+            } else {
+                &header_only_specs
+            },
+            40,
+        )
+        .await
+        {
+            resolved.extend(hop2_resolved);
+        }
+    }
+
+    let mut outputs = Vec::with_capacity(chunk_ranges_1based.len());
+    for (chunk_syms, file_ranges) in per_chunk_symbols.into_iter().zip(per_chunk_ranges) {
+        let mut range_map: LineRangeMap = BTreeMap::new();
+        for sym in &chunk_syms {
+            if let Some((def_path, start, end)) = resolved.get(sym) {
+                add_range(&mut range_map, def_path.clone(), *start, *end);
+            }
+            if let Some(nested_syms) = hop1_to_hop2.get(sym) {
+                for nsym in nested_syms {
+                    if let Some((def_path, start, end)) = resolved.get(nsym) {
+                        add_range(&mut range_map, def_path.clone(), *start, *end);
+                    }
+                }
+            }
+        }
+        outputs.push(
+            render_range_map_with_budget(
+                &range_map,
+                &mut snapshot,
+                &file_ranges,
+                max_chars_per_chunk,
+            )
+            .await?,
+        );
+    }
+
+    Ok(outputs)
+}
+
+fn is_valid_c_ident(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 4
+        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+fn is_likely_prototype_declaration(path_str: &str, line_content: &str, sym: &str) -> bool {
+    let trimmed = line_content.trim();
+    if trimmed.starts_with("extern ") || trimmed.starts_with("EXPORT_SYMBOL") {
+        return true;
+    }
+    if trimmed.ends_with(';')
+        && !trimmed.contains('=')
+        && !trimmed.starts_with("return ")
+        && !trimmed.starts_with("if ")
+        && !trimmed.starts_with("while ")
+        && let Some(pos) = trimmed.find(sym)
+    {
+        let before = trimmed[..pos].trim();
+        let after = trimmed[pos + sym.len()..].trim_start();
+        if after.starts_with('(')
+            && !before.is_empty()
+            && before
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b' ' | b'\t' | b'*'))
+        {
+            return true;
+        }
+        if path_str.ends_with(".h") && before.is_empty() && after.starts_with('(') {
+            return false;
+        }
+    }
+    false
+}
+
+fn build_external_caller_pathspecs(file_path: &str) -> Vec<String> {
+    let mut specs: BTreeSet<String> = build_chunk_prefetch_pathspecs(file_path)
+        .into_iter()
+        .collect();
+    specs.insert("*.rs".to_string());
+    if file_path.starts_with("rust/") || file_path.ends_with(".rs") {
+        specs.insert("rust/".to_string());
+    }
+    let parts: Vec<&str> = file_path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() >= 3 && parts[0] == "arch" {
+        match parts[2] {
+            "kernel" => {
+                specs.insert("kernel/".to_string());
+            }
+            "mm" => {
+                specs.insert("mm/".to_string());
+            }
+            "net" => {
+                specs.insert("net/".to_string());
+            }
+            _ => {}
+        }
+    }
+    specs.into_iter().collect()
+}
+
+/// Prefetches 1-hop external call-site and vtable-registration windows for non-`static`
+/// functions defined in `file_path` at `target_sha`, returning `(whole_file_callers, per_chunk_callers)`.
+pub async fn prefetch_external_callers_for_chunks(
+    repository: &Path,
+    target_sha: &str,
+    file_path: &str,
+    per_chunk_exported_fns: &[Vec<String>],
+    max_file_chars: usize,
+    max_chars_per_chunk: usize,
+) -> Result<(String, Vec<String>)> {
+    if per_chunk_exported_fns.is_empty() {
+        return Ok((String::new(), Vec::new()));
+    }
+    let mut union_syms = BTreeSet::new();
+    for chunk_fns in per_chunk_exported_fns {
+        for sym in chunk_fns {
+            if is_valid_c_ident(sym) {
+                union_syms.insert(sym.clone());
+            }
+        }
+    }
+    if union_syms.is_empty() {
+        return Ok((
+            String::new(),
+            vec![String::new(); per_chunk_exported_fns.len()],
+        ));
+    }
+
+    let mut snapshot = SourceSnapshot::new(repository, target_sha).await?;
+    let all_syms: Vec<String> = union_syms.into_iter().take(60).collect();
+    let pathspecs = build_external_caller_pathspecs(file_path);
+    let revision_prefix = format!("{}:", snapshot.sha);
+    let mut hits_by_sym: HashMap<String, Vec<(PathBuf, usize)>> = HashMap::new();
+
+    for batch in all_syms.chunks(35) {
+        let mut cmd = crate::git_cmd::in_dir_async(repository);
+        cmd.args([
+            "-c",
+            "safe.bareRepository=all",
+            "grep",
+            "--full-name",
+            "--no-color",
+            "-z",
+            "-n",
+            "-I",
+            "-F",
+            "-w",
+        ]);
+        for sym in batch {
+            cmd.arg("-e").arg(sym);
+        }
+        cmd.arg(&snapshot.sha)
+            .arg("--")
+            .args(&pathspecs)
+            .kill_on_drop(true);
+
+        let output = match cmd.output().await {
+            Ok(o) => o,
+            Err(e) => return Err(anyhow!("Failed to run git grep for external callers: {e}")),
+        };
+        if !output.status.success() && output.status.code() != Some(1) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("git grep for external callers failed: {stderr}"));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let Some(rest_line) = line.strip_prefix(&revision_prefix) else {
+                continue;
+            };
+            let Some((path_str, rest)) = rest_line.split_once('\0') else {
+                continue;
+            };
+            if path_str == file_path || !is_prefetchable_source_file(path_str) {
+                continue;
+            }
+            let Some((line_num_str, line_content)) = rest.split_once('\0') else {
+                continue;
+            };
+            let Ok(line_1based) = line_num_str.parse::<usize>() else {
+                continue;
+            };
+            let line_0 = line_1based.saturating_sub(1);
+            for sym in batch {
+                if line_matches_symbol(line_content, sym)
+                    && !is_likely_prototype_declaration(path_str, line_content, sym)
+                {
+                    let entry = hits_by_sym.entry(sym.clone()).or_default();
+                    if entry.len() < 8 {
+                        entry.push((PathBuf::from(path_str), line_0));
+                    }
+                }
+            }
+        }
+    }
+
+    for hits in hits_by_sym.values_mut() {
+        hits.sort_by_key(|(p, line)| {
+            let is_hdr = p.to_string_lossy().ends_with(".h");
+            (usize::from(is_hdr), p.clone(), *line)
+        });
+        hits.truncate(3);
+    }
+
+    let empty_modified = HashMap::new();
+    let mut whole_map: LineRangeMap = BTreeMap::new();
+    for hits in hits_by_sym.values() {
+        for (path, line_0) in hits {
+            add_range(
+                &mut whole_map,
+                path.clone(),
+                line_0.saturating_sub(5),
+                line_0 + 7,
+            );
+        }
+    }
+    let whole_rendered =
+        render_range_map_with_budget(&whole_map, &mut snapshot, &empty_modified, max_file_chars)
+            .await?;
+
+    let mut per_chunk_rendered = Vec::with_capacity(per_chunk_exported_fns.len());
+    for chunk_fns in per_chunk_exported_fns {
+        let mut chunk_map: LineRangeMap = BTreeMap::new();
+        for sym in chunk_fns {
+            if let Some(hits) = hits_by_sym.get(sym) {
+                for (path, line_0) in hits {
+                    add_range(
+                        &mut chunk_map,
+                        path.clone(),
+                        line_0.saturating_sub(5),
+                        line_0 + 7,
+                    );
+                }
+            }
+        }
+        if chunk_map.is_empty() {
+            per_chunk_rendered.push(String::new());
+        } else {
+            per_chunk_rendered.push(
+                render_range_map_with_budget(
+                    &chunk_map,
+                    &mut snapshot,
+                    &empty_modified,
+                    max_chars_per_chunk,
+                )
+                .await?,
+            );
+        }
+    }
+
+    Ok((whole_rendered, per_chunk_rendered))
+}
+
+fn extract_file_struct_member_types_in_tree(
+    tree: &tree_sitter::Tree,
+    source_code: &str,
+) -> HashMap<String, HashSet<String>> {
+    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+    let bytes = source_code.as_bytes();
+
+    fn collect_type_idents(n: Node<'_>, src: &[u8], out: &mut HashSet<String>) {
+        if n.kind() == "type_identifier"
+            && let Ok(txt) = n.utf8_text(src)
+        {
+            let s = txt.trim();
+            if s.len() >= 3 && !is_common_c_word(s) {
+                out.insert(s.to_string());
+            }
+        }
+        let mut cursor = n.walk();
+        for child in n.children(&mut cursor) {
+            collect_type_idents(child, src, out);
+        }
+    }
+
+    fn walk_defs(n: Node<'_>, src: &[u8], map: &mut HashMap<String, HashSet<String>>) {
+        match n.kind() {
+            "function_definition" => {}
+            "struct_specifier" | "union_specifier" => {
+                if let Some(body) = n.child_by_field_name("body")
+                    && let Some(name_node) = n.child_by_field_name("name")
+                    && let Ok(name) = name_node.utf8_text(src)
+                {
+                    let mut members = HashSet::new();
+                    collect_type_idents(body, src, &mut members);
+                    members.remove(name.trim());
+                    if !members.is_empty() {
+                        map.entry(name.trim().to_string())
+                            .or_default()
+                            .extend(members);
+                    }
+                }
+            }
+            "type_definition" => {
+                if let Some(ty) = n.child_by_field_name("type") {
+                    walk_defs(ty, src, map);
+                }
+            }
+            "preproc_if" | "preproc_ifdef" | "preproc_elif" | "preproc_else"
+            | "translation_unit" | "declaration" => {
+                let mut cursor = n.walk();
+                for child in n.children(&mut cursor) {
+                    walk_defs(child, src, map);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk_defs(tree.root_node(), bytes, &mut map);
+    map
+}
+
+fn build_chunk_prefetch_pathspecs(file_path: &str) -> Vec<String> {
+    let parts: Vec<&str> = file_path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() <= 1 {
+        return PREFETCH_GREP_PATHSPECS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+    }
+
+    let mut specs = BTreeSet::new();
+    specs.insert("*.h".to_string());
+    if let Some((parent, _)) = file_path.rsplit_once('/')
+        && !parent.is_empty()
+    {
+        specs.insert(format!("{parent}/"));
+        if let Some((grandparent, _)) = parent.rsplit_once('/')
+            && !grandparent.is_empty()
+            && !matches!(
+                grandparent,
+                "drivers" | "fs" | "arch" | "sound" | "tools" | "samples"
+            )
+        {
+            specs.insert(format!("{grandparent}/"));
+        }
+    }
+    if file_path.contains("/kvm/") || file_path.starts_with("virt/kvm/") {
+        specs.insert("virt/kvm/".to_string());
+    }
+    specs.into_iter().collect()
+}
+
+async fn resolve_symbol_definitions(
+    repository: &Path,
+    snapshot: &mut SourceSnapshot<'_>,
+    symbols: &[String],
+    caller_dirs: &HashSet<&str>,
+    exclude_file: Option<&Path>,
+) -> Result<HashMap<String, (PathBuf, usize, usize)>> {
+    resolve_symbol_definitions_with_pathspecs(
+        repository,
+        snapshot,
+        symbols,
+        caller_dirs,
+        exclude_file,
+        PREFETCH_GREP_PATHSPECS,
+        50,
+    )
+    .await
+}
+
+async fn resolve_symbol_definitions_with_pathspecs(
+    repository: &Path,
+    snapshot: &mut SourceSnapshot<'_>,
+    symbols: &[String],
+    caller_dirs: &HashSet<&str>,
+    exclude_file: Option<&Path>,
+    pathspecs: &[&str],
+    batch_size: usize,
+) -> Result<HashMap<String, (PathBuf, usize, usize)>> {
+    let mut resolved = HashMap::new();
+    if symbols.is_empty() {
+        return Ok(resolved);
+    }
+
+    let effective_batch_size = batch_size.max(1);
+    let mut candidates: HashMap<String, (Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>)> =
+        HashMap::new();
+    let revision_prefix = format!("{}:", snapshot.sha);
+
+    for batch in symbols.chunks(effective_batch_size) {
         let regex_pattern = format!(
             "^((struct|class|enum|union)\\s+(?:GTY\\s*\\(\\(.*?\\)\\)\\s+)?({0})\\b|#define\\s+({0})\\b|([a-zA-Z_][a-zA-Z0-9_ \\t*:<>]+\\s+)?({0})\\s*\\()",
-            symbols.join("|")
+            batch.join("|")
         );
 
-        let caller_dirs: HashSet<&str> = file_ranges
-            .keys()
-            .filter_map(|f| f.rsplit_once('/').map(|(dir, _)| dir))
-            .collect();
-
         let mut cmd = crate::git_cmd::in_dir_async(repository);
-        cmd.arg("grep")
+        cmd.args(["-c", "safe.bareRepository=all"])
+            .arg("grep")
             .arg("--full-name")
             .arg("--no-color")
             .arg("-z")
@@ -217,7 +832,7 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
             .arg(&regex_pattern)
             .arg(&snapshot.sha)
             .arg("--")
-            .args(PREFETCH_GREP_PATHSPECS)
+            .args(pathspecs)
             .kill_on_drop(true);
 
         let output = match cmd.output().await {
@@ -232,10 +847,6 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut candidates: HashMap<String, (Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>)> =
-            HashMap::new();
-
-        let revision_prefix = format!("{}:", snapshot.sha);
         for line in stdout.lines() {
             if let Some(line) = line.strip_prefix(&revision_prefix)
                 && let Some((path_str, rest)) = line.split_once('\0')
@@ -243,7 +854,9 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
                 && let Ok(line_num) = line_num_str.parse::<u64>()
             {
                 let path = PathBuf::from(path_str);
-                if !is_prefetchable_source_file(path_str) {
+                if exclude_file.is_some_and(|ex| ex == path.as_path())
+                    || !is_prefetchable_source_file(path_str)
+                {
                     continue;
                 }
 
@@ -253,7 +866,7 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
                         .iter()
                         .any(|d| rel.starts_with(d) && rel.as_bytes().get(d.len()) == Some(&b'/'));
 
-                for sym in &symbols {
+                for sym in batch {
                     if line_matches_symbol(line_content, sym) {
                         let (general, priority) = candidates
                             .entry(sym.clone())
@@ -270,19 +883,19 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
                 }
             }
         }
+    }
 
-        for (sym, (general, priority)) in candidates {
-            let mut hits = priority;
-            hits.extend(general);
-            if let Some((path, start, end)) =
-                best_definition_range(&sym, &hits, &mut snapshot, &caller_dirs).await?
-            {
-                add_range(&mut range_map, path, start, end);
-            }
+    for (sym, (general, priority)) in candidates {
+        let mut hits = priority;
+        hits.extend(general);
+        if let Some((path, start, end)) =
+            best_definition_range(&sym, &hits, snapshot, caller_dirs).await?
+        {
+            resolved.insert(sym, (path, start, end));
         }
     }
 
-    render_range_map(&range_map, &mut snapshot, &file_ranges).await
+    Ok(resolved)
 }
 
 /// Merge overlapping or adjacent ranges (within `gap` lines).
@@ -304,10 +917,11 @@ fn merge_ranges(ranges: &BTreeSet<(usize, usize)>, gap: usize) -> Vec<(usize, us
 
 /// Render the collected line ranges into the final prefetch context string.
 /// Modified files are rendered first (higher priority when nearing budget).
-async fn render_range_map(
+async fn render_range_map_with_budget(
     range_map: &LineRangeMap,
     snapshot: &mut SourceSnapshot<'_>,
     modified_files: &HashMap<String, Vec<(usize, usize)>>,
+    max_chars: usize,
 ) -> Result<String> {
     let mut output = String::new();
     let mut current_chars = 0;
@@ -322,7 +936,7 @@ async fn render_range_map(
         let Some(ranges) = range_map.get(file_path) else {
             continue;
         };
-        let content = snapshot.read(file_path).await?;
+        let (content, tree) = snapshot.read_with_c_tree(file_path).await?;
         let lines: Vec<&str> = content.lines().collect();
         let relative = file_path.to_string_lossy();
 
@@ -331,7 +945,10 @@ async fn render_range_map(
         for &(start, end) in &merged {
             let clamped_end = std::cmp::min(end, lines.len().saturating_sub(1));
 
-            let names = extract_defined_names(&content, start, clamped_end);
+            let names = tree
+                .as_deref()
+                .map(|t| extract_defined_names_in_tree(t, &content, start, clamped_end))
+                .unwrap_or_default();
             if output.is_empty() {
                 output.push_str(&format!("Source revision: {}\n\n", snapshot.sha));
                 current_chars = output.len();
@@ -349,7 +966,7 @@ async fn render_range_map(
                 String::new()
             };
 
-            if current_chars + header.len() + block.len() + 1 > MAX_PREFETCH_CHARS {
+            if current_chars + header.len() + block.len() + 1 > max_chars {
                 output.push_str("\n... (Context prefetch limits reached)\n");
                 return Ok(output);
             }
@@ -375,17 +992,17 @@ fn overlapping_definitions(
     start_line: usize,
     end_line: usize,
 ) -> Vec<(usize, usize)> {
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_c::LANGUAGE.into())
-        .is_err()
-    {
-        return vec![];
-    }
-    let Some(tree) = parser.parse(source_code, None) else {
+    let Some(tree) = parse_c_tree(source_code) else {
         return vec![];
     };
+    overlapping_definitions_in_tree(&tree, start_line, end_line)
+}
 
+fn overlapping_definitions_in_tree(
+    tree: &tree_sitter::Tree,
+    start_line: usize,
+    end_line: usize,
+) -> Vec<(usize, usize)> {
     let target_kinds = [
         "function_definition",
         "struct_specifier",
@@ -456,8 +1073,8 @@ pub fn extract_enclosing_block(
 // ---------------------------------------------------------------------------
 
 const PREFETCH_GREP_PATHSPECS: &[&str] = &[
-    "*.c", "*.h", "*.cc", "*.cpp", "*.cxx", "*.C", "*.hh", "*.hpp", "*.tcc", "*.inc", "*.def",
-    "*.pd", "*.f90", "*.F90", "*.md",
+    "*.c", "*.h", "*.rs", "*.cc", "*.cpp", "*.cxx", "*.C", "*.hh", "*.hpp", "*.tcc", "*.inc",
+    "*.def", "*.pd", "*.f90", "*.F90", "*.md",
 ];
 
 // These directories contain userspace reimplementations of kernel primitives
@@ -468,8 +1085,8 @@ fn is_prefetchable_source_file(file: &str) -> bool {
         return false;
     }
     const SOURCE_EXTS: &[&str] = &[
-        ".c", ".h", ".cc", ".cpp", ".cxx", ".C", ".hh", ".hpp", ".tcc", ".inc", ".def", ".pd",
-        ".f90", ".F90",
+        ".c", ".h", ".rs", ".cc", ".cpp", ".cxx", ".C", ".hh", ".hpp", ".tcc", ".inc", ".def",
+        ".pd", ".f90", ".F90",
     ];
     if SOURCE_EXTS.iter().any(|ext| file.ends_with(ext)) {
         return true;
@@ -603,14 +1220,15 @@ async fn best_definition_range(
         if tree_sitter_matched.contains(path) {
             continue;
         }
-        let content = snapshot.read(path).await?;
+        let (content, tree) = snapshot.read_with_c_tree(path).await?;
         let rel_path = path.to_string_lossy();
         let Ok(line_usize) = usize::try_from(*line) else {
             continue;
         };
         let line_0 = line_usize.saturating_sub(1);
         let ts_scored = if tree_sitter_checked.insert(path.clone()) {
-            score_best_in_file_for_sym(&content, sym)
+            tree.as_deref()
+                .and_then(|t| score_best_in_tree_for_sym(t, &content, sym))
         } else {
             None
         };
@@ -827,12 +1445,13 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
         .count()
 }
 
-/// Parse `content` and find the highest-scoring definition of `sym`.
+/// Find the highest-scoring definition of `sym` in a parsed C AST.
 /// Returns (score, is_static, start_line, end_line).
-fn score_best_in_file_for_sym(content: &str, sym: &str) -> Option<(i32, bool, usize, usize)> {
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_c::LANGUAGE.into()).ok()?;
-    let tree = parser.parse(content, None)?;
+fn score_best_in_tree_for_sym(
+    tree: &tree_sitter::Tree,
+    content: &str,
+    sym: &str,
+) -> Option<(i32, bool, usize, usize)> {
     let source = content.as_bytes();
 
     let mut best: Option<(i32, Node)> = None;
@@ -976,17 +1595,19 @@ fn find_opaque_types(
 /// Collects the names of all function/struct/enum/union definitions that overlap
 /// the given line range.
 fn extract_defined_names(source_code: &str, start_line: usize, end_line: usize) -> HashSet<String> {
-    let mut names = HashSet::new();
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_c::LANGUAGE.into())
-        .is_err()
-    {
-        return names;
-    }
-    let Some(tree) = parser.parse(source_code, None) else {
-        return names;
+    let Some(tree) = parse_c_tree(source_code) else {
+        return HashSet::new();
     };
+    extract_defined_names_in_tree(&tree, source_code, start_line, end_line)
+}
+
+fn extract_defined_names_in_tree(
+    tree: &tree_sitter::Tree,
+    source_code: &str,
+    start_line: usize,
+    end_line: usize,
+) -> HashSet<String> {
+    let mut names = HashSet::new();
     let source = source_code.as_bytes();
     let root = tree.root_node();
     let mut cursor = root.walk();
@@ -1010,18 +1631,12 @@ fn extract_defined_names(source_code: &str, start_line: usize, end_line: usize) 
 }
 
 /// Extracts function call names from modified lines using tree-sitter.
-fn extract_called_functions(source_code: &str, diff_ranges: &[(usize, usize)]) -> HashSet<String> {
+fn extract_called_functions_in_tree(
+    tree: &tree_sitter::Tree,
+    source_code: &str,
+    diff_ranges: &[(usize, usize)],
+) -> HashSet<String> {
     let mut funcs = HashSet::new();
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_c::LANGUAGE.into())
-        .is_err()
-    {
-        return funcs;
-    }
-    let Some(tree) = parser.parse(source_code, None) else {
-        return funcs;
-    };
     let source = source_code.as_bytes();
 
     fn collect_calls(
@@ -1060,18 +1675,19 @@ pub fn extract_type_names(
     start_line: usize,
     end_line: usize,
 ) -> HashSet<String> {
-    let mut types = HashSet::new();
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_c::LANGUAGE.into())
-        .is_err()
-    {
-        return types;
-    }
-
-    let Some(tree) = parser.parse(source_code, None) else {
-        return types;
+    let Some(tree) = parse_c_tree(source_code) else {
+        return HashSet::new();
     };
+    extract_type_names_in_tree(&tree, source_code, start_line, end_line)
+}
+
+fn extract_type_names_in_tree(
+    tree: &tree_sitter::Tree,
+    source_code: &str,
+    start_line: usize,
+    end_line: usize,
+) -> HashSet<String> {
+    let mut types = HashSet::new();
     let root_node = tree.root_node();
     let start_point = Point::new(start_line, 0);
     let end_point = Point::new(end_line, usize::MAX);
@@ -1258,6 +1874,7 @@ void f(const struct OpaqueHandle *handle, struct PrivOnlyBox *box_ptr) {
             repository: Path::new("."),
             sha: "0".repeat(40),
             blobs,
+            trees: HashMap::new(),
         };
 
         let opaque = find_opaque_types(&types, &file_ranges, &snapshot);
@@ -1266,5 +1883,116 @@ void f(const struct OpaqueHandle *handle, struct PrivOnlyBox *box_ptr) {
         assert!(!opaque.contains("UsedStruct"));
         assert!(!opaque.contains("UsedByValue"));
         assert!(!opaque.contains("ScopedClass"));
+    }
+
+    #[tokio::test]
+    async fn test_chunk_prefetch_chained_local_member_and_rust_external_callers() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let repo = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = crate::git_cmd::in_dir(repo).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+
+        std::fs::create_dir_all(repo.join("include/linux"))?;
+        std::fs::create_dir_all(repo.join("drivers/foo"))?;
+        std::fs::create_dir_all(repo.join("rust/kernel"))?;
+
+        std::fs::write(
+            repo.join("include/linux/ext_sub.h"),
+            "struct ext_sub_state {\n\tint nested_flag;\n};\n",
+        )?;
+        std::fs::write(
+            repo.join("drivers/foo/core.c"),
+            "struct local_ctx {\n\tstruct ext_sub_state sub;\n};\n\nint foo_export_entry(struct local_ctx *ctx)\n{\n\treturn ctx->sub.nested_flag;\n}\n",
+        )?;
+        std::fs::write(
+            repo.join("rust/kernel/foo_wrap.rs"),
+            "pub fn invoke_foo(ptr: *mut core::ffi::c_void) -> i32 {\n    unsafe { foo_export_entry(ptr) }\n}\n",
+        )?;
+
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "initial"]);
+        let sha = run_git(&["rev-parse", "HEAD"]);
+
+        // 1. Chained `ctx->sub.nested_flag` must retain `ext_sub_state` despite no standalone variable.
+        let hdrs = prefetch_external_definitions_for_chunks(
+            repo,
+            &sha,
+            "drivers/foo/core.c",
+            &[(1, 8)],
+            8_000,
+        )
+        .await?;
+        assert_eq!(hdrs.len(), 1);
+        assert!(
+            hdrs[0].contains("struct ext_sub_state") && hdrs[0].contains("nested_flag"),
+            "expected chained local container member struct in prefetched headers, got: {}",
+            hdrs[0]
+        );
+
+        // 2. External caller in `.rs` file must be discovered by `prefetch_external_callers_for_chunks`.
+        let (whole_callers, chunk_callers) = prefetch_external_callers_for_chunks(
+            repo,
+            &sha,
+            "drivers/foo/core.c",
+            &[vec!["foo_export_entry".to_string()]],
+            8_000,
+            4_000,
+        )
+        .await?;
+        assert!(
+            whole_callers.contains("rust/kernel/foo_wrap.rs")
+                && whole_callers.contains("foo_export_entry"),
+            "expected Rust external caller in whole_callers, got: {whole_callers}"
+        );
+        assert!(chunk_callers[0].contains("rust/kernel/foo_wrap.rs"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_source_snapshot_caches_c_tree_and_skips_rust_c_parse() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let repo = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = crate::git_cmd::in_dir(repo).args(args).output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+
+        std::fs::write(repo.join("foo.c"), "int foo(void) { return 1; }\n")?;
+        std::fs::write(
+            repo.join("bar.rs"),
+            "pub fn bar<'a>(s: &'a str) -> &'a str { s }\n",
+        )?;
+        run_git(&["add", "."]);
+        run_git(&["-c", "commit.gpgsign=false", "commit", "-qm", "init"]);
+        let sha = run_git(&["rev-parse", "HEAD"]);
+
+        let mut snapshot = SourceSnapshot::new(repo, &sha).await?;
+        let (_, tree1) = snapshot.read_with_c_tree(Path::new("foo.c")).await?;
+        let (_, tree2) = snapshot.read_with_c_tree(Path::new("foo.c")).await?;
+        let t1 = tree1.expect("C source should parse into a cached tree");
+        let t2 = tree2.expect("second read should return cached tree");
+        assert!(Arc::ptr_eq(&t1, &t2));
+
+        let (_, rs_tree) = snapshot.read_with_c_tree(Path::new("bar.rs")).await?;
+        assert!(
+            rs_tree.is_none(),
+            "Rust files must not be parsed with tree-sitter-c"
+        );
+        Ok(())
     }
 }

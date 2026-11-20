@@ -25,7 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{Duration, sleep};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const LORE_MANIFEST_URL: &str = "https://lore.kernel.org/manifest.js.gz";
 /// The manifest is a few MiB compressed; anything larger is not lore.
@@ -166,9 +166,6 @@ pub struct Ingestor {
     sender: Sender<Event>,
     download: Option<usize>,
     nntp_enabled: bool,
-    /// Follows handed-off articles so the high-water mark can trail behind
-    /// what is actually stored rather than what was merely queued.
-    tracker: IngestTracker,
 }
 
 impl Ingestor {
@@ -185,7 +182,6 @@ impl Ingestor {
             sender,
             download,
             nntp_enabled,
-            tracker: IngestTracker::new(),
         }
     }
 
@@ -194,18 +190,18 @@ impl Ingestor {
     ///
     /// Waiting for the pipeline to go quiet is what makes the mark meaningful:
     /// until then an article is only in memory, and a mark that has already
-    /// passed it means nothing will ever fetch it again.
+    /// passed it means nothing will ever fetch it again. Each group owns its
+    /// own [`IngestTracker`] so concurrent group workers never mix article
+    /// numbers or wait on another group's receipts.
     async fn commit_article_mark(
         &self,
+        tracker: &IngestTracker,
         group: &str,
         committed: u64,
         handed_off_up_to: u64,
     ) -> Result<u64> {
-        self.tracker.wait_until_quiet().await;
-        // Article numbers are per group while the tracker is shared, so the
-        // already committed mark is the floor: everything at or below it is
-        // known stored and a loss recorded elsewhere must not undo that.
-        let safe = self.tracker.take_safe_mark(handed_off_up_to).max(committed);
+        tracker.wait_until_quiet().await;
+        let safe = tracker.take_safe_mark(handed_off_up_to).max(committed);
         if safe < handed_off_up_to {
             warn!(
                 "Group {}: holding the high-water mark at {} instead of {} because articles above it were not stored",
@@ -383,7 +379,7 @@ impl Ingestor {
     }
 
     async fn find_epoch_urls(&self, list_id: &str) -> Result<Vec<(i32, String)>> {
-        info!("Fetching manifest to find epochs for {}", list_id);
+        debug!("Fetching manifest to find epochs for {}", list_id);
 
         // An in-process fetch is dropped together with the task that awaits
         // it, so cancellation cannot leave a shell pipeline running.
@@ -393,7 +389,7 @@ impl Ingestor {
             .context("lore manifest decompression task failed")??;
         let epochs = parse_epoch_urls(list_id, &manifest)?;
 
-        info!("Found {} epochs for {}", epochs.len(), list_id);
+        debug!("Found {} epochs for {}", epochs.len(), list_id);
         Ok(epochs)
     }
 
@@ -460,7 +456,7 @@ impl Ingestor {
                 }
             }
 
-            info!("Fetching latest changes in {:?} with depth {}", path, n);
+            debug!("Fetching latest changes in {:?} with depth {}", path, n);
             let output = bootstrap_fetch_command(path, n).output().await?;
 
             if !output.status.success() {
@@ -485,37 +481,77 @@ impl Ingestor {
         }
     }
 
-    async fn process_nntp_cycle(&self) -> Result<()> {
-        let mut client = NntpClient::connect(
+    async fn ensure_nntp_client(
+        &self,
+        client: &mut Option<NntpClient>,
+        consecutive_failures: &mut usize,
+    ) -> Result<bool> {
+        const MAX_CONSECUTIVE_CONNECT_FAILURES: usize = 3;
+
+        if client.as_ref().is_some_and(NntpClient::is_connected) {
+            return Ok(true);
+        }
+        *client = None;
+
+        match NntpClient::connect(
             &self.settings.nntp.server,
             self.settings.nntp.port,
             self.settings.nntp.tls,
         )
-        .await?;
+        .await
+        {
+            Ok(connected) => {
+                *consecutive_failures = 0;
+                *client = Some(connected);
+                Ok(true)
+            }
+            Err(e) => {
+                *consecutive_failures += 1;
+                if *consecutive_failures >= MAX_CONSECUTIVE_CONNECT_FAILURES {
+                    return Err(anyhow!(
+                        "Aborting NNTP cycle after {} consecutive connection failures: {}",
+                        *consecutive_failures,
+                        e
+                    ));
+                }
+                warn!(
+                    "NNTP reconnect failed (attempt {}/{}): {}",
+                    *consecutive_failures, MAX_CONSECUTIVE_CONNECT_FAILURES, e
+                );
+                Ok(false)
+            }
+        }
+    }
 
-        'groups: for (name, group_name) in self.get_tracked_groups().await? {
+    async fn run_nntp_worker(
+        &self,
+        queue: &tokio::sync::Mutex<std::collections::VecDeque<(String, String)>>,
+    ) -> Result<()> {
+        let mut client: Option<NntpClient> = None;
+        let mut consecutive_connect_failures = 0usize;
+
+        let pop_next = || async { queue.lock().await.pop_front() };
+        'groups: while let Some((name, group_name)) = pop_next().await {
+            if !self
+                .ensure_nntp_client(&mut client, &mut consecutive_connect_failures)
+                .await?
+            {
+                continue;
+            }
+            let active_client = client.as_mut().expect("checked connected above");
             let group_name = &group_name;
 
-            let info = match client.group(group_name).await {
+            let info = match active_client.group(group_name).await {
                 Ok(i) => i,
                 Err(e) => {
                     error!("Failed to select group {}: {}", group_name, e);
-                    if let Ok(new_client) = NntpClient::connect(
-                        &self.settings.nntp.server,
-                        self.settings.nntp.port,
-                        self.settings.nntp.tls,
-                    )
-                    .await
-                    {
-                        client = new_client;
-                    }
                     continue;
                 }
             };
             self.db.ensure_mailing_list(&name, group_name).await?;
             let last_known = self.db.get_last_article_num(group_name).await?;
 
-            info!(
+            debug!(
                 "Group {}: estimated count={}, low={}, high={}, last_known={}",
                 group_name, info.number, info.low, info.high, last_known
             );
@@ -533,7 +569,7 @@ impl Ingestor {
                 };
                 current = info.high.saturating_sub(overlap);
                 self.db.update_last_article_num(group_name, current).await?;
-                info!(
+                debug!(
                     "Initialized high-water mark to {} (overlap window: {})",
                     current, overlap
                 );
@@ -559,14 +595,14 @@ impl Ingestor {
             // wait for the pipeline to drain, and a crash mid-batch only costs
             // a refetch of that batch.
             const MARK_COMMIT_BATCH: u64 = 100;
+            let tracker = IngestTracker::new();
             let mut committed = current;
             let mut handed_off = current;
 
             // Fetch ALL pending messages
             while current < info.high {
                 let next_id = current + 1;
-                // info!("Fetching article {}", next_id);
-                match client.article(&next_id.to_string()).await {
+                match active_client.article(&next_id.to_string()).await {
                     Ok(lines) => {
                         self.sender
                             .send(Event::ArticleFetched {
@@ -575,14 +611,14 @@ impl Ingestor {
                                 content: lines,
                                 raw: None,
                                 baseline: None,
-                                receipt: Some(self.tracker.issue(next_id)),
+                                receipt: Some(tracker.issue(next_id)),
                             })
                             .await?;
                         handed_off = next_id;
                         current = next_id;
                         if handed_off.saturating_sub(committed) >= MARK_COMMIT_BATCH {
                             committed = self
-                                .commit_article_mark(group_name, committed, handed_off)
+                                .commit_article_mark(&tracker, group_name, committed, handed_off)
                                 .await?;
                             if committed < handed_off {
                                 // The tracker consumed this batch's loss record.
@@ -597,7 +633,7 @@ impl Ingestor {
                         // 423 is "No such article number in this group"
                         if msg.contains("423") {
                             if next_id >= info.high {
-                                info!(
+                                debug!(
                                     "Article {} missing (423) at tip for group {}, retrying later",
                                     next_id, group_name
                                 );
@@ -612,28 +648,49 @@ impl Ingestor {
                             }
                         } else {
                             error!("Failed to fetch article {}: {}", next_id, e);
-                            if let Ok(new_client) = NntpClient::connect(
-                                &self.settings.nntp.server,
-                                self.settings.nntp.port,
-                                self.settings.nntp.tls,
-                            )
-                            .await
-                            {
-                                client = new_client;
-                            }
-                            break; // Stop and retry later (transient error or connection lost)
+                            break; // Reconnect lazily on the next group if the socket closed.
                         }
                     }
                 }
             }
 
             if handed_off > committed {
-                self.commit_article_mark(group_name, committed, handed_off)
+                self.commit_article_mark(&tracker, group_name, committed, handed_off)
                     .await?;
             }
         }
 
-        client.quit().await?;
+        if let Some(mut active_client) = client
+            && let Err(e) = active_client.quit().await
+        {
+            debug!("NNTP QUIT at cycle end failed: {}", e);
+        }
+        Ok(())
+    }
+
+    async fn process_nntp_cycle(&self) -> Result<()> {
+        let groups = self.get_tracked_groups().await?;
+        if groups.is_empty() {
+            return Ok(());
+        }
+
+        let worker_count = self.settings.nntp.concurrency.max(1).min(groups.len());
+        let queue = tokio::sync::Mutex::new(std::collections::VecDeque::from(groups));
+        let results =
+            futures_util::future::join_all((0..worker_count).map(|_| self.run_nntp_worker(&queue)))
+                .await;
+
+        let mut first_err: Option<anyhow::Error> = None;
+        for res in results {
+            if let Err(e) = res
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -646,7 +703,7 @@ impl Ingestor {
         info!("Starting Git Ingestion from {:?}", path);
 
         // 1. Start git rev-list (Producer)
-        info!("Starting object enumeration...");
+        debug!("Starting object enumeration...");
         let mut rev_list_cmd = crate::git_cmd::in_dir_async(path);
         rev_list_cmd
             .arg("-c")
@@ -749,7 +806,7 @@ impl Ingestor {
 
                 processed_blobs += 1;
                 if processed_blobs % 1000 == 0 {
-                    info!("Processed {} blobs", processed_blobs);
+                    debug!("Processed {} blobs", processed_blobs);
                 }
             }
 
@@ -792,7 +849,7 @@ pub fn resolve_tracked_group(entry: &str, available_groups: Option<&[String]>) -
                 .iter()
                 .find(|g| g.as_str() == normalized_entry || g.ends_with(&suffix))
             {
-                info!(
+                debug!(
                     "Dynamically resolved short name '{}' to NNTP group '{}'",
                     entry, found
                 );
@@ -1630,5 +1687,232 @@ index bbc440c93e08..1123ef3ccf90 100644
             err.contains("transport 'nohelper' not allowed"),
             "expected git to refuse the helper transport, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_nntp_cycle_recovers_after_failed_reconnect() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Connection 1 (g1): greet, then drop socket on GROUP g1.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.write_all(b"200 ready\r\n").await.unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut cmd = String::new();
+                reader.read_line(&mut cmd).await.unwrap();
+                assert_eq!(cmd.trim(), "GROUP test.g1");
+            }
+
+            // Connection 2 (reconnect for g2): drop immediately before greeting so connect fails.
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                drop(stream);
+            }
+
+            // Connection 3 (reconnect for g3): succeed and serve article 2.
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                stream.get_mut().write_all(b"200 ready\r\n").await.unwrap();
+                loop {
+                    let mut cmd = String::new();
+                    if stream.read_line(&mut cmd).await.unwrap() == 0 {
+                        break;
+                    }
+                    let resp = match cmd.trim() {
+                        "GROUP test.g3" => "211 2 1 2 test.g3\r\n",
+                        "ARTICLE 2" => "220 2 <m2@example.test> article\r\nSubject: ok\r\n.\r\n",
+                        "QUIT" => {
+                            stream.get_mut().write_all(b"205 bye\r\n").await.unwrap();
+                            break;
+                        }
+                        other => panic!("unexpected NNTP command: {other}"),
+                    };
+                    stream.get_mut().write_all(resp.as_bytes()).await.unwrap();
+                }
+            }
+        });
+
+        let mut settings = Settings::new().unwrap();
+        settings.nntp.server = address.ip().to_string();
+        settings.nntp.port = address.port();
+        settings.nntp.concurrency = 1;
+        settings.mailing_lists.track = vec![
+            "g1:test.g1".into(),
+            "g2:test.g2".into(),
+            "g3:test.g3".into(),
+        ];
+        settings.database.url = ":memory:".into();
+
+        let db = Arc::new(Database::new(&settings.database).await.unwrap());
+        db.migrate().await.unwrap();
+        db.ensure_mailing_list("g3", "test.g3").await.unwrap();
+        db.update_last_article_num("test.g3", 1).await.unwrap();
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let consumer = tokio::spawn(async move {
+            let mut fetched = Vec::new();
+            while let Some(Event::ArticleFetched {
+                group,
+                article_id,
+                receipt,
+                ..
+            }) = receiver.recv().await
+            {
+                if let Some(mut r) = receipt {
+                    r.settle();
+                }
+                fetched.push((group, article_id));
+            }
+            fetched
+        });
+
+        let ingestor = Ingestor::new(settings, db.clone(), sender, None, true);
+        ingestor.process_nntp_cycle().await.unwrap();
+        server.await.unwrap();
+        drop(ingestor);
+
+        let fetched = consumer.await.unwrap();
+        assert_eq!(fetched, vec![("test.g3".to_string(), "2".to_string())]);
+        assert_eq!(db.get_last_article_num("test.g3").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_nntp_cycle_aborts_after_consecutive_connect_failures() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_srv = accepts.clone();
+
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accepts_srv.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        let mut settings = Settings::new().unwrap();
+        settings.nntp.server = address.ip().to_string();
+        settings.nntp.port = address.port();
+        settings.nntp.concurrency = 1;
+        settings.mailing_lists.track = (1..=8).map(|i| format!("g{i}:test.g{i}")).collect();
+        settings.database.url = ":memory:".into();
+
+        let db = Arc::new(Database::new(&settings.database).await.unwrap());
+        db.migrate().await.unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+        let ingestor = Ingestor::new(settings, db, sender, None, true);
+
+        let err = ingestor.process_nntp_cycle().await.unwrap_err();
+        server.abort();
+
+        assert!(
+            err.to_string()
+                .contains("Aborting NNTP cycle after 3 consecutive connection failures"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(accepts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_nntp_cycle_polls_groups_concurrently_with_isolated_trackers() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::sync::Barrier;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // Both worker sockets must reach GROUP simultaneously before either proceeds,
+        // proving concurrent polling rather than serial execution.
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_srv = barrier.clone();
+
+        let server = tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let b = barrier_srv.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut stream = BufReader::new(stream);
+                    stream.get_mut().write_all(b"200 ready\r\n").await.unwrap();
+                    loop {
+                        let mut cmd = String::new();
+                        if stream.read_line(&mut cmd).await.unwrap() == 0 {
+                            break;
+                        }
+                        let trimmed = cmd.trim();
+                        if let Some(grp) = trimmed.strip_prefix("GROUP ") {
+                            b.wait().await;
+                            let high = if grp == "test.lossy" { 5 } else { 10 };
+                            let resp = format!("211 {high} 1 {high} {grp}\r\n");
+                            stream.get_mut().write_all(resp.as_bytes()).await.unwrap();
+                        } else if let Some(art) = trimmed.strip_prefix("ARTICLE ") {
+                            let resp = format!(
+                                "220 {art} <m{art}@example.test> article\r\nSubject: {art}\r\n.\r\n"
+                            );
+                            stream.get_mut().write_all(resp.as_bytes()).await.unwrap();
+                        } else if trimmed == "QUIT" {
+                            stream.get_mut().write_all(b"205 bye\r\n").await.unwrap();
+                            break;
+                        }
+                    }
+                }));
+            }
+            for t in tasks {
+                t.await.unwrap();
+            }
+        });
+
+        let mut settings = Settings::new().unwrap();
+        settings.nntp.server = address.ip().to_string();
+        settings.nntp.port = address.port();
+        settings.nntp.concurrency = 2;
+        settings.mailing_lists.track = vec!["lossy:test.lossy".into(), "clean:test.clean".into()];
+        settings.database.url = ":memory:".into();
+
+        let db = Arc::new(Database::new(&settings.database).await.unwrap());
+        db.migrate().await.unwrap();
+        db.ensure_mailing_list("lossy", "test.lossy").await.unwrap();
+        db.update_last_article_num("test.lossy", 2).await.unwrap();
+        db.ensure_mailing_list("clean", "test.clean").await.unwrap();
+        db.update_last_article_num("test.clean", 7).await.unwrap();
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
+        let consumer = tokio::spawn(async move {
+            while let Some(Event::ArticleFetched {
+                group,
+                article_id,
+                receipt: Some(mut receipt),
+                ..
+            }) = receiver.recv().await
+            {
+                // Drop article 4 of test.lossy unsettled; settle everything else.
+                if !(group == "test.lossy" && article_id == "4") {
+                    receipt.settle();
+                }
+            }
+        });
+
+        let ingestor = Ingestor::new(settings, db.clone(), sender, None, true);
+        tokio::time::timeout(Duration::from_secs(5), ingestor.process_nntp_cycle())
+            .await
+            .expect("concurrent NNTP cycle timed out")
+            .unwrap();
+        server.await.unwrap();
+        drop(ingestor);
+        consumer.await.unwrap();
+
+        // test.lossy stops at 3 (below lost article 4), while test.clean advances to 10
+        // unaffected by test.lossy's lower lost article number!
+        assert_eq!(db.get_last_article_num("test.lossy").await.unwrap(), 3);
+        assert_eq!(db.get_last_article_num("test.clean").await.unwrap(), 10);
     }
 }

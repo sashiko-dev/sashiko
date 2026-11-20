@@ -29,17 +29,14 @@ mod tests {
         page.split('\n').count()
     }
 
-    fn get_test_paths() -> (PathBuf, PathBuf) {
-        let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    fn get_test_paths() -> PathBuf {
         // Use current repo as the test repo
-        let linux_path = root.clone();
-        let prompts_path = root.join("projects/linux/prompts");
-        (linux_path, prompts_path)
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
     }
 
     #[test]
     fn test_virtualize_ref() {
-        let mut toolbox = ToolBox::new(PathBuf::from("."), None);
+        let mut toolbox = ToolBox::new(PathBuf::from("."));
 
         // Without virtual HEAD, should return original
         assert_eq!(toolbox.virtualize_ref("HEAD"), "HEAD");
@@ -77,22 +74,24 @@ mod tests {
 
     #[test]
     fn test_git_ls_linux() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({ "revision": "HEAD", "path": "." });
         let result = rt.block_on(toolbox.call("git_ls", args)).unwrap();
-        let entries = result["entries"].as_array().unwrap();
+        let text = result.as_str().unwrap();
+        let entries: Vec<&str> = text.lines().collect();
 
-        assert!(entries.iter().any(|e| e["name"] == "README.md"));
-        assert!(entries.iter().any(|e| e["name"] == "Cargo.toml"));
+        assert!(entries.contains(&"README.md"));
+        assert!(entries.contains(&"Cargo.toml"));
+        assert!(entries.contains(&"src/"));
     }
 
     #[test]
     fn test_read_files_linux_readme() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -102,38 +101,62 @@ mod tests {
             ]
         });
         let result = rt.block_on(toolbox.call("git_read_files", args)).unwrap();
-        let results = result["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1);
+        let content = result.as_str().unwrap();
 
-        let content = results[0]["content"].as_str().unwrap();
-
-        assert!(!content.is_empty());
+        assert!(content.starts_with("=== README.md (lines 1-5 of "));
+        assert!(content.contains("\n1: "));
+        assert!(content.contains("\n5: "));
         assert!(content.contains("Sashiko"));
     }
 
     #[test]
     fn test_git_log() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({ "range": "HEAD", "limit": 1 });
         let result = rt.block_on(toolbox.call("git_log", args)).unwrap();
-        let output = result["output"].as_str().unwrap();
+        let output = result.as_str().unwrap();
 
         assert!(output.contains("commit"));
         assert!(output.contains("Author:"));
     }
 
     #[test]
+    fn test_git_find_files_and_git_diff_plain_text() {
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
+        let rt = Runtime::new().unwrap();
+
+        let find_res = rt
+            .block_on(toolbox.call(
+                "git_find_files",
+                json!({ "revision": "HEAD", "pattern": "*.rs", "path": "src/toolbox" }),
+            ))
+            .unwrap();
+        let find_text = find_res.as_str().unwrap();
+        assert!(find_text.starts_with("Found "));
+        assert!(find_text.contains("src/toolbox/mod.rs"));
+
+        let empty_diff = rt
+            .block_on(toolbox.call(
+                "git_diff",
+                json!({ "base_revision": "HEAD", "target_revision": "HEAD" }),
+            ))
+            .unwrap();
+        assert_eq!(empty_diff.as_str().unwrap(), "No differences found.");
+    }
+
+    #[test]
     fn test_git_show_head() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({ "object": "HEAD" });
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
+        let content = result.as_str().unwrap();
 
         assert!(content.contains("commit"));
         assert!(content.contains("Author:"));
@@ -163,7 +186,7 @@ mod tests {
     #[test]
     fn test_git_show_virtual_head() {
         let (_temp_dir, repo_path) = setup_test_repo();
-        let mut toolbox = ToolBox::new(repo_path.clone(), None);
+        let mut toolbox = ToolBox::new(repo_path.clone());
         let rt = Runtime::new().unwrap();
 
         // Resolve actual HEAD~1 SHA
@@ -179,7 +202,7 @@ mod tests {
         // Call git_show with "HEAD"
         let args = json!({ "object": "HEAD" });
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
+        let content = result.as_str().unwrap();
 
         // The content should match the commit info of HEAD~1 (which is head_minus_1)
         assert!(content.contains(&head_minus_1));
@@ -197,21 +220,23 @@ mod tests {
     }
     #[test]
     fn test_git_show_file_full() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({ "object": "HEAD:README.md" });
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
+        let content = result.as_str().unwrap();
 
+        assert!(content.starts_with("=== HEAD:README.md (lines 1-"));
+        assert!(content.contains("\n1: "));
         assert!(content.contains("Sashiko"));
     }
 
     #[test]
     fn test_git_show_file_range() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -220,20 +245,19 @@ mod tests {
             "end_line": 5
         });
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
-        let end_line = result["end_line"].as_u64().unwrap();
-        let start_line = result["start_line"].as_u64().unwrap();
+        let content = result.as_str().unwrap();
+        let (header, body) = content.split_once('\n').unwrap();
 
-        assert_eq!(start_line, 1);
-        assert_eq!(end_line, 5);
-        let lines_count = page_line_count(content);
+        assert!(header.starts_with("=== HEAD:README.md (lines 1-5 of "));
+        let lines_count = page_line_count(body);
         assert_eq!(lines_count, 5);
+        assert!(body.starts_with("1: "));
     }
 
     #[test]
     fn test_git_show_file_default_limit() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -241,20 +265,19 @@ mod tests {
             "start_line": 10
         });
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
-        let end_line = result["end_line"].as_u64().unwrap();
-        let start_line = result["start_line"].as_u64().unwrap();
+        let content = result.as_str().unwrap();
+        let (header, body) = content.split_once('\n').unwrap();
 
-        assert_eq!(start_line, 10);
-        assert_eq!(end_line, 110);
-        let lines_count = page_line_count(content);
+        assert!(header.starts_with("=== HEAD:README.md (lines 10-110 of "));
+        let lines_count = page_line_count(body);
         assert_eq!(lines_count, 101); // 10 to 110 inclusive is 101 lines
+        assert!(body.starts_with("10: "));
     }
 
     #[test]
     fn test_git_show_raw_caching() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         // Clear/initialize cache check
@@ -267,8 +290,12 @@ mod tests {
             "end_line": 5
         });
         let result1 = rt.block_on(toolbox.call("git_show", args1)).unwrap();
-        assert_eq!(result1["start_line"].as_u64().unwrap(), 1);
-        assert_eq!(result1["end_line"].as_u64().unwrap(), 5);
+        assert!(
+            result1
+                .as_str()
+                .unwrap()
+                .starts_with("=== HEAD:README.md (lines 1-5 of ")
+        );
 
         // Verify raw cache was populated
         let raw_key = "git_show_raw:HEAD:README.md:false:None";
@@ -292,8 +319,12 @@ mod tests {
             "end_line": 15
         });
         let result2 = rt.block_on(toolbox.call("git_show", args2)).unwrap();
-        assert_eq!(result2["start_line"].as_u64().unwrap(), 10);
-        assert_eq!(result2["end_line"].as_u64().unwrap(), 15);
+        assert!(
+            result2
+                .as_str()
+                .unwrap()
+                .starts_with("=== HEAD:README.md (lines 10-15 of ")
+        );
 
         // Verify that no extra git_show raw keys were created
         {
@@ -308,24 +339,23 @@ mod tests {
 
     #[test]
     fn test_git_blame_readme() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args =
             json!({ "revision": "HEAD", "path": "README.md", "start_line": 1, "end_line": 3 });
         let result = rt.block_on(toolbox.call("git_blame", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
+        let content = result.as_str().unwrap();
 
-        assert!(!content.is_empty());
-        // Typical git blame output starts with hash or (
-        // e.g. ^1da177e4c3f (Linus Torvalds 2005-04-16 15:20:36 -0700 1) Linux kernel release 2.6.xx
+        assert!(content.starts_with("=== README.md blame (lines 1-3 of 3) ==="));
+        assert_eq!(content.lines().count(), 4);
     }
 
     #[test]
     fn test_git_blame_truncation() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -335,38 +365,35 @@ mod tests {
             "end_line": 3000
         });
         let result = rt.block_on(toolbox.call("git_blame", args)).unwrap();
-        assert_eq!(result["truncated"].as_bool(), Some(true));
+        let text = result.as_str().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
 
-        let content = result["content"].as_str().unwrap();
-        let returned_items = result["metadata"]["returned_items"].as_u64().unwrap() as usize;
-        let actual_lines = content.lines().count();
+        let header = lines[0];
+        let footer = *lines.last().unwrap();
+        assert!(header.starts_with("=== src/worker/prompts.rs blame (lines 1-"));
+        assert!(footer.starts_with("[Truncated: "));
 
-        println!("git_blame returned_items metadata: {}", returned_items);
-        println!("git_blame actual returned content lines: {}", actual_lines);
+        // Parse end_idx from "=== src/worker/prompts.rs blame (lines 1-<end_idx> of ..."
+        let after_prefix = header
+            .strip_prefix("=== src/worker/prompts.rs blame (lines 1-")
+            .unwrap();
+        let end_idx: usize = after_prefix
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
 
-        assert!(actual_lines < 2400, "Blame was not truncated!");
-        // returned_items should match the actual lines returned excluding the warning line.
-        assert_eq!(
-            returned_items + 1,
-            actual_lines,
-            "returned_items metadata does not match actual lines returned (accounting for warning line)!"
-        );
-
-        // Verify end_index calculation is start_index + returned_items - 1
-        let start_index = result["metadata"]["start_index"].as_u64().unwrap();
-        let end_index = result["metadata"]["end_index"].as_u64().unwrap();
-        assert_eq!(end_index, start_index + returned_items as u64 - 1);
-
-        // Verify next_page_hint suggests end_index + 1
-        let hint = result["next_page_hint"].as_str().unwrap();
-        let expected_next_start = end_index + 1;
-        assert!(hint.contains(&format!("start_line={}", expected_next_start)));
+        // Total lines = 1 header + end_idx blame lines + 1 Truncator warning + 1 continuation footer.
+        assert!(lines.len() < 2400, "Blame was not truncated!");
+        assert_eq!(lines.len(), end_idx + 3);
+        assert!(footer.contains(&format!("start_line={}", end_idx + 1)));
     }
 
     #[test]
     fn test_git_grep_relative_path() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         // Search for "Sashiko" which should be in README.md
@@ -377,27 +404,24 @@ mod tests {
         });
 
         let result = rt.block_on(toolbox.call("git_grep", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
+        let content = result.as_str().unwrap();
 
         assert!(!content.is_empty());
-        // Verify path is relative (does not start with /)
-        // Check that no line starts with /
         for line in content.lines() {
             assert!(
-                !line.starts_with("/"),
+                !line.starts_with('/'),
                 "Line starts with absolute path: {}",
                 line
             );
         }
 
-        // Check if README.md matches are found (it might not be the first match)
         assert!(content.contains("README.md") || content.contains("./README.md"));
     }
 
     #[test]
     fn test_git_grep_hyphen_pattern() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         // Search for a pattern starting with a hyphen (e.g. "-ETIMEDOUT" or "--")
@@ -408,18 +432,83 @@ mod tests {
         });
 
         let result = rt.block_on(toolbox.call("git_grep", args)).unwrap();
-        // Should succeed without error even if no matches found
-        assert!(
-            result.get("content").is_some()
-                || result.get("matches").is_some()
-                || result.get("message").is_some()
-        );
+        let text = result.as_str().unwrap();
+        assert!(!text.starts_with("Error:"), "unexpected grep error: {text}");
+    }
+
+    #[test]
+    fn test_git_grep_function_context() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path().to_path_buf();
+
+        let run_git = |args: &[&str]| {
+            let status = crate::git_cmd::in_dir(&repo_path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test User"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(
+            repo_path.join("sample.c"),
+            "int helper(void)\n{\n    return 1;\n}\n\nint target_caller(int arg)\n{\n    int x = arg + 1;\n    if (x > 10)\n        return special_sink(x);\n    return 0;\n}\n",
+        )
+        .unwrap();
+        run_git(&["add", "sample.c"]);
+        run_git(&["commit", "-m", "Add sample.c"]);
+
+        let toolbox = ToolBox::new(repo_path);
+        let rt = Runtime::new().unwrap();
+
+        let res = rt
+            .block_on(toolbox.call(
+                "git_grep",
+                json!({
+                    "revision": "HEAD",
+                    "pattern": "special_sink",
+                    "function_context": true
+                }),
+            ))
+            .unwrap();
+        let text = res.as_str().unwrap();
+        assert!(text.contains("[file: sample.c]"));
+        assert!(text.contains("6=int target_caller(int arg)"));
+        assert!(text.contains("10:        return special_sink(x);"));
+        assert!(!text.contains("int helper(void)"));
+
+        // Verify normalize_args cache-key parity for default function_context=false
+        let before = toolbox.cache.read().unwrap().len();
+        let _ = rt
+            .block_on(toolbox.call(
+                "git_grep",
+                json!({ "revision": "HEAD", "pattern": "special_sink" }),
+            ))
+            .unwrap();
+        let after_one = toolbox.cache.read().unwrap().len();
+        assert_eq!(after_one, before + 1);
+        let _ = rt
+            .block_on(toolbox.call(
+                "git_grep",
+                json!({
+                    "revision": "HEAD",
+                    "pattern": "special_sink",
+                    "context_lines": 0,
+                    "function_context": false,
+                    "count_only": false,
+                    "is_literal": false
+                }),
+            ))
+            .unwrap();
+        assert_eq!(toolbox.cache.read().unwrap().len(), after_one);
     }
 
     #[test]
     fn test_git_grep_invalid_revision() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -432,71 +521,9 @@ mod tests {
     }
 
     #[test]
-    fn test_read_prompt() {
-        let (linux_path, prompts_path) = get_test_paths();
-        // Enable prompt tool by passing path
-        let toolbox = ToolBox::new(linux_path.clone(), Some(prompts_path.clone()));
-        let rt = Runtime::new().unwrap();
-
-        // Ensure we have a dummy prompt file to read
-        // The real review-prompts might not be populated in test env, check first
-        // Or assume severity.md exists as per repo structure.
-        // But tests might run in clean env. Let's create a dummy one if we can or check existence.
-        // Since we are running in the actual repo, review-prompts should exist.
-
-        let args = json!({ "name": "severity.md" });
-        if prompts_path.join("severity.md").exists() {
-            let result = rt
-                .block_on(toolbox.call("read_prompt", args.clone()))
-                .expect("Failed to call read_prompt");
-            assert!(result.get("content").is_some());
-        } else {
-            // If file doesn't exist (e.g. CI), skip assertion on content but check tool availability
-            println!("Skipping read_prompt content check: severity.md not found");
-        }
-
-        // Test disabled tool
-        let toolbox_disabled = ToolBox::new(linux_path, None);
-        let result = rt.block_on(toolbox_disabled.call("read_prompt", args));
-        assert!(result.is_err());
-    }
-
-    /// read_prompt resolves the requested name against its base, so the base
-    /// has to be the prompt directory. Handed a file, every call fails while
-    /// canonicalizing, which is how a caller passing `<prompts>/tool.md` went
-    /// unnoticed: the tool is optional, so its errors look like the model
-    /// simply choosing not to use it.
-    #[test]
-    fn test_read_prompt_base_is_the_prompt_directory() {
-        let (linux_path, prompts_path) = get_test_paths();
-        let rt = Runtime::new().unwrap();
-        // A guide the workflow already loads by name, so it cannot go missing
-        // without breaking the review itself. The nested path also covers the
-        // subdirectory case, which is most of what the tool is asked for.
-        let args = json!({ "name": "locking.md" });
-
-        let toolbox = ToolBox::new(linux_path.clone(), Some(prompts_path.clone()));
-        let result = rt
-            .block_on(toolbox.call("read_prompt", args.clone()))
-            .expect("a name under the prompt directory must resolve");
-        assert!(!result["content"].as_str().unwrap_or_default().is_empty());
-
-        for alt in ["review-prompts/kernel/locking.md", "./locking.md"] {
-            let alt_res = rt
-                .block_on(toolbox.call("read_prompt", json!({ "name": alt })))
-                .unwrap_or_else(|e| panic!("expected {alt} to resolve: {e}"));
-            assert_eq!(alt_res["content"], result["content"]);
-        }
-
-        // A file as the base cannot resolve anything.
-        let wrong = ToolBox::new(linux_path, Some(prompts_path.join("tool.md")));
-        assert!(rt.block_on(wrong.call("read_prompt", args)).is_err());
-    }
-
-    #[test]
     fn test_git_read_files_truncation() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -507,31 +534,34 @@ mod tests {
         });
 
         let result = rt.block_on(toolbox.call("git_read_files", args)).unwrap();
-        let results = result["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1);
+        let text = result.as_str().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
 
-        let res = &results[0];
-        assert_eq!(res["truncated"].as_bool(), Some(true));
+        let header = lines[0];
+        let footer = *lines.last().unwrap();
+        assert!(header.starts_with("=== Cargo.lock (lines 1-"));
+        assert!(footer.starts_with("[Truncated: lines 1-"));
 
-        let content = res["content"].as_str().unwrap();
-        let returned_items = res["metadata"]["returned_items"].as_u64().unwrap() as usize;
-        let actual_lines = content.lines().count();
+        let after_prefix = header.strip_prefix("=== Cargo.lock (lines 1-").unwrap();
+        let end_idx: usize = after_prefix
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
 
-        println!("returned_items metadata: {}", returned_items);
-        println!("actual returned content lines: {}", actual_lines);
-
-        assert!(actual_lines < 3200, "Content was not truncated!");
-        assert_eq!(
-            returned_items + 1,
-            actual_lines,
-            "returned_items metadata does not match actual lines returned (accounting for warning line)!"
-        );
+        // 1 header + end_idx numbered lines + 1 Truncator warning + 1 continuation footer.
+        assert!(lines.len() < 3200, "Content was not truncated!");
+        assert_eq!(lines.len(), end_idx + 3);
+        assert!(lines[1].starts_with("1: "));
+        assert!(lines[end_idx].starts_with(&format!("{end_idx}: ")));
+        assert!(footer.contains(&format!("start_line={}", end_idx + 1)));
     }
 
     #[test]
     fn test_git_show_truncation() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -541,21 +571,27 @@ mod tests {
         });
 
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
-        assert_eq!(result["truncated"].as_bool(), Some(true));
+        let text = result.as_str().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
 
-        let content = result["content"].as_str().unwrap();
-        let returned_items = result["metadata"]["returned_items"].as_u64().unwrap() as usize;
-        let actual_lines = content.lines().count();
+        let header = lines[0];
+        let footer = *lines.last().unwrap();
+        assert!(header.starts_with("=== HEAD:Cargo.lock (lines 1-"));
+        assert!(footer.starts_with("[Truncated: lines 1-"));
 
-        println!("git_show returned_items metadata: {}", returned_items);
-        println!("git_show actual returned content lines: {}", actual_lines);
+        let after_prefix = header
+            .strip_prefix("=== HEAD:Cargo.lock (lines 1-")
+            .unwrap();
+        let end_idx: usize = after_prefix
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
 
-        assert!(actual_lines < 3200, "Content was not truncated!");
-        assert_eq!(
-            returned_items + 1,
-            actual_lines,
-            "git_show returned_items metadata does not match actual lines returned (accounting for warning line)!"
-        );
+        assert!(lines.len() < 3200, "Content was not truncated!");
+        assert_eq!(lines.len(), end_idx + 3);
+        assert!(footer.contains(&format!("start_line={}", end_idx + 1)));
     }
 
     #[test]
@@ -581,7 +617,7 @@ mod tests {
         run_git(&["add", "empty.txt"]);
         run_git(&["commit", "-m", "Add empty file"]);
 
-        let toolbox = ToolBox::new(repo_path, None);
+        let toolbox = ToolBox::new(repo_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -591,19 +627,16 @@ mod tests {
             ]
         });
         let result = rt.block_on(toolbox.call("git_read_files", args)).unwrap();
-        let results = result["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1);
-
-        let res = &results[0];
-        assert!(res.get("error").is_none(), "unexpected error: {res:?}");
-        assert_eq!(res["content"].as_str().unwrap(), "");
-        assert_eq!(res["total_lines"].as_u64().unwrap(), 0);
+        assert_eq!(
+            result.as_str().unwrap(),
+            "=== empty.txt (empty, 0 lines) ==="
+        );
     }
 
     #[test]
     fn test_git_read_files_with_float_line_ranges() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         let args = json!({
@@ -618,16 +651,16 @@ mod tests {
         });
 
         let result = rt.block_on(toolbox.call("git_read_files", args)).unwrap();
-        let results = result["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["start_line"].as_u64().unwrap(), 3);
-        assert_eq!(results[0]["end_line"].as_u64().unwrap(), 6);
+        let text = result.as_str().unwrap();
+        assert!(text.starts_with("=== README.md (lines 3-6 of "));
+        assert!(text.contains("\n3: "));
+        assert!(text.contains("\n6: "));
     }
 
     #[test]
     fn test_git_tools_reject_invalid_paths() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
+        let linux_path = get_test_paths();
+        let toolbox = ToolBox::new(linux_path);
         let rt = Runtime::new().unwrap();
 
         for bad_path in ["../outside", "/etc/passwd"] {
@@ -685,10 +718,10 @@ mod tests {
                     }),
                 ))
                 .unwrap();
-            let file_res = &res["results"][0];
+            let file_text = res.as_str().unwrap();
             assert!(
-                file_res["error"].is_string() && file_res.get("content").is_none(),
-                "git_read_files should report error for {bad_path}: {file_res:?}"
+                file_text.contains(": ERROR:"),
+                "git_read_files should report error for {bad_path}: {file_text}"
             );
 
             // 7a. git_show with object rev:path
@@ -702,6 +735,21 @@ mod tests {
                 toolbox.call("git_show", json!({ "object": "HEAD", "paths": [bad_path] })),
             );
             assert!(res.is_err(), "git_show paths should reject {bad_path}");
+
+            // 8a. git_log with paths filter
+            let res = rt
+                .block_on(toolbox.call("git_log", json!({ "range": "HEAD", "paths": [bad_path] })));
+            assert!(res.is_err(), "git_log paths should reject {bad_path}");
+
+            // 8b. git_log with line_range path
+            let res = rt.block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "line_range": { "path": bad_path, "start_line": 1, "end_line": 5 }
+                }),
+            ));
+            assert!(res.is_err(), "git_log line_range should reject {bad_path}");
         }
     }
 
@@ -739,7 +787,7 @@ mod tests {
 
         assert!(!repo_path.join("deleted_dir").exists());
 
-        let toolbox = ToolBox::new(repo_path, None);
+        let toolbox = ToolBox::new(repo_path);
         let rt = Runtime::new().unwrap();
 
         // git_read_files on historical deleted path in HEAD~1
@@ -752,12 +800,7 @@ mod tests {
                 }),
             ))
             .unwrap();
-        assert!(
-            read_res["results"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("old_func")
-        );
+        assert!(read_res.as_str().unwrap().contains("1: int old_func"));
 
         // git_show on historical deleted path in HEAD~1
         let show_res = rt
@@ -766,7 +809,182 @@ mod tests {
                 json!({ "object": "HEAD~1:deleted_dir/sub/file.c" }),
             ))
             .unwrap();
-        assert!(show_res["content"].as_str().unwrap().contains("old_func"));
+        assert!(show_res.as_str().unwrap().contains("1: int old_func"));
+
+        // git_log on historical deleted path finds both addition and deletion commits
+        let log_res = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "paths": ["deleted_dir/sub/file.c"],
+                    "oneline": true
+                }),
+            ))
+            .unwrap();
+        let log_text = log_res.as_str().unwrap();
+        assert!(log_text.contains("Add nested file"));
+        assert!(log_text.contains("Remove nested dir"));
+    }
+
+    #[test]
+    fn test_git_log_paths_line_range_and_pickaxe() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path().to_path_buf();
+
+        let run_git = |args: &[&str]| {
+            let status = crate::git_cmd::in_dir(&repo_path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test User"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+
+        std::fs::write(
+            repo_path.join("alpha.c"),
+            "int compute_val(int x)\n{\n    return x + 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(repo_path.join("beta.c"), "int beta(void) { return 0; }\n").unwrap();
+        run_git(&["add", "alpha.c", "beta.c"]);
+        run_git(&["commit", "-m", "Add alpha and beta"]);
+
+        std::fs::write(
+            repo_path.join("alpha.c"),
+            "int compute_val(int x)\n{\n    if (x < 0)\n        return -EINVAL;\n    return x + 2;\n}\n",
+        )
+        .unwrap();
+        run_git(&["add", "alpha.c"]);
+        run_git(&["commit", "-m", "Handle negative input in compute_val"]);
+
+        std::fs::write(repo_path.join("beta.c"), "int beta(void) { return 99; }\n").unwrap();
+        run_git(&["add", "beta.c"]);
+        run_git(&["commit", "-m", "Update beta return value"]);
+
+        let toolbox = ToolBox::new(repo_path);
+        let rt = Runtime::new().unwrap();
+
+        // 1. Path filtering isolates alpha.c commits from beta-only commits
+        let by_path = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({ "range": "HEAD", "paths": ["alpha.c"], "oneline": true }),
+            ))
+            .unwrap();
+        let by_path_text = by_path.as_str().unwrap();
+        assert!(by_path_text.contains("Handle negative input in compute_val"));
+        assert!(!by_path_text.contains("Update beta return value"));
+
+        // 2. Pickaxe (-S) with a leading hyphen ("-EINVAL") must not be parsed as a git flag
+        let pickaxe_s = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({ "range": "HEAD", "pickaxe": "-EINVAL", "oneline": true }),
+            ))
+            .unwrap();
+        let pickaxe_s_text = pickaxe_s.as_str().unwrap();
+        assert!(pickaxe_s_text.contains("Handle negative input in compute_val"));
+        assert!(!pickaxe_s_text.contains("Add alpha and beta"));
+
+        // 3. Regex pickaxe (-G)
+        let pickaxe_g = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "pickaxe": "return [0-9]{2};",
+                    "pickaxe_regex": true,
+                    "oneline": true
+                }),
+            ))
+            .unwrap();
+        assert!(
+            pickaxe_g
+                .as_str()
+                .unwrap()
+                .contains("Update beta return value")
+        );
+
+        // 4. Line evolution (-L start,end:path) and redundant matching paths tolerance
+        let line_hist = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "paths": ["alpha.c"],
+                    "line_range": { "path": "alpha.c", "start_line": 1, "end_line": 6 }
+                }),
+            ))
+            .unwrap();
+        let line_hist_text = line_hist.as_str().unwrap();
+        assert!(line_hist_text.contains("Handle negative input in compute_val"));
+        assert!(line_hist_text.contains("-    return x + 1;"));
+
+        // 5. Symbol evolution (-L :symbol:path) on C top-level function
+        let sym_hist = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "line_range": { "path": "alpha.c", "symbol": "compute_val" }
+                }),
+            ))
+            .unwrap();
+        assert!(
+            sym_hist
+                .as_str()
+                .unwrap()
+                .contains("Handle negative input in compute_val")
+        );
+
+        // 6. Conflicting paths alongside line_range and unsafe symbol injection are rejected
+        assert!(
+            rt.block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "paths": ["beta.c"],
+                    "line_range": { "path": "alpha.c", "start_line": 1, "end_line": 2 }
+                }),
+            ))
+            .is_err()
+        );
+        assert!(
+            rt.block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "line_range": { "path": "alpha.c", "symbol": "bad:inject" }
+                }),
+            ))
+            .is_err()
+        );
+
+        // 7. normalize_args canonicalizes omitted vs explicit default parameters to one cache key
+        let count_before = toolbox.cache.read().unwrap().len();
+        let _ = rt
+            .block_on(toolbox.call("git_log", json!({ "range": "HEAD" })))
+            .unwrap();
+        let count_after_first = toolbox.cache.read().unwrap().len();
+        assert_eq!(count_after_first, count_before + 1);
+        let _ = rt
+            .block_on(toolbox.call(
+                "git_log",
+                json!({
+                    "range": "HEAD",
+                    "limit": 10,
+                    "paths": [],
+                    "pickaxe": "",
+                    "pickaxe_regex": false,
+                    "oneline": false
+                }),
+            ))
+            .unwrap();
+        assert_eq!(toolbox.cache.read().unwrap().len(), count_after_first);
     }
 
     #[test]
@@ -775,17 +993,17 @@ mod tests {
         // the response cache key and of the prompt prefix a provider can
         // cache. They must not depend on the registry's hash map order,
         // which is random for every new registry.
-        let (repo, prompts) = get_test_paths();
+        let repo = get_test_paths();
         let names = |tb: &ToolBox| -> Vec<String> {
             tb.get_declarations_generic()
                 .into_iter()
                 .map(|t| t.name)
                 .collect()
         };
-        let first = names(&ToolBox::new(repo.clone(), Some(prompts.clone())));
+        let first = names(&ToolBox::new(repo.clone()));
         let mut sorted = first.clone();
         sorted.sort();
         assert_eq!(first, sorted, "declarations are not in name order");
-        assert_eq!(first, names(&ToolBox::new(repo, Some(prompts))));
+        assert_eq!(first, names(&ToolBox::new(repo)));
     }
 }

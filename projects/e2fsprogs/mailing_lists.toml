@@ -1,0 +1,136 @@
+# Mailing list policy for --project e2fsprogs. Every key is described in
+# docs/configuration.md.
+#
+# Defaults stay silent so GitHub pull requests on tytso/e2fsprogs (which have
+# empty To:/Cc: headers and post via forge_outbox) do not also enqueue emails.
+
+[defaults]
+track = true
+reply_to = []
+positive_review = "none"
+mute_all = false
+cc = []
+embargo_hours = 0
+ignored_emails = []
+
+[defaults.related_preexisting]
+enabled = false
+
+["linux-ext4@vger.kernel.org"]
+reply_to = ["author", "list"]
+positive_review = "all"
+cc = ["tytso@mit.edu"]
+
+# linux-ext4@vger.kernel.org is shared across the Linux kernel (fs/ext4,
+# fs/jbd2), xfstests/fstests, and e2fsprogs. Filter NNTP articles to e2fsprogs
+# submissions so kernel and xfstests series do not enter the e2fsprogs queue.
+["linux-ext4@vger.kernel.org".ingest_filter]
+allowed_subject_prefixes = ["e2fsprogs"]
+ignored_subject_prefixes = [
+    "fstests",
+    "xfstests",
+    "kernel",
+    "linux",
+    "syzbot",
+    "vfs",
+    "mm",
+    "block",
+]
+allowed_paths = [
+    "lib/ext2fs/",
+    "lib/e2p/",
+    "lib/et/",
+    "lib/ss/",
+    "lib/support/",
+    "lib/blkid/",
+    "lib/uuid/",
+    "lib/Makefile*",
+    "lib/Android.bp",
+    "lib/config.h.in",
+    "lib/dirpaths.h.in",
+    "lib/fpopen.c",
+    "e2fsck/",
+    "misc/",
+    "debugfs/",
+    "resize/",
+    "scrub/",
+    "fuse4fs/",
+    "fuse2fs/",
+    "ext2ed/",
+    "po/",
+    "doc/",
+    "util/",
+    "intl/",
+    "config/",
+    "contrib/",
+    "debian/",
+    "install-utils/",
+    "include/mingw/",
+    "include/nonunix/",
+    "tests/",
+    "ABOUT-NLS",
+    "Android.bp",
+    "CleanSpec.mk",
+    "INSTALL",
+    "INSTALL.elfbin",
+    "MCONFIG.in",
+    "Makefile.in",
+    "NOTICE",
+    "README",
+    "RELEASE-NOTES",
+    "SHLIBS",
+    "SUBMITTING-PATCHES",
+    "acinclude.m4",
+    "aclocal.m4",
+    "configure",
+    "configure.ac",
+    "depfix.sed",
+    "e2fsprogs.lsm",
+    "e2fsprogs.spec",
+    "version.h",
+    "wordwrap.pl",
+    ".github/",
+]
+ignored_paths = [
+    "fs/",
+    "include/linux/",
+    "include/trace/",
+    "include/uapi/",
+    "include/asm-generic/",
+    "include/crypto/",
+    "Documentation/",
+    "arch/",
+    "block/",
+    "drivers/",
+    "init/",
+    "io_uring/",
+    "ipc/",
+    "kernel/",
+    "mm/",
+    "net/",
+    "rust/",
+    "scripts/",
+    "security/",
+    "sound/",
+    "tools/",
+    "virt/",
+    "MAINTAINERS",
+    "Kbuild",
+    "Kconfig",
+    "tests/ext4/",
+    "tests/generic/",
+    "tests/shared/",
+    "tests/xfs/",
+    "tests/btrfs/",
+    "tests/f2fs/",
+    "tests/overlay/",
+    "tests/ceph/",
+    "tests/cifs/",
+    "tests/nfs/",
+    "tests/ocfs2/",
+    "tests/udf/",
+    "tests/Makefile",
+    "common/",
+    "ltp/",
+    "src/",
+]

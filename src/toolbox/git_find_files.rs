@@ -107,24 +107,20 @@ impl LlmTool<SashikoToolContext> for GitFindFilesTool {
             return Err(anyhow!("git ls-tree failed: {}", stderr));
         }
 
-        let returned_items = matched_files.len();
-        let truncated_files = matched_files.join("\n");
+        if total_found == 0 {
+            return Ok(Value::String("No matching files found.".to_string()));
+        }
 
-        Ok(json!({
-            "content": truncated_files,
-            "truncated": is_truncated,
-            "metadata": {
-                "total_items": total_found,
-                "returned_items": returned_items
-            },
-            "next_page_hint": if is_truncated {
-                Some("More than 1000 files matched. Please use a narrower path or pattern prefix to restrict search.".to_string())
-            } else {
-                None
-            },
-            "files": truncated_files,
-            "total_found": total_found,
-            "message": if is_truncated { Some("Output truncated to 1000 files.") } else { None }
-        }))
+        let body = matched_files.join("\n");
+        let out = if is_truncated {
+            format!(
+                "Found {total_found} matching files (showing first 1000):\n{body}\n[Truncated: more than 1000 files matched. Use a narrower path or pattern.]"
+            )
+        } else {
+            let noun = if total_found == 1 { "file" } else { "files" };
+            format!("Found {total_found} matching {noun}:\n{body}")
+        };
+
+        Ok(Value::String(out))
     }
 }

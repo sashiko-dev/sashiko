@@ -111,18 +111,121 @@ pub async fn backfill_patchset_maintainer_sections(db: &Database) -> Result<()> 
 
 /// The union of the sections every part of this patchset touches.
 async fn sections_for_patchset(db: &Database, id: i64) -> Result<Vec<AttributedSubsystem>> {
-    let mut names: Vec<String> = Vec::new();
+    let mut sections: Vec<AttributedSubsystem> = Vec::new();
     for diff in db.patch_diffs_only(id).await? {
-        for name in crate::maintainers::sections_for_diff(&diff) {
-            if !names.contains(&name) {
-                names.push(name);
+        for section in crate::maintainers::sections_for_diff(&diff) {
+            if !sections.contains(&section) {
+                sections.push(section);
             }
         }
     }
-    Ok(names
-        .into_iter()
-        .map(AttributedSubsystem::from_maintainers)
-        .collect())
+    Ok(sections)
+}
+
+/// Records which upstream grants the stored grant rows were derived from.
+const UPSTREAM_GRANTS_FINGERPRINT_KEY: &str = "upstream_grants_fingerprint";
+
+/// Re-derives every stored `bugs_access.toml` path-rule row when the active
+/// path rules change.
+///
+/// Grant rows are written as bugs and patchsets are attributed, so on their
+/// own they only reflect the rules in force at that moment. This brings the
+/// archive in line with the rules loaded now: a new path rule reaches existing
+/// bugs and patchsets, and a removed one stops conferring access. It runs
+/// only when the fingerprint of the loaded path rules differs from the one
+/// recorded after the last complete walk, and records the new one only once
+/// the walk has finished, so an interrupted walk is redone on the next boot.
+///
+/// It does nothing when `is_ready_for_reconcile()` is false (for instance when
+/// the Linux repository could not be read at startup), preserving stored grant
+/// rows until a boot with the repository available.
+pub async fn reconcile_upstream_grant_sections(db: &Database) -> Result<()> {
+    let Some(index) =
+        crate::maintainers::get_global_maintainers().filter(|i| i.is_ready_for_reconcile())
+    else {
+        warn!(
+            "Skipping bugs_access grant reconciliation: base index is not loaded. \
+             Stored grant rows are left as they are."
+        );
+        return Ok(());
+    };
+    let fingerprint = index.bugs_access_fingerprint();
+    if db
+        .get_meta(UPSTREAM_GRANTS_FINGERPRINT_KEY)
+        .await?
+        .as_deref()
+        == Some(&fingerprint)
+    {
+        return Ok(());
+    }
+
+    if index.has_bugs_access_path_rules() {
+        let (bugs, bugs_skipped) = reconcile_bugs(db, &index).await?;
+        let patchsets = reconcile_patchsets(db, &index).await?;
+        info!(
+            "Re-derived bugs_access sections for {bugs} bugs ({bugs_skipped} without \
+             recorded files get none) and {patchsets} patchsets."
+        );
+    } else {
+        db.clear_upstream_sections().await?;
+        info!("No bugs_access path rules are configured; cleared all grant sections.");
+    }
+    db.set_meta(UPSTREAM_GRANTS_FINGERPRINT_KEY, &fingerprint)
+        .await?;
+    Ok(())
+}
+
+/// Returns how many bugs were walked and how many had no recorded files.
+async fn reconcile_bugs(
+    db: &Database,
+    index: &crate::maintainers::MaintainersIndex,
+) -> Result<(usize, usize)> {
+    let (mut after_id, mut walked, mut skipped) = (0i64, 0usize, 0usize);
+    loop {
+        let ids = db.bug_ids_after(after_id, PAGE).await?;
+        let Some(&last) = ids.last() else {
+            return Ok((walked, skipped));
+        };
+        after_id = last;
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(bug) = db.get_bug(id).await? else {
+                continue;
+            };
+            walked += 1;
+            let files = bug.attributable_files().unwrap_or_default();
+            if files.is_empty() {
+                skipped += 1;
+            }
+            rows.push((id, index.bugs_access_sections(&files)));
+        }
+        db.replace_bug_upstream_sections_batch(&rows).await?;
+    }
+}
+
+/// Returns how many patchsets were walked.
+async fn reconcile_patchsets(
+    db: &Database,
+    index: &crate::maintainers::MaintainersIndex,
+) -> Result<usize> {
+    let (mut after_id, mut walked) = (0i64, 0usize);
+    loop {
+        let ids = db.patchset_ids_after(after_id, PAGE).await?;
+        let Some(&last) = ids.last() else {
+            return Ok(walked);
+        };
+        after_id = last;
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            walked += 1;
+            let mut files: Vec<String> = Vec::new();
+            for diff in db.patch_diffs_only(id).await? {
+                files.extend(crate::baseline::extract_files_from_diff(&diff));
+            }
+            rows.push((id, index.bugs_access_sections(&files)));
+        }
+        db.replace_patchset_upstream_sections_batch(&rows).await?;
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +398,110 @@ F:	net/
         init_global_maintainers(Arc::new(MaintainersIndex::new()));
         backfill_patchset_maintainer_sections(&db).await.unwrap();
         assert_eq!(db.get_meta(SECTIONS_BACKFILLED_KEY).await.unwrap(), None);
+
+        clear_global_maintainers();
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_upstream_grants_follows_the_loaded_grants() {
+        let _guard = GLOBAL_INDEX_TEST_LOCK.lock().await;
+        let db = setup_db().await;
+        let net = "NETWORKING [GENERAL]".to_string();
+
+        patchset_with_diffs(
+            &db,
+            1,
+            &["diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c\n"],
+        )
+        .await;
+        patchset_with_diffs(&db, 2, &["diff --git a/unclaimed/x.c b/unclaimed/x.c\n"]).await;
+        let mut bug: crate::db::NewBug =
+            serde_json::from_value(serde_json::json!({"bugid": "b1", "title": "t"})).unwrap();
+        bug.subsystems = vec![AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM")];
+        let bug_id = db
+            .create_bug_with_enrichment(
+                &bug,
+                Some(&crate::db::NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: "test".to_string(),
+                    created_at: 1,
+                    data_json: Some(serde_json::json!({"source_files": ["fs/btrfs/inode.c"]})),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        // A bug filed without files gets no grant, and does not stop the walk.
+        let mut bare: crate::db::NewBug =
+            serde_json::from_value(serde_json::json!({"bugid": "b2", "title": "t"})).unwrap();
+        bare.subsystems = vec![];
+        let bare_id = db.create_bug(&bare).await.unwrap();
+
+        let with_grant = |grants: Vec<crate::bugs_access::RawAccessGrant>| {
+            let mut index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
+            index.set_bugs_access(grants);
+            clear_global_maintainers();
+            init_global_maintainers(Arc::new(index));
+        };
+
+        with_grant(vec![crate::bugs_access::RawAccessGrant {
+            section: Some(net.clone()),
+            paths: vec!["fs/btrfs/".into()],
+            ..Default::default()
+        }]);
+        reconcile_upstream_grant_sections(&db).await.unwrap();
+        assert_eq!(
+            db.authorizing_sections_for_bug(bug_id).await.unwrap(),
+            vec!["BTRFS FILE SYSTEM".to_string(), net.clone()]
+        );
+        assert!(
+            db.authorizing_sections_for_bug(bare_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.authorizing_sections_for_patchset(1).await.unwrap(),
+            vec![net.clone()]
+        );
+        assert!(
+            db.authorizing_sections_for_patchset(2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let recorded = db.get_meta(UPSTREAM_GRANTS_FINGERPRINT_KEY).await.unwrap();
+        assert!(recorded.is_some());
+
+        // Without an index nothing changes and nothing is recorded.
+        clear_global_maintainers();
+        reconcile_upstream_grant_sections(&db).await.unwrap();
+        assert_eq!(
+            db.get_meta(UPSTREAM_GRANTS_FINGERPRINT_KEY).await.unwrap(),
+            recorded
+        );
+        assert_eq!(
+            db.authorizing_sections_for_patchset(1).await.unwrap(),
+            vec![net.clone()]
+        );
+
+        // Removing the grant revokes what it gave.
+        with_grant(Vec::new());
+        reconcile_upstream_grant_sections(&db).await.unwrap();
+        assert_eq!(
+            db.authorizing_sections_for_bug(bug_id).await.unwrap(),
+            vec!["BTRFS FILE SYSTEM".to_string()]
+        );
+        assert!(
+            db.authorizing_sections_for_patchset(1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_ne!(
+            db.get_meta(UPSTREAM_GRANTS_FINGERPRINT_KEY).await.unwrap(),
+            recorded
+        );
 
         clear_global_maintainers();
     }

@@ -3,7 +3,7 @@
 
 [ai]
 provider = "copilot-cli"
-model = "claude-sonnet-4.5"
+model = "claude-sonnet-5.5"
 max_input_tokens = 40000
 max_interactions = 150
 

@@ -4,6 +4,8 @@ metadata:
   name: sashiko-self-backend-config
   namespace: sashiko-self
 spec:
+  securityPolicy:
+    name: sashiko-armor-policy
   healthCheck:
     checkIntervalSec: 15
     timeoutSec: 10

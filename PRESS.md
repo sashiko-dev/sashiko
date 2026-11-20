@@ -31,6 +31,7 @@ In-depth coverage from the premier Linux news source.
 * [Debating the role of large language models in the kernel community](https://lwn.net/Articles/1083275/)
 * [Development statistics for the 7.2 kernel](https://lwn.net/Articles/1088776/)
 * [An update on the Sashiko patch-review system](https://lwn.net/Articles/1096963/)
+* [GCC development with large-language models](https://lwn.net/Articles/1098672/)
 * [The 2026 Maintainers Summit](https://lwn.net/Articles/1099594/)
 * [Development statistics for the 7.3 kernel](https://lwn.net/Articles/1100241/)
 
@@ -38,6 +39,7 @@ In-depth coverage from the premier Linux news source.
 * [Linux Foundation on X](https://x.com/linuxfoundation/status/2036497032429305989)
 * [Open Source Summit NA 2026 Keynote: Linus Torvalds & Dirk Hohndel](https://youtu.be/fi29pfLcW4I?si=xky2533_zmsrtW-G&t=1414) (discussing AI in kernel development)
 * [Open Source Summit India 2026 Keynote: Linus Torvalds & Dirk Hohndel](https://youtu.be/YKkEe-PxW10?si=hsuxkVEoxUo4ftbN&t=1112) (discussing AI in kernel development)
+* [Open Source Summit Europe 2026 Keynote: Linus Torvalds & Dirk Hohndel](https://www.youtube.com/watch?v=0PSA2LFFlvk&t=1567s) (discussing AI in kernel development)
 
 ## Major Tech News
 Coverage in widely read technical publications.
@@ -58,6 +60,7 @@ Coverage in widely read technical publications.
 * **Phoronix:** [HWMON Fixes For Linux 7.2-rc7: "Most Of Them Fixing Critical Or High Severity Bugs"](https://www.phoronix.com/news/Linux-7.2-rc7-HWMON)
 * **Phoronix:** [Google's Sashiko AI Has Completed 191k Patch Reviews, Cited On Nearly 500 Kernel CVEs](https://www.phoronix.com/news/Sashiko-Linux-AI-Metrics)
 * **Phoronix:** [Boro: NVIDIA's Open-Source Effort For AI-Assisted Linux Kernel Development](https://www.phoronix.com/news/NVIDIA-Boro-Linux-Kernel-AI)
+* **Phoronix:** [AI-Powered Sashiko Introduces Experimental Patch Series Design Assessment](https://www.phoronix.com/news/Sashiko-0.9.4-Released)
 
 ## Blogs & Other Coverage
 * **BigGo Finance:** [Linus Torvalds to AI Critics in Linux Community: 'Fork It or Walk Away'](https://finance.biggo.com/news/98b34433-2e7c-4446-9840-149445bfd8ba)
@@ -67,3 +70,4 @@ Coverage in widely read technical publications.
 * **Gigazine:** [Sashiko Linux bug AI](https://gigazine.net/gsc_news/en/20260319-sashiko-linux-bug-ai/)
 * **Hacker Bikepacker:** [Running Sashiko locally](https://hackerbikepacker.com/local-sashiko)
 * **Hardware Busters:** [Sashiko Has Reviewed 191,000 Linux Kernel Patches, and 463 CVEs This Year Cite It](https://hwbusters.com/news/sashiko-has-reviewed-191000-linux-kernel-patches-and-463-cves-this-year-cite-it/)
+* **Google Cloud Blog:** [Lessons from building Sashiko, an agentic code review system](https://cloud.google.com/blog/products/application-development/lessons-from-building-sashiko-an-agentic-code-review-system)

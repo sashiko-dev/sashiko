@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tracing::info;
+use tracing::debug;
 
 // --- Claude API Request/Response Types ---
 
@@ -42,6 +42,11 @@ pub enum ClaudeContent {
     },
     Thinking {
         thinking: String,
+        /// api.anthropic.com always sets this, and it is what allows a
+        /// thinking block to be sent back to the model.  Anthropic-compatible
+        /// gateways do not necessarily return it, so accept a response without
+        /// one: the block is not replayed unless a signature is known.
+        #[serde(default)]
         signature: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
@@ -149,10 +154,18 @@ pub struct ClaudeErrorDetails {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClaudeError {
-    #[error("Rate limit exceeded, retry after {0:?}")]
-    RateLimitExceeded(Duration),
-    #[error("API overloaded, retry after {0:?}")]
-    OverloadedError(Duration),
+    #[error("Rate limit exceeded, retry after {retry_after:?}: {detail}")]
+    RateLimitExceeded {
+        retry_after: Duration,
+        /// Redacted, shortened body of the provider's answer.
+        detail: String,
+    },
+    #[error("API overloaded, retry after {retry_after:?}: {detail}")]
+    OverloadedError {
+        retry_after: Duration,
+        /// Redacted, shortened body of the provider's answer.
+        detail: String,
+    },
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
     #[error("Authentication error: {0}")]
@@ -166,10 +179,10 @@ pub enum ClaudeError {
 impl ClassifyAiError for ClaudeError {
     fn ai_error_class(&self) -> AiErrorClass {
         match self {
-            ClaudeError::RateLimitExceeded(retry_after) => AiErrorClass::RateLimit {
+            ClaudeError::RateLimitExceeded { retry_after, .. } => AiErrorClass::RateLimit {
                 retry_after: *retry_after,
             },
-            ClaudeError::OverloadedError(retry_after)
+            ClaudeError::OverloadedError { retry_after, .. }
             | ClaudeError::TransientError(retry_after, _) => AiErrorClass::Transient {
                 retry_after: *retry_after,
             },
@@ -178,6 +191,16 @@ impl ClassifyAiError for ClaudeError {
             ClaudeError::ApiError(status, _) => {
                 classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
             }
+        }
+    }
+
+    fn ai_error_detail(&self) -> Option<&str> {
+        match self {
+            ClaudeError::RateLimitExceeded { detail, .. }
+            | ClaudeError::OverloadedError { detail, .. } => {
+                (!detail.is_empty()).then_some(detail.as_str())
+            }
+            _ => None,
         }
     }
 }
@@ -198,6 +221,28 @@ pub(crate) fn transport_error(provider: &str, e: reqwest::Error) -> anyhow::Erro
         err_str
     );
     ClaudeError::TransientError(TRANSPORT_RETRY_AFTER, err_str).into()
+}
+
+/// Longest provider error body kept in an error value.
+///
+/// Gateways answer a rejected request with whole HTML pages, while the body
+/// only exists to explain the failure in the one log line that reports it.
+const ERROR_BODY_LIMIT: usize = 1024;
+
+/// Redacts and shortens a response body so it can travel in an error value.
+///
+/// The body of a 429 or 5xx names the quota that was hit or the request the
+/// gateway rejected, which is what tells an account-wide limit apart from a
+/// per-model one or a transient proxy limit. It can also repeat credentials
+/// from the request, hence the redaction, and it can be arbitrarily long,
+/// hence the cut, which falls on a character boundary rather than a byte
+/// offset so multi-byte text cannot panic.
+pub(crate) fn loggable_body(body: &str) -> String {
+    let redacted = redact_secret(body);
+    match redacted.char_indices().nth(ERROR_BODY_LIMIT) {
+        Some((index, _)) => format!("{}...", &redacted[..index]),
+        None => redacted,
+    }
 }
 
 /// Parses a Retry-After in seconds, capped at the quota manager's maximum.
@@ -231,25 +276,58 @@ impl ClaudeClient {
         base_url: String,
         thinking: Option<String>,
         effort: Option<String>,
-    ) -> Self {
+        client_cert: Option<&std::path::Path>,
+    ) -> Result<Self> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .or_else(|_| std::env::var("ANTHROPIC_AUTH_TOKEN"))
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .unwrap_or_default();
 
         let extra_headers = Self::parse_env_headers();
+        let client = match client_cert {
+            Some(path) => Self::client_with_cert(path)?,
+            None => Self::client_builder()
+                .build()
+                .context("Failed to build Claude HTTP client")?,
+        };
 
-        Self {
+        Ok(Self {
             api_key,
             model,
-            client: Client::new(),
+            client,
             enable_caching,
             max_tokens,
             base_url,
             thinking,
             effort,
             extra_headers,
-        }
+        })
+    }
+
+    fn client_with_cert(path: &std::path::Path) -> Result<Client> {
+        let pem = std::fs::read(path)
+            .with_context(|| format!("Failed to read client certificate {}", path.display()))?;
+        let identity = reqwest::Identity::from_pem(&pem).with_context(|| {
+            format!(
+                "Client certificate {} must hold a PEM certificate and private key",
+                path.display()
+            )
+        })?;
+        Self::client_builder()
+            .identity(identity)
+            .build()
+            .context("Failed to build Claude HTTP client")
+    }
+
+    /// A non-streaming response sends nothing until generation ends, and
+    /// some NAT and VPN relays leave keepalive probes unanswered.  reqwest's
+    /// default keepalive and 30s TCP_USER_TIMEOUT then abort a live request,
+    /// which is resent (and billed) in full.
+    fn client_builder() -> reqwest::ClientBuilder {
+        let builder = Client::builder().tcp_keepalive(None);
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        let builder = builder.tcp_user_timeout(None);
+        builder
     }
 
     pub fn default_base_url() -> String {
@@ -321,7 +399,7 @@ impl ClaudeClient {
             let response: ClaudeResponse =
                 serde_json::from_str(&body_text).context("Failed to parse Claude API response")?;
 
-            info!(
+            debug!(
                 "Claude response received. Tokens: in={}, out={}, cache_read={} cache_write={}",
                 response.usage.input_tokens,
                 response.usage.output_tokens,
@@ -336,19 +414,25 @@ impl ClaudeClient {
             let error_body = res
                 .text()
                 .await
-                .map(|t| redact_secret(&t))
+                .map(|t| loggable_body(&t))
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
             match status.as_u16() {
                 429 => {
                     // Rate limit - use parsed retry-after or default to 60s
-                    let duration = retry_after_duration.unwrap_or(Duration::from_secs(60));
-                    Err(ClaudeError::RateLimitExceeded(duration))?
+                    let retry_after = retry_after_duration.unwrap_or(Duration::from_secs(60));
+                    Err(ClaudeError::RateLimitExceeded {
+                        retry_after,
+                        detail: error_body,
+                    })?
                 }
                 500..=599 => {
                     // Overloaded / Server Error - use retry-after or exponential backoff
-                    let duration = retry_after_duration.unwrap_or(Duration::from_secs(0));
-                    Err(ClaudeError::OverloadedError(duration))?
+                    let retry_after = retry_after_duration.unwrap_or(Duration::from_secs(0));
+                    Err(ClaudeError::OverloadedError {
+                        retry_after,
+                        detail: error_body,
+                    })?
                 }
                 400 => Err(ClaudeError::InvalidRequest(error_body))?,
                 401 | 403 => Err(ClaudeError::AuthenticationError(error_body))?,
@@ -556,6 +640,7 @@ pub fn apply_cache_control(request: &mut ClaudeRequest) {
 
 pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
     let mut thought_signature = String::new();
+    let mut thought_is_signed = true;
     let mut content = String::new();
     let mut thought = String::new();
     let mut tool_calls = Vec::new();
@@ -571,6 +656,9 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
                 ..
             } => {
                 thought.push_str(thinking);
+                if signature.is_empty() {
+                    thought_is_signed = false;
+                }
                 thought_signature.push_str(signature);
             }
             ClaudeContent::ToolUse { id, name, input } => {
@@ -625,7 +713,10 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
         } else {
             Some(thought)
         },
-        thought_signature: if thought_signature.is_empty() {
+        // A signature authenticates the text of the block it came with, and
+        // the caller replays the whole merged thought under it, so any
+        // unsigned block in the response makes the merged signature unusable.
+        thought_signature: if thought_signature.is_empty() || !thought_is_signed {
             None
         } else {
             Some(thought_signature)
@@ -768,7 +859,9 @@ mod tests {
                 base_url.to_string(),
                 None,
                 None,
+                None,
             )
+            .unwrap()
         };
         let base = client(4096, "https://example.invalid/v1/messages");
         assert_ne!(
@@ -783,6 +876,54 @@ mod tests {
         );
     }
 
+    fn client_cert_file(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        file
+    }
+
+    fn client_with_cert(path: &std::path::Path) -> Result<ClaudeClient> {
+        ClaudeClient::new(
+            "claude-opus-4-7".to_string(),
+            false,
+            4096,
+            "https://example.invalid/v1/messages".to_string(),
+            None,
+            None,
+            Some(path),
+        )
+    }
+
+    #[test]
+    fn client_cert_loads_a_combined_cert_and_key_pem() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let pem = format!("{}{}", cert.cert.pem(), cert.signing_key.serialize_pem());
+        let file = client_cert_file(&pem);
+        client_with_cert(file.path()).unwrap();
+    }
+
+    #[test]
+    fn client_cert_without_a_key_is_rejected() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let file = client_cert_file(&cert.cert.pem());
+        let Err(err) = client_with_cert(file.path()) else {
+            panic!("a certificate without its private key must be rejected");
+        };
+        assert!(format!("{err:#}").contains("private key"), "{err:#}");
+    }
+
+    #[test]
+    fn missing_client_cert_names_the_path() {
+        let Err(err) = client_with_cert(std::path::Path::new("/nonexistent/cert.pem")) else {
+            panic!("a missing certificate file must be rejected");
+        };
+        assert!(
+            format!("{err:#}").contains("/nonexistent/cert.pem"),
+            "{err:#}"
+        );
+    }
+
     fn make_request(messages: Vec<AiMessage>) -> AiRequest {
         AiRequest {
             system: None,
@@ -792,6 +933,7 @@ mod tests {
             response_format: None,
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         }
     }
 
@@ -799,13 +941,19 @@ mod tests {
     fn test_claude_error_classification() {
         let cases = [
             (
-                ClaudeError::RateLimitExceeded(Duration::from_secs(7)),
+                ClaudeError::RateLimitExceeded {
+                    retry_after: Duration::from_secs(7),
+                    detail: "slow down".to_string(),
+                },
                 AiErrorClass::RateLimit {
                     retry_after: Duration::from_secs(7),
                 },
             ),
             (
-                ClaudeError::OverloadedError(Duration::from_secs(11)),
+                ClaudeError::OverloadedError {
+                    retry_after: Duration::from_secs(11),
+                    detail: String::new(),
+                },
                 AiErrorClass::Transient {
                     retry_after: Duration::from_secs(11),
                 },
@@ -1043,6 +1191,73 @@ mod tests {
         }
     }
 
+    /// A 429 is the answer that says which quota was hit, so its body has to
+    /// survive into the error that the quota manager logs.
+    #[tokio::test]
+    async fn test_rate_limit_body_is_kept_and_redacted() {
+        let err = error_for(test_http::complete(
+            "429 Too Many Requests",
+            "",
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit (token=abc123)"}}"#,
+        ))
+        .await;
+
+        assert_eq!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::RateLimit {
+                retry_after: Duration::from_secs(60)
+            }
+        );
+        let detail = crate::ai::classify_ai_error_detail(&err).expect("detail");
+        assert!(
+            detail.contains("Number of request tokens has exceeded"),
+            "{detail}"
+        );
+        assert!(detail.contains("token=[REDACTED]"), "{detail}");
+        assert!(!detail.contains("abc123"), "{detail}");
+        assert!(
+            format!("{err:#}").contains("Number of request tokens has exceeded"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_overloaded_body_is_kept() {
+        let err = error_for(test_http::complete(
+            "503 Service Unavailable",
+            "",
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"upstream capacity"}}"#,
+        ))
+        .await;
+
+        assert_eq!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::Transient {
+                retry_after: Duration::ZERO
+            }
+        );
+        let detail = crate::ai::classify_ai_error_detail(&err).expect("detail");
+        assert!(detail.contains("upstream capacity"), "{detail}");
+    }
+
+    #[test]
+    fn test_loggable_body_is_cut_on_a_character_boundary() {
+        let body = "é".repeat(ERROR_BODY_LIMIT + 100);
+        let shortened = loggable_body(&body);
+        assert!(shortened.ends_with("..."), "{shortened}");
+        assert_eq!(
+            shortened.trim_end_matches('.').chars().count(),
+            ERROR_BODY_LIMIT
+        );
+        assert!(shortened.len() < body.len());
+    }
+
+    #[test]
+    fn test_loggable_body_keeps_short_bodies_intact() {
+        let body = r#"{"error":{"message":"busy"}}"#;
+        assert_eq!(loggable_body(body), body);
+    }
+
     // --- ThinkingConfig tests (Bug 1 regression) ---
 
     #[test]
@@ -1155,6 +1370,53 @@ mod tests {
             assert_eq!(input, &json!({"n": 5}));
         } else {
             panic!("Expected ToolUse block");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_assistant_replays_thought_only_with_signature() -> Result<()> {
+        // The history keeps the thought alongside a signature, or without
+        // one when a gateway omitted it.  Only a signed thought may be
+        // replayed: the API rejects an unsigned thinking block.
+        let req = make_request(vec![
+            AiMessage {
+                role: AiRole::Assistant,
+                content: None,
+                thought: Some("Done.".to_string()),
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            AiMessage {
+                role: AiRole::Assistant,
+                content: None,
+                thought: Some("Still thinking.".to_string()),
+                thought_signature: Some("sig_abc".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ]);
+
+        let claude_req = translate_ai_request(&req, false, 4096, None, None)?;
+
+        assert!(
+            claude_req.messages[0].content.is_empty(),
+            "an unsigned thought must not be replayed"
+        );
+
+        assert_eq!(claude_req.messages[1].content.len(), 1);
+        if let ClaudeContent::Thinking {
+            thinking,
+            signature,
+            ..
+        } = &claude_req.messages[1].content[0]
+        {
+            assert_eq!(thinking, "Still thinking.");
+            assert_eq!(signature, "sig_abc");
+        } else {
+            panic!("Expected Thinking block");
         }
 
         Ok(())
@@ -1306,6 +1568,58 @@ mod tests {
         assert_eq!(ai_resp.content.as_deref(), Some("Here's my answer."));
         assert_eq!(ai_resp.thought.as_deref(), Some("Let me think..."));
         assert_eq!(ai_resp.thought_signature.as_deref(), Some("sig_abc"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_response_thinking_without_signature() -> Result<()> {
+        // Anthropic-compatible gateways may return a thinking block without
+        // the signature that api.anthropic.com always sets.
+        let body = json!({
+            "id": "msg_4",
+            "content": [
+                {"type": "thinking", "thinking": "Let me think..."},
+                {"type": "text", "text": "Here's my answer."}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 30, "output_tokens": 15}
+        });
+
+        let resp: ClaudeResponse = serde_json::from_value(body)?;
+        let ai_resp = translate_ai_response(&resp)?;
+        assert_eq!(ai_resp.content.as_deref(), Some("Here's my answer."));
+        assert_eq!(ai_resp.thought.as_deref(), Some("Let me think..."));
+        assert_eq!(
+            ai_resp.thought_signature, None,
+            "an unsigned thinking block must not be replayed"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_response_mixed_signed_and_unsigned_thinking() -> Result<()> {
+        // A signature only authenticates the block it was issued for, so a
+        // signed block merged with an unsigned one cannot be replayed either.
+        let body = json!({
+            "id": "msg_5",
+            "content": [
+                {"type": "thinking", "thinking": "First. ", "signature": "sig_a"},
+                {"type": "thinking", "thinking": "Second."},
+                {"type": "text", "text": "Done."}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 30, "output_tokens": 15}
+        });
+
+        let resp: ClaudeResponse = serde_json::from_value(body)?;
+        let ai_resp = translate_ai_response(&resp)?;
+        assert_eq!(ai_resp.thought.as_deref(), Some("First. Second."));
+        assert_eq!(
+            ai_resp.thought_signature, None,
+            "a partially signed thought must not be replayed"
+        );
 
         Ok(())
     }

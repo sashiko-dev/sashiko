@@ -1,0 +1,149 @@
+# Code notes profile for e2fsprogs.
+# See designs/DESIGN_CODE_NOTES_ENGINE.md, section 3.
+
+[units]
+source = "component_map"
+
+[units.components]
+"libext2fs-super-open" = [
+    "lib/ext2fs/ext2fs.h",
+    "lib/ext2fs/ext2fsP.h",
+    "lib/ext2fs/ext2_fs.h",
+    "lib/ext2fs/ext2_err.et.in",
+    "lib/ext2fs/openfs.c",
+    "lib/ext2fs/closefs.c",
+    "lib/ext2fs/initialize.c",
+    "lib/ext2fs/freefs.c",
+    "lib/ext2fs/rw_bitmaps.c",
+    "lib/ext2fs/swapfs.c",
+    "lib/ext2fs/csum.c",
+    "lib/ext2fs/crc32c.c",
+    "lib/ext2fs/orphan.c",
+    "lib/ext2fs/mmp.c",
+]
+"libext2fs-bmap-extents" = [
+    "lib/ext2fs/extent.c",
+    "lib/ext2fs/ext2_ext_attr.h",
+    "lib/ext2fs/bmap.c",
+    "lib/ext2fs/block.c",
+    "lib/ext2fs/alloc*.c",
+    "lib/ext2fs/fallocate.c",
+    "lib/ext2fs/punch.c",
+    "lib/ext2fs/fileio.c",
+    "lib/ext2fs/inode.c",
+    "lib/ext2fs/inode_io.c",
+]
+"libext2fs-dir-xattr-inline" = [
+    "lib/ext2fs/dirblock.c",
+    "lib/ext2fs/dir_iterate.c",
+    "lib/ext2fs/expanddir.c",
+    "lib/ext2fs/link.c",
+    "lib/ext2fs/lookup.c",
+    "lib/ext2fs/mkdir.c",
+    "lib/ext2fs/newdir.c",
+    "lib/ext2fs/ext_attr.c",
+    "lib/ext2fs/inline_data.c",
+    "lib/ext2fs/symlink.c",
+    "lib/ext2fs/hashmap*",
+    "lib/ext2fs/nls_*.c",
+]
+"libext2fs-bitmaps-io" = [
+    "lib/ext2fs/bitmaps.c",
+    "lib/ext2fs/bitops*",
+    "lib/ext2fs/blkmap64_*",
+    "lib/ext2fs/gen_bitmap*",
+    "lib/ext2fs/icount.c",
+    "lib/ext2fs/badblocks.c",
+    "lib/ext2fs/bb_inode.c",
+    "lib/ext2fs/*_io.c",
+    "lib/ext2fs/ext2_io.h",
+    "lib/ext2fs/imager.c",
+    "lib/ext2fs/mkjournal.c",
+    "lib/ext2fs/",
+]
+"e2fsck-passes" = [
+    "e2fsck/pass1.c",
+    "e2fsck/pass1b.c",
+    "e2fsck/pass2.c",
+    "e2fsck/pass3.c",
+    "e2fsck/pass4.c",
+    "e2fsck/pass5.c",
+    "e2fsck/extents.c",
+    "e2fsck/rehash.c",
+    "e2fsck/ea_refcount.c",
+    "e2fsck/encrypted_files.c",
+]
+"e2fsck-core-journal" = [
+    "e2fsck/e2fsck.h",
+    "e2fsck/e2fsck.c",
+    "e2fsck/unix.c",
+    "e2fsck/super.c",
+    "e2fsck/journal.c",
+    "e2fsck/recovery.c",
+    "e2fsck/revoke.c",
+    "e2fsck/problem.c",
+    "e2fsck/problem.h",
+    "e2fsck/problemP.h",
+    "e2fsck/message.c",
+    "e2fsck/",
+]
+"mke2fs-tune2fs" = [
+    "misc/mke2fs*",
+    "misc/tune2fs*",
+    "misc/util*",
+    "misc/create_inode*",
+    "misc/mk_hugefiles*",
+    "misc/default_profile*",
+]
+"misc-tools" = [
+    "misc/dumpe2fs*",
+    "misc/e2image*",
+    "misc/e2undo*",
+    "misc/badblocks*",
+    "misc/e4defrag*",
+    "misc/e4crypt*",
+    "misc/filefrag*",
+    "misc/e2freefrag*",
+    "misc/chattr*",
+    "misc/lsattr*",
+    "misc/mklost+found*",
+    "misc/",
+]
+"resize2fs" = ["resize/"]
+"debugfs" = ["debugfs/"]
+"fuse" = ["fuse4fs/", "fuse2fs/", "misc/fuse2fs*"]
+"libsupport" = ["lib/support/"]
+"libe2p-et-ss" = ["lib/e2p/", "lib/et/", "lib/ss/"]
+"libblkid-uuid" = ["lib/blkid/", "lib/uuid/"]
+
+[languages]
+skip = [
+    "tests/",
+    "po/",
+    "doc/",
+    "debian/",
+    "intl/",
+    "ext2ed/",
+    "contrib/",
+    "**/tst_*.c",
+    "**/test_*.c",
+]
+
+[languages.globs]
+c = ["**.c", "**.h"]
+other = ["**.et.in", "**.ct"]
+
+[agenda]
+modules = ["universal", "lang/c", "domain/e2fsprogs"]
+
+[history]
+fix_patterns = [
+    "^Fixes: [0-9a-f]{8,}",
+    "\\b(fix|fixes|corrupt|overflow|truncat|endian|leak)\\b",
+]
+introducer_pattern = "^Fixes: ([0-9a-f]{8,})"
+max_cases = 60
+
+[limits]
+component_lines = 15000
+unit_note_bytes = 16384

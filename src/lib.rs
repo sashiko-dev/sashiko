@@ -18,11 +18,15 @@ pub mod access;
 pub mod ai;
 pub mod api;
 pub mod auth;
+pub mod authority;
 #[cfg(feature = "server")]
 pub mod backfill;
 pub mod baseline;
 #[cfg(feature = "server")]
 pub mod benchmark;
+#[cfg(feature = "server")]
+pub mod bug_markdown;
+pub mod bugs_access;
 #[cfg(feature = "server")]
 pub mod compression;
 pub mod db;
@@ -30,6 +34,8 @@ pub mod db;
 pub mod email_policy;
 #[cfg(feature = "server")]
 pub mod email_router;
+#[cfg(feature = "server")]
+pub mod email_text;
 #[cfg(feature = "server")]
 pub mod events;
 #[cfg(feature = "server")]
@@ -52,17 +58,22 @@ pub mod patch;
 pub mod patchwork;
 #[cfg(feature = "server")]
 pub mod prerequisites;
+pub mod prior_context;
 pub mod project;
 pub mod prompt_bundle;
 pub mod prompt_namespaces;
+pub mod related_preexisting;
 pub mod repo_sync;
 #[cfg(feature = "server")]
 pub mod reviewer;
+pub mod scan;
+pub mod security_eval;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod settings;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod threat_model;
 pub mod toolbox;
 pub mod utils;
 pub mod worker;
@@ -79,6 +90,9 @@ pub enum ReviewStatus {
     Incomplete,
     /// The patchset is complete and waiting for review.
     Pending,
+    /// The patchset is complete, but automatic reviews have been
+    /// disabled, so this is waiting to be approved.
+    AwaitingReview,
     /// The patchset is currently under AI review.
     InReview,
     /// The review process was cancelled.
@@ -98,6 +112,7 @@ impl fmt::Display for ReviewStatus {
         match self {
             ReviewStatus::Incomplete => write!(f, "Incomplete"),
             ReviewStatus::Pending => write!(f, "Pending"),
+            ReviewStatus::AwaitingReview => write!(f, "Awaiting Review"),
             ReviewStatus::InReview => write!(f, "In Review"),
             ReviewStatus::Cancelled => write!(f, "Cancelled"),
             ReviewStatus::Skipped => write!(f, "Skipped"),
@@ -115,6 +130,7 @@ impl FromStr for ReviewStatus {
         match s {
             "Incomplete" => Ok(ReviewStatus::Incomplete),
             "Pending" => Ok(ReviewStatus::Pending),
+            "Awaiting Review" => Ok(ReviewStatus::AwaitingReview),
             "In Review" => Ok(ReviewStatus::InReview),
             "Cancelled" => Ok(ReviewStatus::Cancelled),
             "Skipped" => Ok(ReviewStatus::Skipped),
@@ -131,6 +147,7 @@ impl ReviewStatus {
         match self {
             ReviewStatus::Incomplete => "Incomplete",
             ReviewStatus::Pending => "Pending",
+            ReviewStatus::AwaitingReview => "Awaiting Review",
             ReviewStatus::InReview => "In Review",
             ReviewStatus::Cancelled => "Cancelled",
             ReviewStatus::Skipped => "Skipped",

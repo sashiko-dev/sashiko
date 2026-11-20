@@ -37,10 +37,14 @@ git. Copy the example and edit it before the first apply.
   `SASHIKO__SERVER__JWT_SECRET` and `SASHIKO__FORGE__WEBHOOK_SECRET`.
   `SASHIKO__FORGE__API_TOKEN` is optional and raises the GitHub API rate limit
   for pull request fetches.
-- Workload Identity binding for
+- Workload Identity binding (`roles/iam.workloadIdentityUser`) for
   `sashiko-agent-163135.svc.id.goog[sashiko-self/sashiko-self-ksa]` on
-  `sashiko-app@sashiko-agent-163135.iam.gserviceaccount.com`, which is what
-  lets the backup job write to Cloud Storage.
+  `sashiko-app@sashiko-agent-163135.iam.gserviceaccount.com` (shared with
+  `gcc.sashiko.dev`), which is what lets the backup jobs write to Cloud Storage.
+  This binding must be persisted in the GCP project's declarative IAM
+  service-account configuration rather than applied via ad-hoc `gcloud`
+  commands; otherwise periodic IAM reconciliation removes it and `gsutil cp`
+  fails with `403 Forbidden`.
 - DNS: `sashiko.sashiko.dev` already resolves to `136.110.177.184`, the
   reserved address named `lb-ipv4-bugrepo`.
 
@@ -124,8 +128,9 @@ kubectl apply -k routing/       # back to the application
 - Worktrees: an `emptyDir` on the node, because they are rebuilt from the
   clone on demand.
 - Backups: nightly at 04:00 America/Los_Angeles into
-  `gs://sashiko-data-backup-163135/sashiko-self`, an hour after the main
-  instance so the two never contend.
+  `gs://sashiko-data-backup-163135/sashiko-self`, two hours after the main
+  instance (`02:00`) and an hour before `gcc.sashiko.dev` (`05:00`) so they
+  never contend.
 
 To inspect or restore the database, use the data manager pod, which mounts the
 same volume without holding the database open:

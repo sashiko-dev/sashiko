@@ -32,7 +32,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -355,6 +355,7 @@ pub fn build_router(
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
         .route("/api/bug", get(get_bug))
+        .route("/api/bug/markdown", get(get_bug_markdown))
         .route("/api/bugs", get(list_bugs))
         .route("/api/bugs/subsystems", get(list_bug_subsystems))
         .route("/api/subsystems", get(list_bug_subsystems))
@@ -364,19 +365,38 @@ pub fn build_router(
         .route("/api/bug/enrichments", get(get_bug_enrichments))
         .route("/api/bug/analyze", post(analyze_bug))
         .route("/api/bug/action", post(bug_action))
-        .route("/bug/{bugid}", get(redirect_bug))
+        .route("/bug/{bugid}", get(bug_path_handler))
         .route(
             "/api/webhook/{provider}",
             post(forge_webhook).layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024)),
         )
         .route("/", get_service(ServeFile::new("static/index.html")))
+        .route("/robots.txt", get(robots_txt))
         .route(
             "/auth/verify",
             get_service(ServeFile::new("static/index.html")),
         )
         .nest_service("/static", ServeDir::new("static"))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            reject_invalid_authorization,
+        ))
         .layer(middleware::from_fn(redirect_www))
         .with_state(state)
+}
+
+async fn reject_invalid_authorization(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Result<axum::response::Response, (StatusCode, &'static str)> {
+    let headers = request.headers();
+    if headers.contains_key(axum::http::header::AUTHORIZATION)
+        && !presents_local_token(headers, &state)
+    {
+        crate::auth::authenticate_bearer_header(headers, &state)?;
+    }
+    Ok(next.run(request).await)
 }
 
 pub async fn run_server(
@@ -403,6 +423,18 @@ pub async fn run_server(
     .await?;
 
     Ok(())
+}
+
+const ROBOTS_TXT: &str = include_str!("../static/robots.txt");
+
+async fn robots_txt() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        ROBOTS_TXT,
+    )
 }
 
 fn normalize_thread_message_id(message_id: &str) -> String {
@@ -446,7 +478,7 @@ async fn submit_patch(
         auth.0.as_ref(),
         crate::settings::Permission::Ingest,
     ) {
-        info!("Refused unauthorized patch submission from {}", addr);
+        warn!("Refused unauthorized patch submission from {}", addr);
         return Err(StatusCode::FORBIDDEN.into_response());
     }
 
@@ -541,7 +573,7 @@ async fn submit_patch(
             // skip creating placeholder and skip fetch queue entirely.
             match state.db.has_patchset_by_msgid(&id).await {
                 Ok(true) => {
-                    info!(
+                    debug!(
                         "Remote fetch request for already ingested SHA {}, skipping placeholder and fetch",
                         id
                     );
@@ -555,6 +587,36 @@ async fn submit_patch(
                 }
                 _ => {}
             }
+
+            let repo_path = std::path::Path::new(&state.settings.git.repository_path);
+            let already_local =
+                repo_path.exists() && crate::git_ops::git_range_exists(repo_path, &sha).await;
+
+            if !already_local && repo.is_none() {
+                warn!(
+                    "Refused remote fetch request for {}: commit not found in local repository and no remote URL provided",
+                    sha
+                );
+                return Err(StatusCode::BAD_REQUEST.into_response());
+            }
+
+            let effective_repo = if already_local {
+                if repo.is_some() {
+                    debug!(
+                        "Target {} is already present in local git repository, skipping remote fetch for {}",
+                        sha, repo_display
+                    );
+                }
+                None
+            } else {
+                repo.clone()
+            };
+
+            let repo_display = if already_local {
+                "local".to_string()
+            } else {
+                repo_display
+            };
 
             let placeholder_id = format!("{}@sashiko.local", id);
             // Create a placeholder record in the DB so the user can track status
@@ -596,14 +658,14 @@ async fn submit_patch(
 
             if should_enqueue {
                 let req = FetchRequest {
-                    repo_url: repo.clone(),
+                    repo_url: effective_repo.clone(),
                     commit_hash: sha.clone(),
                     mr_url: None,
                     mr_title: None,
                     mr_number: None,
                 };
 
-                if crate::fetcher::url_has_embedded_credentials(repo.as_deref()) {
+                if crate::fetcher::url_has_embedded_credentials(effective_repo.as_deref()) {
                     if let Err(e) = state.fetch_sender.try_send(req) {
                         error!("Failed to send fetch request to queue: {}", e);
                         fail_fetching_patchset_logged(
@@ -617,7 +679,7 @@ async fn submit_patch(
                 } else {
                     if let Err(e) = state
                         .db
-                        .enqueue_fetch_request(repo.as_deref(), &sha, None, None, None)
+                        .enqueue_fetch_request(effective_repo.as_deref(), &sha, None, None, None)
                         .await
                     {
                         error!("Failed to persist fetch request in fetch_queue: {}", e);
@@ -748,6 +810,19 @@ async fn list_mailing_lists(
     Ok(Json(result))
 }
 
+const MAX_UNAUTHENTICATED_LIST_PAGE: usize = 20;
+
+fn is_authenticated_reader(
+    state: &Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+    auth: Option<&crate::auth::AuthUser>,
+) -> bool {
+    if is_auth_blocklisted(state, auth) {
+        return false;
+    }
+    state.settings.server.testing_mode || auth.is_some() || presents_local_token(headers, state)
+}
+
 async fn list_patchsets(
     auth: crate::auth::OptionalAuthUser,
     OptionalPrincipal(principal): OptionalPrincipal,
@@ -756,6 +831,11 @@ async fn list_patchsets(
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<PatchsetsResponse>, StatusCode> {
     let page = pagination.page.unwrap_or(1).max(1);
+    if page > MAX_UNAUTHENTICATED_LIST_PAGE
+        && !is_authenticated_reader(&state, &headers, auth.0.as_ref())
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let per_page = pagination.per_page.unwrap_or(50).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
@@ -817,10 +897,17 @@ async fn list_patchsets(
 }
 
 async fn list_messages(
+    auth: crate::auth::OptionalAuthUser,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<MessagesResponse>, StatusCode> {
     let page = pagination.page.unwrap_or(1).max(1);
+    if page > MAX_UNAUTHENTICATED_LIST_PAGE
+        && !is_authenticated_reader(&state, &headers, auth.0.as_ref())
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let per_page = pagination.per_page.unwrap_or(50).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
@@ -1094,19 +1181,22 @@ async fn get_patchset(
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
-        info!("Fetching details for patchset id: {}", id_val);
+        if !is_authenticated_reader(&state, &headers, auth.0.as_ref()) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        debug!("Fetching details for patchset id: {}", id_val);
         state
             .db
             .get_patchset_details(id_val, query.page, query.page_size())
             .await
     } else if query.id.contains('-') && !query.id.contains('@') {
-        info!("Fetching details for patchset slug: {}", query.id);
+        debug!("Fetching details for patchset slug: {}", query.id);
         state
             .db
             .get_patchset_details_by_slug(&query.id, query.page, query.page_size())
             .await
     } else {
-        info!("Fetching details for patchset msgid: {}", query.id);
+        debug!("Fetching details for patchset msgid: {}", query.id);
         state
             .db
             .get_patchset_details_by_msgid(&query.id, query.page, query.page_size())
@@ -1130,11 +1220,11 @@ async fn get_patchset(
             Ok(Json(details))
         }
         Ok(None) => {
-            info!("Patchset not found: {}", query.id);
+            debug!("Patchset not found: {}", query.id);
             Err(StatusCode::NOT_FOUND)
         }
         Err(e) => {
-            info!("Database error: {}", e);
+            error!("Database error: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1171,10 +1261,13 @@ async fn get_review(
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Some(ps_id) = query.patchset_id {
-        info!("Fetching latest review for patchset id: {}", ps_id);
+        if !is_authenticated_reader(&state, &headers, auth.0.as_ref()) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        debug!("Fetching latest review for patchset id: {}", ps_id);
         state.db.get_latest_review_for_patchset(ps_id).await
     } else if let Some(id) = query.id {
-        info!("Fetching details for review id: {}", id);
+        debug!("Fetching details for review id: {}", id);
         state.db.get_review_details(id).await
     } else {
         return Err(StatusCode::BAD_REQUEST);
@@ -1187,11 +1280,11 @@ async fn get_review(
             Ok(Json(details))
         }
         Ok(None) => {
-            info!("Review not found");
+            debug!("Review not found");
             Err(StatusCode::NOT_FOUND)
         }
         Err(e) => {
-            info!("Database error: {}", e);
+            error!("Database error: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1205,19 +1298,22 @@ async fn get_patchset_summary(
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
-        info!("Fetching summary for patchset id: {}", id_val);
+        if !is_authenticated_reader(&state, &headers, auth.0.as_ref()) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        debug!("Fetching summary for patchset id: {}", id_val);
         state
             .db
             .get_patchset_summary(id_val, query.page, query.page_size())
             .await
     } else if query.id.contains('-') && !query.id.contains('@') {
-        info!("Fetching summary for patchset slug: {}", query.id);
+        debug!("Fetching summary for patchset slug: {}", query.id);
         state
             .db
             .get_patchset_summary_by_slug(&query.id, query.page, query.page_size())
             .await
     } else {
-        info!("Fetching summary for patchset msgid: {}", query.id);
+        debug!("Fetching summary for patchset msgid: {}", query.id);
         state
             .db
             .get_patchset_summary_by_msgid(&query.id, query.page, query.page_size())
@@ -1240,11 +1336,11 @@ async fn get_patchset_summary(
             Ok(Json(details))
         }
         Ok(None) => {
-            info!("Patchset not found: {}", query.id);
+            debug!("Patchset not found: {}", query.id);
             Err(StatusCode::NOT_FOUND)
         }
         Err(e) => {
-            info!("Database error: {}", e);
+            error!("Database error: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1258,10 +1354,13 @@ async fn get_review_log(
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Some(ps_id) = query.patchset_id {
-        info!("Fetching latest review log for patchset id: {}", ps_id);
+        if !is_authenticated_reader(&state, &headers, auth.0.as_ref()) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        debug!("Fetching latest review log for patchset id: {}", ps_id);
         state.db.get_latest_review_for_patchset(ps_id).await
     } else if let Some(id) = query.id {
-        info!("Fetching details for review id: {}", id);
+        debug!("Fetching details for review id: {}", id);
         state.db.get_review_details(id).await
     } else {
         return Err(StatusCode::BAD_REQUEST);
@@ -1274,11 +1373,11 @@ async fn get_review_log(
             Ok(Json(details))
         }
         Ok(None) => {
-            info!("Review not found");
+            debug!("Review not found");
             Err(StatusCode::NOT_FOUND)
         }
         Err(e) => {
-            info!("Database error: {}", e);
+            error!("Database error: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1318,17 +1417,19 @@ async fn bug_access_for_query(
 /// Resolves the caller's standing for a single-bug read route.
 ///
 /// Addressing a bug by its `bugid` / `slug` is a capability read, so an
-/// unauthenticated caller (or one holding an expired session) resolves to the
-/// anonymous principal rather than being rejected with 401. Addressing a bug
-/// by its sequential numeric `id` requires a valid session or API token.
+/// unauthenticated caller (no `Authorization` header, or the local operator
+/// token) resolves to the anonymous principal rather than being rejected with
+/// 401; invalid, expired, or revoked `Authorization` tokens are rejected before
+/// reaching here. Addressing a bug by its sequential numeric `id` requires an
+/// authenticated principal.
 fn resolve_bug_read_principal(
-    principal: Result<Principal, (StatusCode, &'static str)>,
+    principal: Principal,
     query: &BugQuery,
 ) -> Result<Principal, StatusCode> {
-    match principal {
-        Ok(p) => Ok(p),
-        Err(_) if query.by_bugid() => Ok(Principal::anonymous()),
-        Err((status, _)) => Err(status),
+    if principal.is_authenticated() || query.by_bugid() {
+        Ok(principal)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
     }
 }
 
@@ -1511,8 +1612,25 @@ async fn redact_embedded_bugs(
     Ok(())
 }
 
+fn attach_security_fields(
+    bug: &crate::db::Bug,
+    val: &mut serde_json::Value,
+    include_full_evaluation: bool,
+) {
+    val["security_score"] = serde_json::to_value(bug.security_score()).unwrap();
+    val["security_score_tenths"] = serde_json::to_value(bug.security_score_tenths()).unwrap();
+    val["security_rating"] = serde_json::to_value(bug.security_rating()).unwrap();
+    val["security_class"] = serde_json::to_value(bug.security_class()).unwrap();
+    val["cvss_vector"] = serde_json::to_value(bug.cvss_vector()).unwrap();
+    val["security_summary"] = serde_json::to_value(bug.security_summary()).unwrap();
+    val["security_eval_requested"] = serde_json::Value::Bool(bug.security_eval_requested());
+    if include_full_evaluation {
+        val["security_evaluation"] = serde_json::to_value(bug.security_evaluation()).unwrap();
+    }
+}
+
 async fn get_bug(
-    principal: Result<Principal, (StatusCode, &'static str)>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1535,43 +1653,15 @@ async fn get_bug(
     val["tokens_in"] = serde_json::Value::Number(bug.tokens_in().into());
     val["tokens_out"] = serde_json::Value::Number(bug.tokens_out().into());
     val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
+    attach_security_fields(&bug, &mut val, true);
 
     attach_duplicate_relations(&state, &principal, &bug, &mut val).await?;
     val["can_comment"] = serde_json::Value::Bool(!state.read_only && access.can_comment());
     val["can_manage"] = serde_json::Value::Bool(!state.read_only && access.can_manage());
-    let mut family = state
-        .db
-        .bug_family(bug.id, false)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut check_ids: Vec<i64> = family.iter().map(|member| member.id).collect();
-    for member in &family {
-        check_ids.extend(referenced_duplicate_ids(member));
-    }
-    check_ids.sort_unstable();
-    check_ids.dedup();
-    let readable_by_principal = readable_bug_ids(&state, &principal, &check_ids).await?;
-    let mut readable_family = readable_by_principal.clone();
-    readable_family.insert(bug.id);
-    family.retain(|member| readable_family.contains(&member.id));
-    for member in &mut family {
-        redact_inaccessible_duplicate_enrichments(member, &readable_by_principal);
-    }
-    let mut evidence = state
-        .db
-        .bug_evidence(&family)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if !principal.has_global_bug_visibility()
-        && let Some(activity) = evidence.get_mut("activity").and_then(|a| a.as_array_mut())
-    {
-        activity.retain(|e| {
-            !matches!(
-                e.get("kind").and_then(|k| k.as_str()),
-                Some("candidate" | "raw_candidate")
-            )
-        });
-    }
+    let evidence = load_redacted_bug_evidence(&state, &principal, bug.id).await?;
+    let (has_reproducer, has_proposed_fix) = attachment_flags_from_evidence(&evidence);
+    val["has_reproducer"] = serde_json::Value::Bool(has_reproducer);
+    val["has_proposed_fix"] = serde_json::Value::Bool(has_proposed_fix);
     val["evidence"] = evidence;
     if let Some(obj) = val.as_object_mut() {
         for key in [
@@ -1588,6 +1678,171 @@ async fn get_bug(
     Ok(Json(val))
 }
 
+/// Reproducer-like enrichment kinds gated behind authenticated access.
+fn is_reproducer_enrichment_kind(kind: &str) -> bool {
+    matches!(kind, "reproducer" | "testcase" | "poc")
+}
+
+/// Proposed-fix enrichment kinds surfaced as unmerged patch attachments.
+///
+/// Merged upstream commits recorded by `fix_check` (`fix_candidate`) are
+/// deliberately excluded because they represent landed fixes already shown via
+/// `fixed_in_commit` and `Fixed` status rather than proposed patches.
+fn is_proposed_fix_enrichment_kind(kind: &str) -> bool {
+    matches!(kind, "proposed_fix" | "suggested_fix")
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BugAttachmentFlags {
+    has_reproducer: bool,
+    has_proposed_fix: bool,
+}
+
+fn attachment_flags_from_evidence(evidence: &serde_json::Value) -> (bool, bool) {
+    let Some(activity) = evidence.get("activity").and_then(|a| a.as_array()) else {
+        return (false, false);
+    };
+    let mut has_reproducer = false;
+    let mut has_proposed_fix = false;
+    for item in activity {
+        if let Some(kind) = item.get("kind").and_then(|k| k.as_str()) {
+            if is_reproducer_enrichment_kind(kind) {
+                has_reproducer = true;
+            } else if is_proposed_fix_enrichment_kind(kind) {
+                has_proposed_fix = true;
+            }
+        }
+    }
+    (has_reproducer, has_proposed_fix)
+}
+
+async fn resolve_bug_attachment_flags(
+    state: &AppState,
+    principal: &Principal,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, BugAttachmentFlags>, StatusCode> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let candidates = state
+        .db
+        .bug_family_attachment_candidates(ids)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let readable_foreign = if principal.has_global_bug_visibility() {
+        None
+    } else {
+        let mut foreign_ids: Vec<i64> = candidates
+            .iter()
+            .filter_map(|&(root_id, member_id, _)| (member_id != root_id).then_some(member_id))
+            .collect();
+        foreign_ids.sort_unstable();
+        foreign_ids.dedup();
+        if foreign_ids.is_empty() {
+            Some(std::collections::HashSet::new())
+        } else {
+            Some(readable_bug_ids(state, principal, &foreign_ids).await?)
+        }
+    };
+
+    let allow_reproducers = principal.is_authenticated();
+    let mut flags_by_bug = std::collections::HashMap::new();
+    for (root_id, member_id, kind) in candidates {
+        if member_id != root_id
+            && let Some(ref readable) = readable_foreign
+            && !readable.contains(&member_id)
+        {
+            continue;
+        }
+        let entry: &mut BugAttachmentFlags = flags_by_bug.entry(root_id).or_default();
+        if allow_reproducers && is_reproducer_enrichment_kind(&kind) {
+            entry.has_reproducer = true;
+        } else if is_proposed_fix_enrichment_kind(&kind) {
+            entry.has_proposed_fix = true;
+        }
+    }
+    Ok(flags_by_bug)
+}
+
+/// Loads a bug's deduplicated family evidence with interaction logs omitted and
+/// inaccessible duplicate counterparts redacted.
+async fn load_redacted_bug_evidence(
+    state: &AppState,
+    principal: &Principal,
+    bug_id: i64,
+) -> Result<serde_json::Value, StatusCode> {
+    let mut family = state
+        .db
+        .bug_family(bug_id, false)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut check_ids: Vec<i64> = family.iter().map(|member| member.id).collect();
+    for member in &family {
+        check_ids.extend(referenced_duplicate_ids(member));
+    }
+    check_ids.sort_unstable();
+    check_ids.dedup();
+    let readable_by_principal = readable_bug_ids(state, principal, &check_ids).await?;
+    let mut readable_family = readable_by_principal.clone();
+    readable_family.insert(bug_id);
+    family.retain(|member| readable_family.contains(&member.id));
+    for member in &mut family {
+        redact_inaccessible_duplicate_enrichments(member, &readable_by_principal);
+    }
+    let mut evidence = state
+        .db
+        .bug_evidence(&family)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let hide_candidates = !principal.has_global_bug_visibility();
+    let hide_reproducers = !principal.is_authenticated();
+    if (hide_candidates || hide_reproducers)
+        && let Some(activity) = evidence.get_mut("activity").and_then(|a| a.as_array_mut())
+    {
+        activity.retain(|e| {
+            let Some(kind) = e.get("kind").and_then(|k| k.as_str()) else {
+                return true;
+            };
+            if hide_candidates && matches!(kind, "candidate" | "raw_candidate") {
+                return false;
+            }
+            if hide_reproducers && is_reproducer_enrichment_kind(kind) {
+                return false;
+            }
+            true
+        });
+    }
+    Ok(evidence)
+}
+
+/// Resolves the canonical target of a duplicate bug when the caller has read
+/// authority over that canonical counterpart.
+async fn readable_canonical_target(
+    state: &AppState,
+    principal: &Principal,
+    bug: &crate::db::Bug,
+) -> Result<Option<(i64, crate::bug_markdown::CanonicalDuplicate)>, StatusCode> {
+    if bug.lifecycle_status != crate::db::BugLifecycleStatus::Duplicate {
+        return Ok(None);
+    }
+    let Some(canonical_id) = bug.duplicate_of_id else {
+        return Ok(None);
+    };
+    if !bug_access(state, principal, canonical_id).await?.can_read() {
+        return Ok(None);
+    }
+    let Some(canonical) = state.db.get_bug(canonical_id).await.ok().flatten() else {
+        return Ok(None);
+    };
+    Ok(Some((
+        canonical.id,
+        crate::bug_markdown::CanonicalDuplicate {
+            bugid: canonical.bugid.clone(),
+            problem: canonical.problem().to_string(),
+        },
+    )))
+}
+
 /// Attaches the bug's duplicate relations, omitting any counterpart the caller
 /// may not read. A pointer to an invisible bug would disclose both that it
 /// exists and what it is about.
@@ -1598,21 +1853,19 @@ async fn attach_duplicate_relations(
     val: &mut serde_json::Value,
 ) -> Result<(), StatusCode> {
     if bug.lifecycle_status == crate::db::BugLifecycleStatus::Duplicate {
-        let Some(canonical_id) = bug.duplicate_of_id else {
-            return Ok(());
-        };
-        if !bug_access(state, principal, canonical_id).await?.can_read() {
-            if let Some(obj) = val.as_object_mut() {
-                obj.remove("duplicate_of_id");
+        match readable_canonical_target(state, principal, bug).await? {
+            Some((canonical_id, canon)) => {
+                val["duplicate_of"] = serde_json::json!({
+                    "id": canonical_id,
+                    "bugid": canon.bugid,
+                    "problem": canon.problem,
+                });
             }
-            return Ok(());
-        }
-        if let Some(canonical) = state.db.get_bug(canonical_id).await.ok().flatten() {
-            val["duplicate_of"] = serde_json::json!({
-                "id": canonical.id,
-                "bugid": canonical.bugid,
-                "problem": canonical.problem(),
-            });
+            None => {
+                if let Some(obj) = val.as_object_mut() {
+                    obj.remove("duplicate_of_id");
+                }
+            }
         }
         return Ok(());
     }
@@ -1697,6 +1950,10 @@ async fn get_bug_enrichments(
     if !principal.has_global_bug_visibility() {
         bug.enrichments
             .retain(|e| e.kind != "candidate" && e.kind != "raw_candidate");
+    }
+    if !principal.is_authenticated() {
+        bug.enrichments
+            .retain(|e| !is_reproducer_enrichment_kind(&e.kind));
     }
     let refs = referenced_duplicate_ids(&bug);
     let readable_refs = readable_bug_ids(&state, &principal, &refs).await?;
@@ -1791,7 +2048,7 @@ async fn analyze_bug(
                 break;
             }
         }
-        let mut tb = crate::toolbox::ToolBox::new(repo_path, None);
+        let mut tb = crate::toolbox::ToolBox::new(repo_path);
         if let Some(m_sha) = mainline_sha {
             tb.set_virtual_head(m_sha);
         }
@@ -1810,22 +2067,20 @@ async fn analyze_bug(
         .or_else(|| Some(provider.get_capabilities().model_name));
     let mut payload = payload.input;
     if payload.subsystems.is_empty() && !payload.source_files.is_empty() {
+        let mindex = crate::maintainers::get_global_maintainers().unwrap_or_else(|| {
+            crate::maintainers::MaintainersIndex::load_for_project(
+                project,
+                std::path::Path::new(&state.settings.git.repository_path),
+            )
+        });
         if project.uses_maintainers() {
-            let matched = if let Some(mindex) = crate::maintainers::get_global_maintainers() {
-                mindex.match_files(&payload.source_files)
-            } else if let Ok(mindex) = crate::maintainers::MaintainersIndex::from_top_of_trunk(
-                &state.settings.git.repository_path,
-            ) {
-                mindex.match_files(&payload.source_files)
+            payload.subsystems = if mindex.is_ready_for_reconcile() {
+                mindex.attribute_files(&payload.source_files)
             } else {
                 Vec::new()
             };
-            payload.subsystems = matched
-                .into_iter()
-                .map(crate::db::AttributedSubsystem::from_maintainers)
-                .collect();
         } else {
-            payload.subsystems =
+            let mut subs: Vec<_> =
                 crate::workflows::linux_bug::extract_directory_subsystems_for_project(
                     &payload.source_files,
                     project,
@@ -1833,6 +2088,13 @@ async fn analyze_bug(
                 .into_iter()
                 .map(crate::db::AttributedSubsystem::from_path_prefix)
                 .collect();
+            subs.extend(
+                mindex
+                    .bugs_access_sections(&payload.source_files)
+                    .into_iter()
+                    .map(crate::db::AttributedSubsystem::from_upstream_grant),
+            );
+            payload.subsystems = subs;
         }
     }
 
@@ -1866,8 +2128,77 @@ async fn analyze_bug(
     }
 }
 
-async fn redirect_bug(Path(bugid): Path<String>) -> impl IntoResponse {
-    Redirect::temporary(&format!("/#/bug/{}", bugid))
+async fn render_bug_markdown_response(
+    principal: Principal,
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    query: &BugQuery,
+) -> Result<axum::response::Response, StatusCode> {
+    let principal = resolve_bug_read_principal(principal, query)?;
+    let (bug, _) = readable_bug_for_view(state, &principal, query).await?;
+    let canonical = readable_canonical_target(state, &principal, &bug)
+        .await?
+        .map(|(_, canon)| canon);
+    let evidence = load_redacted_bug_evidence(state, &principal, bug.id).await?;
+    let activity = evidence
+        .get("activity")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    let base_url = crate::bug_markdown::resolve_public_base_url(&state.settings, headers);
+    let reported_by = crate::bug_markdown::resolve_reported_by(&state.settings, &bug.reporter);
+    let project = crate::bug_markdown::target_project_for_bug(&state.settings, &bug.bugid);
+
+    let body = crate::bug_markdown::render_bug_markdown(&crate::bug_markdown::BugMarkdownContext {
+        bug: &bug,
+        base_url: &base_url,
+        reported_by: &reported_by,
+        project,
+        canonical_duplicate: canonical.as_ref(),
+        activity,
+    });
+
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            ),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+async fn get_bug_markdown(
+    OptionalPrincipal(principal): OptionalPrincipal,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<BugQuery>,
+) -> Result<axum::response::Response, StatusCode> {
+    render_bug_markdown_response(principal, &state, &headers, &query).await
+}
+
+async fn bug_path_handler(
+    OptionalPrincipal(principal): OptionalPrincipal,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(bugid): Path<String>,
+) -> Result<axum::response::Response, StatusCode> {
+    if let Some(stem) = bugid.strip_suffix(".md") {
+        if stem.trim().is_empty() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let query = BugQuery {
+            id: None,
+            bugid: Some(stem.to_string()),
+            slug: None,
+        };
+        return render_bug_markdown_response(principal, &state, &headers, &query).await;
+    }
+    Ok(Redirect::temporary(&format!("/#/bug/{}", bugid)).into_response())
 }
 
 async fn get_message(
@@ -1875,10 +2206,10 @@ async fn get_message(
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<crate::db::MessageRow>, StatusCode> {
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
-        info!("Fetching details for message id: {}", id_val);
+        debug!("Fetching details for message id: {}", id_val);
         state.db.get_message_details(id_val).await
     } else {
-        info!("Fetching details for message msgid: {}", query.id);
+        debug!("Fetching details for message msgid: {}", query.id);
         state.db.get_message_details_by_msgid(&query.id).await
     };
 
@@ -1927,11 +2258,11 @@ async fn get_message(
             Ok(Json(details))
         }
         Ok(None) => {
-            info!("Message not found: {}", query.id);
+            debug!("Message not found: {}", query.id);
             Err(StatusCode::NOT_FOUND)
         }
         Err(e) => {
-            info!("Database error: {}", e);
+            error!("Database error: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1946,6 +2277,7 @@ async fn get_stats(
     let patchsets = crate::metrics::get_patchsets();
     let repo_packs = crate::metrics::get_repo_packs();
     let repo_pack_bytes = crate::metrics::get_repo_pack_bytes();
+    let reviews_skipped_unchanged = crate::metrics::get_reviews_skipped_unchanged();
 
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -1955,7 +2287,8 @@ async fn get_stats(
         "messages": messages,
         "patchsets": patchsets,
         "repo_packs": repo_packs,
-        "repo_pack_bytes": repo_pack_bytes
+        "repo_pack_bytes": repo_pack_bytes,
+        "reviews_skipped_unchanged": reviews_skipped_unchanged
     })))
 }
 
@@ -1971,7 +2304,7 @@ async fn stats_timeline(
                 .get_timeline_stats(params.subsystem_id)
                 .await
                 .map_err(|e| {
-                    info!("Error getting timeline stats: {}", e);
+                    error!("Error getting timeline stats: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })
         })
@@ -1986,7 +2319,7 @@ async fn stats_reviews(
         .stats_reviews_cache
         .get_or_fetch(|| async {
             state.db.get_review_stats().await.map_err(|e| {
-                info!("Error getting review stats: {}", e);
+                error!("Error getting review stats: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })
         })
@@ -2001,7 +2334,7 @@ async fn stats_tools(
         .stats_tools_cache
         .get_or_fetch(|| async {
             state.db.get_tool_usage_stats().await.map_err(|e| {
-                info!("Error getting tool stats: {}", e);
+                error!("Error getting tool stats: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })
         })
@@ -2291,7 +2624,7 @@ async fn forge_webhook(
     // unauthenticated is an endpoint anyone can reach, and arriving on
     // loopback never distinguished the two behind a reverse proxy.
     if !has_secret && !presents_local_token(&headers, &state) && !state.allow_all_submit {
-        info!(
+        warn!(
             "Refused {} webhook from {}: configure webhook_secret or use --enable-unsafe-all-submit",
             crate::forge::loggable(&provider),
             addr
@@ -2365,7 +2698,7 @@ async fn forge_webhook(
     // moves with the target branch. Reviewing an action that changed only a
     // label would spend a full review re-reading code that did not change.
     if forge.review_intent(&action) == crate::forge::ReviewIntent::Skip {
-        info!(
+        debug!(
             "{} {} carries no new commits, skipping review",
             forge.name(),
             crate::forge::loggable(&action)
@@ -2379,7 +2712,7 @@ async fn forge_webhook(
     if let Some(ref author) = metadata.author
         && crate::forge::is_dependabot_author(author)
     {
-        info!(
+        debug!(
             "{} PR #{} by {} is from Dependabot, skipping review",
             forge.name(),
             metadata.pr_number,
@@ -2426,7 +2759,7 @@ pub async fn ingest_forge_pull_request(
     if let Some(ref author) = metadata.author
         && crate::forge::is_dependabot_author(author)
     {
-        info!(
+        debug!(
             "{} PR #{} by {} is from Dependabot, skipping review",
             forge_name,
             metadata.pr_number,
@@ -2522,7 +2855,7 @@ async fn list_bugs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugListQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let scope = principal.maintained_section_names();
+    let scope = principal.readable_section_names();
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(50).clamp(1, 100);
 
@@ -2574,18 +2907,59 @@ async fn list_bugs(
         Some(Err(_)) => return Err(StatusCode::BAD_REQUEST),
         None => None,
     };
-    let assignee = query
+    let min_security_score_tenths = match query
+        .min_security_score
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => match crate::security_eval::parse_security_score_tenths(raw) {
+            Ok(tenths) => Some(tenths),
+            Err(_) => return Err(StatusCode::BAD_REQUEST),
+        },
+        None => None,
+    };
+    let parsed_security_classes: Option<Vec<crate::security_eval::SecurityClass>> = match query
+        .security_class
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => {
+            let mut classes = Vec::new();
+            for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                match part.parse::<crate::security_eval::SecurityClass>() {
+                    Ok(cls) => classes.push(cls),
+                    Err(_) => return Err(StatusCode::BAD_REQUEST),
+                }
+            }
+            if classes.is_empty() {
+                None
+            } else {
+                Some(classes)
+            }
+        }
+        None => None,
+    };
+    let assignee = match query
         .assignee
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|who| {
-            if who.eq_ignore_ascii_case("none") {
-                crate::db::AssigneeFilter::Unassigned
-            } else {
-                crate::db::AssigneeFilter::Is(who)
+    {
+        Some(who) if who.eq_ignore_ascii_case("none") => {
+            Some(crate::db::AssigneeFilter::Unassigned)
+        }
+        Some(who) if who.eq_ignore_ascii_case("me") => {
+            let me = principal.email().trim();
+            if me.is_empty() {
+                return Err(StatusCode::BAD_REQUEST);
             }
-        });
+            Some(crate::db::AssigneeFilter::Is(me))
+        }
+        Some(who) => Some(crate::db::AssigneeFilter::Is(who)),
+        None => None,
+    };
 
     match state
         .db
@@ -2593,6 +2967,8 @@ async fn list_bugs(
             page: Some(page as u32),
             limit: Some(per_page as u32),
             min_severity: min_sev,
+            min_security_score_tenths,
+            security_classes: parsed_security_classes.as_deref(),
             subsystem: if parsed_subsystems.is_none() {
                 query.subsystem.as_deref()
             } else {
@@ -2616,9 +2992,11 @@ async fn list_bugs(
                 .bug_discovery_summaries(&ids)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let attachment_flags = resolve_bug_attachment_flags(&state, &principal, &ids).await?;
             let mut serialized_items = Vec::new();
             for bug in &items {
                 let mut val = serde_json::to_value(bug).unwrap_or(serde_json::json!({}));
+                let flags = attachment_flags.get(&bug.id).copied().unwrap_or_default();
                 val["slug"] = serde_json::Value::String(bug.bugid.clone());
                 val["problem"] = serde_json::Value::String(bug.problem().to_string());
                 val["severity"] = serde_json::to_value(bug.severity()).unwrap();
@@ -2633,10 +3011,13 @@ async fn list_bugs(
                 val["verified_on_sha"] = serde_json::to_value(bug.verified_on_sha()).unwrap();
                 val["is_fixed"] = serde_json::Value::Bool(bug.is_fixed());
                 val["fixed_in_commit"] = serde_json::to_value(bug.fixed_in_commit()).unwrap();
+                val["has_reproducer"] = serde_json::Value::Bool(flags.has_reproducer);
+                val["has_proposed_fix"] = serde_json::Value::Bool(flags.has_proposed_fix);
                 val["raw_input"] = serde_json::to_value(bug.raw_input()).unwrap();
                 val["tokens_in"] = serde_json::Value::Number(bug.tokens_in().into());
                 val["tokens_out"] = serde_json::Value::Number(bug.tokens_out().into());
                 val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
+                attach_security_fields(bug, &mut val, false);
                 val.as_object_mut().map(|obj| obj.remove("enrichments"));
                 val["evidence"] = summaries.remove(&bug.id).unwrap_or_else(|| serde_json::json!({"count": 0, "models": [], "tools": [], "unknown_models": 0}));
                 val.as_object_mut().unwrap().remove("raw_input");
@@ -2667,7 +3048,7 @@ async fn list_bug_subsystems(
         Some(Err(_)) => return Err(StatusCode::BAD_REQUEST),
         None => crate::db::BugLifecycleStatus::Open,
     };
-    let scope = principal.maintained_section_names();
+    let scope = principal.readable_section_names();
     let visibility = principal.visibility(&scope);
     // Key the cache on the parsed status so the alias and the canonical
     // spelling do not each get their own entry, and on the principal's scope so
@@ -2737,7 +3118,8 @@ fn required_access(action: &BugAction) -> BugAccess {
         BugAction::Close { .. }
         | BugAction::Dismiss { .. }
         | BugAction::MarkDuplicate { .. }
-        | BugAction::Assign { .. } => BugAccess::Manage,
+        | BugAction::Assign { .. }
+        | BugAction::EvaluateSecurity { .. } => BugAccess::Manage,
     }
 }
 
@@ -2929,7 +3311,7 @@ async fn bug_action(
     let model = payload.model.filter(|s| !s.trim().is_empty());
     let db = state.db.with_bug_actor(&actor, tool, model);
     match payload.action {
-        BugAction::Comment { content } => {
+        BugAction::Comment { content, kind } => {
             if content.trim().is_empty() {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -2939,7 +3321,7 @@ async fn bug_action(
             db.add_bug_enrichment(
                 bug.id,
                 &crate::db::NewBugEnrichment {
-                    kind: "comment".into(),
+                    kind: kind.as_str().into(),
                     content: Some(content),
                     ..Default::default()
                 },
@@ -3042,6 +3424,32 @@ async fn bug_action(
             db.assign_bug(bug.id, assignee, reason.as_deref(), email.as_ref())
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        BugAction::EvaluateSecurity { reason } => {
+            if bug.pipeline_state != crate::db::BugPipelineState::Succeeded
+                || bug.duplicate_of_id.is_some()
+                || !matches!(
+                    bug.lifecycle_status,
+                    crate::db::BugLifecycleStatus::Open
+                        | crate::db::BugLifecycleStatus::Fixed
+                        | crate::db::BugLifecycleStatus::Closed
+                )
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Only verified canonical bugs (open, fixed, or closed) can be queued for security evaluation".into(),
+                ));
+            }
+            let queued = db
+                .request_bug_security_eval(bug.id, reason.as_deref())
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if !queued {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Only verified canonical bugs (open, fixed, or closed) can be queued for security evaluation".into(),
+                ));
+            }
         }
     }
 
@@ -3284,6 +3692,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoked_cancel.status(), StatusCode::FORBIDDEN);
+        let revoked_public = client
+            .get(format!("http://{}/api/patchsets", addr))
+            .bearer_auth(&revoked_session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(revoked_public.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -3295,16 +3710,76 @@ mod tests {
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 
+        // Initialize an isolated temporary git repository with two commits.
+        let temp_repo = tempfile::tempdir().unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["-c", "safe.bareRepository=all", "init", "-q", "-b", "main"])
+            .output()
+            .await
+            .unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .await
+            .unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(temp_repo.path().join("value1.txt"), "base\n").unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["add", "value1.txt"])
+            .output()
+            .await
+            .unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["commit", "-q", "-s", "-m", "base"])
+            .output()
+            .await
+            .unwrap();
+        let head1_out = crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await
+            .unwrap();
+        let existing_sha_1 = String::from_utf8(head1_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        std::fs::write(temp_repo.path().join("value2.txt"), "second\n").unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["add", "value2.txt"])
+            .output()
+            .await
+            .unwrap();
+        crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["commit", "-q", "-s", "-m", "second"])
+            .output()
+            .await
+            .unwrap();
+        let head2_out = crate::git_cmd::in_dir_async(temp_repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await
+            .unwrap();
+        let existing_sha_2 = String::from_utf8(head2_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
         // Everything that could authorize the request for another reason is
         // switched off, so only the token can be what admits it.
         let mut settings = crate::settings::Settings::new().unwrap();
         settings.server.testing_mode = false;
         settings.server.acl = crate::settings::AclSettings::default();
+        settings.git.repository_path = temp_repo.path().to_string_lossy().to_string();
         let settings = Arc::new(settings);
 
         let local_token = crate::auth::LocalToken::generate().unwrap();
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(10);
         let app = build_router(
             settings,
             db.clone(),
@@ -3365,7 +3840,7 @@ mod tests {
             .await
             .unwrap()
             .status();
-        assert_eq!(unparsed_wrong_token, 403);
+        assert_eq!(unparsed_wrong_token, 401);
 
         let unparsed_authorized = client
             .post(&submit)
@@ -3390,7 +3865,7 @@ mod tests {
             .unwrap()
             .status();
         assert_eq!(
-            wrong, 403,
+            wrong, 401,
             "a token this server did not write must not ingest"
         );
 
@@ -3403,6 +3878,83 @@ mod tests {
             .unwrap()
             .status();
         assert!(accepted.is_success(), "token was refused: {}", accepted);
+        let req_missing_with_remote = fetch_rx
+            .try_recv()
+            .expect("fetch request must be queued for missing commit with remote repo");
+        assert_eq!(
+            req_missing_with_remote.repo_url.as_deref(),
+            Some("https://example.org/linux.git")
+        );
+
+        // Missing commit with no repo URL is rejected immediately with 400.
+        let missing_no_repo = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "remote",
+                "sha": "fedcba9876543210fedcba9876543210fedcba98",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            missing_no_repo, 400,
+            "missing local commit without remote repo must be rejected with 400"
+        );
+
+        // Existing local commit with no remote repo URL is accepted and sets effective_repo to None.
+        let local_no_repo = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "remote",
+                "sha": existing_sha_1,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(
+            local_no_repo.is_success(),
+            "existing local commit without repo was refused: {}",
+            local_no_repo
+        );
+        let req_local_no_repo = fetch_rx
+            .try_recv()
+            .expect("fetch request must be queued for local commit");
+        assert_eq!(req_local_no_repo.commit_hash, existing_sha_1);
+        assert_eq!(
+            req_local_no_repo.repo_url, None,
+            "effective_repo must be None for local commit"
+        );
+
+        // Existing local commit with redundant remote repo URL is accepted and clears effective_repo to None.
+        let local_with_redundant_repo = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "remote",
+                "sha": existing_sha_2,
+                "repo": "https://example.org/linux.git",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(
+            local_with_redundant_repo.is_success(),
+            "existing local commit with remote repo was refused: {}",
+            local_with_redundant_repo
+        );
+        let req_local_with_redundant = fetch_rx
+            .try_recv()
+            .expect("fetch request must be queued for local commit with redundant repo");
+        assert_eq!(req_local_with_redundant.commit_hash, existing_sha_2);
+        assert_eq!(
+            req_local_with_redundant.repo_url, None,
+            "effective_repo must be cleared to None when commit already exists locally"
+        );
 
         // The token is an authority, not an identity, so it cannot act on a
         // bug however local its holder is.
@@ -3548,6 +4100,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), 404);
+
+        // Testing mode has no email identity, so assignee=me must be rejected.
+        let me_without_email = reqwest::get(format!("http://{}/api/bugs?assignee=me", addr))
+            .await
+            .unwrap();
+        assert_eq!(me_without_email.status(), 400);
     }
 
     #[tokio::test]
@@ -3929,7 +4487,7 @@ mod tests {
         assert_eq!(canon_resp["duplicates"].as_array().unwrap().len(), 1);
         assert_eq!(canon_resp["duplicates"][0]["id"], dup_id);
 
-        // Test 4: redirect_bug
+        // Test 4: redirect_bug and /bug/<bugid>.md markdown prompt
         let no_redirect = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -3944,6 +4502,43 @@ mod tests {
             res.headers().get("location").unwrap().to_str().unwrap(),
             "/#/bug/pb-12345678"
         );
+
+        let md_res = no_redirect
+            .get(format!("http://{}/bug/linux-12345678.md", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(md_res.status(), 200);
+        assert_eq!(
+            md_res
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            md_res
+                .headers()
+                .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "nosniff"
+        );
+        let md_body = md_res.text().await.unwrap();
+        assert!(md_body.contains("# Fix Linux Kernel Bug:"));
+        assert!(md_body.contains("- **Bug ID**: `linux-12345678`"));
+        assert!(md_body.contains(&format!("Closes: http://{}/#/bug/linux-12345678", addr)));
+        assert!(md_body.contains("Reported-by: Sashiko <sashiko@sashiko.dev>"));
+
+        let empty_stem = no_redirect
+            .get(format!("http://{}/bug/.md", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(empty_stem.status(), 404);
 
         // Test 5: bug_action. The security list may comment on any bug.
         let action_res = client
@@ -5055,6 +5650,30 @@ mod tests {
             .await
             .unwrap();
         }
+        // Attach a reproducer to the hidden duplicate (SECTION B) and a
+        // proposed fix to the accessible sibling duplicate (SECTION A).
+        db.add_bug_enrichment(
+            ids[1],
+            &crate::db::NewBugEnrichment {
+                kind: "reproducer".into(),
+                tool: "hidden-repro".into(),
+                content: Some("hidden reproducer payload".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.add_bug_enrichment(
+            ids[2],
+            &crate::db::NewBugEnrichment {
+                kind: "proposed_fix".into(),
+                tool: "sibling-fix".into(),
+                content: Some("sibling proposed patch".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let settings = Arc::new(crate::settings::Settings::new().unwrap());
         let (sender, _) = mpsc::channel(1);
         let (fetch_sender, _) = mpsc::channel(1);
@@ -5097,7 +5716,7 @@ mod tests {
         ] {
             let principal = Principal::resolve(email, &acl, Some(&index));
             let Json(body) = get_bug(
-                Ok(principal.clone()),
+                OptionalPrincipal(principal.clone()),
                 State(state.clone()),
                 Query(BugQuery {
                     id: Some(id),
@@ -5115,7 +5734,38 @@ mod tests {
                     "{email} learned about {name}: {evidence}"
                 );
             }
+            let md_resp = get_bug_markdown(
+                OptionalPrincipal(principal.clone()),
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Query(BugQuery {
+                    id: Some(id),
+                    bugid: None,
+                    slug: None,
+                }),
+            )
+            .await
+            .unwrap();
+            let md_bytes = axum::body::to_bytes(md_resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let md_str = String::from_utf8(md_bytes.to_vec()).unwrap();
+            for name in &excluded {
+                assert!(
+                    !md_str.contains(name),
+                    "{email} learned about {name} from markdown: {md_str}"
+                );
+            }
+            assert!(!md_str.contains("candidate confidential content"));
+
             if email == "a@example.org" && id == ids[0] {
+                assert_eq!(body["has_proposed_fix"], true);
+                assert_eq!(body["has_reproducer"], false);
+                let flags = resolve_bug_attachment_flags(&state, &principal, &[ids[0]])
+                    .await
+                    .unwrap();
+                assert!(flags[&ids[0]].has_proposed_fix);
+                assert!(!flags[&ids[0]].has_reproducer);
                 assert!(evidence.contains("Deduplication Check completed"));
                 let Json(enrichments) = get_bug_enrichments(
                     principal.clone(),
@@ -5140,7 +5790,7 @@ mod tests {
                 assert!(!evidence.contains("hidden candidate confidential content"));
 
                 let Json(enrichments) = get_bug_enrichments(
-                    principal,
+                    principal.clone(),
                     State(state.clone()),
                     Query(BugQuery {
                         id: Some(id),
@@ -5171,6 +5821,13 @@ mod tests {
                 assert!(dedup["data_json"].is_null());
             }
             if email == "operator@example.org" {
+                assert_eq!(body["has_proposed_fix"], true);
+                assert_eq!(body["has_reproducer"], true);
+                let flags = resolve_bug_attachment_flags(&state, &principal, &[ids[0]])
+                    .await
+                    .unwrap();
+                assert!(flags[&ids[0]].has_proposed_fix);
+                assert!(flags[&ids[0]].has_reproducer);
                 assert!(evidence.contains("hidden comment confidential content"));
                 assert!(evidence.contains("hidden-model"));
                 assert!(evidence.contains("same defect as canonical"));
@@ -5184,7 +5841,7 @@ mod tests {
             ("hidden", vec!["canonical", "sibling"]),
         ] {
             let Json(body) = get_bug(
-                Err((StatusCode::UNAUTHORIZED, "no token")),
+                OptionalPrincipal(Principal::anonymous()),
                 State(state.clone()),
                 Query(BugQuery {
                     id: None,
@@ -5235,7 +5892,7 @@ mod tests {
             .unwrap();
         let b_principal = Principal::resolve("b@example.org", &acl, Some(&index));
         let Json(reparented_body) = get_bug(
-            Ok(b_principal.clone()),
+            OptionalPrincipal(b_principal.clone()),
             State(state.clone()),
             Query(BugQuery {
                 id: Some(ids[1]),
@@ -5359,6 +6016,11 @@ mod tests {
             .unwrap();
         assert_eq!(garbage.status(), 401);
 
+        let anon_md_id = get(format!("/api/bug/markdown?id={}", bug_id), None)
+            .await
+            .unwrap();
+        assert_eq!(anon_md_id.status(), 401);
+
         let anon_enrich_id = get(format!("/api/bug/enrichments?id={}", bug_id), None)
             .await
             .unwrap();
@@ -5371,6 +6033,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(denied.status(), 404);
+        let denied_md_id = get(
+            format!("/api/bug/markdown?id={}", bug_id),
+            Some(stranger.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied_md_id.status(), 404);
         let denied_enrich_id = get(
             format!("/api/bug/enrichments?id={}", bug_id),
             Some(stranger.clone()),
@@ -5386,7 +6055,7 @@ mod tests {
         // Knowing the bugid or slug grants read-only access on GET /api/bug
         // for both anonymous and unprivileged authenticated callers, while
         // GET /api/bug/enrichments remains gated by Principal authority.
-        for bearer in [None, Some("nonsense".into()), Some(stranger.clone())] {
+        for bearer in [None, Some(stranger.clone())] {
             for query in ["bugid=linux-authz01", "slug=linux-authz01"] {
                 let res = get(format!("/api/bug?{}", query), bearer.clone())
                     .await
@@ -5410,14 +6079,79 @@ mod tests {
             };
             assert_eq!(enrich_res.status(), expected_enrich_status);
 
-            let missing_bugid = get(
-                "/api/bug?bugid=linux-does-not-exist".to_string(),
-                bearer.clone(),
-            )
+            for md_path in [
+                "/bug/linux-authz01.md",
+                "/api/bug/markdown?bugid=linux-authz01",
+                "/api/bug/markdown?slug=linux-authz01",
+            ] {
+                let md_res = get(md_path.to_string(), bearer.clone()).await.unwrap();
+                assert_eq!(md_res.status(), 200, "{} failed capability read", md_path);
+                let md_text = md_res.text().await.unwrap();
+                assert!(md_text.contains("`linux-authz01`"));
+                assert!(md_text.contains("Reported-by:"));
+                assert!(md_text.contains("Link:"));
+            }
+            for missing_md in [
+                "/api/bug?bugid=linux-does-not-exist",
+                "/bug/linux-does-not-exist.md",
+                "/api/bug/markdown?bugid=linux-does-not-exist",
+            ] {
+                let missing = get(missing_md.to_string(), bearer.clone()).await.unwrap();
+                assert_eq!(missing.status(), 404);
+            }
+        }
+
+        // Presenting an invalid or expired Authorization header is rejected
+        // with 401 across public and capability-addressed routes rather than
+        // silently downgrading to anonymous.
+        let expired_key = jsonwebtoken::EncodingKey::from_secret(SECRET.as_ref()).unwrap();
+        let expired = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &crate::auth::Claims {
+                sub: "stranger@example.org".to_string(),
+                exp: 1,
+                iat: Some(1),
+                sid: Some("expired-sid-00000000000000000000".to_string()),
+                typ: Some("session".to_string()),
+                max_bug_access: None,
+            },
+            &expired_key,
+        )
+        .unwrap();
+        for bad_bearer in ["nonsense".to_string(), expired] {
+            for path in [
+                "/api/bug?bugid=linux-authz01",
+                "/api/bug?slug=linux-authz01",
+                "/bug/linux-authz01.md",
+                "/bug/linux-authz01",
+                "/api/bug/markdown?bugid=linux-authz01",
+                "/api/patchsets",
+                "/api/messages",
+                "/api/config",
+                "/api/stats",
+            ] {
+                let res = get(path.to_string(), Some(bad_bearer.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    res.status(),
+                    401,
+                    "{} accepted invalid Authorization header",
+                    path
+                );
+            }
+        }
+
+        // Duplicate Authorization headers are rejected even when one carries a
+        // valid token.
+        let dup_res = client
+            .get(format!("http://{}/api/patchsets", addr))
+            .header("Authorization", format!("Bearer {}", stranger))
+            .header("Authorization", "Bearer nonsense")
+            .send()
             .await
             .unwrap();
-            assert_eq!(missing_bugid.status(), 404);
-        }
+        assert_eq!(dup_res.status(), 401);
 
         // Raw transcript routes remain restricted even when bugid is known.
         for path in ["/api/bug/logs", "/api/bug/raw", "/api/bug/input"] {
@@ -5482,13 +6216,50 @@ mod tests {
             assert_eq!(body["can_manage"], true);
         }
 
-        let listing: serde_json::Value = get("/api/bugs".to_string(), Some(operator))
+        let listing: serde_json::Value = get("/api/bugs".to_string(), Some(operator.clone()))
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
         assert_eq!(listing["total"], 1);
+
+        // assignee=me resolves to the authenticated caller's email (ignoring
+        // ASCII case against the stored assignee).
+        let empty_mine: serde_json::Value =
+            get("/api/bugs?assignee=me".to_string(), Some(operator.clone()))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(empty_mine["total"], 0);
+
+        let assign_res = client
+            .post(format!("http://{}/api/bug/action?id={}", addr, bug_id))
+            .header("Authorization", format!("Bearer {}", operator))
+            .json(&serde_json::json!({
+                "action": "assign",
+                "assignee": "Operator@Example.org"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(assign_res.status(), 200);
+
+        for query in [
+            "/api/bugs?assignee=me",
+            "/api/bugs?assignee=operator%40example.org",
+        ] {
+            let mine: serde_json::Value = get(query.to_string(), Some(operator.clone()))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(mine["total"], 1, "failed query {query}");
+            assert_eq!(mine["items"][0]["bugid"], "linux-authz01");
+        }
 
         // Mutations are not bypassable from loopback or by knowing bugid.
         let unauthenticated_action = client
@@ -5569,6 +6340,282 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn comment_types_and_reproducer_login_gating() {
+        const SECRET: &str = "bug-repro-test-key-12345678901234567890";
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let bug_id = db
+            .create_bug(&crate::db::NewBug {
+                bugid: "linux-repro01".to_string(),
+                title: "resource leak in widget_close()".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::New,
+                pipeline_state: crate::db::BugPipelineState::Pending,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 123456,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![crate::db::AttributedSubsystem::from_maintainers(
+                    "NETWORKING [GENERAL]",
+                )],
+            })
+            .await
+            .unwrap();
+        db.add_bug_enrichment(
+            bug_id,
+            &crate::db::NewBugEnrichment {
+                kind: "testcase".into(),
+                tool: "ci".into(),
+                content: Some("TESTCASE_FIXTURE_MARKER".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.add_bug_enrichment(
+            bug_id,
+            &crate::db::NewBugEnrichment {
+                kind: "poc".into(),
+                tool: "manual".into(),
+                content: Some("MINIMAL_REPRO_MARKER".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let merged_fix_bug_id = db
+            .create_bug(&crate::db::NewBug {
+                bugid: "linux-merged-fix".to_string(),
+                title: "already fixed upstream issue".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::Fixed,
+                pipeline_state: crate::db::BugPipelineState::Succeeded,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 123457,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![crate::db::AttributedSubsystem::from_maintainers(
+                    "NETWORKING [GENERAL]",
+                )],
+            })
+            .await
+            .unwrap();
+        db.add_bug_enrichment(
+            merged_fix_bug_id,
+            &crate::db::NewBugEnrichment {
+                kind: "fix_candidate".into(),
+                tool: "sashiko:linux_bug:fix_check".into(),
+                content: Some("Fixed upstream".into()),
+                data_json: Some(serde_json::json!({
+                    "status": "merged",
+                    "commit_sha": "deadbeef1234"
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.testing_mode = false;
+        settings.server.jwt_secret = Some(SECRET.to_string());
+        settings.server.acl.admins = vec!["operator@example.org".to_string()];
+        settings.server.read_only = false;
+        let settings = Arc::new(settings);
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            settings,
+            db,
+            event_tx,
+            fetch_tx,
+            ServerOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let operator_tok =
+            crate::auth::create_token("operator@example.org", SECRET, Some("session".into()), 3600)
+                .unwrap();
+        let stranger_tok =
+            crate::auth::create_token("stranger@example.org", SECRET, Some("session".into()), 3600)
+                .unwrap();
+
+        // Operator attaches default comment, proposed_fix, and reproducer comments.
+        for (payload, expected_kind) in [
+            (
+                serde_json::json!({"action": "comment", "content": "PLAIN_COMMENT_TEXT"}),
+                "comment",
+            ),
+            (
+                serde_json::json!({"action": "comment", "kind": "proposed_fix", "content": "PROPOSED_FIX_PATCH_TEXT"}),
+                "proposed_fix",
+            ),
+            (
+                serde_json::json!({"action": "comment", "kind": "reproducer", "content": "REPRODUCER_FIXTURE_MARKER"}),
+                "reproducer",
+            ),
+        ] {
+            let res = client
+                .post(format!(
+                    "http://{}/api/bug/action?bugid=linux-repro01",
+                    addr
+                ))
+                .header("Authorization", format!("Bearer {}", operator_tok))
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200, "failed posting {expected_kind}");
+        }
+
+        // Verify invalid comment kind is rejected.
+        let invalid_kind = client
+            .post(format!(
+                "http://{}/api/bug/action?bugid=linux-repro01",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", operator_tok))
+            .json(&serde_json::json!({"action": "comment", "kind": "unknown_kind", "content": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid_kind.status(), 422);
+
+        // Anonymous direct-UUID capability reads see comment and proposed_fix,
+        // but must NEVER see reproducer/testcase/poc entries, while an invalid
+        // Authorization header is rejected with 401.
+        {
+            let resp = client
+                .get(format!("http://{}/api/bug?bugid=linux-repro01", addr))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["has_proposed_fix"], true);
+            assert_eq!(body["has_reproducer"], false);
+            let activity_str = body["evidence"]["activity"].to_string();
+            assert!(activity_str.contains("PLAIN_COMMENT_TEXT"));
+            assert!(activity_str.contains("PROPOSED_FIX_PATCH_TEXT"));
+            assert!(!activity_str.contains("REPRODUCER_FIXTURE_MARKER"));
+            assert!(!activity_str.contains("TESTCASE_FIXTURE_MARKER"));
+            assert!(!activity_str.contains("MINIMAL_REPRO_MARKER"));
+
+            let md = client
+                .get(format!("http://{}/bug/linux-repro01.md", addr))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(md.contains("PLAIN_COMMENT_TEXT"));
+            assert!(md.contains("PROPOSED_FIX_PATCH_TEXT"));
+            assert!(!md.contains("REPRODUCER_FIXTURE_MARKER"));
+            assert!(!md.contains("TESTCASE_FIXTURE_MARKER"));
+            assert!(!md.contains("MINIMAL_REPRO_MARKER"));
+
+            for bad_url in [
+                format!("http://{}/api/bug?bugid=linux-repro01", addr),
+                format!("http://{}/bug/linux-repro01.md", addr),
+            ] {
+                let bad_resp = client
+                    .get(bad_url)
+                    .header("Authorization", "Bearer nonsense")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(bad_resp.status(), 401);
+            }
+        }
+
+        // Logged-in users (both direct-UUID capability reader and operator) DO see reproducers.
+        for tok in [&stranger_tok, &operator_tok] {
+            let body: serde_json::Value = client
+                .get(format!("http://{}/api/bug?bugid=linux-repro01", addr))
+                .header("Authorization", format!("Bearer {}", tok))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(body["has_proposed_fix"], true);
+            assert_eq!(body["has_reproducer"], true);
+            let activity_str = body["evidence"]["activity"].to_string();
+            assert!(activity_str.contains("PLAIN_COMMENT_TEXT"));
+            assert!(activity_str.contains("PROPOSED_FIX_PATCH_TEXT"));
+            assert!(activity_str.contains("REPRODUCER_FIXTURE_MARKER"));
+            assert!(activity_str.contains("TESTCASE_FIXTURE_MARKER"));
+            assert!(activity_str.contains("MINIMAL_REPRO_MARKER"));
+
+            let md = client
+                .get(format!("http://{}/bug/linux-repro01", addr) + ".md")
+                .header("Authorization", format!("Bearer {}", tok))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(md.contains("REPRODUCER_FIXTURE_MARKER"));
+        }
+
+        // Bugs list surfaces attachment flags while keeping merged fix_candidate
+        // enrichments distinct from proposed_fix attachments.
+        let list_body: serde_json::Value = client
+            .get(format!("http://{}/api/bugs", addr))
+            .header("Authorization", format!("Bearer {}", operator_tok))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let items = list_body["items"].as_array().unwrap();
+        let repro_item = items
+            .iter()
+            .find(|item| item["bugid"] == "linux-repro01")
+            .expect("expected linux-repro01 in bugs list");
+        assert_eq!(repro_item["has_reproducer"], true);
+        assert_eq!(repro_item["has_proposed_fix"], true);
+        let merged_item = items
+            .iter()
+            .find(|item| item["bugid"] == "linux-merged-fix")
+            .expect("expected linux-merged-fix in bugs list");
+        assert_eq!(merged_item["has_reproducer"], false);
+        assert_eq!(merged_item["has_proposed_fix"], false);
+    }
+
     #[test]
     fn test_is_sign_in_eligible_checks_maintainers_and_blocklist() {
         let maintainers_text = r#"
@@ -5616,6 +6663,39 @@ F:	net/
             "stranger@example.org",
             &acl,
             Some(&index)
+        ));
+
+        // bugs_access.toml `read` and `read_write` grantees become sign-in
+        // eligible, while a maintainer removed by `replace_emails` loses
+        // eligibility.
+        let mut with_grants = index;
+        with_grants.set_bugs_access(vec![
+            crate::bugs_access::RawAccessGrant {
+                section: Some("BTRFS FILE SYSTEM".into()),
+                read: vec!["btrfs-reader@example.org".into()],
+                ..Default::default()
+            },
+            crate::bugs_access::RawAccessGrant {
+                section: Some("NETWORKING [GENERAL]".into()),
+                replace_emails: true,
+                read_write: vec!["net-delegate@example.org".into()],
+                ..Default::default()
+            },
+        ]);
+        assert!(is_sign_in_eligible(
+            "btrfs-reader@example.org",
+            &acl,
+            Some(&with_grants)
+        ));
+        assert!(is_sign_in_eligible(
+            "net-delegate@example.org",
+            &acl,
+            Some(&with_grants)
+        ));
+        assert!(!is_sign_in_eligible(
+            "davem@davemloft.net",
+            &acl,
+            Some(&with_grants)
         ));
     }
 
@@ -5668,6 +6748,23 @@ F:	net/
         );
         let resp = client.get(&health_url).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let robots_resp = client
+            .get(format!("http://{}/robots.txt", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(robots_resp.status(), StatusCode::OK);
+        assert_eq!(
+            robots_resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+        let robots_body = robots_resp.text().await.unwrap();
+        assert!(robots_body.contains("Disallow: /api/"));
+        assert!(robots_body.contains("Disallow: /bug/"));
     }
 
     #[tokio::test]
@@ -5834,12 +6931,32 @@ F:	*
             per_page: None,
             limit: None,
         };
+        let msgid_query = || PatchQuery {
+            id: "<embargo-srv@example.com>".to_string(),
+            page: None,
+            per_page: None,
+            limit: None,
+        };
         let list_pagination = || Pagination {
             page: Some(1),
             per_page: Some(50),
             q: None,
             mailing_list: None,
         };
+
+        // Anonymous sequential numeric patchset lookup is forbidden.
+        assert_eq!(
+            get_patchset(
+                crate::auth::OptionalAuthUser(None),
+                OptionalPrincipal(Principal::anonymous()),
+                headers.clone(),
+                State(state.clone()),
+                Query(query()),
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
 
         // 1. Anonymous caller sees Embargoed with empty reviews, zeroed list counts,
         // 404 on /api/review, and 403 on release_patchset_embargo.
@@ -5848,7 +6965,7 @@ F:	*
             OptionalPrincipal(Principal::anonymous()),
             headers.clone(),
             State(state.clone()),
-            Query(query()),
+            Query(msgid_query()),
         )
         .await
         .unwrap();
@@ -5896,6 +7013,18 @@ F:	*
 
         // 2. Unrelated subsystem maintainer (davem) and blocklisted maintainer are denied
         // both viewing embargoed results and releasing the embargo.
+        assert_eq!(
+            get_patchset(
+                auth_for("blocked@example.org"),
+                OptionalPrincipal(Principal::resolve("blocked@example.org", acl, Some(&index))),
+                headers.clone(),
+                State(state.clone()),
+                Query(query()),
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
         for email in [
             "davem@davemloft.net",
             "stranger@example.org",
@@ -5907,7 +7036,7 @@ F:	*
                 OptionalPrincipal(p.clone()),
                 headers.clone(),
                 State(state.clone()),
-                Query(query()),
+                Query(msgid_query()),
             )
             .await
             .unwrap();
@@ -6251,6 +7380,545 @@ F:	*
         assert_eq!(resp2["status"], "accepted");
         assert!(db.lock_pending_fetch_queue().await.unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn test_bug_security_api_filtering_sorting_and_reeval_action() {
+        const SECRET: &str = "bug-sec-api-secret-12345678901234567890";
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let make_bug =
+            |bugid: &str, title: &str, status: crate::db::BugLifecycleStatus| crate::db::NewBug {
+                bugid: bugid.to_string(),
+                title: title.to_string(),
+                lifecycle_status: status,
+                pipeline_state: crate::db::BugPipelineState::Succeeded,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 1_762_345_000,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![crate::db::AttributedSubsystem::from_maintainers(
+                    "BTRFS FILE SYSTEM",
+                )],
+            };
+
+        let crit_id = db
+            .create_bug(&make_bug(
+                "linux-sec-crit",
+                "Remote heap OOB write",
+                crate::db::BugLifecycleStatus::Open,
+            ))
+            .await
+            .unwrap();
+        let non_id = db
+            .create_bug(&make_bug(
+                "linux-sec-non",
+                "Root module unload leak",
+                crate::db::BugLifecycleStatus::Open,
+            ))
+            .await
+            .unwrap();
+        let _pend_id = db
+            .create_bug(&make_bug(
+                "linux-sec-pend",
+                "Unevaluated open bug",
+                crate::db::BugLifecycleStatus::Open,
+            ))
+            .await
+            .unwrap();
+        let _dismissed_id = db
+            .create_bug(&make_bug(
+                "linux-sec-dismissed",
+                "Dismissed false positive",
+                crate::db::BugLifecycleStatus::Dismissed,
+            ))
+            .await
+            .unwrap();
+
+        let vuln_eval = crate::security_eval::SecurityEvaluation::from_raw_output(
+            crate::security_eval::RawSecurityEvaluationOutput {
+                security_class: "vulnerability".to_string(),
+                trust_boundary: Some("Network peer to host kernel".to_string()),
+                attacker_model: Some("Unauthenticated remote client".to_string()),
+                summary: "Unauthenticated network peer triggers kernel heap out-of-bounds write."
+                    .to_string(),
+                cvss_v4: Some(crate::security_eval::RawCvssV4Metrics {
+                    av: "N".to_string(),
+                    ac: "L".to_string(),
+                    at: "N".to_string(),
+                    pr: "N".to_string(),
+                    ui: "N".to_string(),
+                    vc: "H".to_string(),
+                    vi: "H".to_string(),
+                    va: "H".to_string(),
+                    sc: "N".to_string(),
+                    si: "N".to_string(),
+                    sa: "N".to_string(),
+                    ..Default::default()
+                }),
+                metric_justifications: Some(crate::security_eval::RawMetricJustifications {
+                    exploitability: "Remote packet parsed before authentication.".to_string(),
+                    vulnerable_system_impact: "Arbitrary kernel heap corruption.".to_string(),
+                    subsequent_system_impact: "Host kernel only.".to_string(),
+                }),
+            },
+            Some("deadbeef".to_string()),
+            Some("cafebabe".to_string()),
+        )
+        .unwrap();
+        assert!(
+            db.record_bug_security_evaluation(
+                crit_id,
+                crate::db::SecurityEvaluationRecordParams {
+                    evaluation: &vuln_eval,
+                    logs: None,
+                    tokens_in: Some(100),
+                    tokens_out: Some(50),
+                    tokens_cached: None,
+                    release_lease: false,
+                },
+            )
+            .await
+            .unwrap()
+        );
+
+        let non_eval = crate::security_eval::SecurityEvaluation::from_raw_output(
+            crate::security_eval::RawSecurityEvaluationOutput {
+                security_class: "not_security".to_string(),
+                trust_boundary: None,
+                attacker_model: None,
+                summary: "Requires CAP_SYS_MODULE root privileges during module teardown."
+                    .to_string(),
+                cvss_v4: None,
+                metric_justifications: None,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            db.record_bug_security_evaluation(
+                non_id,
+                crate::db::SecurityEvaluationRecordParams {
+                    evaluation: &non_eval,
+                    logs: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    tokens_cached: None,
+                    release_lease: false,
+                },
+            )
+            .await
+            .unwrap()
+        );
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.testing_mode = false;
+        settings.server.jwt_secret = Some(SECRET.to_string());
+        settings.server.acl.admins = vec!["operator@example.org".to_string()];
+        settings.server.acl.security = vec!["sec-reader@example.org".to_string()];
+        settings.server.read_only = false;
+        let settings = Arc::new(settings);
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            settings,
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            ServerOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let token = |email: &str| {
+            crate::auth::create_token(email, SECRET, Some("session".to_string()), 3600).unwrap()
+        };
+        let operator = token("operator@example.org");
+        let sec_reader = token("sec-reader@example.org");
+
+        // Sort descending by security_score: 9.3, 0.0, null.
+        let sorted: serde_json::Value = client
+            .get(format!(
+                "http://{}/api/bugs?lifecycle_status=open&sort_by=security_score&sort_order=desc",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", operator))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let sorted_ids: Vec<&str> = sorted["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["bugid"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            sorted_ids,
+            vec!["linux-sec-crit", "linux-sec-non", "linux-sec-pend"]
+        );
+
+        // Filter min_security_score=7.0 -> only linux-sec-crit.
+        let high_only: serde_json::Value = client
+            .get(format!(
+                "http://{}/api/bugs?lifecycle_status=open&min_security_score=7.0",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", operator))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(high_only["total"], 1);
+        assert_eq!(high_only["items"][0]["bugid"], "linux-sec-crit");
+        assert_eq!(high_only["items"][0]["security_score"], 9.3);
+        assert_eq!(high_only["items"][0]["security_rating"], "Critical");
+        assert_eq!(high_only["items"][0]["security_class"], "vulnerability");
+
+        // Filter comma-separated security_class=not_security,hardening -> only linux-sec-non.
+        let non_sec_only: serde_json::Value = client
+            .get(format!(
+                "http://{}/api/bugs?lifecycle_status=open&security_class=not_security,hardening",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", operator))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(non_sec_only["total"], 1);
+        assert_eq!(non_sec_only["items"][0]["bugid"], "linux-sec-non");
+
+        // Invalid filter inputs return 400 Bad Request.
+        for bad_q in ["min_security_score=10.5", "security_class=bogus"] {
+            let bad = client
+                .get(format!("http://{}/api/bugs?{}", addr, bad_q))
+                .header("Authorization", format!("Bearer {}", operator))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "{}", bad_q);
+        }
+
+        // Comment-only principal (acl.security) cannot trigger evaluate_security.
+        let denied_reeval = client
+            .post(format!(
+                "http://{}/api/bug/action?bugid=linux-sec-crit",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", sec_reader))
+            .json(&serde_json::json!({
+                "action": "evaluate_security",
+                "reason": "Updated threat model"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied_reeval.status(), StatusCode::FORBIDDEN);
+
+        // Dismissed bug rejects evaluate_security with 400 Bad Request.
+        let bad_dismissed = client
+            .post(format!(
+                "http://{}/api/bug/action?bugid=linux-sec-dismissed",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", operator))
+            .json(&serde_json::json!({ "action": "evaluate_security" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_dismissed.status(), StatusCode::BAD_REQUEST);
+
+        // Operator queues evaluate_security and GET /api/bug reflects the queued state + full evaluation.
+        let ok_reeval = client
+            .post(format!(
+                "http://{}/api/bug/action?bugid=linux-sec-crit",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", operator))
+            .json(&serde_json::json!({
+                "action": "evaluate_security",
+                "reason": "Updated threat model"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_reeval.status(), StatusCode::OK);
+
+        let detail: serde_json::Value = client
+            .get(format!("http://{}/api/bug?bugid=linux-sec-crit", addr))
+            .header("Authorization", format!("Bearer {}", operator))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail["security_eval_requested"], true);
+        assert_eq!(
+            detail["security_evaluation"]["cvss_vector"],
+            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+        );
+        let audit_msgs: Vec<&str> = detail["evidence"]["activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "audit")
+            .filter_map(|e| e["content"].as_str())
+            .collect();
+        assert!(
+            audit_msgs
+                .iter()
+                .any(|m| m.contains("Security re-evaluation requested: Updated threat model"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bugs_access_read_vs_read_write_and_path_overrides_endpoints() {
+        let _guard = crate::maintainers::GLOBAL_INDEX_TEST_LOCK.lock().await;
+        crate::maintainers::clear_global_maintainers();
+
+        let maintainers_text = r#"
+Maintainers List
+===================
+
+BTRFS FILE SYSTEM
+M:	Chris Mason <clm@fb.com>
+S:	Maintained
+F:	fs/btrfs/
+
+NETWORKING [GENERAL]
+M:	David S. Miller <davem@davemloft.net>
+S:	Maintained
+F:	net/
+"#;
+        let mut index =
+            crate::maintainers::MaintainersIndex::from_reader(maintainers_text.as_bytes()).unwrap();
+        index.set_bugs_access(vec![
+            crate::bugs_access::RawAccessGrant {
+                section: Some("BTRFS FILE SYSTEM".into()),
+                exclude_paths: vec!["fs/btrfs/tests/".into()],
+                ..Default::default()
+            },
+            crate::bugs_access::RawAccessGrant {
+                section: Some("BTRFS FILE SYSTEM".into()),
+                read: vec!["btrfs-reader@example.org".into()],
+                read_write: vec!["btrfs-rw@example.org".into()],
+                ..Default::default()
+            },
+        ]);
+        let index = Arc::new(index);
+        crate::maintainers::init_global_maintainers(index.clone());
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.database.url = ":memory:".to_string();
+        settings.server.testing_mode = false;
+        settings.server.read_only = false;
+        settings.server.jwt_secret = Some("test-bugs-access-secret".to_string());
+        settings.linux_bug.enabled = true;
+        let db = Arc::new(Database::new(&settings.database).await.unwrap());
+        db.migrate().await.unwrap();
+        let settings = Arc::new(settings);
+
+        // Bug 1: fs/btrfs/inode.c (covered by BTRFS after exclude_paths).
+        let mut visible_bug: crate::db::NewBug = serde_json::from_value(serde_json::json!({
+            "bugid": "linux-btrfs-visible",
+            "title": "btrfs: uaf in inode"
+        }))
+        .unwrap();
+        visible_bug.subsystems = index.attribute_files(["fs/btrfs/inode.c"]);
+        let visible_id = db
+            .create_bug_with_enrichment(
+                &visible_bug,
+                Some(&crate::db::NewBugEnrichment {
+                    kind: "reproducer".to_string(),
+                    tool: "test".to_string(),
+                    created_at: 10,
+                    content: Some("BTRFS_REPRO_MARKER".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Bug 2: fs/btrfs/tests/extent-io-tests.c (excluded by exclude_paths,
+        // even though raw MAINTAINERS still matches BTRFS FILE SYSTEM).
+        let mut excluded_bug: crate::db::NewBug = serde_json::from_value(serde_json::json!({
+            "bugid": "linux-btrfs-excluded",
+            "title": "btrfs: test helper warning"
+        }))
+        .unwrap();
+        excluded_bug.subsystems = index.attribute_files(["fs/btrfs/tests/extent-io-tests.c"]);
+        let excluded_id = db.create_bug(&excluded_bug).await.unwrap();
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(settings, db, event_tx, fetch_tx, ServerOptions::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let secret = "test-bugs-access-secret";
+        let reader_tok = crate::auth::create_token(
+            "btrfs-reader@example.org",
+            secret,
+            Some("session".into()),
+            3600,
+        )
+        .unwrap();
+        let rw_tok =
+            crate::auth::create_token("btrfs-rw@example.org", secret, Some("session".into()), 3600)
+                .unwrap();
+        let client = reqwest::Client::new();
+
+        // 1. Read grantee lists BTRFS bugs (seeing only the non-excluded bug),
+        //    sees subsystem counts, and reads full bug details + reproducers,
+        //    with can_comment = false and can_manage = false.
+        let list_body: serde_json::Value = client
+            .get(format!("http://{}/api/bugs", addr))
+            .header("Authorization", format!("Bearer {}", reader_tok))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list_body["total"], 1);
+        assert_eq!(list_body["items"][0]["bugid"], "linux-btrfs-visible");
+        assert_eq!(
+            list_body["items"][0]["subsystems"],
+            serde_json::json!(["BTRFS FILE SYSTEM"])
+        );
+
+        let subs_body: serde_json::Value = client
+            .get(format!(
+                "http://{}/api/bugs/subsystems?lifecycle_status=new",
+                addr
+            ))
+            .header("Authorization", format!("Bearer {}", reader_tok))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(subs_body.as_array().unwrap().len(), 1);
+        assert_eq!(subs_body[0]["name"], "BTRFS FILE SYSTEM");
+        assert_eq!(subs_body[0]["count"], 1);
+
+        let detail_reader: serde_json::Value = client
+            .get(format!("http://{}/api/bug?id={}", addr, visible_id))
+            .header("Authorization", format!("Bearer {}", reader_tok))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail_reader["can_comment"], false);
+        assert_eq!(detail_reader["can_manage"], false);
+        assert!(
+            detail_reader["evidence"]["activity"]
+                .to_string()
+                .contains("BTRFS_REPRO_MARKER")
+        );
+
+        // Excluded path bug returns 404 even by numeric id to BTRFS grantees.
+        for tok in [&reader_tok, &rw_tok] {
+            let excluded_resp = client
+                .get(format!("http://{}/api/bug?id={}", addr, excluded_id))
+                .header("Authorization", format!("Bearer {}", tok))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(excluded_resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        // Read grantee is rejected with 403 on Comment and Close mutations.
+        for payload in [
+            serde_json::json!({ "action": "comment", "content": "nope" }),
+            serde_json::json!({ "action": "close", "reason": "nope" }),
+        ] {
+            let resp = client
+                .post(format!("http://{}/api/bug/action?id={}", addr, visible_id))
+                .header("Authorization", format!("Bearer {}", reader_tok))
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        // 2. Read-write grantee gets can_comment = true, can_manage = true,
+        //    and succeeds on Comment and Close mutations.
+        let detail_rw: serde_json::Value = client
+            .get(format!("http://{}/api/bug?id={}", addr, visible_id))
+            .header("Authorization", format!("Bearer {}", rw_tok))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail_rw["can_comment"], true);
+        assert_eq!(detail_rw["can_manage"], true);
+
+        let comment_ok = client
+            .post(format!("http://{}/api/bug/action?id={}", addr, visible_id))
+            .header("Authorization", format!("Bearer {}", rw_tok))
+            .json(&serde_json::json!({ "action": "comment", "content": "triaged" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(comment_ok.status(), StatusCode::OK);
+
+        let close_ok = client
+            .post(format!("http://{}/api/bug/action?id={}", addr, visible_id))
+            .header("Authorization", format!("Bearer {}", rw_tok))
+            .json(&serde_json::json!({ "action": "close", "reason": "fixed" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(close_ok.status(), StatusCode::OK);
+
+        crate::maintainers::clear_global_maintainers();
+    }
 }
 
 /// Whether the caller may exercise a capability.
@@ -6321,9 +7989,16 @@ pub(crate) fn presents_local_token(
         return false;
     };
 
-    headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
+    let mut values = headers.get_all(axum::http::header::AUTHORIZATION).iter();
+    let Some(raw) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+
+    raw.to_str()
+        .ok()
         .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|presented| token.matches(presented.trim()))
 }
@@ -6384,7 +8059,7 @@ fn is_sign_in_eligible(
     !email.is_empty()
         && !acl.is_blocklisted(email)
         && (acl.is_known_identity(email)
-            || maintainers.is_some_and(|m| m.subsystems_for_address(email).is_some()))
+            || maintainers.is_some_and(|m| m.has_access_for_address(email)))
 }
 
 use crate::db::SIGN_IN_LINK_LIFETIME_SECONDS;
@@ -6475,7 +8150,7 @@ async fn request_link(
                 lifetime.max(0) as u64,
             );
             if state.settings.smtp.is_some() {
-                let _ = state.db.conn.query("SELECT 1", ()).await;
+                let _ = state.db.read_conn().query("SELECT 1", ()).await;
             }
             tracing::debug!(
                 "Ignored sign-in link request for ineligible or rate-limited address: {}",
