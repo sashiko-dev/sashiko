@@ -33,6 +33,7 @@ use crate::db::{
 
 const DONE_KEY: &str = "stats_backfill:v1:done";
 const CLEAN_PATCHES_DONE_KEY: &str = "stats_backfill:v1:clean_patches_done";
+const VERSIONED_ISSUES_DONE_KEY: &str = "stats_backfill:v1:versioned_issues_done";
 const PIPELINE_CURSOR_KEY: &str = "stats_backfill:v1:cursor:pipeline";
 const PIPELINE_COUNT_KEY: &str = "stats_backfill:v1:pipeline_count";
 const PIPELINE_TARGET: usize = 1000;
@@ -95,7 +96,11 @@ pub async fn run_stats_backfill_once(db: &Database) -> Result<()> {
     let email_cursor = read_phase_cursor(db, "email_outbox").await?;
     let clean_patches_done =
         read_meta_str(db, CLEAN_PATCHES_DONE_KEY).await?.as_deref() == Some("1");
-    if main_done && email_cursor <= 0 && clean_patches_done {
+    let versioned_issues_done = read_meta_str(db, VERSIONED_ISSUES_DONE_KEY)
+        .await?
+        .as_deref()
+        == Some("1");
+    if main_done && email_cursor <= 0 && clean_patches_done && versioned_issues_done {
         debug!("StatsBackfill already completed; exiting.");
         return Ok(());
     }
@@ -117,6 +122,15 @@ pub async fn run_stats_backfill_once(db: &Database) -> Result<()> {
                 "INSERT INTO meta (key, value) VALUES (?, '1')
                  ON CONFLICT(key) DO UPDATE SET value = '1'",
                 libsql::params![CLEAN_PATCHES_DONE_KEY],
+            )
+            .await?;
+        }
+        if !versioned_issues_done {
+            backfill_versioned_issues(db).await?;
+            db.execute(
+                "INSERT INTO meta (key, value) VALUES (?, '1')
+                 ON CONFLICT(key) DO UPDATE SET value = '1'",
+                libsql::params![VERSIONED_ISSUES_DONE_KEY],
             )
             .await?;
         }
@@ -143,6 +157,17 @@ pub async fn run_stats_backfill_once(db: &Database) -> Result<()> {
             )
             .await?;
             info!("StatsBackfill: clean_patches rollup backfill completed.");
+        }
+        if !versioned_issues_done {
+            info!("StatsBackfill: running incremental versioned_issues rollup backfill...");
+            backfill_versioned_issues(db).await?;
+            db.execute(
+                "INSERT INTO meta (key, value) VALUES (?, '1')
+                 ON CONFLICT(key) DO UPDATE SET value = '1'",
+                libsql::params![VERSIONED_ISSUES_DONE_KEY],
+            )
+            .await?;
+            info!("StatsBackfill: versioned_issues rollup backfill completed.");
         }
     }
     Ok(())
@@ -602,6 +627,31 @@ async fn backfill_clean_patches(db: &Database) -> Result<()> {
     Ok(())
 }
 
+async fn backfill_versioned_issues(db: &Database) -> Result<()> {
+    let cursor_key = "stats_backfill:v1:cursor:versioned_issues";
+    let mut cursor = match read_meta_str(db, cursor_key).await? {
+        Some(s) => s.parse::<i64>().unwrap_or(0).max(0),
+        None => {
+            let mut r = db
+                .read_conn()
+                .query("SELECT COALESCE(MAX(id), 0) FROM patchsets", ())
+                .await?;
+            match r.next().await? {
+                Some(row) => row.get::<i64>(0)?.max(0),
+                None => 0,
+            }
+        }
+    };
+    while cursor > 0 {
+        let low = (cursor - TX_ENTITY_CHUNK).max(0);
+        db.backfill_versioned_issues_chunk(low, cursor, now_unix())
+            .await?;
+        cursor = low;
+        sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -732,6 +782,21 @@ mod tests {
         )
         .await?;
         assert!((dirty_patches - 1.0).abs() < f64::EPSILON);
+
+        let v2_patches = sum_rollup_86400(
+            &db,
+            "sashiko_patches_reviewed_by_version_total",
+            r#"{"version_bucket":"v2"}"#,
+        )
+        .await?;
+        let v2_findings = sum_rollup_86400(
+            &db,
+            "sashiko_findings_by_version_total",
+            r#"{"version_bucket":"v2"}"#,
+        )
+        .await?;
+        assert!((v2_patches - 1.0).abs() < f64::EPSILON);
+        assert!((v2_findings - 1.0).abs() < f64::EPSILON);
 
         Ok(())
     }
@@ -988,6 +1053,17 @@ mod tests {
         let clean_cnt2 =
             sum_rollup_86400(&db, "sashiko_patches_reviewed_total", r#"{"clean":"true"}"#).await?;
         assert!((clean_cnt2 - 2.0).abs() < f64::EPSILON);
+
+        let ver_patches = sum_rollup_86400(
+            &db,
+            "sashiko_patches_reviewed_by_version_total",
+            r#"{"version_bucket":"v1"}"#,
+        )
+        .await?;
+        assert!(
+            (ver_patches - 2.0).abs() < f64::EPSILON,
+            "expected exactly 2 v1 reviewed patches without double-counting, got {ver_patches}"
+        );
 
         Ok(())
     }

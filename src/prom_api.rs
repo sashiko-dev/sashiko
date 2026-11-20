@@ -121,6 +121,18 @@ pub static DB_METRIC_CATALOG: &[MetricDef] = &[
         unit: "",
     },
     MetricDef {
+        name: "sashiko_patches_reviewed_by_version_total",
+        metric_type: MetricType::Counter,
+        help: "Total reviewed patches on non-embargoed patchsets grouped by series revision bucket.",
+        unit: "",
+    },
+    MetricDef {
+        name: "sashiko_findings_by_version_total",
+        metric_type: MetricType::Counter,
+        help: "Total patch-introduced findings on non-embargoed patchsets grouped by series revision bucket.",
+        unit: "",
+    },
+    MetricDef {
         name: "sashiko_findings_discovered_total",
         metric_type: MetricType::Counter,
         help: "Total review findings on non-embargoed patchsets grouped by severity and preexisting flag.",
