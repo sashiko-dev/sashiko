@@ -147,6 +147,13 @@ fn parse_prerequisite_metadata(body: &str) -> Result<Option<PrerequisiteMetadata
     Ok(parse_based_on_message_id(body)?.map(PrerequisiteMetadata::BasedOn))
 }
 
+/// Returns true when `body` declares valid prerequisite metadata recognized by
+/// the prerequisite resolver (`prerequisite-patch-id`,
+/// `prerequisite-message-id`, or `Based-on`).
+pub(crate) fn has_prerequisite_metadata(body: &str) -> bool {
+    parse_prerequisite_metadata(body).is_ok_and(|meta| meta.is_some())
+}
+
 fn parse_prerequisite_series_ids(body: &str) -> Result<Vec<String>> {
     let mut ids = Vec::new();
     let mut seen = HashSet::new();
