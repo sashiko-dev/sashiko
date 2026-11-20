@@ -1,0 +1,482 @@
+[
+    {
+        "Commit": "c2fa4320803ba54fced5548482df76a03d83faec",
+        "Fixed-by": "9e2e59301c7f7617438ef55370b5b236d68be902",
+        "subsystem": "riscv",
+        "problem_description": "rvserver_ref_machine_init() creates the ACLINT mtimer with RISCV_ACLINT_DEFAULT_TIMEBASE_FREQ (10 MHz) while the same machine advertises RVSERVER_ACLINT_TIMEBASE_FREQ (1 GHz) as the timebase-frequency in the device tree. The guest OS boots with a timer ticking 100x slower than what the device tree (and the RISC-V Server Platform spec) claims, so guest timekeeping runs at the wrong rate."
+    },
+    {
+        "Commit": "7d10ff8a4de7a9bff1e7b25011f5eb43f24a6713",
+        "Fixed-by": "59d7f16d8ed862a0d2b6ad4bcce72784512db675",
+        "subsystem": "riscv",
+        "problem_description": "virt_machine_init() now builds the PLIC hart-config string with riscv_plic_hart_config_string(), which gives harts without supervisor mode no S context, but create_fdt_socket_plic() still emits an M and an S entry in 'interrupts-extended' for every hart. Booting with e.g. '-cpu rv64,s=false' makes the device tree advertise more PLIC contexts than the PLIC implements, so context numbering shifts and every hart but the first drives the wrong (or a nonexistent) PLIC context."
+    },
+    {
+        "Commit": "dc5bd18fa57254e4b8597747c2100c92a55fc409",
+        "Fixed-by": "9f7677f5d7bc494f1d2e033b4e5c5164e1079ea4",
+        "subsystem": "riscv",
+        "problem_description": "The new cpu.h defines MMU_USER_IDX as 3, but the RISC-V user-mode MMU index is 0 (PRV_U is 0 and the MMU index is derived from the privilege level). CONFIG_USER_ONLY builds that obtain the MMU index from MMU_USER_IDX via generic code will use index 3 while the target's own mmu-index logic uses 0, giving inconsistent TLB index handling in riscv-user emulation."
+    },
+    {
+        "Commit": "4eb471258bd0e331678bece4c894c477928b3b0b",
+        "Fixed-by": "69790460f8779844121c72355b498702537c04a8",
+        "subsystem": "riscv",
+        "problem_description": "kvm_riscv_handle_sbi() dereferences serial_hd(0)->be without checking that serial_hd(0) is non-NULL; when QEMU is started without a serial backend (e.g. -serial none), a KVM guest issuing a legacy console SBI call (putchar/getchar, as with earlycon=sbi) makes QEMU dereference a NULL pointer and crash."
+    },
+    {
+        "Commit": "a6b53378f537a51355a49826b7d119698c74ffba",
+        "Fixed-by": "69790460f8779844121c72355b498702537c04a8",
+        "subsystem": "riscv",
+        "problem_description": "kvm_riscv_handle_sbi_dbcn() calls qemu_chr_fe_read_all/write_all on serial_hd(0)->be without verifying the serial backend exists, and calls exit(1) whenever the chardev reports an I/O error. With -serial none a guest DBCN SBI call crashes QEMU on a NULL dereference, and on an existing but failing backend a guest-triggered DBCN read/write terminates the QEMU process instead of returning an SBI error."
+    },
+    {
+        "Commit": "284d697c74ef3f4210cbccc5cd6b4894740e4ab3",
+        "Fixed-by": "bf67d56f282c1ee25b67dfda3f8ca54d2bd4648e",
+        "subsystem": "riscv",
+        "problem_description": "The commit widens CPURISCVState.mstatus/vsstatus/mstatus_hs to uint64_t, but the TCG translator still accesses them with 32-bit tcg_gen_ld_tl/st_tl at offsetof(CPURISCVState, mstatus) (mark_fs_dirty()/mark_vs_dirty()). On a big-endian host running an riscv32 guest that offset selects the upper 32 bits (the mstatush half), so FS/VS dirty marking reads and corrupts the wrong word of mstatus/mstatus_hs."
+    },
+    {
+        "Commit": "74112400df659b0edb1da35db5c948313ffeffd0",
+        "Fixed-by": "9164d533ecaebd9d07f61e5fc7026cc9afa80e92",
+        "subsystem": "riscv",
+        "problem_description": "pmu_timer_trigger_irq() declares uint64_t curr_ctr_val/curr_ctrh_val uninitialized and passes (target_ulong *)&curr_ctr_val to riscv_pmu_read_ctr(), which stores a target_ulong; on RV32 only the low 32 bits are written and the upper 32 bits remain stack garbage. The garbage half is then compared against the software-written counter value to decide if the counter overflowed, so a stray bit causes LCOFI interrupts to be wrongly suppressed or wrongly raised."
+    },
+    {
+        "Commit": "a7aa525b93c3f7a847cd2185b71aef97a17ec3d5",
+        "Fixed-by": "87c60331651d15f253f512de573177cc9a352e3d",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_process_dbg() builds the TR_RESPONSE from iotlb.translated_addr & ~iotlb.addr_mask, i.e. the base of the whole translation range (which may be a superpage or NAPOT range), but always clears TR_RESPONSE_S and never encodes the range in the PPN. A debug translation request landing inside a superpage therefore gets an S=0 (4 KiB) response naming the wrong physical page, disagreeing with the RISC-V IOMMU debug interface semantics."
+    },
+    {
+        "Commit": "4bf501dc0118a28699e28c01acb34e28ddeb0acc",
+        "Fixed-by": "387ed674f599fa728abe17225d8d183d69e7a144",
+        "subsystem": "riscv",
+        "problem_description": "pmp_unlock_entries() bounds its reset loop with pmp_get_num_rules(), which returns the number of active rules (A field not OFF) rather than the number of implemented PMP entries; with a sparse configuration (entries 0/1 OFF, entries 2/3 locked) the loop stops early and never clears the LOCK/AMATCH bits of the later entries, and since riscv_cpu_reset_hold() already cleared mseccfg (including RLB), the locked stale PMP rules can never be rewritten again for the lifetime of the machine."
+    },
+    {
+        "Commit": "9d085a1c3cb2b6a1ee77d5f6e0ca20241208acd8",
+        "Fixed-by": "9c20897e50f44837e53896fe504a63a6dd696c34",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_translate() allocates a RISCVIOMMUEntry with g_new0() and hands ownership to riscv_iommu_iot_update(), but when ioatc-limit=0 that helper returns early without inserting or freeing the entry, so every cacheable non-identity translation leaks one RISCVIOMMUEntry (unbounded host memory growth for a long-running device with ioatc-limit=0)."
+    },
+    {
+        "Commit": "8747c9eeb2aaec8441d0900b198725ab33af4951",
+        "Fixed-by": "9b6fc2a75102ff1713deb1d86bca90ebdf9594fc",
+        "subsystem": "riscv",
+        "problem_description": "The new read_vsepc()/write_vsepc() accessors copy env->vsepc verbatim, unlike the mepc/sepc accessors which mask with get_xepc_mask(); vsepc is a WARL register whose low address bits must read as zero per IALIGN, so guests can observe and store invalid low bits through vsepc (e.g. bit 1 with IALIGN=32)."
+    },
+    {
+        "Commit": "cfc96df65e01b339fc8b544ad56863279c80decb",
+        "Fixed-by": "57b484e2d232423c95ce559919b9624041254b0c",
+        "subsystem": "riscv",
+        "problem_description": "This commit makes riscv_pmu_ctr_get_fixed_counters_val() always return the full 64-bit fixed-counter value but leaves the RV32 callers treating the result as a 32-bit half: riscv_pmu_write_ctrh() deposits the low 32 bits of the complete value into the high half of mhpmcounter_prev, and riscv_pmu_read_ctr() subtracts only an extracted 32-bit half of the previous value from the full 64-bit value, so on RV32 writes to mcycleh/minstreth can be lost and carries between the low and high halves are mishandled."
+    },
+    {
+        "Commit": "3e6f1e61b4bc0facd13967580feed47d96a2c28c",
+        "Fixed-by": "ee23f530e99d1091f31585dd0ca1b948d4873939",
+        "subsystem": "riscv",
+        "problem_description": "spcr_setup() declares the riscv virt machine's 16550-compatible UART with base_addr.width = 32 (apparently copied from ARM's PL011), but this UART has an 8-bit register stride, so ACPI guests that trust the SPCR will access the serial console registers with a 32-bit stride and get broken early-console/debug output."
+    },
+    {
+        "Commit": "3ca78c0689d504366d7c8dc516e7144940aa7c0c",
+        "Fixed-by": "f20acdba2a960689cc7adb179e96b0441cb83e25",
+        "subsystem": "riscv",
+        "problem_description": "kvm_riscv_get_regs_vector()/kvm_riscv_put_regs_vector() synchronize vstart, vl and vtype with KVM but never vcsr, so env->vxrm/vxsat go stale in the QEMU migration stream and the destination never restores the values KVM holds; the guest's vector rounding mode and vxsat flag are lost across migration."
+    },
+    {
+        "Commit": "27abe66f31efa8bcd15f0f998db2127b4ffb628a",
+        "Fixed-by": "0f9adcab46c08246f21c290bd0a9382c5b02bd6c",
+        "subsystem": "riscv",
+        "problem_description": "The timer-frequency sanity check in kvm_riscv_put_regs_timer() is guarded by migration_is_running(migrate_get_current()->state), which is false on the incoming/destination side where the check is needed, and the source's kvm_timer_frequency is never placed in the migration stream, so (contrary to the patch's own stated intent) migration between hosts with different KVM timer frequencies completes silently instead of being rejected, corrupting the guest timebase."
+    },
+    {
+        "Commit": "937f0b45120bea964ca4ababbe98e1a2de05a077",
+        "Fixed-by": "e52de6b65f5fa584209a8c147d6170d8370ffdee",
+        "subsystem": "riscv",
+        "problem_description": "kvm_riscv_get_regs_fp() pulls f0-f31 from KVM but never reads the FCSR register, so the accrued FP exception flags (fflags) and rounding mode (frm) are not reflected in the QEMU CPU state and are lost from the migration stream \u2014 after migration (or any KVM->QEMU sync) the guest's fcsr state is stale."
+    },
+    {
+        "Commit": "9997cc1e19d1f909551783c280cfe441a0838943",
+        "Fixed-by": "e52de6b65f5fa584209a8c147d6170d8370ffdee",
+        "subsystem": "riscv",
+        "problem_description": "kvm_riscv_put_regs_fp() writes f0-f31 to KVM but never pushes FCSR (KVM_REG_RISCV_FP_{F,D}_REG(fcsr)) back, so the fflags/frm values restored from the migration stream in env are never applied to the KVM vCPU and the resumed guest runs with a stale floating-point control/status register."
+    },
+    {
+        "Commit": "55c2a12cbcd3d417de39ee82dfe1d26b22a07116",
+        "Fixed-by": "410166b550ccacdc46065af00e68cea4d60efb65",
+        "subsystem": "riscv",
+        "problem_description": "The WFI decode (case 0x105 in the SYSTEM opcode handling) emits gen_helper_wfi(cpu_env) but leaves the disassembler state as continue (BS_NONE/DISAS_NEXT) instead of ending the TB, even though helper_wfi() never returns to translated code (it halts the CPU or raises); the instruction following WFI is folded into the same TB, and with icount enabled that extra instruction count makes minstret increment once too many when WFI exits."
+    },
+    {
+        "Commit": "27f9566dcd98bdde045ef5ae7b8199456c8a51c1",
+        "Fixed-by": "7f9ab1dc6c6e0f855e0b098b3d8f404e760a1df5",
+        "subsystem": "riscv",
+        "problem_description": "Changing LOCAL_INTERRUPTS from ~0x1FFF to ~0xFFFF drops bits 13-15 (including MIP_LCOFIP) from every mask derived from it (all_ints, mvip/mvien/sip/hvip/hvien/vsip writable masks and the AIA mie/mideleg/sie/sip alias computations), so even with Sscofpmf and Smaia/Ssaia implemented the local counter overflow interrupt can never be enabled, set, or delegated via a CSR and LCOFI is never delivered to the HS or VS level."
+    },
+    {
+        "Commit": "a42bd0016654cafd6ca8ca4dbb82fc921ca19ae4",
+        "Fixed-by": "055f9cb47d4e1c5889bdbca4e6dc1d5201964ccb",
+        "subsystem": "riscv",
+        "problem_description": "tdata_csr_write() dispatches on the trigger type extracted from the written tdata1 value and falls through to a default case calling g_assert_not_reached() for any unassigned type (e.g. reserved types 1 or 8-14); tdata CSRs are WARL and writable by guest/debugger software, so such a write abruptly aborts the QEMU process instead of being legalized per write-any-read-legal semantics."
+    },
+    {
+        "Commit": "549cbf789ef8669a835207e020db67d20045b1a9",
+        "Fixed-by": "f7594e0cedb348169521933b00966c78cb7ba2c6",
+        "subsystem": "riscv",
+        "problem_description": "riscv_cpu_init() assigns a freshly created hash table to the single static global multi_ext_user_opts on every CPU instance, so creating a second hart overwrites and leaks the first table (and any user-set extension entries recorded for it); LeakSanitizer reports leaks when a multi-hart machine exits."
+    },
+    {
+        "Commit": "21915d16c6fbe857773cc9e10badb3e29cd7194a",
+        "Fixed-by": "f7594e0cedb348169521933b00966c78cb7ba2c6",
+        "subsystem": "riscv",
+        "problem_description": "tcg_cpu_instance_init() assigns a new hash table to the global static misa_ext_user_opts for every CPU instance created, overwriting the only reference to the previous table on second and later harts \u2014 leaking it (LeakSanitizer-verified) and discarding the recorded MISA user options of earlier CPUs."
+    },
+    {
+        "Commit": "954886ea6dd496ad259f8c576a8767e1d7059a28",
+        "Fixed-by": "9d6ac47d3182f2bdadea4bed596c82759a167e67",
+        "subsystem": "riscv",
+        "problem_description": "create_fdt_socket_aclint() names the mtimer node \"mtimer@<addr>\" using the mtimecmp base address, but the first reg entry is addr + RISCV_ACLINT_DEFAULT_MTIME (0xBFF8), so with aclint=on the generated guest device tree has a node whose unit address does not match its reg property (dtc reports simple_bus_reg unit-address format errors)."
+    },
+    {
+        "Commit": "7778f4b27bb1068fb361ca60e6f3f9a43080619f",
+        "Fixed-by": "0d25e0802d17f55778811fbcfa9138fa5668cb43",
+        "subsystem": "riscv",
+        "problem_description": "tt_atlantis_machine_init() passes TT_IRQCHIP_GUESTS = 63 as aia_guests \u2014 a placeholder value chosen only to size the IMSIC stride to 0x40000 \u2014 so the machine emulates and advertises (via the device tree riscv,guest-index-bits) 63 AIA guest contexts where the actual hardware supports GEILEN = 5, misrepresenting guest interrupt support to software."
+    },
+    {
+        "Commit": "dcd028517749835a618bb1fe8dca32d82318e1c1",
+        "Fixed-by": "a9779d24be31338d90aa19a560e69cc4c9660627",
+        "subsystem": "riscv",
+        "problem_description": "The new riscv_write_uxl() legalizes a UXL write of 3 to (XLEN of) the CPU even when the hart is RV128 (xl == MXL_RV128), so on an RV128 machine writing UXL = 3 \u2014 the valid encoding for 128-bit U-mode operation \u2014 to mstatus or vsstatus is silently rewritten to RV64, breaking experimental RV128 support."
+    },
+    {
+        "Commit": "4923f672e3d751cd8b7a10e32e09328c8f85ba1d",
+        "Fixed-by": "bd1ee9ab3c39f269d8bea8acf83ea833a69a6e10",
+        "subsystem": "riscv",
+        "problem_description": "write_menvcfg() and write_henvcfg() add MENVCFG_LPE/HENVCFG_LPE to the writable mask only inside the riscv_cpu_mxl(env) == MXL_RV64 block, but LPE (bit 2) resides in the low 32 bits and the CFI spec defines it for RV32 as well, so on qemu-system-riscv32 with zicfilp=true an M/HS-mode write setting menvcfg.LPE/henvcfg.LPE silently reads back as zero and landing pads can never be enabled."
+    },
+    {
+        "Commit": "8205bc127a83719d85a28ceffdd5e822b8fa3db7",
+        "Fixed-by": "bd1ee9ab3c39f269d8bea8acf83ea833a69a6e10",
+        "subsystem": "riscv",
+        "problem_description": "write_menvcfg() and write_henvcfg() add the Zicfiss MENVCFG_SSE/HENVCFG_SSE bits to the writable mask only inside the riscv_cpu_mxl(env) == MXL_RV64 block, but per the CFI spec these enable bits live in the low 32 bits and are defined for RV32 too. On qemu-system-riscv32 a Zicfiss-capable CPU silently drops writes to menvcfg.SSE/henvcfg.SSE (they read back as zero), so shadow stacks can never be enabled, unlike the senvcfg.SSE path added in the same patch which is MXLEN-independent."
+    },
+    {
+        "Commit": "b18e3f0e2d0f301952ff3ae4cb73d0e9eb4ee697",
+        "Fixed-by": "aa51eec004461f671f878145d3fc921c6cabee48",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_spa_fetch() now stores the request-narrowed permission into the iotlb on a successful walk (iotlb->perm &= pte_perm), but that narrowed value is what riscv_iommu_translate() caches in the IOMMU TLB for the IOVA. A write to an RW mapping caches the entry as write-only, so a subsequent read to the same page hits the cached entry and raises a spurious IOMMU fault even though the leaf PTE allows reads (observed as bogus NVMe completions and controller timeouts)."
+    },
+    {
+        "Commit": "b795ea0ba4715182805994db0cdabd2650a553a7",
+        "Fixed-by": "f16fd27b3fe3c305d95c61d3516e458c45c6e8c9",
+        "subsystem": "riscv",
+        "problem_description": "The new '!(pte & PTE_U) && !pv' fault check in riscv_iommu_spa_fetch() is placed before the leaf/non-leaf branch of the walk loop, so it fires on every PTE visited, including non-leaf (table) PTEs for which the U bit is not defined per the RISC-V privileged spec's translation algorithm. Any user-mode (no process_id) DMA translation whose intermediate page-table entries have U=0 - the normal case - now reports a spurious page fault instead of completing the walk."
+    },
+    {
+        "Commit": "77442380ecbe3b3c092c2a48dbfe8286336e7e78",
+        "Fixed-by": "51362da8f73b13ad029287ee33e190a212894183",
+        "subsystem": "riscv",
+        "problem_description": "The new SEED_OPST_* macros are plain signed int expressions (e.g. SEED_OPST_ES16 = 0b10 << 30 sets bit 31, making it a negative int), so in rmw_seed() the result ORed into the target_ulong return value is sign-extended on RV64. Every successful read of the seed CSR on RV64 returns bits 63:32 set to 1 instead of the required zero-extended value, and the DEAD failure path (0b11 << 30) has the same problem."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "ce7fb3282756c04433274e3abcd59407f77c4923",
+        "subsystem": "riscv",
+        "problem_description": "When device/process context fetching fails, riscv_iommu_ctx() reports the fault with a hardcoded RISCV_IOMMU_FQ_TTYPE_UADDR_RD transaction type and an iotval of 0, regardless of the actual access. A failing write access is reported to the guest's fault queue as a read fault, and the faulting IOVA is never recorded, so guest software gets wrong ttype-iotval fault records for context-fetch errors."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "6d2b9d542fe2cec17eec71bdb33e45bee8805105",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_spa_fetch() honors the DC.tc GADE/SADE bits (local 'ade') to skip PTE A/D-bit faults, but the emulation never advertises capabilities.AMO_HWAD, and per the RISC-V IOMMU spec GADE/SADE are reserved when AMO_HWAD is zero - a device context with them set must be rejected with a DDT_MISCONFIGURED fault. Instead, a guest can set these reserved tc bits and translations silently proceed with hardware A/D-update semantics."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "79616dd6e499c4eed0af534872f3ff0e3c133c04",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_spa_fetch() updates iotlb->translated_addr only when a translation phase completes, so the do-while fault-exit path returns with translated_addr still zero (the caller's designated-initializer leaves it zeroed). riscv_iommu_translate() then reports the fault with iotval2 = iotlb->translated_addr, so any page-walk fault records iotval2=0 in the guest-visible fault queue entry instead of the faulting GPA/SPA it had reached."
+    },
+    {
+        "Commit": "69a9ae483696e185889edaeddacf46afd9110bc6",
+        "Fixed-by": "bf274c54295c81aeda3835e2e0bc971f0bd57f47",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_validate_device_ctx() gains DC.iohgatp mode validation in this patch (rejecting T2GPA with a Bare iohgatp) but omits the spec-mandated misconfigured-DDT condition that a non-Bare DC.iohgatp.PPN root address must be 16-KiB aligned; a guest can program a device context with a non-Bare iohgatp and a misaligned root PPN and the IOMMU will perform G-stage translation from the misaligned address instead of reporting a DDT-misconfigured fault."
+    },
+    {
+        "Commit": "01c1caa9d1b4a1938e0baba1a64c26636a3aff9f",
+        "Fixed-by": "58e801f74e6a4ebd3a0cf3ab1a96e1676b263efd",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_sysdev_send_MSI() issues the IOMMU's own MSI write via address_space_stl_le() and captures the MemTxResult but only feeds it to a trace point; when the MSI write fails (e.g. guest programmed an unmapped MSI address) the device silently drops it instead of recording a RISCV_IOMMU_FQ_CAUSE_MSI_WR_FAULT record in the fault queue as the RISC-V IOMMU spec requires, so the guest is never notified."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "9158c900ab308cbb8a70edcc7358efab7b34730e",
+        "subsystem": "riscv",
+        "problem_description": "In riscv_iommu_spa_fetch(), the leaf-PTE acceptance chain never checks PTE_U on the second-stage (G-stage) pass, but the RISC-V IOMMU spec states that when checking the U bit in a second-stage PTE the transaction is treated as not requesting supervisor privilege; a G-stage leaf PTE with U=0 must fault, yet it is accepted, letting device DMA reach supervisor-only G-stage mappings that hardware would reject."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "b795ea0ba4715182805994db0cdabd2650a553a7",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_spa_fetch() performs no PTE_U check when accepting a leaf PTE, even though all IOMMU transactions are treated as user-mode accesses unless a valid process context (process_id) is present; a DMA access without a process_id to a page mapped by a non-user PTE (U=0) is incorrectly granted instead of raising a fault, violating the RISC-V IOMMU spec."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "c1d5ec3a2f4bbc9fdc120ba5697e8ad89e682e45",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_spa_fetch() validates PTE_V and the reserved R/W/X encodings but never faults when the reserved PTE bits (63:61/60:54) are set; a leaf PTE with reserved bits set is walked and used for translation instead of causing a page fault as the IOMMU/privileged spec requires, so illegal guest page tables are silently honored."
+    },
+    {
+        "Commit": "69a9ae483696e185889edaeddacf46afd9110bc6",
+        "Fixed-by": "b18e3f0e2d0f301952ff3ae4cb73d0e9eb4ee697",
+        "subsystem": "riscv",
+        "problem_description": "This patch rewrites the fault-path transaction-type selection in riscv_iommu_translate() to test iotlb->perm & IOMMU_RW before IOMMU_RO, but IOMMU_RW (== IOMMU_RO|IOMMU_WO) subsumes a pure read and iotlb->perm may hold the leaf PTE's permissions (overwritten by riscv_iommu_spa_fetch()) rather than the original request for faults raised after the translation phase; a faulting read is therefore logged in the fault queue with ttype UADDR_WR (and a faulting write can be logged as a read), producing guest-visible fault records with the wrong transaction type."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "64ce9ac18757d79f3b5b337f7bcbdd0dabef3ce1",
+        "subsystem": "riscv",
+        "problem_description": "In riscv_iommu_spa_fetch(), the access-bit fault check is gated on the access being a read ((iotlb->perm & IOMMU_RO) && !ade && !(pte & PTE_A)), but with SADE/GADE=0 the spec requires a page fault for a clear A bit regardless of access type; a write to a page whose PTE has A=0 and D=1 is silently allowed instead of faulting."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "3cee183ff9a1a644fcc027ce2751276a5525b123",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_msi_write() computes the MRIF interrupt-pending bit address as addr | ((data & 0x7c0) >> 3); each pending-bit doubleword covers 64 interrupt identities so the offset must advance 0x10 per batch (>> 2), and with >> 3 any interrupt identity >= 64 reads and sets its pending bit at the wrong MRIF address, losing or misdirecting MRIF-mode MSIs."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "887d2d75b1a9da8d8252d9f983558c45173afbae",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_report_fault() takes a pv flag from its callers but hardcodes RISCV_IOMMU_FQ_HDR_PV to true while only filling in RISCV_IOMMU_FQ_HDR_PID when pv is set, so fault records for transactions without a valid process_id are reported with PV=1 and a zero PID, delivering corrupted fault-queue records to the guest."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "6ed77682d51fd0d8a21a6caba12dddec967ca7fb",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_process_cq_tail() executes IOFENCE.C without validating the command's reserved bits (dword0[31:14]), but per the RISC-V IOMMU spec an IOFENCE.C with any reserved bit set is an illegal command that must set CQCSR.cmd_ill and stop command processing; QEMU instead executes the fence and advances the command queue, diverging from spec-mandated behavior."
+    },
+    {
+        "Commit": "f310df58bd2c570be8b802bffb37cb30da0c346e",
+        "Fixed-by": "dcd028517749835a618bb1fe8dca32d82318e1c1",
+        "subsystem": "riscv",
+        "problem_description": "write_vsstatus() accepts any non-zero vsstatus.UXL value without WARL legalization, so a VS-mode guest can store the reserved UXL=3 (RV128) encoding into vsstatus; unlike write_mstatus(), the reserved encoding is never rewritten to a legal value, leaving the emulated hart reporting an unsupported U-mode XLEN for VS state."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "13c2fc34f18491c7b74451cc64e91139bc5db272",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_validate_device_ctx() never checks the reserved DC.TC bits (bits 12-23 and 33-63), so a device context with reserved TC bits set is accepted instead of being reported as a DDT-misconfigured fault as required by the RISC-V IOMMU spec."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "5a3fd18f4f9b9c2a19c0800e88d7b38403e210ca",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_realize() sets the FCTL read-only mask to ~(FCTL_BE | FCTL_WSI), leaving FCTL.BE guest-writable even though the device does not advertise big-endian support (CAP.END=0) and always performs little-endian accesses, while FCTL.GXL, which the spec permits software to write freely, is made read-only."
+    },
+    {
+        "Commit": "638181a180bd4815eb4db64cfc50092cc3e5035e",
+        "Fixed-by": "46d96da1309869af6261d1997623b7a5212814d8",
+        "subsystem": "riscv",
+        "problem_description": "Moving plugin vCPU state creation and the queued qemu_plugin_vcpu_init__async callback into cpu_common_initfn makes TCG plugin vcpu_init_cb callbacks run before the vCPU is realized/reset, so a plugin register read can reach read_vtype() with env->xl still zero and hit g_assert_not_reached(), aborting QEMU."
+    },
+    {
+        "Commit": "d641da6ed431f497b763a6e6bf30e0b4dc00e0d9",
+        "Fixed-by": "fdfcd98f6656b0cf425475bd8ce7f4c08adf8ca6",
+        "subsystem": "riscv",
+        "problem_description": "riscv_acpi_madt_add_rintc() reports the S-mode PLIC context ID as 2*local_cpu_id+1 (TCG's M/S context interleaving), but under KVM the virt machine exposes only S-mode PLIC contexts numbered contiguously from 0; with KVM+ACPI the guest enables a PLIC context that QEMU never delivers interrupts to, stalling e.g. virtio-blk INTx boot."
+    },
+    {
+        "Commit": "63469ad75dcc17849a29ad115ec3711d72308eeb",
+        "Fixed-by": "0ef6910e3269548112c8d81e511c8627d0b9396a",
+        "subsystem": "riscv",
+        "problem_description": "After routing the IMSIC callback result through a local wide_val, rmw_xireg_aia() and rmw_xtopei() unconditionally execute *val = wide_val, but val is NULL for write-only CSR accesses, so a guest writing xireg/xtopei (e.g. setting up IMSIC with aia=aplic-imsic) causes a NULL-pointer dereference and crashes QEMU."
+    },
+    {
+        "Commit": "2c12de146071beca8021d71cf2ac49bde36b2c8e",
+        "Fixed-by": "926a8b8e4f11a1b1955f5f46c89069614ea28156",
+        "subsystem": "riscv",
+        "problem_description": "create_fdt_pcie() emits a malformed iommu-map for the riscv-iommu-sys device: it includes a junk zero-length (rid-base, iommu, iommu-base, length)=(0, phandle, 0, 0) tuple and passes 0xffff as the length instead of 0x10000, so the device tree tells the guest that only requester IDs 0x0-0xfffe are mapped to the IOMMU, breaking proper PCI BDF-to-IOMMU association."
+    },
+    {
+        "Commit": "5db557f82bff480437275d4cc9e0b5463bc04484",
+        "Fixed-by": "c483b90ccd9b8cb3c7445c1b8f0dfbb5e03a6e5f",
+        "subsystem": "riscv",
+        "problem_description": "The new Smrnmi state fields (mnscratch, mnepc, mncause, mnstatus, rnmip) are added after the \"Fields from here on are preserved across CPU reset\" marker in CPUArchState, so cpu_reset does not clear mnscratch/mnepc/mncause and they leak stale values into the guest across a CPU reset."
+    },
+    {
+        "Commit": "98f21c30f5beffc45232721ae79c019df58ae9f1",
+        "Fixed-by": "d85a4ec06a65ccdd5c7d0f00b3e6695fc14a547a",
+        "subsystem": "riscv",
+        "problem_description": "promote_load_fault() omits the RISCV_EXCP_LOAD_ADDR_MIS -> RISCV_EXCP_STORE_AMO_ADDR_MIS promotion, so when RISCV_UW2_ALWAYS_STORE_AMO is set a misaligned AMO raises a load-address-misaligned exception (cause 4) instead of the architecturally required store/AMO-address-misaligned exception (cause 6)."
+    },
+    {
+        "Commit": "d167a2247edefc640e95497321e571721cd7952e",
+        "Fixed-by": "3febc1f6e2efa95333805b058fb305686d302f4f",
+        "subsystem": "riscv",
+        "problem_description": "riscv_cpu_init() assigns a freshly allocated GHashTable to the file-global general_user_opts on every CPU instance creation, so creating a second hart leaks the first hart's table and the user-set-property bookkeeping is shared (and clobbered) across all CPU instances instead of being per-CPU."
+    },
+    {
+        "Commit": "cfc96df65e01b339fc8b544ad56863279c80decb",
+        "Fixed-by": "02284108376a6bcfdd56a11de1c6e0bcc3d0e53b",
+        "subsystem": "riscv",
+        "problem_description": "On RV32, riscv_pmu_write_ctrh() passes the full 64-bit value of riscv_pmu_ctr_get_fixed_counters_val() straight into deposit64(mhpmcounter_prev, 32, 32, ...) without applying the upper-half shift, so the LOW 32 bits of the running cycle/instret counter are stored into the high half of mhpmcounter_prev instead of the high 32 bits. A guest write to mhpmcounterXh while the counter is running therefore corrupts the snapshot and makes subsequent mhpmcounterh reads wildly wrong."
+    },
+    {
+        "Commit": "2cf2a6c027ba1a47be04c53d7cd8f6269007a0b1",
+        "Fixed-by": "f6d03ae4bbefaa684d440bcab1ab8096f17da913",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_process_iocntinh_cy() detects a CY-bit toggle by XOR-ing the entire 32-bit IOCOUNTINH value with the previous CY bit instead of masking CY first, so any guest write that changes other iocountinh inhibit bits (or rewrites them while CY is constant) spuriously enters the enable/disable path, corrupting the guest-visible iohpmcycles counter."
+    },
+    {
+        "Commit": "32bbab666e08856c1a6660c3743a4493170a9afd",
+        "Fixed-by": "d58ab4937c88a65981767ee92cbe8cbf169e9f0a",
+        "subsystem": "riscv",
+        "problem_description": "The new xlrbr vendor extension is registered in riscv_cpu_vendor_exts[] but the matching ISA_EXT_DATA_ENTRY is missing from isa_edata_arr[], so even when enabled the extension never appears in the ISA string / riscv,isa device-tree node, hiding an enabled CPU capability from guests."
+    },
+    {
+        "Commit": "6247dc2ef70b512523d4495e8ea8349ccd6b0ef0",
+        "Fixed-by": "348a781971872226721bf9747da7e3b184ad408c",
+        "subsystem": "riscv",
+        "problem_description": "scountinhibit_pred() checks only ext_ssccfg/ext_smcdeleg and virt_enabled but never checks menvcfg.CDE, so S-mode can access scountinhibit even when M-mode has counter delegation disabled (menvcfg.CDE=0), whereas the Smcdeleg spec requires an illegal-instruction exception in that case."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "fcbd93e96be2ed0e5139542f54be31efa6d2b1dc",
+        "subsystem": "riscv",
+        "problem_description": "The page-table walkers in riscv_iommu_spa_fetch() and pdt_memory_read() ignore PTE.N/Svnapot: a 64KB NAPOT leaf PTE encodes the contiguity size in PPN[3:0], but the code builds the leaf address from the raw PPN, yielding a physical address ~32KB above the correct base for Svnapot pages, which the IOMMU spec mandates supporting."
+    },
+    {
+        "Commit": "71eb522c406342c3cefa7a2837c7417eeb430ae1",
+        "Fixed-by": "4f64d7e336391e2886d06fa6e125c5a323b7d579",
+        "subsystem": "riscv",
+        "problem_description": "virt_flash_create() qdev_creates two PFlashCFI01 devices and hangs them off the machine object, but the virt machine type has no instance_finalize, so if the machine object is destroyed while the flash devices are unrealized they are leaked (unbalanced object lifecycle, reported by ASan)."
+    },
+    {
+        "Commit": "0c3e702aca76ca6ebf2aac4451870efc9d52a7a3",
+        "Fixed-by": "b2e874bfec59f6150b49a70df0529458efa0726b",
+        "subsystem": "riscv",
+        "problem_description": "get_physical_address()'s 'restart' label, taken when the A/D-bit atomic cmpxchg fails due to another vCPU modifying the PTE, re-enters the walk loop without re-initializing ptshift and base, so the restarted walk computes PTE addresses from a decremented ptshift and an inner-PTE base, causing wrong physical mappings or guest crashes on SMP MTTCG with A/D-bit updates."
+    },
+    {
+        "Commit": "ebfd392893701a8cde9c1b6017009a03c90ab34b",
+        "Fixed-by": "4cb2f91773e8ec9511002de851734820f7ba64fe",
+        "subsystem": "riscv",
+        "problem_description": "build_rhct() hardcodes the RHCT Time Base Frequency to RISCV_ACLINT_DEFAULT_TIMEBASE_FREQ, but under KVM the actual timer frequency is provided by the host, so guests reading the ACPI RHCT get a wrong time base frequency on KVM-accelerated VMs (the DT timer node already uses the KVM-reported frequency)."
+    },
+    {
+        "Commit": "17288e38bebf20121c4aa20b264e661a7fa50ed8",
+        "Fixed-by": "0e8ad6a8460fe070ecdde4625e4ed6d791550e3d",
+        "subsystem": "riscv",
+        "problem_description": "vext_ldff()'s new broad probing for fault-only-first loads mishandles page crossings: the second-page probe is sized with the element count that fit in the FIRST page (elems * msize) instead of the remaining elements, and the second-page start is computed as addr + (elems << log2_esz), omitting the field stride (nf). A fault-only-first vector load crossing a page boundary can miss a non-present tail element and raise a page fault instead of trimming vl as the RISC-V V spec requires."
+    },
+    {
+        "Commit": "e0a3054f18e20602768d328b0cb7d5910253a327",
+        "Fixed-by": "b25133d38fe693589cf695b85968caa0724bfafd",
+        "subsystem": "riscv",
+        "problem_description": "trans_c_lhu(), trans_c_lh() and trans_c_sh() in the newly added trans_rvzce.c.inc pass MO_UW/MO_SW to gen_load()/gen_store() instead of the target-endian flags MO_TEUW/MO_TESW used by the other compressed halfword accesses, so when emulating a big-endian RISC-V guest c.lhu/c.lh/c.sh load and store the wrong byte order (qemu issue #3131)."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "15abfced803929f935bb59a0e1b02558bd8325c4",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_ctx_fetch() walks the Process-Directory-Table with raw dma_memory_read() on s->target_as, treating the PDT root from DC.fsc (PDTP) as a supervisor physical address; per the RISC-V IOMMU spec the PDT is in GPA space and must be translated through the G-stage (iohgatp) tables, so with DC.tc.PDTV=1 and iohgatp != bare the process-directory entries are read from the wrong addresses, yielding garbage process contexts/faults for nested translation."
+    },
+    {
+        "Commit": "1f9c4462334f424d844b52c3476fb3b0ec62ab46",
+        "Fixed-by": "a86d3352ab70f33f5feabbf9bad9450d3c19d0bf",
+        "subsystem": "riscv",
+        "problem_description": "opcode_at(), which is only used by the semihosting opcode-pattern check outside normal instruction translation, is switched to translator_ldl(); translator_ld* is only valid for addresses inside the current TB translation record, so when the checked page is not covered by the record/TLB QEMU aborts with 'record_save: Assertion `offset == db->record_start + db->record_len' failed'."
+    },
+    {
+        "Commit": "38c83e8d3a333b8b377367756a2b6c700c7d0084",
+        "Fixed-by": "cebaf7434b4af059caca053ee1ec7ed8df91c2a7",
+        "subsystem": "riscv",
+        "problem_description": "The commit makes riscv_csrrw() always pass write=true to riscv_csrrw_check() so that zero-mask CSRRS/CSRRC writes to read-only CSRs trap, but it fails to update the riscv_csr_read() inline in cpu.h, which still reads via riscv_csrrw(env, csrno, &val, 0, 0); internal reads of read-only CSRs (e.g. vector vtype/vl) through that helper now hit the read-only write check and raise an illegal instruction exception instead of returning the CSR value."
+    },
+    {
+        "Commit": "0c54acb8243dfc51a021d108ffef794c89c84f72",
+        "Fixed-by": "4f7528295b3e6dfe1189f660fa7865ad972d82e7",
+        "subsystem": "riscv",
+        "problem_description": "riscv_iommu_msi_write() rejects MSI writes with 'if (intn >= 256)', hardcoding a one-page MSI page-table limit; per AIA spec section 8.5 the table size is bounded only by the requirement that the msiptp base is aligned to the table size (derived from msi_addr_mask), so legitimate MSIs targeting interrupt files >= 256 in a larger table are wrongly faulted as MSI_LOAD_FAULT."
+    },
+    {
+        "Commit": "c1fbcecb3a97ecce2cde5052319df34ca6bcc988",
+        "Fixed-by": "30ef718423e8018723087cd17be0fd9c6dfa2e53",
+        "subsystem": "riscv",
+        "problem_description": "The virtual-instruction path added to riscv_csrrw_check() only triggers when the CSR's encoded privilege level is exactly PRV_S + 1 (hypervisor/VS CSR encodings); a VU-mode guest accessing an ordinary supervisor CSR (csr_priv == PRV_S) still receives an illegal instruction exception, but the privileged/hypervisor spec mandates a virtual instruction exception for VU-mode supervisor-CSR accesses."
+    },
+    {
+        "Commit": "3157a553ec6b9a52ad0aa6b52cca27d3a964167e",
+        "Fixed-by": "16aa7771afeac422dcf7be2833d5426da6b814fa",
+        "subsystem": "riscv",
+        "problem_description": "The exception raising for mret/mnret is moved into the nested helper check_ret_from_m_mode(), which calls GETPC() from a non-top-level helper function; when helper_mret()/helper_mnret() raises (illegal instruction when not in M-mode, misaligned mepc/mnepc with RVC disabled, or PMP access fault), GETPC() yields a wrong host return address, breaking TCG exception unwinding (qemu issue #3020)."
+    },
+    {
+        "Commit": "2af005d6107da71da35299449ee48e2115f1c8db",
+        "Fixed-by": "cab6b5d8c351863b21d05eb8c9bb7920ad883b05",
+        "subsystem": "riscv",
+        "problem_description": "riscv_cpu_validate_profile() ends with 'profile->enabled = profile_impl' on the static, globally shared RISCVCPUProfile object during per-vCPU finalize; because vCPUs are initialized and realized one at a time, a vCPU whose extension set happens to satisfy a profile (e.g. a hand-extended rv64 matching rva22s64) marks the global profile enabled, pushing later-created vCPUs onto the profile code path (forced mandatory extensions/satp mode) even though it was never requested for them."
+    },
+    {
+        "Commit": "fba92a92e39069d7dc648cba1e561f28b7e91df6",
+        "Fixed-by": "f655704c3dfefd57172e3347c22aca18283ee2b7",
+        "subsystem": "riscv",
+        "problem_description": "riscv_cpu_add_profiles() pre-enables a profile selected in cpu_init() (e.g. '-cpu rva22u64', whose init sets RVA22U64.enabled) by invoking the user-facing qdev setter object_property_set_bool(..., profile->name, true), which routes through cpu_set_profile() and sets profile->user_set = true on the static global profile object; internal CPU-driven enablement is thereby misrecorded as an explicit user request, polluting shared profile state across CPUs with spurious user-attributed profile-mandate warnings."
+    },
+    {
+        "Commit": "55398025e7dfe0c8e6455e542980d1fc6157543c",
+        "Fixed-by": "a429f9304d54e9a44773b753d0844204b4b3b22f",
+        "subsystem": "riscv",
+        "problem_description": "cpu_set_profile() runs the satp_mode block unconditionally instead of only when the profile is being enabled: it passes profile->enabled as the value for the satp mode property, so disabling a profile (e.g. rva22s64=off) forces 'mmu' on while clearing the virtual-memory mode property, leaving the CPU with mmu=on and no satp mode selected."
+    },
+    {
+        "Commit": "4db19d5b21e058e6eb3474b6be470d1184afaa9e",
+        "Fixed-by": "f396c217a53d9b7960dd002fbb07cfe1d46b27aa",
+        "subsystem": "riscv",
+        "problem_description": "kvm_riscv_get_regs_csr()/kvm_riscv_put_regs_csr() issue KVM_GET_ONE_REG/KVM_SET_ONE_REG for scounteren and senvcfg unconditionally, with no check that the host kernel implements these CSRs; on kernels that don't know senvcfg (e.g. Linux 6.6) the ioctls fail, the error propagates, and KVM guests fail to boot."
+    },
+    {
+        "Commit": "f18637cd611cd42bfe1eb4dafa337051fc4f6061",
+        "Fixed-by": "7b069906b6ac47dc905d187c72f07ef82b400501",
+        "subsystem": "riscv",
+        "problem_description": "write_misa() decides whether to suppress the 'C' bit by testing alignment of GETPC() \u2014 a random host return address \u2014 and with the inverted mask '& ~3', instead of the guest's next PC; as a result any csrw misa that keeps C set almost always spuriously clears the C extension bit, corrupting the guest-visible misa state."
+    },
+    {
+        "Commit": "df4252b2ecaf93b601109373a17427d1867046e8",
+        "Fixed-by": "4e9e2478dfd26480bbf50367a67b9be0edafef2b",
+        "subsystem": "riscv",
+        "problem_description": "The buggy commit adds VSTART_CHECK_EARLY_EXIT() to the inner workers vext_vv_rm_1()/vext_vx_rm_1() but not to the dispatchers vext_vv_rm_2()/vext_vx_rm_2(), so when vstart >= vl (e.g. vl=0, where the instruction must be a nop) the early exit in _1 does nothing to stop _2 from still calling vext_set_elems_1s(), which writes the tail elements to all-1s when VTA=1."
+    },
+    {
+        "Commit": "f06bfe3dc38cb6d112d17218cceda223725f3fd4",
+        "Fixed-by": "d2c5759c8dd4c00195d4ebecc7d009e41df6baef",
+        "subsystem": "riscv",
+        "problem_description": "trans_ssamoswap_w/d() are not gated on ext_zicfiss and never special-case privilege: with shadow stack disabled they fall back to illegal instruction for every privilege, but per priv spec section 22.2.3, when effective privilege is M (where SSE cannot be enabled) ssamoswap must instead raise a store/AMO access fault. Executing ssamoswap in M-mode therefore produces the wrong guest-visible exception."
+    },
+    {
+        "Commit": "8205bc127a83719d85a28ceffdd5e822b8fa3db7",
+        "Fixed-by": "86c78b280607fcff787866a03374047c65037a90",
+        "subsystem": "riscv",
+        "problem_description": "cfi_ss() gates access to CSR_SSP on cpu_get_bcfien(), which always returns false in M-mode ('M-mode shadow stack is always off'), so M-mode firmware accessing the ssp CSR gets an illegal-instruction exception even though, per priv spec section 22.2.1, ssp CSR access is not gated on xSSE and M-mode always has access when the zicfiss extension is implemented."
+    },
+    {
+        "Commit": "95799e36c15a9ab602a388491c40f6860f6ae8bf",
+        "Fixed-by": "3fba76e61caa46329afc399b3ecaaba70c8b0a4e",
+        "subsystem": "riscv",
+        "problem_description": "type2_breakpoint_insert() in the new Sdtrig Trigger Module code inserts the memory watchpoint for a type-2 trigger with a hardcoded length of 8 bytes whenever mcontrol's size fields select the default size, ignoring the CPU's XLEN; since QEMU forces select=0 (VA match), the Debug Spec says the default access size is XLEN, so on 32-bit RISC-V CPUs the trigger watches 8 bytes instead of 4 and fires for accesses that the spec says should not match."
+    },
+    {
+        "Commit": "4f6d036cccf84180bca7e45156f3a04032b624e1",
+        "Fixed-by": "bf3adf93f16730ca5aaa6c26cf969e64eeff6e7b",
+        "subsystem": "riscv",
+        "problem_description": "After replacing cpu->cfg.vlen (bits) with cpu->cfg.vlenb (bytes), prop_vlen_set() still compares the user-supplied vlen value in bits against cpu->cfg.vlenb in bytes, so on vendor CPU types an explicit vlen that matches the CPU's default (e.g. vlen=1024 with vlenb=128) is rejected with a spurious error; the very same hunk's error hint even prints 'vlenb << 3' as the current value, showing the unit mismatch."
+    },
+    {
+        "Commit": "fe5c9ab1fc185e96bf7e034954127429ca74d386",
+        "Fixed-by": "ffd455963f230c7dc04965609d6675da687a5a78",
+        "subsystem": "riscv",
+        "problem_description": "The GEN_VEXT_RED macro implementing the vector single-width integer reduction instructions unconditionally writes the accumulated scalar s1 to vd[0] even when vl == 0 and the element loop executed nothing; the RVV spec requires that with vl=0 no operation is performed and the destination register is not updated, so executing any vred* instruction with vl=0 corrupts vd[0] with the value of vs1[0]."
+    }
+]
