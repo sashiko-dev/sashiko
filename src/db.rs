@@ -3616,6 +3616,33 @@ impl Database {
             )
             .await?;
         }
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stats_rollups_cover ON stats_rollups(resolution_secs, series_id, bucket_ts, value)",
+            (),
+        )
+        .await?;
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stats_bug_subsys_cover ON stats_bug_subsystem_facets(is_authorizing, subsystem, lifecycle_status, severity_int, security_rating, count)",
+            (),
+        )
+        .await?;
+        let has_bugs = {
+            let mut rows = self
+                .read_conn()
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bugs'",
+                    (),
+                )
+                .await?;
+            rows.next().await?.is_some()
+        };
+        if has_bugs {
+            self.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bugs_fixed_updated ON bugs(updated_at, id) WHERE lifecycle_status = 'fixed'",
+                (),
+            )
+            .await?;
+        }
 
         debug!("Database schema is up to date at version 23.");
 

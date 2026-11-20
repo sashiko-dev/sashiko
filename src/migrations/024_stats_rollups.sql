@@ -61,6 +61,16 @@ CREATE INDEX IF NOT EXISTS idx_stats_bug_subsys_rank
 CREATE INDEX IF NOT EXISTS idx_stats_bug_subsys_nocase
     ON stats_bug_subsystem_facets(subsystem COLLATE NOCASE, is_authorizing);
 
+CREATE INDEX IF NOT EXISTS idx_stats_bug_subsys_cover
+    ON stats_bug_subsystem_facets(
+        is_authorizing,
+        subsystem,
+        lifecycle_status,
+        severity_int,
+        security_rating,
+        count
+    );
+
 CREATE TABLE IF NOT EXISTS stats_series (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     metric TEXT NOT NULL,
@@ -80,6 +90,9 @@ CREATE TABLE IF NOT EXISTS stats_rollups (
 
 CREATE INDEX IF NOT EXISTS idx_stats_rollups_expiry
     ON stats_rollups(resolution_secs, bucket_ts);
+
+CREATE INDEX IF NOT EXISTS idx_stats_rollups_cover
+    ON stats_rollups(resolution_secs, series_id, bucket_ts, value);
 
 -- Pre-extracted uncompressed per-review pipeline summary (< 500 bytes/row) so
 -- Last-N pipeline queries never decompress ai_interactions.output_raw blobs.

@@ -1506,60 +1506,41 @@ impl Database {
                 )
                 .await;
         }
-        let mut series_meta: std::collections::HashMap<i64, (String, BTreeMap<String, String>)> =
-            std::collections::HashMap::new();
-        let mut series_ids: Vec<i64> = Vec::new();
+        let mut out = Vec::new();
         for chunk in metrics.chunks(SUB_BATCH_SIZE) {
             let ph = vec!["?"; chunk.len()].join(", ");
-            let params: Vec<libsql::Value> = chunk
+
+            // 1. Interior buckets summed in SQLite in one covering-index pass (1 row per series).
+            // CROSS JOIN forces SQLite to drive from stats_series(metric) into idx_stats_rollups_cover
+            // instead of scanning idx_stats_rollups_expiry across unrelated metrics.
+            let mut sum_params: Vec<libsql::Value> = chunk
                 .iter()
                 .map(|m| libsql::Value::Text(m.clone()))
                 .collect();
-            let sql =
-                format!("SELECT id, metric, labels_json FROM stats_series WHERE metric IN ({ph})");
-            let mut rows = self.read_conn().query(&sql, params).await?;
-            while let Some(r) = rows.next().await? {
-                let id: i64 = r.get(0)?;
-                let metric: String = r.get(1)?;
-                let lj: String = r.get(2)?;
-                let labels = decode_labels_json(&lj);
-                if accept_series(&metric, &labels) {
-                    series_ids.push(id);
-                    series_meta.insert(id, (metric, labels));
-                }
-            }
-        }
-        if series_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut out = Vec::new();
-        for chunk in series_ids.chunks(SUB_BATCH_SIZE) {
-            let ph = vec!["?"; chunk.len()].join(", ");
-
-            // 1. Interior buckets summed in SQLite (1 row per series_id).
-            let mut sum_params: Vec<libsql::Value> =
-                chunk.iter().map(|&id| libsql::Value::Integer(id)).collect();
             sum_params.push(libsql::Value::Integer(resolution_secs));
             sum_params.push(libsql::Value::Integer(full_start));
             sum_params.push(libsql::Value::Integer(full_end));
             let sum_sql = format!(
-                "SELECT series_id, SUM(value)
-                 FROM stats_rollups
-                 WHERE series_id IN ({ph})
-                   AND resolution_secs = ?
-                   AND bucket_ts >= ?
-                   AND bucket_ts <= ?
-                 GROUP BY series_id"
+                "SELECT ss.metric, ss.labels_json, SUM(sr.value)
+                 FROM stats_series ss
+                 CROSS JOIN stats_rollups sr
+                 WHERE ss.metric IN ({ph})
+                   AND sr.resolution_secs = ?
+                   AND sr.series_id = ss.id
+                   AND sr.bucket_ts >= ?
+                   AND sr.bucket_ts <= ?
+                 GROUP BY sr.series_id"
             );
             let mut sum_rows = self.read_conn().query(&sum_sql, sum_params).await?;
             while let Some(r) = sum_rows.next().await? {
-                let sid: i64 = r.get(0)?;
-                let value: f64 = r.get(1)?;
-                if let Some((metric, labels)) = series_meta.get(&sid) {
+                let metric: String = r.get(0)?;
+                let lj: String = r.get(1)?;
+                let value: f64 = r.get(2)?;
+                let labels = decode_labels_json(&lj);
+                if accept_series(&metric, &labels) {
                     out.push(RollupBucketRow {
-                        metric: metric.clone(),
-                        labels: labels.clone(),
+                        metric,
+                        labels,
                         bucket_ts: full_start,
                         value,
                     });
@@ -1567,33 +1548,77 @@ impl Database {
             }
             drop(sum_rows);
 
-            // 2. Boundary buckets (left/right edges outside full_start..=full_end).
-            let mut edge_params: Vec<libsql::Value> =
-                chunk.iter().map(|&id| libsql::Value::Integer(id)).collect();
-            edge_params.push(libsql::Value::Integer(resolution_secs));
-            edge_params.push(libsql::Value::Integer(query_start));
-            edge_params.push(libsql::Value::Integer(full_start));
-            edge_params.push(libsql::Value::Integer(full_end));
-            edge_params.push(libsql::Value::Integer(query_end));
-            let edge_sql = format!(
-                "SELECT series_id, bucket_ts, value
-                 FROM stats_rollups
-                 WHERE series_id IN ({ph})
-                   AND resolution_secs = ?
-                   AND ((bucket_ts >= ? AND bucket_ts < ?) OR (bucket_ts > ? AND bucket_ts <= ?))"
-            );
-            let mut edge_rows = self.read_conn().query(&edge_sql, edge_params).await?;
-            while let Some(r) = edge_rows.next().await? {
-                let sid: i64 = r.get(0)?;
-                let bucket_ts: i64 = r.get(1)?;
-                let value: f64 = r.get(2)?;
-                if let Some((metric, labels)) = series_meta.get(&sid) {
-                    out.push(RollupBucketRow {
-                        metric: metric.clone(),
-                        labels: labels.clone(),
-                        bucket_ts,
-                        value,
-                    });
+            // 2. Left boundary buckets (only when window start is not bucket-aligned).
+            if query_start < full_start {
+                let mut left_params: Vec<libsql::Value> = chunk
+                    .iter()
+                    .map(|m| libsql::Value::Text(m.clone()))
+                    .collect();
+                left_params.push(libsql::Value::Integer(resolution_secs));
+                left_params.push(libsql::Value::Integer(query_start));
+                left_params.push(libsql::Value::Integer(full_start));
+                let left_sql = format!(
+                    "SELECT ss.metric, ss.labels_json, sr.bucket_ts, sr.value
+                     FROM stats_series ss
+                     CROSS JOIN stats_rollups sr
+                     WHERE ss.metric IN ({ph})
+                       AND sr.resolution_secs = ?
+                       AND sr.series_id = ss.id
+                       AND sr.bucket_ts >= ?
+                       AND sr.bucket_ts < ?"
+                );
+                let mut left_rows = self.read_conn().query(&left_sql, left_params).await?;
+                while let Some(r) = left_rows.next().await? {
+                    let metric: String = r.get(0)?;
+                    let lj: String = r.get(1)?;
+                    let bucket_ts: i64 = r.get(2)?;
+                    let value: f64 = r.get(3)?;
+                    let labels = decode_labels_json(&lj);
+                    if accept_series(&metric, &labels) {
+                        out.push(RollupBucketRow {
+                            metric,
+                            labels,
+                            bucket_ts,
+                            value,
+                        });
+                    }
+                }
+            }
+
+            // 3. Right boundary buckets (only when window end is not bucket-aligned).
+            if query_end > full_end {
+                let mut right_params: Vec<libsql::Value> = chunk
+                    .iter()
+                    .map(|m| libsql::Value::Text(m.clone()))
+                    .collect();
+                right_params.push(libsql::Value::Integer(resolution_secs));
+                right_params.push(libsql::Value::Integer(full_end));
+                right_params.push(libsql::Value::Integer(query_end));
+                let right_sql = format!(
+                    "SELECT ss.metric, ss.labels_json, sr.bucket_ts, sr.value
+                     FROM stats_series ss
+                     CROSS JOIN stats_rollups sr
+                     WHERE ss.metric IN ({ph})
+                       AND sr.resolution_secs = ?
+                       AND sr.series_id = ss.id
+                       AND sr.bucket_ts > ?
+                       AND sr.bucket_ts <= ?"
+                );
+                let mut right_rows = self.read_conn().query(&right_sql, right_params).await?;
+                while let Some(r) = right_rows.next().await? {
+                    let metric: String = r.get(0)?;
+                    let lj: String = r.get(1)?;
+                    let bucket_ts: i64 = r.get(2)?;
+                    let value: f64 = r.get(3)?;
+                    let labels = decode_labels_json(&lj);
+                    if accept_series(&metric, &labels) {
+                        out.push(RollupBucketRow {
+                            metric,
+                            labels,
+                            bucket_ts,
+                            value,
+                        });
+                    }
                 }
             }
         }
@@ -1903,31 +1928,25 @@ impl Database {
         if !list.is_empty() && status_filter.is_none_or(|st| st == "fixed") {
             let cutoff_60d = chrono::Utc::now().timestamp().saturating_sub(60 * 86_400);
             let mut fixed_60d_by_sub: BTreeMap<String, u64> = BTreeMap::new();
-            let sub_names: Vec<String> = list.iter().map(|s| s.subsystem.clone()).collect();
-            for chunk in sub_names.chunks(SUB_BATCH_SIZE) {
-                let placeholders = vec!["?"; chunk.len()].join(", ");
-                let mut params: Vec<libsql::Value> = Vec::with_capacity(chunk.len() + 1);
-                params.push(libsql::Value::Integer(cutoff_60d));
-                for name in chunk {
-                    params.push(libsql::Value::Text(name.clone()));
-                }
-                let sql = format!(
+            let mut rows = self
+                .read_conn()
+                .query(
                     "SELECT l.subsystem, COUNT(*)
                      FROM bugs b
                      JOIN stats_bug_section_links l ON l.bug_id = b.id
                      WHERE b.lifecycle_status = 'fixed'
-                       AND COALESCE(b.updated_at, b.reported_at, b.created_at, 0) >= ?
+                       AND b.updated_at >= ?
                        AND l.is_authorizing = 1
-                       AND l.subsystem IN ({placeholders})
-                     GROUP BY l.subsystem"
-                );
-                let mut rows = self.read_conn().query(&sql, params).await?;
-                while let Some(row) = rows.next().await? {
-                    let sub: String = row.get(0)?;
-                    let cnt = row.get::<i64>(1)?.max(0) as u64;
-                    *fixed_60d_by_sub.entry(sub).or_insert(0) += cnt;
-                }
+                     GROUP BY l.subsystem",
+                    libsql::params![cutoff_60d],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let sub: String = row.get(0)?;
+                let cnt = row.get::<i64>(1)?.max(0) as u64;
+                *fixed_60d_by_sub.entry(sub).or_insert(0) += cnt;
             }
+            // Only attach counts to subsystems already authorized in `list`.
             for item in &mut list {
                 item.fixed_60d = fixed_60d_by_sub.get(&item.subsystem).copied().unwrap_or(0);
             }
@@ -3671,7 +3690,9 @@ mod tests {
         for sql in [
             "SELECT value FROM stats_state_gauges WHERE metric = 'sashiko_messages_stored' AND labels_json = '{}'",
             "SELECT r.bucket_ts, r.value FROM stats_rollups r WHERE r.series_id = 1 AND r.resolution_secs = 3600 AND r.bucket_ts BETWEEN 1000 AND 50000",
+            "SELECT ss.metric, ss.labels_json, SUM(sr.value) FROM stats_series ss CROSS JOIN stats_rollups sr WHERE ss.metric IN ('sashiko_subsystem_findings_total') AND sr.resolution_secs = 86400 AND sr.series_id = ss.id AND sr.bucket_ts >= 1000 AND sr.bucket_ts <= 50000 GROUP BY sr.series_id",
             "SELECT subsystem, lifecycle_status, severity_int, security_rating, count FROM stats_bug_subsystem_facets WHERE is_authorizing = 1 AND count > 0 AND subsystem COLLATE NOCASE IN ('NET')",
+            "SELECT l.subsystem, COUNT(*) FROM bugs b JOIN stats_bug_section_links l ON l.bug_id = b.id WHERE b.lifecycle_status = 'fixed' AND b.updated_at >= 1000 AND l.is_authorizing = 1 GROUP BY l.subsystem",
         ] {
             let mut plan_rows = db
                 .read_conn()

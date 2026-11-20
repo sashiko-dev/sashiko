@@ -89,6 +89,7 @@ impl<T: Clone> AsyncCache<T> {
 struct AsyncMapCache<K, V> {
     inner: RwLock<std::collections::HashMap<K, CachedValue<V>>>,
     ttl: Duration,
+    max_entries: Option<usize>,
 }
 
 impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
@@ -96,6 +97,15 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
         Self {
             inner: RwLock::new(std::collections::HashMap::new()),
             ttl,
+            max_entries: None,
+        }
+    }
+
+    fn new_bounded(ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            inner: RwLock::new(std::collections::HashMap::new()),
+            ttl,
+            max_entries: Some(max_entries.max(1)),
         }
     }
 
@@ -118,6 +128,20 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
         }
 
         let value = fetch().await?;
+        if let Some(cap) = self.max_entries
+            && write_guard.len() >= cap
+        {
+            let ttl = self.ttl;
+            write_guard.retain(|_, v| v.timestamp.elapsed() < ttl);
+            if write_guard.len() >= cap
+                && let Some(oldest_key) = write_guard
+                    .iter()
+                    .min_by_key(|(_, v)| v.timestamp)
+                    .map(|(k, _)| k.clone())
+            {
+                write_guard.remove(&oldest_key);
+            }
+        }
         write_guard.insert(
             key,
             CachedValue {
@@ -242,6 +266,7 @@ pub struct ServerOptions {
 }
 
 type StateGaugeRows = Vec<(String, std::collections::BTreeMap<String, String>, i64)>;
+type RollupSumCacheKey = (Vec<String>, i64, i64, i64, i64, i64);
 
 pub struct AppState {
     pub settings: Arc<crate::settings::Settings>,
@@ -267,6 +292,7 @@ pub struct AppState {
     pipeline_stats_cache: AsyncCache<crate::db::PipelineMultiWindowStats>,
     stats_state_gauges_cache: AsyncCache<StateGaugeRows>,
     stats_bug_facets_unrestricted_cache: AsyncCache<Vec<crate::db::BugSubsystemFacetSummary>>,
+    stats_rollup_sum_cache: AsyncMapCache<RollupSumCacheKey, Vec<crate::db::RollupBucketRow>>,
     project_releases_cache: AsyncCache<Vec<(String, i64)>>,
 }
 
@@ -308,6 +334,40 @@ impl AppState {
             })
             .await
             .unwrap_or_default()
+    }
+
+    pub async fn get_cached_rollup_sums(
+        &self,
+        metrics: Vec<String>,
+        resolution_secs: i64,
+        query_start: i64,
+        full_start: i64,
+        full_end: i64,
+        query_end: i64,
+    ) -> anyhow::Result<Vec<crate::db::RollupBucketRow>> {
+        let key = (
+            metrics.clone(),
+            resolution_secs,
+            query_start,
+            full_start,
+            full_end,
+            query_end,
+        );
+        self.stats_rollup_sum_cache
+            .get_or_fetch(key, || async move {
+                self.db
+                    .query_rollup_sums_filtered(
+                        &metrics,
+                        resolution_secs,
+                        query_start,
+                        full_start,
+                        full_end,
+                        query_end,
+                        |_, _| true,
+                    )
+                    .await
+            })
+            .await
     }
 }
 
@@ -432,7 +492,8 @@ pub fn build_router(
         bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
         pipeline_stats_cache: AsyncCache::new(Duration::from_secs(60)),
         stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
-        stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+        stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(60)),
+        stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(60), 128),
         project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
     });
 
@@ -5036,6 +5097,7 @@ mod tests {
             pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
             stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
             stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+            stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(30), 128),
             project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
         });
 
@@ -5610,6 +5672,7 @@ mod tests {
                 pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
                 stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
                 stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+                stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(30), 128),
                 project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
             })
         };
@@ -5681,6 +5744,7 @@ mod tests {
                 pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
                 stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
                 stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+                stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(30), 128),
                 project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
             })
         };
@@ -5856,6 +5920,7 @@ mod tests {
             pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
             stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
             stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+            stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(30), 128),
             project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
             local_token: None,
             email_worker_heartbeat: None,
@@ -7076,6 +7141,7 @@ F:	*
             pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
             stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
             stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+            stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(30), 128),
             project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
             sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
         });
@@ -7457,6 +7523,7 @@ F:	*
             pipeline_stats_cache: AsyncCache::new(Duration::from_secs(15)),
             stats_state_gauges_cache: AsyncCache::new(Duration::from_secs(5)),
             stats_bug_facets_unrestricted_cache: AsyncCache::new(Duration::from_secs(15)),
+            stats_rollup_sum_cache: AsyncMapCache::new_bounded(Duration::from_secs(30), 128),
             project_releases_cache: AsyncCache::new(Duration::from_secs(3600)),
         });
 
