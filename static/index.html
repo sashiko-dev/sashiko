@@ -693,7 +693,7 @@
             bugMinSeverity: '', bugSecurityFilter: '', bugLifecycleStatus: 'open', bugAssignee: '', bugSortBy: 'severity', bugSortOrder: 'desc',
             patchsetId: null, patchsetPage: 1, patchsetTotalPages: 1, patchsetLimit: 50,
             settings: { theme: 'auto', colorblind: false },
-            statsTab: 'health', statsHealthWin: '24h', statsProjectWin: '12w', statsProjectSub: '', statsPipeWin: '100',
+            statsTab: 'project', statsHealthWin: '24h', statsBugsWin: '12w', statsProjectWin: '12w', statsProjectSub: '', statsPipeWin: '100',
             activeCharts: []
         };
 
@@ -1086,7 +1086,7 @@
             [/^#\/log\/baseline\/(.+)\/(\d+)$/, m => ({ view: 'baseline_log', id: safeDecodeURI(m[1]), idx: parseInt(m[2], 10) })],
             [/^#\/log\/(\d+)$/, m => ({ view: 'log', id: m[1] })],
             [/^#\/map\/(\d+)$/, m => ({ view: 'map', id: m[1] })],
-            [/^#\/stats(?:\/([a-z]+))?$/, m => ({ view: 'stats', tab: m[1] || 'health' })]
+            [/^#\/stats(?:\/([a-z]+))?$/, m => ({ view: 'stats', tab: m[1] || 'project' })]
         ];
 
         function parseHash() {
@@ -4430,14 +4430,14 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         // =====================================================================
         // STATS VIEW (4-TAB PROMETHEUS-BACKED DASHBOARD)
         // =====================================================================
-        const VALID_STATS_TABS = ['health', 'bugs', 'project', 'pipeline'];
+        const VALID_STATS_TABS = ['project', 'bugs', 'health', 'pipeline'];
         const STATS_TAB_ALIASES = { ops: 'health', maintainers: 'project' };
 
         function normalizeStatsTab(raw) {
             const mapped = STATS_TAB_ALIASES[raw] || raw;
             if (VALID_STATS_TABS.includes(mapped)) return mapped;
             const prev = STATS_TAB_ALIASES[state.statsTab] || state.statsTab;
-            return VALID_STATS_TABS.includes(prev) ? prev : 'health';
+            return VALID_STATS_TABS.includes(prev) ? prev : 'project';
         }
 
         async function promBatch(queries) {
@@ -4644,6 +4644,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const tab = normalizeStatsTab(requestedTab);
             state.statsTab = tab;
             if (!state.statsHealthWin) state.statsHealthWin = '24h';
+            if (!state.statsBugsWin) state.statsBugsWin = '12w';
             if (!state.statsProjectWin) state.statsProjectWin = '12w';
             if (!state.statsPipeWin) state.statsPipeWin = '100';
             if (typeof state.statsProjectSub === 'undefined') state.statsProjectSub = '';
@@ -4653,9 +4654,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 <div class="nav"><a href="#/" id="statsBackLink">← Back</a></div>
                 <h1>Statistics</h1>
                 <div class="controls">
-                    <button type="button" data-stats-tab="health" class="${tab === 'health' ? 'active' : ''}">Health</button>
-                    <button type="button" data-stats-tab="bugs" class="${tab === 'bugs' ? 'active' : ''}">Bugs</button>
                     <button type="button" data-stats-tab="project" class="${tab === 'project' ? 'active' : ''}">Project</button>
+                    <button type="button" data-stats-tab="bugs" class="${tab === 'bugs' ? 'active' : ''}">Bugs</button>
+                    <button type="button" data-stats-tab="health" class="${tab === 'health' ? 'active' : ''}">Health</button>
                     <button type="button" data-stats-tab="pipeline" class="${tab === 'pipeline' ? 'active' : ''}">Pipeline</button>
                     ${toolbarHtml ? `<div class="mode-switcher">${toolbarHtml}</div>` : ''}
                 </div>
@@ -4690,12 +4691,22 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <button type="button" data-health-win="1h" class="${w === '1h' ? 'active' : ''}">1h</button>
                     <button type="button" data-health-win="24h" class="${w === '24h' ? 'active' : ''}">24h</button>`;
             }
+            if (tab === 'bugs') {
+                const w = state.statsBugsWin;
+                return `<span class="bug-filter-label">Window</span>
+                    <button type="button" data-bugs-win="12w" class="${w === '12w' ? 'active' : ''}">12w</button>
+                    <button type="button" data-bugs-win="26w" class="${w === '26w' ? 'active' : ''}">26w</button>
+                    <button type="button" data-bugs-win="52w" class="${w === '52w' ? 'active' : ''}">52w</button>
+                    <button type="button" data-bugs-win="all" class="${w === 'all' ? 'active' : ''}">All</button>`;
+            }
             if (tab === 'project') {
                 const w = state.statsProjectWin;
                 return `<select id="projectSubsystemSelect"><option value="">All Mailing Lists</option></select>
                     <button type="button" data-project-win="4w" class="${w === '4w' ? 'active' : ''}">4w</button>
                     <button type="button" data-project-win="12w" class="${w === '12w' ? 'active' : ''}">12w</button>
-                    <button type="button" data-project-win="26w" class="${w === '26w' ? 'active' : ''}">26w</button>`;
+                    <button type="button" data-project-win="26w" class="${w === '26w' ? 'active' : ''}">26w</button>
+                    <button type="button" data-project-win="52w" class="${w === '52w' ? 'active' : ''}">52w</button>
+                    <button type="button" data-project-win="all" class="${w === 'all' ? 'active' : ''}">All</button>`;
             }
             if (tab === 'pipeline') {
                 const w = state.statsPipeWin;
@@ -4718,6 +4729,12 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 btn.addEventListener('click', () => {
                     state.statsHealthWin = btn.dataset.healthWin;
                     renderStatsView('health');
+                });
+            });
+            document.querySelectorAll('[data-bugs-win]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    state.statsBugsWin = btn.dataset.bugsWin;
+                    renderStatsView('bugs');
                 });
             });
             document.querySelectorAll('[data-project-win]').forEach(btn => {
@@ -5023,10 +5040,13 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         // TAB 2: BUGS DATABASE (#/stats/bugs)
         // ---------------------------------------------------------------------
         async function renderBugsStatsTab(renderSeq) {
+            const bugWinWeeks = { '12w': 12, '26w': 26, '52w': 52, 'all': 260 };
+            const win = (state.statsBugsWin in bugWinWeeks) ? state.statsBugsWin : '12w';
+            const weeks = bugWinWeeks[win];
             const stepWeek = 7 * 86400;
             const endSec = alignedEndUtc(stepWeek);
-            const span12w = 12 * stepWeek;
-            const startSec = endSec - span12w + stepWeek;
+            const spanSec = weeks * stepWeek;
+            const startSec = endSec - spanSec + stepWeek;
 
             const r = await promBatch([
                 { id: 'bf', query: 'sashiko_stats_backfill_complete' },
@@ -5073,7 +5093,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             ];
 
             let html = `<h2>Bugs Database</h2>` + renderSummaryTable(['Metric', 'Count', 'Detail'], rows);
-            html += `<h2>Weekly Discovery vs Fixes (Last 12 Weeks)</h2><div class="stats-chart-wrap"><div id="bugs-chart-velocity" class="chart-container"></div></div>`;
+            html += `<h2>Cumulative Open vs Fixed Bugs</h2><div class="stats-chart-wrap"><div id="bugs-chart-velocity" class="chart-container"></div></div>`;
             html += `<h2>Open Bugs by Severity: Engineering vs CVSS v4.0 <span class="text-muted-sm">non-security: ${fmtNum(secOpenMap['none'] || 0)} · hardening: ${fmtNum(secClsMap['hardening'] || 0)}</span></h2><div class="stats-chart-wrap"><div id="bugs-chart-severity" class="chart-container"></div></div>`;
 
             if (subRows.length > 0) {
@@ -5103,17 +5123,37 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             if (signBtn) signBtn.addEventListener('click', () => openAuthModal());
 
             const pal = getStatsPalette();
-            const velAxis = buildFixedAxis(startSec, endSec, stepWeek, span12w);
-            const relMark = buildReleaseMarkLine(r.releases, velAxis.sorted, velAxis.labels, stepWeek, pal);
+            const rawAxis = buildFixedAxis(startSec, endSec, stepWeek, spanSec);
+            const discWk = seriesIntsAt(r.rngEvents.find(s => s.metric?.event === 'discovered'), rawAxis.sorted);
+            const fixWk = seriesIntsAt(r.rngEvents.find(s => s.metric?.event === 'fixed'), rawAxis.sorted);
+            const netOpenWk = discWk.map((d, i) => d - fixWk[i]);
+            let oRun = openCnt - netOpenWk.reduce((a, b) => a + b, 0);
+            let fRun = fixedCnt - fixWk.reduce((a, b) => a + b, 0);
+            let openCum = netOpenWk.map(v => Math.max(0, (oRun += v)));
+            let fixCum = fixWk.map(v => Math.max(0, (fRun += v)));
+            let velSorted = rawAxis.sorted;
+            let velLabels = rawAxis.labels;
+            if (win === 'all') {
+                const firstIdx = discWk.findIndex((d, i) => d > 0 || fixWk[i] > 0);
+                const startIdx = firstIdx >= 0 ? firstIdx : Math.max(0, velSorted.length - 12);
+                if (startIdx > 0) {
+                    velSorted = velSorted.slice(startIdx);
+                    velLabels = velLabels.slice(startIdx);
+                    openCum = openCum.slice(startIdx);
+                    fixCum = fixCum.slice(startIdx);
+                }
+            }
+            const relMark = buildReleaseMarkLine(r.releases, velSorted, velLabels, stepWeek, pal);
+            const showDot = velSorted.length <= 26;
             const velSeries = [
-                { name: 'Discovered', type: 'line', smooth: 0.2, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2 }, areaStyle: { opacity: 0.08 }, itemStyle: { color: pal.pending }, data: seriesIntsAt(r.rngEvents.find(s => s.metric?.event === 'discovered'), velAxis.sorted) },
-                { name: 'Fixed', type: 'line', smooth: 0.2, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2 }, areaStyle: { opacity: 0.08 }, itemStyle: { color: pal.ok }, data: seriesIntsAt(r.rngEvents.find(s => s.metric?.event === 'fixed'), velAxis.sorted) }
+                { name: 'Open', type: 'line', smooth: 0.2, showSymbol: showDot, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2 }, areaStyle: { opacity: 0.08 }, itemStyle: { color: pal.pending }, data: openCum },
+                { name: 'Fixed', type: 'line', smooth: 0.2, showSymbol: showDot, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2 }, areaStyle: { opacity: 0.08 }, itemStyle: { color: pal.ok }, data: fixCum }
             ];
             if (relMark) velSeries[0].markLine = relMark;
             mountStatsChart('bugs-chart-velocity', {
                 legend: { bottom: 0 },
                 grid: { left: '3%', right: '4%', bottom: '12%', top: '12%', containLabel: true },
-                xAxis: { type: 'category', data: velAxis.labels },
+                xAxis: { type: 'category', data: velLabels },
                 yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
                 series: velSeries
             });
@@ -5149,8 +5189,16 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         // TAB 3: PROJECT — LINUX LEADERS & MAINTAINERS (#/stats/project)
         // ---------------------------------------------------------------------
         async function renderProjectStatsTab(renderSeq) {
-            const win = ['4w', '12w', '26w'].includes(state.statsProjectWin) ? state.statsProjectWin : '12w';
-            const weeks = parseInt(win, 10) || 12;
+            const projWinCfg = {
+                '4w': { dur: '4w', weeks: 4 },
+                '12w': { dur: '12w', weeks: 12 },
+                '26w': { dur: '26w', weeks: 26 },
+                '52w': { dur: '52w', weeks: 52 },
+                'all': { dur: '260w', weeks: 260 }
+            };
+            const win = (state.statsProjectWin in projWinCfg) ? state.statsProjectWin : '12w';
+            const dur = projWinCfg[win].dur;
+            const weeks = projWinCfg[win].weeks;
             const stepWeek = 7 * 86400;
             const endSec = alignedEndUtc(stepWeek);
             const spanSec = weeks * stepWeek;
@@ -5164,21 +5212,23 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const queries = [
                 { id: 'bf', query: 'sashiko_stats_backfill_complete' },
                 { id: 'releases', query: 'sashiko_project_release_timestamp_seconds' },
-                { id: 'subPsAll', query: `sum by (subsystem) (increase(sashiko_subsystem_patchsets_total[${win}]))`, time: endStr },
-                { id: 'subPatchesAll', query: `sum by (subsystem) (increase(sashiko_subsystem_patches_total[${win}]))`, time: endStr },
-                { id: 'subFindingsAll', query: `sum by (subsystem, severity) (increase(sashiko_subsystem_findings_total[${win}]))`, time: endStr },
-                { id: 'psByVer', query: selectedSub ? `sum(increase(sashiko_subsystem_patchsets_total${subFilter}[${win}]))` : `sum by (version_bucket) (increase(sashiko_patchsets_ingested_by_version_total[${win}]))`, time: endStr },
-                { id: 'patchesTot', query: selectedSub ? `sum(increase(sashiko_subsystem_patches_total${subFilter}[${win}]))` : `sum(increase(sashiko_patches_ingested_total[${win}]))`, time: endStr },
-                { id: 'findingsBySev', query: selectedSub ? `sum by (severity) (increase(sashiko_subsystem_findings_total${subFilter}[${win}]))` : `sum by (severity) (increase(sashiko_findings_discovered_total{preexisting="false"}[${win}]))`, time: endStr },
+                { id: 'subPsAll', query: `sum by (subsystem) (increase(sashiko_subsystem_patchsets_total[${dur}]))`, time: endStr },
+                { id: 'subPatchesAll', query: `sum by (subsystem) (increase(sashiko_subsystem_patches_total[${dur}]))`, time: endStr },
+                { id: 'subFindingsAll', query: `sum by (subsystem, severity) (increase(sashiko_subsystem_findings_total[${dur}]))`, time: endStr },
+                { id: 'psByVer', query: selectedSub ? `sum(increase(sashiko_subsystem_patchsets_total${subFilter}[${dur}]))` : `sum by (version_bucket) (increase(sashiko_patchsets_ingested_by_version_total[${dur}]))`, time: endStr },
+                { id: 'patchesTot', query: selectedSub ? `sum(increase(sashiko_subsystem_patches_total${subFilter}[${dur}]))` : `sum(increase(sashiko_patches_ingested_total[${dur}]))`, time: endStr },
+                { id: 'findingsBySev', query: selectedSub ? `sum by (severity) (increase(sashiko_subsystem_findings_total${subFilter}[${dur}]))` : `sum by (severity) (increase(sashiko_findings_discovered_total{preexisting="false"}[${dur}]))`, time: endStr },
                 { id: 'rngPsVer', query: selectedSub ? `sum(increase(sashiko_subsystem_patchsets_total${subFilter}[7d]))` : 'sum by (version_bucket) (increase(sashiko_patchsets_ingested_by_version_total[7d]))', start: startStr, end: endStr, step: stepStr },
                 { id: 'rngPatches', query: selectedSub ? `sum(increase(sashiko_subsystem_patches_total${subFilter}[7d]))` : 'sum(increase(sashiko_patches_ingested_total[7d]))', start: startStr, end: endStr, step: stepStr },
                 { id: 'rngFindings', query: selectedSub ? `sum by (severity) (increase(sashiko_subsystem_findings_total${subFilter}[7d]))` : 'sum by (severity) (increase(sashiko_findings_discovered_total{preexisting="false"}[7d]))', start: startStr, end: endStr, step: stepStr }
             ];
             if (!selectedSub) {
                 queries.push(
-                    { id: 'psCompleted', query: `sum by (status, clean) (increase(sashiko_patchsets_completed_total[${win}]))`, time: endStr },
-                    { id: 'patchesReviewed', query: `sum by (clean) (increase(sashiko_patches_reviewed_total[${win}]))`, time: endStr },
-                    { id: 'priorByOrigin', query: `sum by (origin_kind, outcome) (increase(sashiko_prior_feedback_total[${win}]))`, time: endStr },
+                    { id: 'psCompleted', query: `sum by (status, clean) (increase(sashiko_patchsets_completed_total[${dur}]))`, time: endStr },
+                    { id: 'patchesReviewed', query: `sum by (clean) (increase(sashiko_patches_reviewed_total[${dur}]))`, time: endStr },
+                    { id: 'priorByOrigin', query: `sum by (origin_kind, outcome) (increase(sashiko_prior_feedback_total[${dur}]))`, time: endStr },
+                    { id: 'rngCleanPatches', query: 'sum by (clean) (increase(sashiko_patches_reviewed_total[7d]))', start: startStr, end: endStr, step: stepStr },
+                    { id: 'rngCleanPatchsets', query: 'sum by (clean) (increase(sashiko_patchsets_completed_total{status="Reviewed"}[7d]))', start: startStr, end: endStr, step: stepStr },
                     { id: 'rngFixups', query: 'sum by (outcome) (increase(sashiko_prior_feedback_total[7d]))', start: startStr, end: endStr, step: stepStr }
                 );
             }
@@ -5186,6 +5236,22 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const r = await promBatch(queries);
             if (renderSeq !== statsRenderSeq || state.view !== 'stats') return;
             updateBackfillBanner(r.bf);
+
+            const rawAxis = buildFixedAxis(startSec, endSec, stepWeek, spanSec);
+            let axis = rawAxis;
+            if (win === 'all') {
+                const weeklyPs = selectedSub
+                    ? seriesIntsAt(r.rngPsVer[0], rawAxis.sorted)
+                    : sumSeriesIntsAt(r.rngPsVer, rawAxis.sorted);
+                const maxWeekly = weeklyPs.reduce((m, v) => (v > m ? v : m), 0);
+                const minWeekly = maxWeekly > 0 ? Math.max(1, Math.min(10, Math.round(maxWeekly * 0.01))) : 1;
+                const firstIdx = weeklyPs.findIndex(v => v >= minWeekly);
+                const startIdx = firstIdx >= 0 ? firstIdx : Math.max(0, rawAxis.sorted.length - 12);
+                if (startIdx > 0) {
+                    axis = { sorted: rawAxis.sorted.slice(startIdx), labels: rawAxis.labels.slice(startIdx) };
+                }
+            }
+            const activeWeeks = win === 'all' ? Math.max(1, axis.sorted.length) : weeks;
 
             const subPsMap = promMapBy(r.subPsAll, 'subsystem');
             const subNameSet = new Set(Object.keys(subPsMap));
@@ -5214,8 +5280,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             let summaryRows = [];
             if (selectedSub) {
                 summaryRows = [
-                    ['Patchsets / Week', fmtNum(Math.round(psTotal / weeks)), `${fmtNum(psTotal)} total`],
-                    ['Patches / Week', fmtNum(Math.round(patchesCount / weeks)), `${fmtNum(patchesCount)} total · avg ${psTotal > 0 ? (patchesCount / psTotal).toFixed(1) : '-'} patches/series`],
+                    ['Patchsets / Week', fmtNum(Math.round(psTotal / activeWeeks)), `${fmtNum(psTotal)} total`],
+                    ['Patches / Week', fmtNum(Math.round(patchesCount / activeWeeks)), `${fmtNum(patchesCount)} total · avg ${psTotal > 0 ? (patchesCount / psTotal).toFixed(1) : '-'} patches/series`],
                     ['Issues / Patchset', psTotal > 0 ? (fTotal / psTotal).toFixed(2) : '-', `${fmtNum(fTotal)} total · ${fmtNum(fHighCrit)} high/critical`],
                     ['Issues / Patch', patchesCount > 0 ? (fTotal / patchesCount).toFixed(2) : '-', 'patch-introduced issues']
                 ];
@@ -5271,8 +5337,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 ].filter(Boolean).join(' · ') || 'no follow-up revisions checked';
 
                 summaryRows = [
-                    ['Patchsets / Week', fmtNum(Math.round(psTotal / weeks)), `${fmtNum(psTotal)} total (${psTotal > 0 ? Math.round((v2PlusCnt / psTotal) * 100) + '% v2+ revisions' : '-'})`],
-                    ['Patches / Week', fmtNum(Math.round(patchesCount / weeks)), `${fmtNum(patchesCount)} total (avg ${psTotal > 0 ? (patchesCount / psTotal).toFixed(1) : '-'} patches/series)`],
+                    ['Patchsets / Week', fmtNum(Math.round(psTotal / activeWeeks)), `${fmtNum(psTotal)} total (${psTotal > 0 ? Math.round((v2PlusCnt / psTotal) * 100) + '% v2+ revisions' : '-'})`],
+                    ['Patches / Week', fmtNum(Math.round(patchesCount / activeWeeks)), `${fmtNum(patchesCount)} total (avg ${psTotal > 0 ? (patchesCount / psTotal).toFixed(1) : '-'} patches/series)`],
                     ['Clean Patchsets', cleanPct, `${fmtNum(compClean)} of ${fmtNum(compReviewed)} reviewed had 0 issues`],
                     ['Clean Patches', cleanPatchPct, `${fmtNum(patchClean)} of ${fmtNum(patchRevTot)} reviewed had 0 issues`],
                     ['Issues / Patchset', compReviewed > 0 ? (fTotal / compReviewed).toFixed(2) : '-', `${patchesCount > 0 ? (fTotal / patchesCount).toFixed(2) : '-'} / patch · ${fmtNum(fHighCrit)} high/critical`],
@@ -5284,6 +5350,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             let html = `<h2>Project Activity${selectedSub ? ` · ${escapeHtml(selectedSub)}` : ''}</h2>` +
                 renderSummaryTable(['Metric', 'Value', 'Detail'], summaryRows);
             html += `<h2>Weekly Patchsets &amp; Patches</h2><div class="stats-chart-wrap"><div id="project-chart-volume" class="chart-container"></div></div>`;
+            if (!selectedSub) {
+                html += `<h2>Clean Patches &amp; Patchsets per Week (%)</h2><div class="stats-chart-wrap"><div id="project-chart-clean" class="chart-container"></div></div>`;
+            }
             html += `<h2>Issues Discovered per Week by Severity</h2><div class="stats-chart-wrap"><div id="project-chart-findings" class="chart-container"></div></div>`;
             if (!selectedSub) {
                 html += `<h2>Issues from Prior Versions: Fixed vs Left Unfixed in v2+</h2><div class="stats-chart-wrap"><div id="project-chart-fixups" class="chart-container"></div></div>`;
@@ -5325,7 +5394,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             container.innerHTML = html;
 
             const pal = getStatsPalette();
-            const axis = buildFixedAxis(startSec, endSec, stepWeek, spanSec);
             const relMark = buildReleaseMarkLine(r.releases, axis.sorted, axis.labels, stepWeek, pal);
 
             const volSeries = selectedSub
@@ -5347,6 +5415,31 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 ],
                 series: volSeries
             });
+
+            if (!selectedSub) {
+                const cleanPctAt = vec => {
+                    const c = seriesIntsAt((vec || []).find(s => s.metric?.clean === 'true'), axis.sorted);
+                    const d = seriesIntsAt((vec || []).find(s => s.metric?.clean === 'false'), axis.sorted);
+                    return axis.sorted.map((_, i) => {
+                        const tot = c[i] + d[i];
+                        return tot > 0 ? Math.round((c[i] / tot) * 1000) / 10 : null;
+                    });
+                };
+                const showDot = axis.sorted.length <= 26;
+                const cleanSeries = [
+                    { name: 'Clean Patches %', type: 'line', smooth: 0.2, showSymbol: showDot, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2 }, itemStyle: { color: pal.ok }, data: cleanPctAt(r.rngCleanPatches) },
+                    { name: 'Clean Patchsets %', type: 'line', smooth: 0.2, showSymbol: showDot, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2 }, itemStyle: { color: pal.pending }, data: cleanPctAt(r.rngCleanPatchsets) }
+                ];
+                if (relMark) cleanSeries[0].markLine = relMark;
+                mountStatsChart('project-chart-clean', {
+                    tooltip: { trigger: 'axis', valueFormatter: v => (v == null ? '-' : `${v}%`) },
+                    legend: { bottom: 0 },
+                    grid: { left: '3%', right: '4%', bottom: '12%', top: '12%', containLabel: true },
+                    xAxis: { type: 'category', data: axis.labels },
+                    yAxis: { type: 'value', min: 0, max: 100, axisLabel: { formatter: '{value}%' }, splitLine: { lineStyle: { type: 'dashed' } } },
+                    series: cleanSeries
+                });
+            }
 
             mountStatsChart('project-chart-findings', {
                 legend: { bottom: 0 },
