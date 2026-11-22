@@ -26,6 +26,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -35,6 +36,9 @@ use crate::notes::output::{MANIFEST_FILE, Manifest};
 
 /// Directory holding notes sets inside a project's prompt directory.
 pub const NOTES_RELDIR: &str = "notes";
+
+/// Upper bound for the read-only git queries used to select code notes.
+const METADATA_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One notes set found in the prompt directory.
 #[derive(Debug, Clone)]
@@ -93,23 +97,44 @@ pub async fn choose_set<'a>(
     Ok(dated.first().map(|(_, set)| *set))
 }
 
+/// Builds a metadata query that may lazily fetch a missing revision, but
+/// never waits for interactive credentials.
+fn metadata_git(repo: &Path) -> tokio::process::Command {
+    let mut command = git_cmd::in_dir_async(repo);
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null());
+    command
+}
+
 async fn commit_time(repo: &Path, rev: &str) -> Result<Option<i64>> {
     if rev.starts_with('-') {
         return Ok(None);
     }
-    let output = git_cmd::in_dir_async(repo)
-        .args([
-            "-c",
-            "safe.bareRepository=all",
-            "log",
-            "-1",
-            "--format=%ct",
-            rev,
-            "--",
-        ])
-        .output()
-        .await
-        .context("failed to run git log")?;
+    // A partial clone may lazily fetch a missing revision here.  Bound the
+    // wait so an unreachable promisor cannot stall the whole review.
+    let output = match tokio::time::timeout(
+        METADATA_GIT_TIMEOUT,
+        metadata_git(repo)
+            .args([
+                "-c",
+                "safe.bareRepository=all",
+                "log",
+                "-1",
+                "--format=%ct",
+                rev,
+                "--",
+            ])
+            .output(),
+    )
+    .await
+    {
+        Ok(result) => result.context("failed to run git log")?,
+        Err(_) => {
+            tracing::warn!(revision = rev, "timed out reading code-notes commit time");
+            return Ok(None);
+        }
+    };
     if !output.status.success() {
         return Ok(None);
     }
@@ -120,18 +145,31 @@ async fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bo
     if ancestor.starts_with('-') || descendant.starts_with('-') {
         return Ok(false);
     }
-    let status = git_cmd::in_dir_async(repo)
-        .args([
-            "-c",
-            "safe.bareRepository=all",
-            "merge-base",
-            "--is-ancestor",
-            ancestor,
-            descendant,
-        ])
-        .status()
-        .await
-        .context("failed to run git merge-base")?;
+    let status = match tokio::time::timeout(
+        METADATA_GIT_TIMEOUT,
+        metadata_git(repo)
+            .args([
+                "-c",
+                "safe.bareRepository=all",
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+            ])
+            .status(),
+    )
+    .await
+    {
+        Ok(result) => result.context("failed to run git merge-base")?,
+        Err(_) => {
+            tracing::warn!(
+                ancestor = ancestor,
+                descendant = descendant,
+                "timed out checking code-notes ancestry"
+            );
+            return Ok(false);
+        }
+    };
     Ok(status.success())
 }
 
