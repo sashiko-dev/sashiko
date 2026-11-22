@@ -350,7 +350,7 @@ NOTHING else. Do NOT apply sections 1-14. Do NOT apply TASK POSITIVE.1.**
    fabricated or misquoted the rule, eliminate the issue.
 
 2. **Does the cited code exist?** Confirm the function, variable, or code
-   pattern the agent cited is real. Use `find_function` or read the file. If
+   pattern the agent cited is real. Use `git_grep` or `git_read_files`. If
    the agent hallucinated the code (wrong function name, nonexistent variable,
    fabricated code path), eliminate the issue.
 
