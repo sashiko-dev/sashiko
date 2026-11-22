@@ -1350,7 +1350,7 @@ fn default_max_total_tokens() -> usize {
 }
 
 fn default_max_total_output_tokens() -> usize {
-    1_000_000
+    2_000_000
 }
 
 fn default_max_lines_changed() -> usize {
@@ -3258,5 +3258,21 @@ concurrency = 4
         std::fs::write(&path, toml_enabled).unwrap();
         let loaded = Settings::load(Some(&path)).unwrap();
         assert!(loaded.review.design);
+    }
+
+    #[test]
+    fn test_default_max_total_output_tokens_accommodates_large_reviews() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Settings.toml");
+        let toml = r#"
+            [ai]
+            provider = "gemini"
+            model = "gemini-4-carbon"
+            [review]
+            concurrency = 2
+        "#;
+        std::fs::write(&path, toml).unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        assert_eq!(settings.review.max_total_output_tokens, 2_000_000);
     }
 }
