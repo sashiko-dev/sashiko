@@ -417,28 +417,38 @@ impl ClaudeClient {
                 .map(|t| loggable_body(&t))
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
-            match status.as_u16() {
-                429 => {
-                    // Rate limit - use parsed retry-after or default to 60s
-                    let retry_after = retry_after_duration.unwrap_or(Duration::from_secs(60));
-                    Err(ClaudeError::RateLimitExceeded {
-                        retry_after,
-                        detail: error_body,
-                    })?
-                }
-                500..=599 => {
-                    // Overloaded / Server Error - use retry-after or exponential backoff
-                    let retry_after = retry_after_duration.unwrap_or(Duration::from_secs(0));
-                    Err(ClaudeError::OverloadedError {
-                        retry_after,
-                        detail: error_body,
-                    })?
-                }
-                400 => Err(ClaudeError::InvalidRequest(error_body))?,
-                401 | 403 => Err(ClaudeError::AuthenticationError(error_body))?,
-                _ => Err(ClaudeError::ApiError(status, error_body))?,
+            Err(status_error(status, retry_after_duration, error_body))?
+        }
+    }
+}
+
+/// Types an error status by what retrying can do about it.  `error_body`
+/// is the redacted, shortened body that came with it.
+pub(crate) fn status_error(
+    status: reqwest::StatusCode,
+    retry_after_duration: Option<Duration>,
+    error_body: String,
+) -> ClaudeError {
+    match status.as_u16() {
+        429 => {
+            // Rate limit - use parsed retry-after or default to 60s
+            let retry_after = retry_after_duration.unwrap_or(Duration::from_secs(60));
+            ClaudeError::RateLimitExceeded {
+                retry_after,
+                detail: error_body,
             }
         }
+        500..=599 => {
+            // Overloaded / Server Error - use retry-after or exponential backoff
+            let retry_after = retry_after_duration.unwrap_or(Duration::from_secs(0));
+            ClaudeError::OverloadedError {
+                retry_after,
+                detail: error_body,
+            }
+        }
+        400 => ClaudeError::InvalidRequest(error_body),
+        401 | 403 => ClaudeError::AuthenticationError(error_body),
+        _ => ClaudeError::ApiError(status, error_body),
     }
 }
 
