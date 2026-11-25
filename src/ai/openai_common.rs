@@ -282,12 +282,18 @@ pub trait StreamAssembler: Send {
     /// stream that ends without it.
     fn terminal_event(&self) -> &'static str;
 
+    /// Whether a stream that ended without its terminal event still holds
+    /// the whole generation.
+    fn complete_at_eof(&self) -> bool {
+        false
+    }
+
     /// Takes one event, returning `Flow::Done` once the document is
     /// complete.  An event that breaks the format is an error.
     fn on_event(&mut self, event: SseEvent) -> Result<Flow, OpenAiCompatError>;
 
     /// The rebuilt document.  Called only after `on_event` returned
-    /// `Flow::Done`.
+    /// `Flow::Done`, or the stream ended and `complete_at_eof` held.
     fn into_document(self: Box<Self>) -> Value;
 }
 
@@ -330,6 +336,12 @@ async fn collect_stream(
     let mut assembler = new_assembler();
     match read_events(res, |event| assembler.on_event(event)).await {
         Ok(StreamEnd::Terminal) => {}
+        Ok(StreamEnd::Eof) if assembler.complete_at_eof() => {
+            tracing::debug!(
+                "OpenAI stream ended without {}; every choice had finished",
+                assembler.terminal_event()
+            );
+        }
         Ok(StreamEnd::Eof) => {
             return Err(body_read_error(&format!(
                 "stream ended before {}",
