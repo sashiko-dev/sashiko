@@ -13,6 +13,7 @@ third_party/sashiko/
 third_party/gcc/
 third_party/qemu/
 third_party/e2fsprogs/
+third_party/llvm/
 benchmarks/runs/
 review_trees/
 sashiko.log

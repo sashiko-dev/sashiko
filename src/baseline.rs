@@ -1124,6 +1124,7 @@ fn is_non_linux_project_url(url: &str) -> bool {
         || lower.contains("qemu/qemu")
         || lower.contains("zephyrproject-rtos/zephyr")
         || lower.contains("e2fsprogs")
+        || lower.contains("llvm-project")
         || lower.contains("sashiko")
 }
 

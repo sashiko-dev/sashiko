@@ -43,6 +43,7 @@ pub enum ProjectId {
     Qemu,
     Zephyr,
     E2fsprogs,
+    Llvm,
 }
 
 impl ProjectId {
@@ -56,6 +57,7 @@ impl ProjectId {
             ProjectId::Qemu => "qemu",
             ProjectId::Zephyr => "zephyr",
             ProjectId::E2fsprogs => "e2fsprogs",
+            ProjectId::Llvm => "llvm",
         }
     }
 
@@ -68,6 +70,7 @@ impl ProjectId {
             ProjectId::Qemu => "QEMU",
             ProjectId::Zephyr => "Zephyr",
             ProjectId::E2fsprogs => "e2fsprogs",
+            ProjectId::Llvm => "LLVM",
         }
     }
 
@@ -75,7 +78,7 @@ impl ProjectId {
     pub fn mainline_branch(self) -> &'static str {
         match self {
             ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu | ProjectId::E2fsprogs => "master",
-            ProjectId::Sashiko | ProjectId::Zephyr => "main",
+            ProjectId::Sashiko | ProjectId::Zephyr | ProjectId::Llvm => "main",
         }
     }
 
@@ -101,6 +104,11 @@ impl ProjectId {
                     || url.contains("tytso/e2fsprogs")
                     || url.contains("e2fsprogs.git.sourceforge.net")
             }
+            ProjectId::Llvm => {
+                url.contains("llvm/llvm-project")
+                    || url.contains("llvm-project.git")
+                    || url.contains("llvm.org/git/llvm")
+            }
         }
     }
 
@@ -121,6 +129,7 @@ impl ProjectId {
             ProjectId::Qemu => "qemu",
             ProjectId::Zephyr => "zephyr",
             ProjectId::E2fsprogs => "e2fsprogs",
+            ProjectId::Llvm => "llvm",
         }
     }
 
@@ -135,7 +144,8 @@ impl ProjectId {
             | ProjectId::Gcc
             | ProjectId::Qemu
             | ProjectId::Zephyr
-            | ProjectId::E2fsprogs => false,
+            | ProjectId::E2fsprogs
+            | ProjectId::Llvm => false,
         }
     }
 
@@ -154,7 +164,8 @@ impl ProjectId {
             | ProjectId::Gcc
             | ProjectId::Qemu
             | ProjectId::Zephyr
-            | ProjectId::E2fsprogs => crate::authority::TrustedBots(&[]),
+            | ProjectId::E2fsprogs
+            | ProjectId::Llvm => crate::authority::TrustedBots(&[]),
         }
     }
 
@@ -168,6 +179,7 @@ impl ProjectId {
             ProjectId::Qemu => "projects/qemu/mailing_lists.toml",
             ProjectId::Zephyr => "projects/zephyr/mailing_lists.toml",
             ProjectId::E2fsprogs => "projects/e2fsprogs/mailing_lists.toml",
+            ProjectId::Llvm => "projects/llvm/mailing_lists.toml",
         }
     }
 
@@ -181,6 +193,7 @@ impl ProjectId {
             ProjectId::Qemu => "projects/qemu/bugs_access.toml",
             ProjectId::Zephyr => "projects/zephyr/bugs_access.toml",
             ProjectId::E2fsprogs => "projects/e2fsprogs/bugs_access.toml",
+            ProjectId::Llvm => "projects/llvm/bugs_access.toml",
         }
     }
 
@@ -215,6 +228,10 @@ impl ProjectId {
             ProjectId::E2fsprogs => Upstream {
                 url: "https://git.kernel.org/pub/scm/fs/ext2/e2fsprogs.git",
                 seed: Seed::Mirror("https://github.com/tytso/e2fsprogs.git"),
+            },
+            ProjectId::Llvm => Upstream {
+                url: "https://github.com/llvm/llvm-project.git",
+                seed: Seed::None,
             },
         }
     }
@@ -263,6 +280,7 @@ impl FromStr for ProjectId {
             "qemu" => Ok(ProjectId::Qemu),
             "zephyr" => Ok(ProjectId::Zephyr),
             "e2fsprogs" => Ok(ProjectId::E2fsprogs),
+            "llvm" => Ok(ProjectId::Llvm),
             _ => Err(UnknownProject(s.to_string())),
         }
     }
@@ -303,6 +321,7 @@ impl ProjectId {
         ProjectId::Qemu,
         ProjectId::Zephyr,
         ProjectId::E2fsprogs,
+        ProjectId::Llvm,
     ];
 }
 
@@ -339,10 +358,11 @@ mod tests {
                 | ProjectId::Gcc
                 | ProjectId::Qemu
                 | ProjectId::Zephyr
-                | ProjectId::E2fsprogs => {}
+                | ProjectId::E2fsprogs
+                | ProjectId::Llvm => {}
             }
         }
-        assert_eq!(ProjectId::ALL.len(), 6);
+        assert_eq!(ProjectId::ALL.len(), 7);
     }
 
     #[test]
@@ -361,6 +381,7 @@ mod tests {
         assert_eq!(ProjectId::Qemu.display_name(), "QEMU");
         assert_eq!(ProjectId::Zephyr.display_name(), "Zephyr");
         assert_eq!(ProjectId::E2fsprogs.display_name(), "e2fsprogs");
+        assert_eq!(ProjectId::Llvm.display_name(), "LLVM");
     }
 
     #[test]

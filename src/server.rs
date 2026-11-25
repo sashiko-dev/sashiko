@@ -830,6 +830,12 @@ fn release_tag_display_label(project: crate::project::ProjectId, tag: &str) -> O
             let matches = is_two_part_version(rest) || parse_three_part_version(rest).is_some();
             matches.then(|| tag.to_string())
         }
+        // llvm-project tags releases as `llvmorg-<major>.<minor>.<patch>`;
+        // release candidates carry a `-rcN` suffix and are not releases.
+        ProjectId::Llvm => {
+            let rest = tag.strip_prefix("llvmorg-")?;
+            parse_three_part_version(rest).map(|_| tag.to_string())
+        }
     }
 }
 
@@ -8968,6 +8974,14 @@ F:	net/
         );
         assert_eq!(
             release_tag_display_label(ProjectId::E2fsprogs, "v1.47.2-rc1"),
+            None
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::Llvm, "llvmorg-21.1.0").as_deref(),
+            Some("llvmorg-21.1.0")
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::Llvm, "llvmorg-21.1.0-rc1"),
             None
         );
 

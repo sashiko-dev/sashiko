@@ -27,6 +27,7 @@ use crate::workflows::e2fsprogs_patch_review;
 use crate::workflows::gcc_patch_review;
 use crate::workflows::guard::sanitize_prompt_relpath;
 use crate::workflows::linux_patch_review::{self, LinuxPatchReviewState};
+use crate::workflows::llvm_patch_review;
 use crate::workflows::qemu_patch_review;
 use crate::workflows::sashiko_patch_review;
 use crate::workflows::zephyr_patch_review;
@@ -283,6 +284,7 @@ fn static_stage_guides(project: ProjectId, stage_name: &str) -> Vec<String> {
             ProjectId::Qemu => qemu_patch_review::ANALYSIS_STAGES,
             ProjectId::Zephyr => zephyr_patch_review::ANALYSIS_STAGES,
             ProjectId::E2fsprogs => e2fsprogs_patch_review::ANALYSIS_STAGES,
+            ProjectId::Llvm => llvm_patch_review::ANALYSIS_STAGES,
         };
         for def in all_defs {
             for g in def.guides {
@@ -301,6 +303,7 @@ fn static_stage_guides(project: ProjectId, stage_name: &str) -> Vec<String> {
         ProjectId::Qemu => qemu_patch_review::analysis_stage_by_name(stage_name),
         ProjectId::Zephyr => zephyr_patch_review::analysis_stage_by_name(stage_name),
         ProjectId::E2fsprogs => e2fsprogs_patch_review::analysis_stage_by_name(stage_name),
+        ProjectId::Llvm => llvm_patch_review::analysis_stage_by_name(stage_name),
     };
     if let Some(def) = analysis_def {
         for g in def.guides {
@@ -323,7 +326,7 @@ fn static_stage_guides(project: ProjectId, stage_name: &str) -> Vec<String> {
             push_unique(&mut guides, "severity.md");
         }
         "report" => match project {
-            ProjectId::Linux | ProjectId::Gcc | ProjectId::E2fsprogs => {
+            ProjectId::Linux | ProjectId::Gcc | ProjectId::E2fsprogs | ProjectId::Llvm => {
                 push_unique(&mut guides, "inline-template.md");
             }
             ProjectId::Sashiko => push_unique(&mut guides, "github-summary-template.md"),
@@ -387,7 +390,7 @@ fn build_prompts_manifest(
             "false-positive-guide.md".to_string(),
             "severity.md".to_string(),
         ],
-        ProjectId::Qemu | ProjectId::Zephyr | ProjectId::E2fsprogs => vec![
+        ProjectId::Qemu | ProjectId::Zephyr | ProjectId::E2fsprogs | ProjectId::Llvm => vec![
             "review-core.md".to_string(),
             "false-positive-guide.md".to_string(),
             "severity.md".to_string(),

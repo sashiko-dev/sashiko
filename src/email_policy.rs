@@ -1208,6 +1208,10 @@ mod tests {
                 .ingest_filter_for_nntp_group("org.kernel.vger.linux-ext4")
                 .is_some()
         );
+
+        let llvm_config = EmailPolicyConfig::load("projects/llvm/mailing_lists.toml")
+            .expect("projects/llvm/mailing_lists.toml failed to parse");
+        assert!(llvm_config.tracked_nntp_groups().is_empty());
     }
 
     /// The documented example parses, and so does every commented-out
