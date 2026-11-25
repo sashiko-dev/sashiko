@@ -77,6 +77,17 @@ base_url = "https://gateway.example.com/v1/messages"
 client_cert = "/path/to/cert-and-key.pem"
 ```
 
+Set `stream = true` to let the endpoint send events during generation.
+This can help when a proxy or gateway closes idle requests, sometimes
+with an HTTP 524. Sashiko assembles the full message before handing it
+to a review stage. If the stream ends before `message_stop`, a retry
+starts the request again.
+
+```toml
+[ai.claude]
+stream = true
+```
+
 ## Claude Code CLI
 
 Uses a local [Claude Code](https://claude.com/claude-code) installation as

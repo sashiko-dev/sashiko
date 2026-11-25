@@ -169,6 +169,7 @@ Settings specific to the Claude API provider (`provider = "claude"`).
 | `client_cert` | path | -- | PEM file holding a certificate and its private key, presented as the TLS client identity to endpoints that authenticate callers with mutual TLS. |
 | `thinking` | string | -- | Thinking mode, sent as `thinking.type`: `"adaptive"` (Opus 4.6, Sonnet 4.6, and later), or `"disabled"` where the model allows it. |
 | `effort` | string | -- | Effort level, sent as `output_config.effort`: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Which levels a model accepts, and its default, vary by model. |
+| `stream` | bool | `false` | Request server-sent events to help keep idle connections open during generation. Sashiko assembles the full message before returning it to the review stage and also accepts a regular JSON reply. |
 
 #### `[ai.claude_cli]`
 

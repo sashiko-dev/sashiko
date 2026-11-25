@@ -934,15 +934,18 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
             let thinking = claude.and_then(|c| c.thinking.clone());
             let effort = claude.and_then(|c| c.effort.clone());
             let client_cert = claude.and_then(|c| c.client_cert.as_deref());
-            Ok(Arc::new(claude::ClaudeClient::new(
-                model,
-                enable_caching,
-                max_tokens,
-                base_url,
-                thinking,
-                effort,
-                client_cert,
-            )?))
+            Ok(Arc::new(
+                claude::ClaudeClient::new(
+                    model,
+                    enable_caching,
+                    max_tokens,
+                    base_url,
+                    thinking,
+                    effort,
+                    client_cert,
+                )?
+                .with_stream(claude.is_some_and(|c| c.stream)),
+            ))
         }
         "stdio-claude" => Ok(Arc::new(claude::StdioClaudeClient::new())),
         #[cfg(feature = "bedrock")]
@@ -2036,6 +2039,22 @@ mod tests {
         settings.ai.openai_compat = Some(compat(Some("assistants")));
         assert!(create_provider(&settings).is_err());
 
+        Ok(())
+    }
+
+    /// The Claude stream setting parses, is off when unset, and builds.
+    #[test]
+    fn test_claude_stream_setting_is_opt_in() -> Result<()> {
+        let parsed: crate::settings::ClaudeSettings = toml::from_str("stream = true")?;
+        assert!(parsed.stream);
+        let unset: crate::settings::ClaudeSettings = toml::from_str("")?;
+        assert!(!unset.stream, "streaming is opt-in");
+
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.provider = "claude".to_string();
+        settings.ai.model = "claude-test".to_string();
+        settings.ai.claude = Some(parsed);
+        assert!(create_provider(&settings).is_ok());
         Ok(())
     }
 
