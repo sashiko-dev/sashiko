@@ -402,7 +402,6 @@ async fn post_json_once<T: DeserializeOwned>(
     }
 
     let status = res.status();
-    let status_code = status.as_u16();
 
     let retry_after_duration = res
         .headers()
@@ -413,10 +412,20 @@ async fn post_json_once<T: DeserializeOwned>(
 
     let error_text = redact_secret(&res.text().await.unwrap_or_default());
 
-    match status_code {
+    Err(status_error(status, retry_after_duration, error_text))
+}
+
+/// Types an error status by what retrying can do about it.  `error_text`
+/// is the redacted body that came with it.
+pub fn status_error(
+    status: reqwest::StatusCode,
+    retry_after_duration: Option<Duration>,
+    error_text: String,
+) -> OpenAiCompatError {
+    match status.as_u16() {
         429 if is_insufficient_quota(&error_text) => {
             tracing::error!("OpenAI quota exhausted: {}", error_text);
-            Err(OpenAiCompatError::QuotaExhausted(error_text))
+            OpenAiCompatError::QuotaExhausted(error_text)
         }
         429 => {
             let default_retry = retry_after_duration.unwrap_or(Duration::from_secs(60));
@@ -429,17 +438,17 @@ async fn post_json_once<T: DeserializeOwned>(
                 "OpenAI 429 Rate Limit. Retry in {}s",
                 retry_duration.as_secs_f64()
             );
-            Err(OpenAiCompatError::RateLimitExceeded(retry_duration))
+            OpenAiCompatError::RateLimitExceeded(retry_duration)
         }
-        401 | 403 => Err(OpenAiCompatError::AuthenticationError(error_text)),
+        401 | 403 => OpenAiCompatError::AuthenticationError(error_text),
         500..=599 => {
             tracing::warn!("OpenAI Server Error {}: {}", status, error_text);
-            Err(OpenAiCompatError::TransientError(
+            OpenAiCompatError::TransientError(
                 retry_after_duration.unwrap_or(Duration::from_secs(0)),
                 error_text,
-            ))
+            )
         }
-        _ => Err(OpenAiCompatError::ApiError(status, error_text)),
+        _ => OpenAiCompatError::ApiError(status, error_text),
     }
 }
 
