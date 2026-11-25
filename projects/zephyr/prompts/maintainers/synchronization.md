@@ -13,7 +13,12 @@ symbols = [
     "K_WORK_DEFINE",
     "atomic_*",
     "k_condvar_*",
+    "k_event_*",
+    "k_fifo_*",
+    "k_lifo_*",
+    "k_msgq_*",
     "k_mutex_*",
+    "k_queue_*",
     "k_sched_lock",
     "k_sem_*",
     "k_spin_*",
@@ -52,9 +57,12 @@ doc/kernel/services/smp/smp.rst; include/zephyr/spinlock.h.
 - Prefer the spinlock API for SMP code. Check `irq_lock()` in the target tree
   before claiming that it cannot serialize other CPUs.
 
-## Mutexes and semaphores
+## Mutexes, semaphores, events, and queues
 
-Source: doc/kernel/services/synchronization/mutexes.rst.
+Source: doc/kernel/services/synchronization/mutexes.rst;
+doc/kernel/services/synchronization/semaphores.rst;
+doc/kernel/services/synchronization/events.rst;
+doc/kernel/services/data_passing/message_queues.rst.
 
 - Mutexes are for threads only. A mutex may be locked recursively and must be
   unlocked the same number of times.
@@ -62,6 +70,11 @@ Source: doc/kernel/services/synchronization/mutexes.rst.
   must be unlocked before it is released.
 - Check timeouts: a `k_mutex_lock()` or `k_sem_take()` with a finite timeout can
   fail, and the code must not enter the critical section when it does.
+- When threads can block with `K_FOREVER` on a semaphore, condition variable,
+  event, or queue, check that error, reset, and teardown paths wake all blocked
+  waiters so they are not stranded indefinitely.
+- Re-read shared state after releasing and reacquiring a lock across a wait or
+  sleep; acting on a snapshot captured before dropping the lock is a race.
 
 ## Workqueues
 

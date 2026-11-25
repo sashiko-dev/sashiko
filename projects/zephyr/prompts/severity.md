@@ -23,9 +23,12 @@ auditable.
   of a widely used subsystem.
 - **Who controls the trigger**: Only escalate for untrusted input when an external
   peer or a user-mode thread can actually reach the code with values it controls.
-- **Speculative findings**: If a finding rests on an unverified assumption, such
-  as undocumented hardware behavior, mark it speculative and cap its severity at
-  `Medium` (or `Low` if the impact is minor).
+- **Speculative findings**: If a finding rests on an unverified assumption
+  (such as unusual peripheral sequencing where the datasheet is absent), mark it
+  speculative and cap its severity at `Medium` (or `Low` if the impact is
+  narrow). Never report invented register bitfield positions, reserved-bit
+  ranges, or manual section numbers from memory; drop those per `review-core.md`
+  and `false-positive-guide.md`.
 
 ## Critical
 

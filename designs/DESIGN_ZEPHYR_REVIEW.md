@@ -67,6 +67,8 @@ post-verification states that a Kconfig or Devicetree logic error is not noise.
 | Note | Loaded by |
 |---|---|
 | `general` | every patch |
+| `boards` | `boards/`, `soc/` |
+| `cmake` | `CMakeLists.txt` and `*.cmake` files |
 | `execution-context` | `arch/`, `drivers/`, `kernel/`, `soc/`, or interrupt, timer, and callback symbols |
 | `synchronization` | `kernel/`, or lock, workqueue, and thread symbols |
 | `device-drivers` | `drivers/`, `include/zephyr/drivers/`, or `DEVICE_*` symbols |

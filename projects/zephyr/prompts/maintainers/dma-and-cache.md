@@ -9,6 +9,7 @@ symbols = [
     "dma_config",
     "dma_reload",
     "dma_start",
+    "k_mem_phys_addr",
     "sys_cache_data_*",
 ]
 +++
@@ -42,5 +43,24 @@ Source: doc/hardware/cache/guide.rst.
   with unrelated data can destroy that data.
 - `__nocache` requires `CONFIG_NOCACHE_MEMORY`. Check that the option is enabled
   for configurations using the attribute.
-- Do not report cache maintenance on SoCs without a data cache, or where the driver
-  is built only for such SoCs. Confirm that through Kconfig before reporting.
+- On architectures where the MMU enables hardware data caches independently of
+  `CONFIG_DCACHE` or `CONFIG_CACHE_MANAGEMENT` (inspect the target
+  architecture's MMU and cache headers in the tree, such as ARM64 with
+  `CONFIG_ARM_MMU`), `sys_cache_data_*()` can silently become a no-op or return
+  `-ENOTSUP` while caches remain active; check that Kconfig guards keep cache
+  maintenance active wherever DMA touches cached memory.
+- Verify `k_mem_phys_addr()` preconditions in
+  `include/zephyr/kernel/internal/mm.h` and `include/zephyr/sys/mem_manage.h`
+  in the target tree: it only translates permanent linearly mapped kernel RAM
+  (not dynamic `k_mem_map()` regions, which may not be physically contiguous),
+  and under `CONFIG_MMU=n` with `CONFIG_ASSERT=y` it can assert on non-SRAM
+  addresses before a subsequent driver range check runs.
+- On transfer abort, timeout, or controller reset, halt in-flight hardware DMA
+  and clear saved caller buffer pointers before returning buffer ownership to
+  the caller. Masking interrupts does not stop active bus-master DMA, and a
+  stale saved pointer later passed to `sys_cache_data_invd_range()` can corrupt
+  freed or reused memory.
+- Do not report cache maintenance on SoCs whose hardware has no data cache, or
+  where the driver is built only for such SoCs (confirm via hardware capability
+  symbols such as `CPU_HAS_DCACHE` and architecture MMU/cache setup in the tree,
+  not `CONFIG_DCACHE=n` alone).
