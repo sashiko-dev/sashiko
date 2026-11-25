@@ -21,7 +21,7 @@ The Linux kernel is Sashiko's primary focus and most mature target (`--project l
 | **Linux Kernel** | `linux` | **Production** | [sashiko.dev](https://sashiko.dev) | Local review, `lore.kernel.org` mailing lists, bug tracking, codebase scanning |
 | **GCC** | `gcc` | **Official pilot** | [gcc.sashiko.dev](https://gcc.sashiko.dev) | Local review, `gcc-patches@gcc.gnu.org` mailing list, bug tracking |
 | **Sashiko** | `sashiko` | **Production** | [sashiko.sashiko.dev](https://sashiko.sashiko.dev) | Local review, GitHub pull requests, bug tracking |
-| **QEMU** | `qemu` | **Pilot** | None | Local review, mailing lists (self-hosted) |
+| **QEMU** | `qemu` | **Pilot** | None | Local review |
 | **Zephyr RTOS** | `zephyr` | **Pilot** | None | Local review |
 | **LLVM** | `llvm` | **Pilot** | None | Local review |
 
