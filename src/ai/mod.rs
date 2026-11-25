@@ -1301,6 +1301,7 @@ pub mod openai_responses;
 pub mod proxy;
 pub mod quota;
 pub mod session;
+pub mod sse;
 #[cfg(test)]
 pub(crate) mod test_http;
 pub mod token_budget;
