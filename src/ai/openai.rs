@@ -374,6 +374,7 @@ impl OpenAiCompatClient {
             headers,
             body,
             &self.temperature_unsupported,
+            None,
         )
         .await?;
         tracing::debug!(
