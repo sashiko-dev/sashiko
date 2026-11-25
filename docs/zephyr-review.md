@@ -108,8 +108,8 @@ By default, three analysis stages always run: `goal`, `implementation`, and
 
 | Stage | Looks for |
 |---|---|
-| `resources` | Leaks, object lifetime against pending work and timers, power management balance, DMA buffer ownership |
-| `concurrency` | Blocking in the wrong execution context, locks, SMP, workqueues, unbounded work in ISRs |
+| `resources` | Leaks, static RAM footprint, object lifetime against pending work and timers, power management balance, DMA buffer ownership |
+| `concurrency` | Blocking in ISRs or non-yielding contexts, locks, panic/console lock safety, SMP, workqueues, bounded ISRs and timeouts |
 | `configuration` | Kconfig, Devicetree, and CMake logic that disagrees with the code it gates |
 | `security` | Untrusted input from peers, system call verification, flash and update paths |
 

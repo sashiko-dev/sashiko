@@ -151,11 +151,11 @@ const STAGE_GOAL_INSTRUCTION: &str = r#"# Analyze commit main goal, architecture
 You are a senior Zephyr maintainer evaluating the high-level intent, architectural soundness, and commit message quality of a proposed Zephyr change. Enforce the priority hierarchy in the review guidelines: memory safety and trust boundaries > execution context correctness > concurrency and timing > configuration consistency > hardware contract > everything else.
 - Problem Clarity: Is it clear what concrete problem the patch solves (a defect, a new board or driver, a subsystem feature)? Flag commits where the motivation is vague, circular, or unintelligible.
 - Intent vs. Implementation: Does the code change match what the commit message claims? For each concern, cite the specific commit message claim and the code that contradicts or insufficiently implements it.
-- Architectural Soundness: Is the chosen approach sound for this Zephyr subsystem? Does it fit Zephyr's patterns (the device model and `DEVICE_API()`, Devicetree for hardware description, Kconfig for software selection, workqueues for deferred work) and respect API contracts?
-- Public API Impact: If a public header changes, check the API's status in its `@version` tag. Flag a breaking change to a stable API that does not follow the API lifecycle.
+- Architectural Soundness: Is the chosen approach sound for this Zephyr subsystem? Does it fit Zephyr's patterns (the device model and `DEVICE_API()`, Devicetree for hardware description, Kconfig for software selection, workqueues for deferred work), respect API contracts, and honor layering (drivers and SoCs use public `include/zephyr/` headers instead of private `kernel/include` or internal arch headers, and standard specification definitions or protocol retries stay in shared subsystem layers rather than one vendor driver)?
+- Public API Impact: If a public header changes, check the API's status in its `@version` tag (and whether a long-shipped unversioned public header breaks signatures), SemVer version bump, and draft release or migration notes. Flag a breaking change to a stable API that does not follow the API lifecycle.
 - Alternatives: Are there obviously simpler or more idiomatic approaches that achieve the same goal using existing Zephyr facilities?
-- Single Responsibility: Flag commits that bundle unrelated changes or mix concerns that should be split into separate commits.
-- Commit Message Audit (Mandatory): Verify the title follows `area: summary`, the body explains both WHAT changed and WHY it is needed rather than restating the diff, and a `Signed-off-by: Real Name <email>` trailer is present (`<fixes_context>` when available) using a real human name (not a handle/username, placeholder, or bot identity) and a valid routable `<email>` address; if `Signed-off-by:` is missing or clearly broken, raise a `High` severity concern (`"preexisting": false`) on `"commit_message"`."#;
+- Single Responsibility: Flag commits that bundle unrelated changes or reformatting, split skeleton/fixup work that should be squashed, or place a test before the fix it verifies (breaking bisectability).
+- Commit Message Audit (Mandatory): Verify the title follows `area: summary`, the body concisely explains WHY the change is needed, the problem/approach, and key impact rather than either restating the title or walking through mechanical implementation details line-by-line, and claims match actual reachability and final code (flag misleading `Fixes:` trailers on defensive-only hardening, omitted test-only scope needed for backport decisions, PR-feedback references, or `cherry picked from` trailers). Verify a `Signed-off-by: Real Name <email>` trailer is present (`<fixes_context>` when available) using a real human name (not a handle/username, placeholder, or bot identity) and a valid routable `<email>` address; if `Signed-off-by:` is missing or clearly broken, raise a `High` severity concern (`"preexisting": false`) on `"commit_message"`."#;
 
 const STAGE_IMPLEMENTATION_INSTRUCTION: &str = r#"# Verify implementation against intent
 
@@ -184,22 +184,22 @@ const STAGE_RESOURCES_INSTRUCTION: &str = r#"# Audit resource management and dev
 Audit the memory and object lifecycle of everything the change touches:
 - Memory management: leaks, use-after-free, double-free, especially on error paths. Cover `k_malloc()`, `k_heap_alloc()`, `k_mem_slab_alloc()`, and `net_buf` reference counts.
 - Object lifetime against deferred execution: an object must outlive every pending work item, timer, and callback that refers to it. Freeing or re-initializing a structure containing a pending `k_work` or a running `k_timer` is a defect.
-- Fixed pools: blocking forever on an exhausted pool, and buffers that are never returned to it.
+- Fixed pools and waiters: blocking forever on an exhausted pool, buffers never returned to it, and threads blocked on `K_FOREVER` left stranded when a queue or device faults, resets, or tears down.
 - Device lifecycle: init and deinit symmetry, clocks and interrupts released on failure, and `pm_device_runtime_get()` and `pm_device_runtime_put()` balance on every path.
-- DMA buffers: ownership while a transfer is running, and cache maintenance around it.
-- Stacks: large local buffers on threads, ISRs, or workqueue stacks with a small configured size.
+- DMA buffers: ownership while a transfer is running, cache maintenance around it, and halting active hardware DMA plus clearing saved caller pointers on abort or reset paths before returning buffer ownership.
+- Static RAM footprint and stacks: oversized static tables, bitmaps, or buffers (such as duplicating mutually exclusive tables or sizing static arrays to architectural maxima while ignoring Devicetree or Kconfig bounds), and large local buffers on threads, ISRs, or workqueue stacks with a small configured size.
 - Do not stop after finding several bugs in one function or hunk; systematically audit every modified resource acquisition and release across the entire diff before concluding.
 If it is not provable from the code that every acquired resource is released, raise a concern with the concrete leak path."#;
 
 const STAGE_CONCURRENCY_INSTRUCTION: &str = r#"# Audit execution context, locking, and timing
 
 First establish the context of every modified function: thread, ISR, `k_timer` expiry function, driver callback, workqueue handler, or pre-kernel init. Walk up to the `IRQ_CONNECT()`, callback registration, or `SYS_INIT()` that reaches it. Then audit the change:
-- Blocking in the wrong context: sleeping APIs in an ISR or under a spinlock or `irq_lock()`. Check the API's `@isr_ok` tag and any note requiring `K_NO_WAIT`. Remember that `__ASSERT()` is the only guard on many of these paths.
-- Protection that matches the contexts: a mutex cannot protect state shared with an ISR. Use a spinlock, `irq_lock()`, or one atomic operation on a single word. Check `k_spin_lock()` and `k_spin_unlock()` pairing on every return, and never leave a `K_SPINLOCK()` block with `return`, `break`, or `goto`.
-- Lock ordering and recursion: spinlocks are not recursive, and distinct locks must nest in a consistent order. A work handler waiting on something only the same workqueue can provide deadlocks.
+- Blocking in the wrong context: sleeping APIs in an ISR, under a spinlock or `irq_lock()`, in non-yielding thread contexts (`k_can_yield() == false`, such as synchronous `printk()` under `CONFIG_PRINTK_SYNC`), or inside callbacks running on a shared subsystem workqueue. Check the API's `@isr_ok` tag and any note requiring `K_NO_WAIT`. Remember that `__ASSERT()` is the only guard on many of these paths.
+- Protection that matches the contexts: a mutex cannot protect state shared with an ISR. Use a spinlock, `irq_lock()`, or one atomic operation on a single word. Check `k_spin_lock()` and `k_spin_unlock()` pairing on every return, and never leave a `K_SPINLOCK()` block with `return`, `break`, or `goto`. Re-read shared state after releasing and reacquiring a lock across a wait.
+- Lock ordering and recursion: spinlocks are not recursive, and distinct locks must nest in a consistent order. Check console and assertion output paths for scheduler-lock re-entrancy on SMP, panic and coredump handlers for taking driver spinlocks that may already be held, and work handlers waiting on something only the same workqueue can provide.
 - SMP: a cooperative thread, `k_sched_lock()`, and local interrupt masking do not exclude another CPU under `CONFIG_SMP`. `irq_lock()` does, through a global lock. Check atomics and publish/consume ordering.
 - Workqueues: a blocking handler stalls every later item on that queue, and the system workqueue is shared. Check that a pending work item is not altered or freed.
-- Timing: unbounded work inside an ISR or critical section, and timeouts that can be `K_FOREVER` on a path that must make progress.
+- Timing: unbounded work or uncapped drain loops inside an ISR or critical section, timeouts restarted on each retry instead of using a single `k_timepoint_t` deadline, and timeouts that can be `K_FOREVER` on a path that must make progress.
 - Do not stop after finding several bugs in one function or hunk; systematically audit every modified shared-state access and lock scope across the entire diff before concluding.
 Name the concrete interleaving that triggers a race; do not report concurrency issues as abstract possibilities."#;
 
@@ -207,8 +207,8 @@ const STAGE_CONFIGURATION_INSTRUCTION: &str = r#"# Audit Kconfig, Devicetree, an
 
 One source file builds under many configurations. Audit whether the configuration the change depends on matches the code it gates.
 - Code and Kconfig: a `CONFIG_*` symbol used by the code must be defined and reachable. Trace the disabled path: conditionally compiled fields, functions, and calls must agree, and the build must still link and behave correctly with the option off.
-- Dependencies: check `depends on` and `select`. Selecting a symbol with its own dependencies can produce a configuration those dependencies forbid. A new driver option normally has `default y` and `depends on DT_HAS_<COMPAT>_ENABLED`. A plain `config FOO` added in a `Kconfig.defconfig` file weakens the base definition's `depends on`, unlike `configdefault FOO`.
-- Build rules: a source file must be compiled under the same condition its users assume. Compare the `zephyr_library_sources_ifdef()` or similar line in `CMakeLists.txt` with the Kconfig option and with any header that declares the file's functions.
+- Dependencies: check `depends on` and `select`. Selecting a symbol with its own dependencies can produce a configuration those dependencies forbid, and `select` forces `y` over user `=n` assignments rather than acting as a weak default. When a symbol is only meant to be `select`ed by another symbol, make it promptless instead of adding a circular `depends on` back to its selector. A new driver option normally has `default y` and `depends on DT_HAS_<COMPAT>_ENABLED`, and board `*_defconfig` files should not redundantly enable `DT_HAS_*` drivers or `select`ed buses. Modifying defaults of existing symbols belongs in `Kconfig.defconfig` using `configdefault FOO` (a plain `config FOO` weakens the base `depends on`). Also check cache-maintenance Kconfig guards on MMU architectures where hardware caches remain active when `CONFIG_DCACHE=n` or `CONFIG_CACHE_MANAGEMENT=n`.
+- Build rules: a source file must be compiled under the same condition its users assume. Compare `zephyr_library_sources_ifdef()` or `if(CONFIG_...)` in `CMakeLists.txt` with the Kconfig option and every C `#if` caller guard. Check that driver or subsystem `CMakeLists.txt` files do not add private `kernel/include` paths, that optional external host tools are not run unconditionally via `execute_process()` at configure time, and that setting `DTC_OVERLAY_FILE` does not unintentionally suppress auto-discovery of `boards/<board>.overlay` (where `EXTRA_DTC_OVERLAY_FILE` appends).
 - Code and Devicetree: every property the driver reads must exist in the binding and be `required` or handled when absent. `DT_INST_FOREACH_STATUS_OKAY()` instantiation, `DT_DRV_COMPAT`, and `compatible` strings must agree.
 - Optional nodes: `DEVICE_DT_GET()` on a node that may be disabled fails to link. Check that optional nodes are guarded.
 - Shared files: a change to an SoC `.dtsi`, a shared Kconfig default, or a common binding affects every board using it. Check that boards relying on the old behavior still work.
@@ -224,7 +224,7 @@ Zephyr devices process untrusted data, often without memory protection. Flag all
 - System calls, when `CONFIG_USERSPACE` is enabled: every `z_vrfy_` function must validate each user pointer, buffer size, and kernel object with the `K_SYSCALL_*` macros. Compare it with its `z_impl_` function; general parameter checks stay in the implementation. Data read from user memory must be copied before it is checked (TOCTOU), and a kernel-mode callback must never be registered from user mode.
 - Kernel objects and stacks: objects must stay outside user-accessible memory, and threads that can run in user mode use `K_THREAD_STACK_*`.
 - Secrets and cryptography: keys left in memory, non-constant-time comparison of authentication values, and fixed nonces. Use `sys_csrand_get()` where unpredictability matters.
-- Flash, firmware update, and settings paths that can leave a device unable to boot.
+- Flash, firmware update, and settings paths that can leave a device unable to boot, or flash-mount paths omitting `FS_MOUNT_FLAG_NO_FORMAT` that can destructively reformat existing user partitions on error.
 - Do not stop after finding several bugs in one function or hunk; systematically audit every path that handles untrusted input across the entire diff before concluding."#;
 
 const STAGE_VERIFICATION_INSTRUCTION: &str = r#"# Verification and severity estimation
@@ -1242,6 +1242,14 @@ mod tests {
                 "Zephyr {name} stage must include full-hunk sweep directive"
             );
         }
+        assert!(
+            STAGE_GOAL_INSTRUCTION.contains("concisely explains WHY")
+                && STAGE_RESOURCES_INSTRUCTION.contains("Static RAM footprint")
+                && STAGE_CONCURRENCY_INSTRUCTION.contains("k_can_yield()")
+                && STAGE_CONFIGURATION_INSTRUCTION.contains("configdefault FOO")
+                && STAGE_CONFIGURATION_INSTRUCTION.contains("circular `depends on`"),
+            "Zephyr analysis stages must carry commit-conciseness, footprint, non-yielding, and Kconfig directives"
+        );
         assert!(
             STAGE_VERIFICATION_INSTRUCTION.contains("speculative_dismissal")
                 && STAGE_VERIFICATION_INSTRUCTION
