@@ -663,12 +663,17 @@ fn response_failure(status: Option<&str>, error: Option<ResponsesError>) -> Opti
     );
 
     // server_error is this reply's 5xx, so it retries on the same terms:
-    // no delay of its own, leaving the pace to the caller's backoff.  Any
-    // other code names something the request did, which another attempt
-    // repeats.
+    // no delay of its own, leaving the pace to the caller's backoff.
+    // rate_limit_exceeded is its 429, which a stream can only report this
+    // way once its 200 has gone out; it waits as long as a 429 without a
+    // Retry-After does.  Any other code names something the request did,
+    // which another attempt repeats.
     Some(match code.as_str() {
         "server_error" => {
             OpenAiCompatError::TransientError(Duration::from_secs(0), reported).into()
+        }
+        "rate_limit_exceeded" => {
+            OpenAiCompatError::RateLimitExceeded(Duration::from_secs(60)).into()
         }
         _ => OpenAiCompatError::ResponseFailed(reported).into(),
     })
@@ -1401,6 +1406,15 @@ mod tests {
             crate::ai::classify_ai_error(&fatal),
             crate::ai::AiErrorClass::Fatal
         ));
+
+        assert!(matches!(
+            crate::ai::classify_ai_error(&failed("rate_limit_exceeded")),
+            crate::ai::AiErrorClass::RateLimit { .. }
+        ));
+        assert!(matches!(
+            crate::ai::classify_ai_error(&failed("insufficient_quota")),
+            crate::ai::AiErrorClass::Fatal
+        ));
     }
 
     /// The endpoint returns item types this build does not model, and a new
@@ -1595,6 +1609,32 @@ mod tests {
                 ),
                 transient,
                 "{code}: {err:#}"
+            );
+        }
+    }
+
+    /// A stream can only report a rate limit inside its 200, as a failed
+    /// response or an error event, and either waits like a 429.
+    #[tokio::test]
+    async fn a_rate_limit_inside_a_stream_is_a_rate_limit() {
+        let mut reply: Value = serde_json::from_str(MESSAGE).unwrap();
+        reply["status"] = json!("failed");
+        reply["output"] = json!([]);
+        reply["error"] = json!({"code": "rate_limit_exceeded", "message": "try again in 2s"});
+        for body in [
+            stream_of("response.failed", &reply.to_string()),
+            event_stream(&[json!({"type": "error", "code": "rate_limit_exceeded",
+                                  "message": "try again in 2s", "param": null})]),
+        ] {
+            let err = generate_streamed(body)
+                .await
+                .expect_err("a rate limit fails");
+            assert!(
+                matches!(
+                    crate::ai::classify_ai_error(&err),
+                    crate::ai::AiErrorClass::RateLimit { .. }
+                ),
+                "{err:#}"
             );
         }
     }

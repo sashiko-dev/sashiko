@@ -42,7 +42,7 @@ existing error classification.
 carry the full response object. Intermediate events can be skipped. An
 `error` event is converted to a failed response so it goes through the
 same classification. `server_error` can retry with the caller's
-backoff.
+backoff, and `rate_limit_exceeded` uses the default rate-limit delay.
 
 ### OpenAI Chat Completions
 
