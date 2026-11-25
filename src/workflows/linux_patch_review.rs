@@ -132,6 +132,9 @@ pub struct LinuxPatchReviewState {
     pub fixes: String,
     /// Pre-computed deterministic `Fixes:` trailer checks and `git blame` candidates.
     pub fixes_analysis: crate::worker::fixes_check::FixesAnalysis,
+    /// History of the modified code for a `history` stage, collected only
+    /// for projects with a history profile.
+    pub code_history: Option<crate::workflows::code_history::CodeHistoryContext>,
 }
 
 impl LinuxPatchReviewState {
