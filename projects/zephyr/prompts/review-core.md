@@ -74,6 +74,9 @@ explains what changed and why.
   triggers the issue, demote it or drop it.
 - **Do not re-explain code the author wrote.** Restating that a hunk "looks
   correct" is noise, not a finding. Clean code does not need praise.
-- **Hardware claims need a source.** The datasheet is usually not in the tree.
-  When a finding depends on how a register or peripheral behaves, say what you
-  based that on, and mark the finding speculative if it rests on an assumption.
+- **Hardware claims need a source.** The datasheet and architecture manuals are
+  usually not in the tree. Never invent or cite specific register bitfield
+  positions, reserved-bit ranges, or manual section numbers from memory without
+  verifiable in-tree evidence (headers, bindings, or sibling drivers). For other
+  register or peripheral behavior claims, say what you based that on, and mark
+  the finding speculative if it rests on an assumption.

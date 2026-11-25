@@ -16,8 +16,10 @@ symbols = [
     "gpio_init_callback",
     "irq_connect_dynamic",
     "irq_lock",
+    "k_can_yield",
     "k_is_in_isr",
     "k_is_pre_kernel",
+    "k_panic",
     "k_timer_*",
     "k_timer_init",
     "uart_callback_set",
@@ -69,6 +71,30 @@ Source: doc/kernel/services/interrupts.rst (Offloading ISR Work).
 - An ISR should run quickly. Time-consuming processing is offloaded to a thread
   or a work item. Report bus transactions or long polling loops added to an ISR
   when the path is real and the delay is unbounded or long for that bus.
+- Bound ISR drain or status-polling loops so a stuck hardware status bit or
+  continuous interrupt source cannot livelock the CPU.
+
+## Non-yielding, console, and fatal paths
+
+Source: doc/kernel/services/interrupts.rst; doc/services/debugging/coredump.rst;
+include/zephyr/kernel.h.
+
+- Thread context is not always yieldable: when `k_can_yield()` is false (for
+  example under a spinlock, with interrupts locked, or inside synchronous
+  `printk()` under `CONFIG_PRINTK_SYNC`), the caller cannot sleep and cannot
+  wait for completion interrupts that require unlocking first.
+- Low-level console, logging, and assertion output paths can be entered while
+  the kernel scheduler spinlock is already held on SMP; calling kernel wait
+  queue, event, or stack primitives (such as `k_event_clear()` or
+  `k_stack_push()`) from those paths deadlocks.
+- Panic, fatal error, and coredump handlers can run while any driver spinlock is
+  already held; taking a driver spinlock on a crash or coredump path deadlocks
+  diagnostics. During early secondary-CPU bringup, verify that architecture
+  per-CPU state (such as CPU/thread pointer registers) is initialized before any
+  branch that can invoke `k_panic()`.
+- Check whether subsystem callbacks (such as Bluetooth host or GATT callbacks)
+  execute on a shared subsystem workqueue where blocking on a mutex or semaphore
+  can stall or deadlock that subsystem.
 
 ## Interrupt locks
 

@@ -72,12 +72,16 @@ See doc/kernel/services/scheduling/index.rst and the Meta-IRQ Priorities section
 of doc/kernel/services/threads/index.rst. A uniprocessor-only file does not need
 SMP protection when Kconfig rules out `CONFIG_SMP`.
 
-### 8. Hardware behavior you cannot verify
+### 8. Hardware behavior and specifications you cannot verify
 
-The datasheet is usually not in the tree. Do not report a register sequence as
-wrong because it looks unusual. A vendor sequence can look redundant and still be
-required. Report it only with evidence from the tree, such as a sibling driver,
-a binding, or a vendor HAL header, or mark it speculative.
+The datasheet and architecture reference manuals are usually not in the tree. Do
+not invent or cite specific register bitfield positions, reserved-bit ranges, or
+architecture manual section numbers from memory without verifiable evidence from
+the tree (such as architecture or driver headers, a binding, or a sibling
+driver). For other hardware register sequences that look unusual without a
+datasheet in the tree, remember a vendor sequence can still be required: state
+what you based the concern on and mark it speculative (capped per
+`severity.md`), or drop it when there is no concrete in-tree basis.
 
 ### 9. External modules
 
@@ -105,3 +109,42 @@ locking, or system call verification defect.
 
 Follow `doc/contribute/style/code.rst`, which says to match nearby code where the
 guidelines leave a choice. Do not report a preference the guidelines do not state.
+
+### 13. Auto-discovered board config and overlay files
+
+Zephyr's build system automatically discovers application-local board and SoC
+configuration and overlay files under `boards/` and `socs/` (for example
+`boards/<board>.conf`, `boards/<board>.overlay`, and
+`socs/<SOC>_<BOARD_QUALIFIERS>.overlay`, distinct from the top-level `boards/`
+and `soc/` trees) unless `CONF_FILE` or `DTC_OVERLAY_FILE` overrides discovery
+(verify the discovery rules in `doc/build/dts/howtos.rst` and
+`doc/build/kconfig/setting.rst` in the target tree). Do not report a
+`boards/<board>.conf` or `boards/<board>.overlay` file in `tests/` or `samples/`
+as unused or orphaned merely because `testcase.yaml` or `sample.yaml` does not
+reference it via `EXTRA_CONF_FILE` or `EXTRA_DTC_OVERLAY_FILE` or list the board
+in `platform_allow`.
+
+### 14. Invalid or unbuildable remediation suggestions
+
+Verify that every suggested fix obeys Zephyr's build and runtime rules before
+reporting it:
+
+- Do not suggest sleeping, mutexes, or workqueue waits inside `PRE_KERNEL_1` or
+  `PRE_KERNEL_2` init paths.
+- Do not suggest overriding `enum:` from an `include:`d Devicetree binding YAML;
+  `edtlib` forbids overriding keys from included bindings with conflicting
+  values (`doc/build/dts/bindings-syntax.rst`).
+- Do not demand test Kconfig values that exceed target architecture or linker
+  limits without checking architecture Kconfig ranges in the tree.
+- Do not ask a driver to accept invalid inputs to work around a buggy caller
+  when the subsystem API contract requires rejecting them.
+
+### 15. Existing API signatures and non-functional coding-guideline noise
+
+Consistent with Rule 11.8 in `maintainers/general.md`, do not report a
+`(void *)` cast that drops `const` when it is forced by an unchanged existing
+Zephyr API parameter type (such as `k_mem_phys_addr(void *)`), unless the
+callee actually mutates read-only memory (which remains a `High` defect). Do not
+report stylistic MISRA preferences with no functional or safety defect (such as
+omitting an empty trailing `else` branch or testing `if (ret)` on an `int`
+status code).

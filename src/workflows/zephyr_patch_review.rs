@@ -1140,6 +1140,44 @@ mod tests {
 
         let selected = selected_notes(&["samples/net/foo/boards/bar.overlay"], "");
         assert!(selected.iter().any(|n| n == "devicetree"), "{selected:?}");
+
+        for file in [
+            "CMakeLists.txt",
+            "drivers/spi/CMakeLists.txt",
+            "boards/vendor/foo/board.cmake",
+        ] {
+            let selected = selected_notes(&[file], "");
+            assert!(
+                selected.iter().any(|n| n == "cmake"),
+                "{file}: {selected:?}"
+            );
+        }
+
+        for file in ["boards/vendor/foo/foo.yaml", "soc/vendor/bar/soc.c"] {
+            let selected = selected_notes(&[file], "");
+            assert!(
+                selected.iter().any(|n| n == "boards"),
+                "{file}: {selected:?}"
+            );
+        }
+
+        let selected = selected_notes(
+            &["drivers/sdhc/sdhc_foo.c"],
+            "@@ -10,2 +10,3 @@\n+\taddr = k_mem_phys_addr(buf);\n",
+        );
+        assert!(
+            selected.iter().any(|n| n == "dma-and-cache"),
+            "{selected:?}"
+        );
+
+        let selected = selected_notes(
+            &["subsys/console/foo.c"],
+            "@@ -10,2 +10,3 @@\n+\tk_event_wait(&ev, 1, false, K_FOREVER);\n",
+        );
+        assert!(
+            selected.iter().any(|n| n == "synchronization"),
+            "{selected:?}"
+        );
     }
 
     #[test]

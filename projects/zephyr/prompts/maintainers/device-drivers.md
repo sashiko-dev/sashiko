@@ -51,20 +51,40 @@ Source: doc/contribute/guidelines.rst (Specialized driver requirements).
 - A driver for a standalone device uses the Zephyr bus APIs (SPI, I2C, and so on)
   so that it works on any SoC. An SoC-specific fast path must keep a regular
   path for all other SoCs, and exceptions need Architecture WG approval.
+- Keep standard specification register or descriptor definitions in shared
+  subsystem headers and keep protocol-level retry loops in the subsystem stack
+  rather than duplicating them inside one vendor driver.
 
-## Blocking and interrupts
+## Blocking, timeouts, and interrupts
 
-Source: doc/kernel/drivers/index.rst.
+Source: doc/kernel/drivers/index.rst; include/zephyr/sys/clock.h;
+include/zephyr/sys/util.h.
 
 - A driver should support an interrupt-based implementation rather than polling,
   unless the hardware provides no interrupt.
 - Calls through device APIs such as `i2c.h` or `spi.h` are usually synchronous, so
   they should block until the operation completes.
+- Compute a single deadline at API entry using `k_timepoint_t`
+  (`sys_timepoint_calc()` and `sys_timepoint_timeout()`) rather than restarting
+  fresh per-step timeouts across multi-phase operations or retries, and prefer
+  `WAIT_FOR()` over ad-hoc busy-wait loops.
 
-## Return values
+## Hardware bounds, state, and return values
 
 Source: the doxygen for each API in `include/zephyr/drivers/`.
 
 - Check the return value of bus transfers. Report a value used after the transfer
   that should have produced it failed.
-- Return the errno the API documents, since callers rely on specific codes.
+- Return the errno the API documents (for example `-ETIMEDOUT` versus
+  `-EAGAIN`), since callers rely on specific codes.
+- Do not permanently latch a device into a failed state after a recoverable
+  configuration, negotiation, or tuning error unless hardware state is genuinely
+  unrecoverable.
+- When bounds-checking MMIO register offsets against a mapped window size,
+  include the register access width without integer overflow (for example
+  `size >= sizeof(uint32_t) && offset <= size - sizeof(uint32_t)`) and apply the
+  check on every active access path, not only initialization.
+- Check power-of-two assumptions on MSI vector counts and ring sizes (including
+  `UINT32_MAX` wrap on non-power-of-two indices), and watch for zero-initialized
+  table slots or `0` return sentinels colliding with valid ID `0` or empty
+  success.
