@@ -50,7 +50,7 @@ Optional. Describes the project this configuration is for.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `kind` | string | -- | Project this file is for: `"linux"`, `"sashiko"`, `"gcc"`, `"qemu"`, or `"zephyr"`. When set, it is checked against the project selected by `--project` / `SASHIKO_PROJECT`, and a mismatch is an error. When absent, the file is accepted for any project. |
+| `kind` | string | -- | Project this file is for: `"linux"`, `"sashiko"`, `"gcc"`, `"qemu"`, `"zephyr"`, `"e2fsprogs"`, or `"llvm"`. When set, it is checked against the project selected by `--project` / `SASHIKO_PROJECT`, and a mismatch is an error. When absent, the file is accepted for any project. |
 | `name` | string | `""` | Display name shown in the web UI. |
 | `description` | string | `""` | Optional instance note shown in the web UI About dialog (in addition to the standard Sashiko overview). |
 | `domain` | string | `""` | Public hostname used to build links to the web UI in forge comments (`https://<domain>/#/patchset/...`). Falls back to `sashiko.sashiko.dev` when empty. |
@@ -442,7 +442,7 @@ pass.
 
 ### `[linux_bug]`
 
-Controls pre-existing bug tracking and background analysis for the configured project (`linux`, `gcc`, `sashiko`, `qemu`, or `zephyr`).
+Controls pre-existing bug tracking and background analysis for the configured project (`linux`, `gcc`, `sashiko`, `qemu`, `zephyr`, `e2fsprogs`, or `llvm`).
 The section is also accepted as `[bugs]` (preferred for non-Linux configurations), and `fix_check_enabled` as
 `verify_fixes`.
 By default (`enabled = false`), pre-existing issues discovered during patch
@@ -703,7 +703,7 @@ startup reconciles stored access rows across existing bugs and patchsets.
 | `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT` | GCP project ID for the Vertex AI provider, in that order. |
 | `CLOUD_ML_REGION`, `GOOGLE_CLOUD_LOCATION` | GCP region for the Vertex AI provider, in that order. |
 | `SASHIKO_CONFIG` | Settings file to read when `--settings` is not given. |
-| `SASHIKO_PROJECT` | Project to review (`linux`, `sashiko`, `gcc`, `qemu` or `zephyr`), like `--project`. |
+| `SASHIKO_PROJECT` | Project to review (`linux`, `sashiko`, `gcc`, `qemu`, `zephyr`, `e2fsprogs` or `llvm`), like `--project`. |
 | `SASHIKO_SERVER` | Override daemon URL for CLI commands. |
 | `SASHIKO__*` | Override any Settings.toml value (e.g. `SASHIKO__AI__PROVIDER`). |
 | `SASHIKO__FORGE__WEBHOOK_SECRET` | Override webhook secret from Settings.toml. Avoids storing the secret on disk. |

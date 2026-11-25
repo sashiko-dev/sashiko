@@ -1674,6 +1674,7 @@ fn is_any_stage_exclusive_guide(name: &str) -> bool {
         crate::workflows::qemu_patch_review::ANALYSIS_STAGES,
         crate::workflows::zephyr_patch_review::ANALYSIS_STAGES,
         crate::workflows::e2fsprogs_patch_review::ANALYSIS_STAGES,
+        crate::workflows::llvm_patch_review::ANALYSIS_STAGES,
     ]
     .into_iter()
     .flat_map(|stages| stages.iter())

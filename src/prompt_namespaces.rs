@@ -32,4 +32,5 @@ pub const PROJECT_PROMPT_NAMESPACES: &[(&str, &str)] = &[
     ("qemu", "qemu"),
     ("zephyr", "zephyr"),
     ("e2fsprogs", "e2fsprogs"),
+    ("llvm", "llvm"),
 ];

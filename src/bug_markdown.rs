@@ -287,6 +287,8 @@ pub fn target_project_for_bug(settings: &Settings, bugid: &str) -> ProjectId {
         ProjectId::Zephyr
     } else if lower.starts_with("e2fsprogs-") {
         ProjectId::E2fsprogs
+    } else if lower.starts_with("llvm-") {
+        ProjectId::Llvm
     } else {
         settings.project.kind.unwrap_or_default()
     }
@@ -1631,6 +1633,7 @@ mod tests {
             ProjectId::Qemu,
             ProjectId::Zephyr,
             ProjectId::E2fsprogs,
+            ProjectId::Llvm,
         ] {
             let mut bug = sample_bug(&format!("{}-00112233", project.as_str()));
             bug.enrichments.push(enrichment(
