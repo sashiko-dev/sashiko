@@ -2329,6 +2329,7 @@ mod tests {
             send_empty_tool_call_content: false,
             api: None,
             service_tier: None,
+            stream: false,
         });
         let provider = crate::ai::create_provider(&settings)?;
 

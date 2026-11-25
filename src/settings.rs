@@ -590,6 +590,12 @@ pub struct OpenAiCompatSettings {
     /// it with `provider = "openai-compatible"` is a configuration error.
     #[serde(default)]
     pub service_tier: Option<ServiceTier>,
+    /// Ask for each reply as an event stream, on either endpoint, and
+    /// rebuild the document from its events. Bytes then keep flowing while
+    /// the model works, which keeps gateways that close idle requests from
+    /// cutting off long generations. Off by default.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 /// OpenAI processing tier. The set is fixed by the API rather than by the

@@ -702,6 +702,22 @@ a chat completion only.
 Setting any of them with `api = "responses"` is refused at startup
 rather than ignored.
 
+If a gateway closes idle requests, set `stream = true` for either
+OpenAI transport so the endpoint can send events during generation.
+Sashiko assembles the full reply before handing it to a review stage.
+
+```toml
+[ai.openai_compat]
+stream = true
+```
+
+An interrupted reply is retried from the start. Chat can treat a reply
+as complete without `[DONE]` if it has at least one choice and each
+choice has reported a finish reason other than `error`. Chat endpoints
+must accept `stream_options.include_usage`, which Sashiko requests for
+token counts. Set `api_timeout_secs` to cover the longest expected
+request, including generation.
+
 `service_tier` picks the processing tier and is sent on both endpoints,
 omitted when unset. `"flex"` halves the per-token price in exchange
 for slower responses and a higher rate of 429s, which the usual retry
