@@ -64,8 +64,9 @@ block indices from `message_start` through `message_stop`. Unknown event
 types can be skipped. An unknown delta for an active block is a
 protocol error because losing it could change the reconstructed block.
 
-Tool-call input is parsed when its block closes. Invalid JSON is a
-protocol error.
+Tool-call input is parsed when its block closes. An unparseable input
+fragment is allowed only in the last block of a reply whose stop reason
+is `max_tokens`. This lets the session handle the reply as truncated.
 
 ## Verification
 

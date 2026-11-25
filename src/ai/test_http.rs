@@ -72,7 +72,6 @@ pub(crate) async fn serve(bytes: Vec<u8>) -> TestServer {
 
 /// Answers one connection per response, in order, and records each request
 /// body it received.
-#[cfg(feature = "bedrock")]
 pub(crate) async fn serve_sequence(
     responses: Vec<Vec<u8>>,
 ) -> (TestServer, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {

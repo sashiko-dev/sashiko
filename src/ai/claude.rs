@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::ai::claude_stream::{MessageStream, StreamError};
+use crate::ai::sse::{ReadError, StreamEnd, is_event_stream, read_events};
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
     ProviderCapabilities, ToolCall, classify_status_code,
@@ -103,6 +105,10 @@ pub struct ClaudeRequest {
     pub thinking: Option<ThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<OutputConfig>,
+    /// Ask for an event stream.  Left out of the body unless set, so a
+    /// request that does not stream is byte for byte what it was before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -266,6 +272,9 @@ pub struct ClaudeClient {
     thinking: Option<String>,
     effort: Option<String>,
     extra_headers: std::collections::HashMap<String, String>,
+    /// Ask for an event stream, which keeps bytes flowing while the model
+    /// works; see claude_stream.
+    stream: bool,
 }
 
 impl ClaudeClient {
@@ -301,7 +310,14 @@ impl ClaudeClient {
             thinking,
             effort,
             extra_headers,
+            stream: false,
         })
+    }
+
+    /// Asks for each reply as an event stream rather than one document.
+    pub fn with_stream(mut self, stream: bool) -> Self {
+        self.stream = stream;
+        self
     }
 
     fn client_with_cert(path: &std::path::Path) -> Result<Client> {
@@ -395,7 +411,11 @@ impl ClaudeClient {
         let status = res.status();
 
         if status.is_success() {
-            let body_text = res.text().await.map_err(|e| transport_error("Claude", e))?;
+            let body_text = if body.stream && is_event_stream(&res) {
+                collect_stream(res).await?
+            } else {
+                res.text().await.map_err(|e| transport_error("Claude", e))?
+            };
             let response: ClaudeResponse =
                 serde_json::from_str(&body_text).context("Failed to parse Claude API response")?;
 
@@ -419,6 +439,70 @@ impl ClaudeClient {
 
             Err(status_error(status, retry_after_duration, error_body))?
         }
+    }
+}
+
+/// Reads an event-stream reply and returns the message it rebuilds, as
+/// JSON text for the same decoding a plain reply goes through.  A body
+/// that ends before message_stop lost the generation on the way and is
+/// transient, like a dropped plain body; a stream that breaks the format
+/// is fatal, like a plain body that does not parse.
+async fn collect_stream(res: reqwest::Response) -> Result<String> {
+    let mut stream = MessageStream::new();
+    match read_events(res, |event| stream.on_event(event)).await {
+        Ok(StreamEnd::Terminal) => {}
+        Ok(StreamEnd::Eof) => {
+            let detail = format!(
+                "stream ended in state {} before message_stop",
+                stream.state_name()
+            );
+            tracing::error!(
+                "{}Claude request failed (transport): {}",
+                crate::ai::get_log_prefix(),
+                detail
+            );
+            return Err(ClaudeError::TransientError(TRANSPORT_RETRY_AFTER, detail).into());
+        }
+        Err(ReadError::Transport(e)) => return Err(transport_error("Claude", e)),
+        Err(ReadError::Framing(e)) => {
+            return Err(anyhow::anyhow!("Malformed Claude event stream: {e}"));
+        }
+        Err(ReadError::Handler(StreamError::Upstream {
+            error_type,
+            message,
+        })) => {
+            let detail = loggable_body(&format!("{error_type}: {message}"));
+            return Err(status_error(stream_error_status(&error_type), None, detail).into());
+        }
+        Err(ReadError::Handler(e)) => {
+            return Err(anyhow::anyhow!(
+                "Malformed Claude event stream: {}",
+                redact_secret(&e.to_string())
+            ));
+        }
+    }
+    let document = stream
+        .into_document()
+        .context("Claude event stream ended without a message")?;
+    serde_json::to_string(&document).context("Failed to serialize the rebuilt Claude message")
+}
+
+/// The HTTP status the API documents for an error type, which an error
+/// event inside a stream reports in place of a status.  A type this build
+/// does not know is taken as a server error: it arrived after the request
+/// was accepted, so it is not something the request did.
+fn stream_error_status(error_type: &str) -> reqwest::StatusCode {
+    use reqwest::StatusCode;
+    match error_type {
+        "invalid_request_error" => StatusCode::BAD_REQUEST,
+        "authentication_error" => StatusCode::UNAUTHORIZED,
+        "billing_error" => StatusCode::PAYMENT_REQUIRED,
+        "permission_error" => StatusCode::FORBIDDEN,
+        "not_found_error" => StatusCode::NOT_FOUND,
+        "request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+        "rate_limit_error" => StatusCode::TOO_MANY_REQUESTS,
+        "overloaded_error" => StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -606,6 +690,7 @@ pub fn translate_ai_request(
         tools,
         thinking: thinking.map(|thinking_type| ThinkingConfig { thinking_type }),
         output_config: effort.map(|effort| OutputConfig { effort }),
+        stream: false,
     };
 
     // Apply cache control if enabled
@@ -757,6 +842,7 @@ impl AiProvider for ClaudeClient {
 
         // 2. Set the model
         claude_req.model = self.model.clone();
+        claude_req.stream = self.stream;
 
         // 3. Make API call
         let response = self.post_request(&claude_req).await?;
@@ -857,7 +943,7 @@ mod tests {
         AiErrorClass, AiMessage, AiRequest, AiRole, AiTool, ClassifyAiError, DEFAULT_RETRY_AFTER,
         ToolCall,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn cache_identity_tracks_the_knobs_outside_the_request() {
@@ -1020,6 +1106,7 @@ mod tests {
             thinking: None,
             effort: None,
             extra_headers: std::collections::HashMap::new(),
+            stream: false,
         }
     }
 
@@ -1248,6 +1335,303 @@ mod tests {
         );
         let detail = crate::ai::classify_ai_error_detail(&err).expect("detail");
         assert!(detail.contains("upstream capacity"), "{detail}");
+    }
+
+    /// A reply as the Messages API returns it without streaming: thinking,
+    /// text and a tool call.
+    const PLAIN_MESSAGE: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[{"type":"thinking","thinking":"Let me look.","signature":"sig=="},{"type":"text","text":"Reading the file."},{"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"a.rs"}}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":42,"cache_creation_input_tokens":3,"cache_read_input_tokens":5}}"#;
+
+    /// The same reply as the API streams it.
+    const STREAMED_MESSAGE: &[(&str, &str)] = &[
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":1,"cache_creation_input_tokens":3,"cache_read_input_tokens":5}}}"#,
+        ),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        ),
+        ("ping", r#"{"type":"ping"}"#),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me "}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"look."}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig=="}}"#,
+        ),
+        (
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Reading "}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"the file."}}"#,
+        ),
+        (
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":1}"#,
+        ),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":""}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\": \"a"}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":".rs\"}"}}"#,
+        ),
+        (
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":2}"#,
+        ),
+        (
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":42}}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ];
+
+    fn event_stream(events: &[(&str, &str)]) -> String {
+        events
+            .iter()
+            .map(|(name, data)| format!("event: {name}\ndata: {data}\n\n"))
+            .collect()
+    }
+
+    fn streamed_request() -> ClaudeRequest {
+        let mut request = hello_request();
+        request.stream = true;
+        request
+    }
+
+    async fn post_streamed(reply: Vec<u8>) -> Result<ClaudeResponse> {
+        let server = test_http::serve(reply).await;
+        let result = tokio::time::timeout(
+            test_http::TEST_TIMEOUT,
+            local_client(&server.url).post_request(&streamed_request()),
+        )
+        .await
+        .expect("request did not complete in time");
+        server.finish().await;
+        result
+    }
+
+    fn translated(response: Result<ClaudeResponse>) -> Value {
+        serde_json::to_value(translate_ai_response(&response.unwrap()).unwrap()).unwrap()
+    }
+
+    /// A streamed reply reaches the stage as exactly the response the
+    /// plain reply does.
+    #[tokio::test]
+    async fn test_a_streamed_reply_matches_the_plain_one() {
+        let plain = post_streamed(test_http::complete("200 OK", "", PLAIN_MESSAGE)).await;
+        let streamed = post_streamed(test_http::sse(&event_stream(STREAMED_MESSAGE))).await;
+        let plain_wire = serde_json::to_value(plain.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(streamed.as_ref().unwrap()).unwrap(),
+            plain_wire
+        );
+        assert_eq!(translated(streamed), translated(plain));
+    }
+
+    /// The flag reaches the wire only when enabled, and is the only
+    /// difference between the two requests.
+    #[tokio::test]
+    async fn test_stream_flag_reaches_the_request_only_when_enabled() {
+        let (server, bodies) = test_http::serve_sequence(vec![
+            test_http::complete("200 OK", "", PLAIN_MESSAGE),
+            test_http::sse(&event_stream(STREAMED_MESSAGE)),
+        ])
+        .await;
+        let request = make_request(vec![AiMessage {
+            role: AiRole::User,
+            content: Some("hi".to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        let plain = local_client(&server.url)
+            .generate_content(request.clone())
+            .await
+            .unwrap();
+        let streamed = local_client(&server.url)
+            .with_stream(true)
+            .generate_content(request)
+            .await
+            .unwrap();
+        server.finish().await;
+
+        assert_eq!(
+            serde_json::to_value(&streamed).unwrap(),
+            serde_json::to_value(&plain).unwrap()
+        );
+        let bodies = bodies.lock().unwrap();
+        let plain_body: Value = serde_json::from_str(&bodies[0]).unwrap();
+        let mut streamed_body: Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert!(plain_body.get("stream").is_none());
+        assert_eq!(streamed_body["stream"], true);
+        streamed_body.as_object_mut().unwrap().remove("stream");
+        assert_eq!(streamed_body, plain_body);
+    }
+
+    #[tokio::test]
+    async fn test_a_plain_reply_to_a_streamed_request_is_accepted() {
+        let response = post_streamed(test_http::complete("200 OK", "", PLAIN_MESSAGE))
+            .await
+            .unwrap();
+        assert_eq!(response.id, "msg_1");
+    }
+
+    #[tokio::test]
+    async fn test_a_stream_cut_before_message_stop_is_transient() {
+        let cut = event_stream(&STREAMED_MESSAGE[..12]);
+        let err = post_streamed(test_http::sse(&cut))
+            .await
+            .expect_err("a cut stream fails");
+        let msg = transient_message(&err);
+        assert!(
+            msg.contains("stream ended in state InBlock before message_stop"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_stream_whose_connection_drops_is_transient() {
+        let reply = test_http::truncated_with_type(
+            "200 OK",
+            "text/event-stream",
+            "",
+            &event_stream(&STREAMED_MESSAGE[..5]),
+        );
+        let err = post_streamed(reply)
+            .await
+            .expect_err("a dropped stream fails");
+        let msg = transient_message(&err);
+        assert!(msg.contains(test_http::BODY_READ_FAILURE), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_an_error_event_is_classified_like_its_status() {
+        let cases = [
+            ("overloaded_error", "transient"),
+            ("api_error", "transient"),
+            ("some_future_error", "transient"),
+            ("rate_limit_error", "rate limit"),
+            ("invalid_request_error", "fatal"),
+            ("authentication_error", "fatal"),
+            ("billing_error", "fatal"),
+        ];
+        for (error_type, expected) in cases {
+            let error = format!(
+                r#"{{"type":"error","error":{{"type":"{error_type}","message":"went wrong"}}}}"#
+            );
+            let body = event_stream(&[STREAMED_MESSAGE[0], ("error", &error)]);
+            let err = post_streamed(test_http::sse(&body))
+                .await
+                .expect_err("an error event fails");
+            let class = crate::ai::classify_ai_error(&err);
+            let matches = match expected {
+                "transient" => matches!(class, AiErrorClass::Transient { .. }),
+                "rate limit" => matches!(class, AiErrorClass::RateLimit { .. }),
+                _ => matches!(class, AiErrorClass::Fatal),
+            };
+            assert!(matches, "{error_type}: {class:?} for {err:#}");
+            assert!(format!("{err:#}").contains("went wrong"), "{err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_malformed_stream_is_fatal() {
+        let cases: [&[(&str, &str)]; 4] = [
+            &[("message_start", "not json")],
+            &[("message_stop", r#"{"type":"message_stop"}"#)],
+            &[
+                STREAMED_MESSAGE[0],
+                STREAMED_MESSAGE[1],
+                (
+                    "content_block_delta",
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}"#,
+                ),
+            ],
+            &[
+                STREAMED_MESSAGE[0],
+                (
+                    "content_block_start",
+                    r#"{"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}"#,
+                ),
+            ],
+        ];
+        for events in cases {
+            let err = post_streamed(test_http::sse(&event_stream(events)))
+                .await
+                .expect_err("a malformed stream fails");
+            assert!(
+                matches!(crate::ai::classify_ai_error(&err), AiErrorClass::Fatal),
+                "{err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains("Malformed Claude event stream"),
+                "{err:#}"
+            );
+        }
+    }
+
+    /// A tool call cut off by max_tokens reaches the session as a
+    /// truncated reply, which it already handles, rather than as a broken
+    /// stream.
+    #[tokio::test]
+    async fn test_a_tool_call_cut_by_max_tokens_is_truncated() {
+        let mut events = STREAMED_MESSAGE[..14].to_vec();
+        events.push((
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":2}"#,
+        ));
+        events.push((
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":1024}}"#,
+        ));
+        events.push(("message_stop", r#"{"type":"message_stop"}"#));
+        let response = post_streamed(test_http::sse(&event_stream(&events)))
+            .await
+            .unwrap();
+        let translated = translate_ai_response(&response).unwrap();
+        assert!(translated.truncated);
+    }
+
+    #[test]
+    fn test_stream_is_omitted_from_a_request_that_does_not_stream() {
+        let body = serde_json::to_value(hello_request()).unwrap();
+        assert!(body.get("stream").is_none());
+        let body = serde_json::to_value(streamed_request()).unwrap();
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn test_stream_stays_out_of_the_cache_identity() {
+        let plain = local_client("http://localhost");
+        let streamed = local_client("http://localhost").with_stream(true);
+        assert_eq!(plain.cache_identity(), streamed.cache_identity());
     }
 
     #[test]
