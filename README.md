@@ -24,6 +24,7 @@ The Linux kernel is Sashiko's primary focus and most mature target (`--project l
 | **QEMU** | `qemu` | **Pilot** | None | Local review |
 | **Zephyr RTOS** | `zephyr` | **Pilot** | None | Local review |
 | **LLVM** | `llvm` | **Pilot** | None | Local review |
+| **binutils-gdb** | `binutils-gdb` | **Pilot** | None | Local review |
 
 Compute infrastructure and LLM tokens for the public Sashiko instances are generously provided and funded by **Google**.
 
@@ -55,7 +56,7 @@ Gemini is used by default. For Claude, OpenAI-compatible endpoints, AWS Bedrock,
 
 ### 3. Review Your Patches
 
-Run `sashiko review` from inside your Linux kernel checkout (or pass `--project <gcc|qemu|zephyr|llvm|sashiko>` in another supported repository):
+Run `sashiko review` from inside your Linux kernel checkout (or pass `--project <gcc|qemu|zephyr|llvm|binutils-gdb|sashiko>` in another supported repository):
 
 ```bash
 # Review the latest Linux kernel commit
@@ -68,7 +69,7 @@ sashiko review --report-preexisting
 # Report only the one or two pre-existing bugs closely related to the change
 sashiko review --report-related-preexisting [--related-preexisting-min-severity medium]
 
-# Review commits in another supported project (gcc, qemu, zephyr, llvm, sashiko)
+# Review commits in another supported project (gcc, qemu, zephyr, llvm, binutils-gdb, sashiko)
 sashiko review --project gcc
 
 # Continue a review cut short by a quota stop, a timeout or Ctrl-C

@@ -33,4 +33,5 @@ pub const PROJECT_PROMPT_NAMESPACES: &[(&str, &str)] = &[
     ("zephyr", "zephyr"),
     ("e2fsprogs", "e2fsprogs"),
     ("llvm", "llvm"),
+    ("binutils-gdb", "binutils-gdb"),
 ];

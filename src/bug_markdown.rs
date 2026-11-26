@@ -289,6 +289,8 @@ pub fn target_project_for_bug(settings: &Settings, bugid: &str) -> ProjectId {
         ProjectId::E2fsprogs
     } else if lower.starts_with("llvm-") {
         ProjectId::Llvm
+    } else if lower.starts_with("binutils-gdb-") {
+        ProjectId::BinutilsGdb
     } else {
         settings.project.kind.unwrap_or_default()
     }
@@ -1634,6 +1636,7 @@ mod tests {
             ProjectId::Zephyr,
             ProjectId::E2fsprogs,
             ProjectId::Llvm,
+            ProjectId::BinutilsGdb,
         ] {
             let mut bug = sample_bug(&format!("{}-00112233", project.as_str()));
             bug.enrichments.push(enrichment(

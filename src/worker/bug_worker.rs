@@ -158,6 +158,7 @@ impl BugWorker {
             crate::project::ProjectId::Zephyr => "sashiko:zephyr_bug",
             crate::project::ProjectId::E2fsprogs => "sashiko:e2fsprogs_bug",
             crate::project::ProjectId::Llvm => "sashiko:llvm_bug",
+            crate::project::ProjectId::BinutilsGdb => "sashiko:binutils_gdb_bug",
         };
         self.db = Arc::new(self.db.with_bug_actor("system", bug_tool, None));
         self
@@ -598,6 +599,7 @@ impl BugWorker {
             crate::project::ProjectId::Zephyr => "sashiko:zephyr_bug:security_eval",
             crate::project::ProjectId::E2fsprogs => "sashiko:e2fsprogs_bug:security_eval",
             crate::project::ProjectId::Llvm => "sashiko:llvm_bug:security_eval",
+            crate::project::ProjectId::BinutilsGdb => "sashiko:binutils_gdb_bug:security_eval",
         }
     }
 
@@ -1054,6 +1056,7 @@ impl BugWorker {
             crate::project::ProjectId::Zephyr => "sashiko:zephyr_bug",
             crate::project::ProjectId::E2fsprogs => "sashiko:e2fsprogs_bug",
             crate::project::ProjectId::Llvm => "sashiko:llvm_bug",
+            crate::project::ProjectId::BinutilsGdb => "sashiko:binutils_gdb_bug",
         };
         let actor = if !bug.reporter.is_empty() {
             bug.reporter.as_str()

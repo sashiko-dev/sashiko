@@ -54,6 +54,9 @@ impl ClassifyAiError for ReviewError {
 
 use crate::project::ProjectId;
 use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
+use crate::workflows::binutils_gdb_patch_review::{
+    binutils_gdb_system_prompt, build_binutils_gdb_patch_review_workflow_with_effort,
+};
 use crate::workflows::e2fsprogs_patch_review::{
     build_e2fsprogs_patch_review_workflow_with_effort, e2fsprogs_system_prompt,
 };
@@ -433,7 +436,8 @@ impl Worker {
             | ProjectId::Qemu
             | ProjectId::Zephyr
             | ProjectId::E2fsprogs
-            | ProjectId::Llvm => build_follow_up_series_context(
+            | ProjectId::Llvm
+            | ProjectId::BinutilsGdb => build_follow_up_series_context(
                 self.series_range.as_deref(),
                 &patchset,
                 &target_commit_sha,
@@ -536,6 +540,7 @@ impl Worker {
                 ProjectId::Zephyr => zephyr_system_prompt(true),
                 ProjectId::E2fsprogs => e2fsprogs_system_prompt(true),
                 ProjectId::Llvm => llvm_system_prompt(true),
+                ProjectId::BinutilsGdb => binutils_gdb_system_prompt(true),
             };
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
@@ -580,6 +585,11 @@ impl Worker {
                 self.effort,
             ),
             ProjectId::Llvm => build_llvm_patch_review_workflow_with_effort(
+                self.max_interactions,
+                self.temperature,
+                self.effort,
+            ),
+            ProjectId::BinutilsGdb => build_binutils_gdb_patch_review_workflow_with_effort(
                 self.max_interactions,
                 self.temperature,
                 self.effort,

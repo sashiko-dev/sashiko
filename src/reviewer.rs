@@ -3902,6 +3902,9 @@ impl Reviewer {
                                             crate::project::ProjectId::Llvm => {
                                                 "sashiko:llvm_patch_review"
                                             }
+                                            crate::project::ProjectId::BinutilsGdb => {
+                                                "sashiko:binutils_gdb_patch_review"
+                                            }
                                         };
                                         let discovery_db = ctx.db.with_bug_actor(
                                             ctx.settings.project.attribution(),
