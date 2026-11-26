@@ -14,6 +14,7 @@
 
 use crate::project::ProjectId;
 
+pub mod binutils_gdb_patch_review;
 pub mod code_notes;
 pub mod design_assessment;
 pub mod e2fsprogs_patch_review;
@@ -44,6 +45,7 @@ pub fn stage_short_label(project: ProjectId, stage: &str) -> Option<&'static str
         ProjectId::Zephyr => zephyr_patch_review::stage_short_label(stage),
         ProjectId::E2fsprogs => e2fsprogs_patch_review::stage_short_label(stage),
         ProjectId::Llvm => llvm_patch_review::stage_short_label(stage),
+        ProjectId::BinutilsGdb => binutils_gdb_patch_review::stage_short_label(stage),
     }
 }
 
@@ -75,6 +77,10 @@ pub fn default_stage_count(project: ProjectId) -> usize {
         }
         ProjectId::Llvm => {
             llvm_patch_review::ANALYSIS_STAGES.len() + llvm_patch_review::CONSOLIDATION_STAGES.len()
+        }
+        ProjectId::BinutilsGdb => {
+            binutils_gdb_patch_review::ANALYSIS_STAGES.len()
+                + binutils_gdb_patch_review::CONSOLIDATION_STAGES.len()
         }
     }
 }
@@ -220,6 +226,25 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
             if !planned.is_empty() {
                 planned.extend(
                     llvm_patch_review::CONSOLIDATION_STAGES
+                        .iter()
+                        .map(|s| s.name.to_string()),
+                );
+            }
+            planned
+        }
+        ProjectId::BinutilsGdb => {
+            let mut planned: Vec<String> = stage_names
+                .iter()
+                .filter(|n| {
+                    binutils_gdb_patch_review::analysis_stage_by_name(n).is_some()
+                        || is_combined(n)
+                        || prior_feedback::is_prior_feedback_stage_name(n)
+                })
+                .map(|n| n.to_string())
+                .collect();
+            if !planned.is_empty() {
+                planned.extend(
+                    binutils_gdb_patch_review::CONSOLIDATION_STAGES
                         .iter()
                         .map(|s| s.name.to_string()),
                 );

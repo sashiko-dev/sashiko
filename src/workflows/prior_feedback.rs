@@ -1318,6 +1318,7 @@ mod tests {
                 ProjectId::Gcc,
                 ProjectId::E2fsprogs,
                 ProjectId::Llvm,
+                ProjectId::BinutilsGdb,
             ] {
                 assert!(crate::workflows::is_counted_stage(project, name));
             }

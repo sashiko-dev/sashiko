@@ -836,6 +836,19 @@ fn release_tag_display_label(project: crate::project::ProjectId, tag: &str) -> O
             let rest = tag.strip_prefix("llvmorg-")?;
             parse_three_part_version(rest).map(|_| tag.to_string())
         }
+        // binutils-gdb uses two independent release trains:
+        // `binutils-2_45` / `binutils-2_45_1` and `gdb-16.3-release`.
+        ProjectId::BinutilsGdb => {
+            if let Some(rest) = tag.strip_prefix("binutils-") {
+                let ok = rest
+                    .split('_')
+                    .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+                return ok.then(|| tag.to_string());
+            }
+            let rest = tag.strip_prefix("gdb-")?;
+            let rest = rest.strip_suffix("-release")?;
+            is_two_part_version(rest).then(|| tag.to_string())
+        }
     }
 }
 
@@ -8982,6 +8995,24 @@ F:	net/
         );
         assert_eq!(
             release_tag_display_label(ProjectId::Llvm, "llvmorg-21.1.0-rc1"),
+            None
+        );
+        for tag in ["binutils-2_45", "binutils-2_45_1"] {
+            assert_eq!(
+                release_tag_display_label(ProjectId::BinutilsGdb, tag).as_deref(),
+                Some(tag)
+            );
+        }
+        assert_eq!(
+            release_tag_display_label(ProjectId::BinutilsGdb, "binutils-2_45-branch"),
+            None
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::BinutilsGdb, "gdb-16.3-release").as_deref(),
+            Some("gdb-16.3-release")
+        );
+        assert_eq!(
+            release_tag_display_label(ProjectId::BinutilsGdb, "gdb-16-branchpoint"),
             None
         );
 

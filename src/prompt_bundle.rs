@@ -108,6 +108,15 @@ pub fn llvm_severity_guide() -> &'static str {
         .expect("llvm/severity.md must exist in prompt bundle")
 }
 
+/// Returns the compiled-in content of `binutils-gdb/severity.md`.
+pub fn binutils_gdb_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "binutils-gdb/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("binutils-gdb/severity.md must exist in prompt bundle")
+}
+
 /// Returns the compiled-in severity guide for `project`.
 pub fn severity_guide(project: ProjectId) -> &'static str {
     match project {
@@ -118,6 +127,7 @@ pub fn severity_guide(project: ProjectId) -> &'static str {
         ProjectId::Zephyr => zephyr_severity_guide(),
         ProjectId::E2fsprogs => e2fsprogs_severity_guide(),
         ProjectId::Llvm => llvm_severity_guide(),
+        ProjectId::BinutilsGdb => binutils_gdb_severity_guide(),
     }
 }
 
@@ -385,6 +395,38 @@ mod tests {
             assert!(
                 PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
                 "missing LLVM framing file in bundle: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_binutils_gdb_prompt_bundle_integrity() {
+        let guide = binutils_gdb_severity_guide();
+        assert!(guide.contains("# Severity Levels"));
+        assert!(guide.contains("binutils"));
+        assert_eq!(
+            severity_guide(ProjectId::BinutilsGdb),
+            binutils_gdb_severity_guide()
+        );
+
+        let required_framing = [
+            "binutils-gdb/review-core.md",
+            "binutils-gdb/severity.md",
+            "binutils-gdb/false-positive-guide.md",
+            "binutils-gdb/inline-template.md",
+            "binutils-gdb/maintainers/general.md",
+            "binutils-gdb/maintainers/bfd.md",
+            "binutils-gdb/maintainers/binutils.md",
+            "binutils-gdb/maintainers/gas.md",
+            "binutils-gdb/maintainers/ld.md",
+            "binutils-gdb/maintainers/gdb.md",
+            "binutils-gdb/maintainers/gdbserver.md",
+            "binutils-gdb/maintainers/sim.md",
+        ];
+        for path in required_framing {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing binutils-gdb framing file in bundle: {path}"
             );
         }
     }

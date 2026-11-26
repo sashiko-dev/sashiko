@@ -44,6 +44,8 @@ pub enum ProjectId {
     Zephyr,
     E2fsprogs,
     Llvm,
+    #[serde(rename = "binutils-gdb")]
+    BinutilsGdb,
 }
 
 impl ProjectId {
@@ -58,6 +60,7 @@ impl ProjectId {
             ProjectId::Zephyr => "zephyr",
             ProjectId::E2fsprogs => "e2fsprogs",
             ProjectId::Llvm => "llvm",
+            ProjectId::BinutilsGdb => "binutils-gdb",
         }
     }
 
@@ -71,13 +74,18 @@ impl ProjectId {
             ProjectId::Zephyr => "Zephyr",
             ProjectId::E2fsprogs => "e2fsprogs",
             ProjectId::Llvm => "LLVM",
+            ProjectId::BinutilsGdb => "binutils-gdb",
         }
     }
 
     /// The upstream development branch, independent of a fork's URL.
     pub fn mainline_branch(self) -> &'static str {
         match self {
-            ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu | ProjectId::E2fsprogs => "master",
+            ProjectId::Linux
+            | ProjectId::Gcc
+            | ProjectId::Qemu
+            | ProjectId::E2fsprogs
+            | ProjectId::BinutilsGdb => "master",
             ProjectId::Sashiko | ProjectId::Zephyr | ProjectId::Llvm => "main",
         }
     }
@@ -109,6 +117,7 @@ impl ProjectId {
                     || url.contains("llvm-project.git")
                     || url.contains("llvm.org/git/llvm")
             }
+            ProjectId::BinutilsGdb => url.contains("binutils-gdb"),
         }
     }
 
@@ -130,6 +139,7 @@ impl ProjectId {
             ProjectId::Zephyr => "zephyr",
             ProjectId::E2fsprogs => "e2fsprogs",
             ProjectId::Llvm => "llvm",
+            ProjectId::BinutilsGdb => "binutils-gdb",
         }
     }
 
@@ -145,7 +155,8 @@ impl ProjectId {
             | ProjectId::Qemu
             | ProjectId::Zephyr
             | ProjectId::E2fsprogs
-            | ProjectId::Llvm => false,
+            | ProjectId::Llvm
+            | ProjectId::BinutilsGdb => false,
         }
     }
 
@@ -165,7 +176,8 @@ impl ProjectId {
             | ProjectId::Qemu
             | ProjectId::Zephyr
             | ProjectId::E2fsprogs
-            | ProjectId::Llvm => crate::authority::TrustedBots(&[]),
+            | ProjectId::Llvm
+            | ProjectId::BinutilsGdb => crate::authority::TrustedBots(&[]),
         }
     }
 
@@ -180,6 +192,7 @@ impl ProjectId {
             ProjectId::Zephyr => "projects/zephyr/mailing_lists.toml",
             ProjectId::E2fsprogs => "projects/e2fsprogs/mailing_lists.toml",
             ProjectId::Llvm => "projects/llvm/mailing_lists.toml",
+            ProjectId::BinutilsGdb => "projects/binutils-gdb/mailing_lists.toml",
         }
     }
 
@@ -194,6 +207,7 @@ impl ProjectId {
             ProjectId::Zephyr => "projects/zephyr/bugs_access.toml",
             ProjectId::E2fsprogs => "projects/e2fsprogs/bugs_access.toml",
             ProjectId::Llvm => "projects/llvm/bugs_access.toml",
+            ProjectId::BinutilsGdb => "projects/binutils-gdb/bugs_access.toml",
         }
     }
 
@@ -232,6 +246,10 @@ impl ProjectId {
             ProjectId::Llvm => Upstream {
                 url: "https://github.com/llvm/llvm-project.git",
                 seed: Seed::None,
+            },
+            ProjectId::BinutilsGdb => Upstream {
+                url: "https://sourceware.org/git/binutils-gdb.git",
+                seed: Seed::Mirror("https://github.com/gnutools/binutils-gdb.git"),
             },
         }
     }
@@ -281,6 +299,7 @@ impl FromStr for ProjectId {
             "zephyr" => Ok(ProjectId::Zephyr),
             "e2fsprogs" => Ok(ProjectId::E2fsprogs),
             "llvm" => Ok(ProjectId::Llvm),
+            "binutils-gdb" => Ok(ProjectId::BinutilsGdb),
             _ => Err(UnknownProject(s.to_string())),
         }
     }
@@ -322,6 +341,7 @@ impl ProjectId {
         ProjectId::Zephyr,
         ProjectId::E2fsprogs,
         ProjectId::Llvm,
+        ProjectId::BinutilsGdb,
     ];
 }
 
@@ -359,10 +379,11 @@ mod tests {
                 | ProjectId::Qemu
                 | ProjectId::Zephyr
                 | ProjectId::E2fsprogs
-                | ProjectId::Llvm => {}
+                | ProjectId::Llvm
+                | ProjectId::BinutilsGdb => {}
             }
         }
-        assert_eq!(ProjectId::ALL.len(), 7);
+        assert_eq!(ProjectId::ALL.len(), 8);
     }
 
     #[test]
@@ -382,6 +403,7 @@ mod tests {
         assert_eq!(ProjectId::Zephyr.display_name(), "Zephyr");
         assert_eq!(ProjectId::E2fsprogs.display_name(), "e2fsprogs");
         assert_eq!(ProjectId::Llvm.display_name(), "LLVM");
+        assert_eq!(ProjectId::BinutilsGdb.display_name(), "binutils-gdb");
     }
 
     #[test]
@@ -451,6 +473,8 @@ mod tests {
         }
         let holder: Holder = toml::from_str("kind = \"sashiko\"").unwrap();
         assert_eq!(holder.kind, ProjectId::Sashiko);
+        let holder: Holder = toml::from_str("kind = \"binutils-gdb\"").unwrap();
+        assert_eq!(holder.kind, ProjectId::BinutilsGdb);
         assert!(toml::from_str::<Holder>("kind = \"freebsd\"").is_err());
     }
 }

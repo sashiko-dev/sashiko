@@ -1,0 +1,13 @@
+# Per-mailing-list configuration for binutils-gdb (--project binutils-gdb).
+# This profile covers local review only: no list is tracked and nothing is
+# mailed. binutils patches go to binutils@sourceware.org and GDB patches to
+# gdb-patches@sourceware.org; both can be enabled later.
+
+[defaults]
+track = false
+embargo_hours = 0
+reply_to = []
+positive_review = "none"
+mute_all = true
+cc = []
+ignored_emails = []
