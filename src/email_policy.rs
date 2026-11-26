@@ -1219,6 +1219,64 @@ mod tests {
         assert!(binutils_gdb_config.tracked_nntp_groups().is_empty());
     }
 
+    /// Other projects' patches on lists the linux project shares are
+    /// filtered out, and these sample kernel patches are not.
+    #[test]
+    fn test_production_linux_ingest_filters() {
+        let config = EmailPolicyConfig::load("projects/linux/mailing_lists.toml")
+            .expect("Production projects/linux/mailing_lists.toml failed to parse");
+        let (kvm, kvmarm) = ("kvm@vger.kernel.org", "kvmarm@lists.linux.dev");
+        let netdev = "netdev@vger.kernel.org";
+        let ovpn = "openvpn-devel@lists.sourceforge.net";
+        // (list, subject, touched path or "" for none, allowed)
+        let cases = [
+            (kvm, "[PATCH kvmtool] x", "Makefile", false),
+            (kvmarm, "[PATCH kvmtool] arm64: x", "arm64/kvm.c", false),
+            (kvm, "[kvm-unit-tests PATCH v2 1/3] x", "arm/pmu.c", false),
+            (kvmarm, "[kvm-unit-tests PATCH] x", "arm/pmu.c", false),
+            (kvm, "[PATCH v2 1/3] KVM: x", "virt/kvm/kvm_main.c", true),
+            (kvmarm, "[PATCH] KVM: x", "arch/arm64/kvm/arm.c", true),
+            (netdev, "[PATCH iproute2-next] x", "bridge/vni.c", false),
+            (netdev, "[PATCH iproute2] x", "ip/ip.c", false),
+            (netdev, "[PATCH net-next] x", "net/bridge/br.c", true),
+            (ovpn, "[Openvpn-devel] [PATCH v2] x", "src/ssl.c", false),
+            (
+                ovpn,
+                "[Openvpn-devel] [PATCH ovpn net-next 0/3] x",
+                "",
+                true,
+            ),
+            (
+                ovpn,
+                "[Openvpn-devel] [PATCH ovpn net] x",
+                "drivers/net/ovpn/io.c",
+                true,
+            ),
+            (
+                ovpn,
+                "[Openvpn-devel] [PATCH net] x",
+                "drivers/net/ovpn/io.c",
+                true,
+            ),
+        ];
+        for (list, subject, path, allowed) in cases {
+            let filter = config
+                .ingest_filter_for_nntp_group(&derive_nntp_group(list))
+                .expect("list has an ingest filter");
+            let prefixes = crate::patch::get_subject_prefixes(subject);
+            let paths: Vec<String> = Some(path)
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .into_iter()
+                .collect();
+            assert_eq!(
+                filter.allows_submission(&prefixes, &paths),
+                allowed,
+                "{list}: {subject}"
+            );
+        }
+    }
+
     /// The documented example parses, and so does every commented-out
     /// section in it once uncommented, so copying any part of it works.
     #[test]

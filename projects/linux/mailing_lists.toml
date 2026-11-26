@@ -172,6 +172,10 @@ embargo_hours = 24
 embargo_hours = 24
 subject_prefixes = ["net", "net-next"]
 
+# netdev also carries iproute2 patches.
+["netdev@vger.kernel.org".ingest_filter]
+ignored_subject_prefixes = ["iproute2", "iproute2-next"]
+
 [["netdev@vger.kernel.org".baselines]]
 url = "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git"
 subject_prefixes = ["net-next"]
@@ -215,6 +219,17 @@ reply_to = ["author", "list"]
 
 ["openvpn-devel@lists.sourceforge.net"]
 cc = ["antonio@mandelbit.com", "ralf@mandelbit.com", "sd@queasysnail.net"]
+
+# The list also carries OpenVPN userspace patches. Keep the kernel ovpn
+# tree's, tagged "ovpn", and any touching its MAINTAINERS entry's files.
+["openvpn-devel@lists.sourceforge.net".ingest_filter]
+allowed_subject_prefixes = ["ovpn"]
+allowed_paths = [
+    "Documentation/netlink/specs/ovpn.yaml",
+    "drivers/net/ovpn/",
+    "include/uapi/linux/ovpn.h",
+    "tools/testing/selftests/net/ovpn/",
+]
 
 ["live-patching@vger.kernel.org"]
 reply_to = ["author", "list", "recipients"]
@@ -290,6 +305,11 @@ cc = [
 ["kvm@vger.kernel.org"]
 reply_to = ["author", "list"]
 
+# kvm@vger.kernel.org also carries kvmtool and kvm-unit-tests patches,
+# which never apply to a kernel tree.
+["kvm@vger.kernel.org".ingest_filter]
+ignored_subject_prefixes = ["kvmtool", "kvm-unit-tests"]
+
 ["linux-modules@vger.kernel.org"]
 reply_to = ["author", "list"]
 cc = ["Petr Pavlu <petr.pavlu@suse.com>"]
@@ -363,6 +383,9 @@ cc = [
 ["kvmarm@lists.linux.dev"]
 reply_to = ["author", "list"]
 cc = ["Oliver Upton <oupton@kernel.org>", "Marc Zyngier <maz@kernel.org>"]
+
+["kvmarm@lists.linux.dev".ingest_filter]
+ignored_subject_prefixes = ["kvmtool", "kvm-unit-tests"]
 
 ["nvdimm@lists.linux.dev"]
 reply_to = ["author", "list"]
