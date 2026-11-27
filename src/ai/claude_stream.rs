@@ -35,6 +35,7 @@
 //! deltas applied, so a block type the parser does not model reaches it
 //! unchanged and fails or passes exactly as in a non-streamed reply.
 
+use crate::ai::claude::loggable_body;
 use crate::ai::sse::{Flow, SseEvent};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
@@ -500,7 +501,10 @@ impl MessageStream {
             .ok_or_else(|| malformed("event after the stream failed"))?;
         let from = state.name();
         let next = step(state, event).inspect_err(|e| {
-            tracing::debug!("Claude stream: {from} --{event_name}--> error: {e}");
+            tracing::debug!(
+                "Claude stream: {}",
+                loggable_body(&format!("{from} --{event_name}--> error: {e}"))
+            );
         })?;
         tracing::trace!("Claude stream: {from} --{event_name}--> {}", next.name());
         let flow = match next {
@@ -697,6 +701,43 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn stream_error_debug_log_redacts_and_truncates() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(log.reopen().unwrap())
+            .finish();
+        let error_type = "gateway_error token=synthetic_event_token";
+        let message = format!(
+            "key=synthetic_message_key {} unlogged_tail",
+            "é".repeat(1024)
+        );
+        let event = SseEvent {
+            event: None,
+            data: json!({"type": "error", "error": {"type": error_type, "message": message}})
+                .to_string(),
+        };
+        let result =
+            tracing::subscriber::with_default(subscriber, || MessageStream::new().on_event(event));
+        assert_eq!(
+            result,
+            Err(StreamError::Upstream {
+                error_type: error_type.into(),
+                message,
+            })
+        );
+
+        let log = std::fs::read_to_string(log.path()).unwrap();
+        assert!(log.contains("token=[REDACTED]"));
+        assert!(log.contains("key=[REDACTED]"));
+        assert!(!log.contains("synthetic_event_token"));
+        assert!(!log.contains("synthetic_message_key"));
+        assert!(!log.contains("unlogged_tail"));
+        assert!(log.trim_end().ends_with("..."));
     }
 
     #[test]
