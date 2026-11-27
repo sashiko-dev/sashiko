@@ -43,6 +43,7 @@ cargo run --bin sashiko -- benchmark projects/linux/benchmarks/benchmark_tiny.js
 | `projects/linux/benchmarks/benchmark_performance.json` | Balanced Linux performance regression and soak-verified `expect_clean` neutral suite (40 entries: 20 positive + 20 neutral). |
 | `projects/linux/benchmarks/benchmark_preexisting.json` | Tests detection of pre-existing bugs. |
 | `projects/linux/benchmarks/benchmark_versioned.json` | Multi-version LKML patchset stories (`v1..vN`) testing prior-feedback verification, reviewer attribution, and false-positive suppression. |
+| `projects/qemu/benchmarks/benchmark_riscv.json` | QEMU RISC-V bugs fixed in 2025-2026, each checked to be a real defect visible in the buggy commit's own diff (80 entries). |
 
 ### GCC pilot (`projects/gcc/benchmarks/`, run with `--project gcc`)
 
