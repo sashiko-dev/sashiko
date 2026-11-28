@@ -23,8 +23,10 @@
 //! See designs/DESIGN_OPENAI_RESPONSES_TRANSPORT.md.
 
 use crate::ai::openai_common::{
-    OpenAiCompatError, build_http_client, lenient_option, normalize_base_url, post_json,
+    NewAssembler, OpenAiCompatError, StreamAssembler, build_http_client, event_json,
+    lenient_option, normalize_base_url, post_json, stream_protocol_error,
 };
+use crate::ai::sse::{Flow, SseEvent};
 use crate::ai::{
     AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiTool, AiUsage,
     ProviderCapabilities, ToolCall,
@@ -263,6 +265,9 @@ pub struct OpenAiResponsesClient {
     service_tier: Option<ServiceTier>,
     /// Learned by post_json; see there.
     temperature_unsupported: AtomicBool,
+    /// Ask for an event stream, which keeps bytes flowing while the model
+    /// works; see ResponsesStream.
+    stream: bool,
     client: Client,
 }
 
@@ -287,8 +292,15 @@ impl OpenAiResponsesClient {
             effort,
             service_tier,
             temperature_unsupported: AtomicBool::new(false),
+            stream: false,
             client,
         })
+    }
+
+    /// Asks for each reply as an event stream rather than one document.
+    pub fn with_stream(mut self, stream: bool) -> Self {
+        self.stream = stream;
+        self
     }
 
     /// OpenAI is the only vendor serving this endpoint, so the default does
@@ -311,6 +323,14 @@ impl OpenAiResponsesClient {
     }
 
     async fn post_request(&self, body: &mut Value) -> Result<ResponsesResponse, OpenAiCompatError> {
+        let stream = if self.stream {
+            if let Some(fields) = body.as_object_mut() {
+                fields.insert("stream".to_string(), Value::Bool(true));
+            }
+            Some(ResponsesStream::boxed as NewAssembler)
+        } else {
+            None
+        };
         // No gateway-specific headers: only OpenAI's own API serves this
         // endpoint.
         let response: ResponsesResponse = post_json(
@@ -319,6 +339,7 @@ impl OpenAiResponsesClient {
             &reqwest::header::HeaderMap::new(),
             body,
             &self.temperature_unsupported,
+            stream,
         )
         .await?;
         let details = response.usage.output_tokens_details.as_ref();
@@ -340,6 +361,92 @@ impl OpenAiResponsesClient {
             response.service_tier.as_deref(),
         );
         Ok(response)
+    }
+}
+
+/// Rebuilds a streamed reply.  Each terminal event carries the whole
+/// response object, which is the document a non-streamed request returns,
+/// so every other event is skipped and nothing is pieced together from
+/// deltas.  An `error` event becomes a failed response carrying its code
+/// and message, which response_failure then classifies exactly as it
+/// classifies a failed reply that was not streamed.
+#[derive(Debug, Default)]
+struct ResponsesStream {
+    document: Option<Value>,
+}
+
+/// Events whose `response` field is the finished response.
+const TERMINAL_EVENTS: [&str; 3] = [
+    "response.completed",
+    "response.incomplete",
+    "response.failed",
+];
+
+impl ResponsesStream {
+    fn boxed() -> Box<dyn StreamAssembler> {
+        Box::new(Self::default())
+    }
+}
+
+impl StreamAssembler for ResponsesStream {
+    fn terminal_event(&self) -> &'static str {
+        "response.completed"
+    }
+
+    fn on_event(&mut self, event: SseEvent) -> Result<Flow, OpenAiCompatError> {
+        if event.data == "[DONE]" {
+            return Err(stream_protocol_error(
+                "stream sent [DONE] before a finished response",
+            ));
+        }
+        let mut data = event_json(&event)?;
+        let kind = data
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let kind = kind.as_str();
+        if TERMINAL_EVENTS.contains(&kind) {
+            let response = data
+                .get_mut("response")
+                .map(Value::take)
+                .filter(Value::is_object)
+                .ok_or_else(|| {
+                    stream_protocol_error(format_args!("{kind} event carries no response object"))
+                })?;
+            self.document = Some(response);
+            return Ok(Flow::Done);
+        }
+        if kind == "error" {
+            // The documented event keeps code and message at the top level;
+            // accept them nested under "error" as an error body has them.
+            // A null code falls back to the nested error's type, which is
+            // where a server failure says "server_error".
+            let source = match data.get("error") {
+                Some(nested) if nested.is_object() => nested,
+                _ => &data,
+            };
+            let nested_type = data.get("error").and_then(|error| error.get("type"));
+            let code = source
+                .get("code")
+                .filter(|code| code.is_string())
+                .or(nested_type.filter(|kind| kind.is_string()))
+                .cloned()
+                .unwrap_or(Value::Null);
+            self.document = Some(serde_json::json!({
+                "status": "failed",
+                "error": {
+                    "code": code,
+                    "message": source.get("message").cloned().unwrap_or(Value::Null),
+                },
+            }));
+            return Ok(Flow::Done);
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn into_document(self: Box<Self>) -> Value {
+        self.document.unwrap_or(Value::Null)
     }
 }
 
@@ -556,12 +663,17 @@ fn response_failure(status: Option<&str>, error: Option<ResponsesError>) -> Opti
     );
 
     // server_error is this reply's 5xx, so it retries on the same terms:
-    // no delay of its own, leaving the pace to the caller's backoff.  Any
-    // other code names something the request did, which another attempt
-    // repeats.
+    // no delay of its own, leaving the pace to the caller's backoff.
+    // rate_limit_exceeded is its 429, which a stream can only report this
+    // way once its 200 has gone out; it waits as long as a 429 without a
+    // Retry-After does.  Any other code names something the request did,
+    // which another attempt repeats.
     Some(match code.as_str() {
         "server_error" => {
             OpenAiCompatError::TransientError(Duration::from_secs(0), reported).into()
+        }
+        "rate_limit_exceeded" => {
+            OpenAiCompatError::RateLimitExceeded(Duration::from_secs(60)).into()
         }
         _ => OpenAiCompatError::ResponseFailed(reported).into(),
     })
@@ -1294,6 +1406,15 @@ mod tests {
             crate::ai::classify_ai_error(&fatal),
             crate::ai::AiErrorClass::Fatal
         ));
+
+        assert!(matches!(
+            crate::ai::classify_ai_error(&failed("rate_limit_exceeded")),
+            crate::ai::AiErrorClass::RateLimit { .. }
+        ));
+        assert!(matches!(
+            crate::ai::classify_ai_error(&failed("insufficient_quota")),
+            crate::ai::AiErrorClass::Fatal
+        ));
     }
 
     /// The endpoint returns item types this build does not model, and a new
@@ -1352,6 +1473,241 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0]["temperature"], 0.0);
         assert!(seen[1].get("temperature").is_none());
+    }
+
+    /// Frames each value as one event named by its "type".
+    fn event_stream(events: &[Value]) -> String {
+        events
+            .iter()
+            .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+            .collect()
+    }
+
+    /// The events the endpoint sends around a finished response: progress
+    /// first, a text delta, keepalive comments, then the terminal event.
+    fn stream_of(terminal: &str, response: &str) -> String {
+        let response: Value = serde_json::from_str(response).unwrap();
+        let mut events = event_stream(&[
+            json!({"type": "response.created", "sequence_number": 0,
+                   "response": {"status": "in_progress", "output": []}}),
+            json!({"type": "response.output_text.delta", "sequence_number": 1,
+                   "item_id": "msg_1", "output_index": 0, "content_index": 0,
+                   "delta": "partial"}),
+        ]);
+        events.push_str(": keepalive\n\n");
+        events.push_str(&event_stream(&[
+            json!({"type": terminal, "sequence_number": 2, "response": response}),
+        ]));
+        events
+    }
+
+    async fn generate(
+        stream: bool,
+        replies: Vec<(u16, &'static str, String)>,
+    ) -> (Result<AiResponse>, Vec<Value>) {
+        use crate::ai::openai_common::tests::serve_typed_replies;
+        let (base_url, seen) = serve_typed_replies(replies).await;
+        let client = test_client(&base_url, "gpt-5.4", None).with_stream(stream);
+        let response = client.generate_content(sample_request()).await;
+        let seen = seen.lock().unwrap().clone();
+        (response, seen)
+    }
+
+    async fn generate_streamed(body: String) -> Result<AiResponse> {
+        generate(true, vec![(200, "text/event-stream", body)])
+            .await
+            .0
+    }
+
+    /// The point of the stream is the bytes on the wire, not its content:
+    /// every recorded reply, rebuilt from its events, reaches the stage as
+    /// exactly the response the plain reply does.
+    #[tokio::test]
+    async fn a_streamed_reply_matches_the_plain_one() {
+        for fixture in [
+            MESSAGE,
+            REASONING_MESSAGE,
+            FUNCTION_CALL,
+            REASONING_FUNCTION_CALL,
+        ] {
+            let (plain, plain_seen) =
+                generate(false, vec![(200, "application/json", fixture.to_string())]).await;
+            let (streamed, streamed_seen) = generate(
+                true,
+                vec![(
+                    200,
+                    "text/event-stream",
+                    stream_of("response.completed", fixture),
+                )],
+            )
+            .await;
+
+            assert_eq!(
+                serde_json::to_value(streamed.unwrap()).unwrap(),
+                serde_json::to_value(plain.unwrap()).unwrap()
+            );
+            assert!(plain_seen[0].get("stream").is_none());
+            assert_eq!(streamed_seen[0]["stream"], true);
+            let mut unstreamed = streamed_seen[0].clone();
+            unstreamed.as_object_mut().unwrap().remove("stream");
+            assert_eq!(unstreamed, plain_seen[0], "only the stream flag differs");
+        }
+    }
+
+    /// A server that ignores the flag and answers with a document is read
+    /// as one.
+    #[tokio::test]
+    async fn a_plain_reply_to_a_streamed_request_is_accepted() {
+        let (response, seen) =
+            generate(true, vec![(200, "application/json", MESSAGE.to_string())]).await;
+        assert!(response.unwrap().content.is_some());
+        assert_eq!(seen[0]["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_stream_reply_is_truncated() {
+        let mut reply: Value = serde_json::from_str(MESSAGE).unwrap();
+        reply["status"] = json!("incomplete");
+        reply["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        let response = generate_streamed(stream_of("response.incomplete", &reply.to_string()))
+            .await
+            .unwrap();
+        assert!(response.truncated);
+    }
+
+    #[tokio::test]
+    async fn a_failed_stream_reply_is_classified_like_a_plain_one() {
+        let mut reply: Value = serde_json::from_str(MESSAGE).unwrap();
+        reply["status"] = json!("failed");
+        reply["output"] = json!([]);
+        reply["error"] = json!({"code": "server_error", "message": "upstream fell over"});
+        let err = generate_streamed(stream_of("response.failed", &reply.to_string()))
+            .await
+            .expect_err("a failed reply is an error");
+        assert!(err.to_string().contains("upstream fell over"), "{err:#}");
+        assert!(matches!(
+            crate::ai::classify_ai_error(&err),
+            crate::ai::AiErrorClass::Transient { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_error_event_is_classified_like_a_failed_reply() {
+        for (code, transient) in [("server_error", true), ("invalid_prompt", false)] {
+            let body = event_stream(&[
+                json!({"type": "response.created", "response": {"status": "in_progress"}}),
+                json!({"type": "error", "code": code, "message": "went wrong", "param": null}),
+            ]);
+            let err = generate_streamed(body)
+                .await
+                .expect_err("an error event fails");
+            assert!(err.to_string().contains("went wrong"), "{err:#}");
+            assert_eq!(
+                matches!(
+                    crate::ai::classify_ai_error(&err),
+                    crate::ai::AiErrorClass::Transient { .. }
+                ),
+                transient,
+                "{code}: {err:#}"
+            );
+        }
+    }
+
+    /// A stream can only report a rate limit inside its 200, as a failed
+    /// response or an error event, and either waits like a 429.
+    #[tokio::test]
+    async fn a_rate_limit_inside_a_stream_is_a_rate_limit() {
+        let mut reply: Value = serde_json::from_str(MESSAGE).unwrap();
+        reply["status"] = json!("failed");
+        reply["output"] = json!([]);
+        reply["error"] = json!({"code": "rate_limit_exceeded", "message": "try again in 2s"});
+        for body in [
+            stream_of("response.failed", &reply.to_string()),
+            event_stream(&[json!({"type": "error", "code": "rate_limit_exceeded",
+                                  "message": "try again in 2s", "param": null})]),
+        ] {
+            let err = generate_streamed(body)
+                .await
+                .expect_err("a rate limit fails");
+            assert!(
+                matches!(
+                    crate::ai::classify_ai_error(&err),
+                    crate::ai::AiErrorClass::RateLimit { .. }
+                ),
+                "{err:#}"
+            );
+        }
+    }
+
+    /// A nested error with a null code is classified by its type, which
+    /// is where a server failure names itself.
+    #[tokio::test]
+    async fn a_nested_error_event_without_a_code_uses_its_type() {
+        for (kind, transient) in [("server_error", true), ("invalid_request_error", false)] {
+            let body = event_stream(&[json!({"type": "error", "error": {
+                "type": kind, "code": null, "message": "went wrong", "param": null}})]);
+            let err = generate_streamed(body)
+                .await
+                .expect_err("an error event fails");
+            assert!(err.to_string().contains(kind), "{err:#}");
+            assert_eq!(
+                matches!(
+                    crate::ai::classify_ai_error(&err),
+                    crate::ai::AiErrorClass::Transient { .. }
+                ),
+                transient,
+                "{kind}: {err:#}"
+            );
+        }
+    }
+
+    /// A body that ends before the terminal event lost the generation on
+    /// the way, which another attempt may not.
+    #[tokio::test]
+    async fn a_stream_cut_before_its_terminal_event_is_transient() {
+        let full = stream_of("response.completed", MESSAGE);
+        let cut = full[..full.rfind("event: response.completed").unwrap()].to_string();
+        let err = generate_streamed(cut)
+            .await
+            .expect_err("a cut stream fails");
+        assert!(
+            err.to_string()
+                .contains("stream ended before response.completed"),
+            "{err:#}"
+        );
+        assert!(matches!(
+            crate::ai::classify_ai_error(&err),
+            crate::ai::AiErrorClass::Transient { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_stream_is_fatal() {
+        for body in [
+            "data: not json\n\n".to_string(),
+            "data: [1]\n\n".to_string(),
+            "data: [DONE]\n\n".to_string(),
+            event_stream(&[json!({"type": "response.completed"})]),
+        ] {
+            let err = generate_streamed(body.clone())
+                .await
+                .expect_err("a malformed stream fails");
+            assert!(err.to_string().contains("Stream error"), "{body}: {err:#}");
+            assert!(
+                matches!(
+                    crate::ai::classify_ai_error(&err),
+                    crate::ai::AiErrorClass::Fatal
+                ),
+                "{body}: {err:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_terminal_event_ends_the_read() {
+        let mut body = stream_of("response.completed", MESSAGE);
+        body.push_str("data: not json, and never read\n\n");
+        assert!(generate_streamed(body).await.unwrap().content.is_some());
     }
 
     #[test]

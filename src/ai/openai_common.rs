@@ -18,6 +18,7 @@
 //! whichever endpoint serves the request; only the request and response
 //! bodies differ.
 
+use crate::ai::sse::{Flow, ReadError, SseEvent, StreamEnd, is_event_stream, read_events};
 use crate::ai::{AiErrorClass, ClassifyAiError, classify_status_code};
 use crate::settings::ServiceTier;
 use crate::utils::redact_secret;
@@ -246,26 +247,115 @@ fn is_insufficient_quota(error_text: &str) -> bool {
 /// front.  The refusal is learned from the reply rather than the model
 /// name, so a new model or a compatible endpoint needs no list to
 /// maintain.
+///
+/// With `stream` set, the request is expected to carry `"stream": true`,
+/// and an event-stream reply is folded back into the document a
+/// non-streamed request returns before it is decoded.  A reply that comes
+/// back as a plain document anyway is decoded as one.
 pub async fn post_json<T: DeserializeOwned>(
     client: &Client,
     url: &str,
     headers: &HeaderMap,
     body: &mut Value,
     temperature_unsupported: &AtomicBool,
+    stream: Option<NewAssembler>,
 ) -> Result<T, OpenAiCompatError> {
     if temperature_unsupported.load(Ordering::Relaxed) {
         strip_temperature(body);
     }
-    match post_json_once(client, url, headers, body).await {
+    match post_json_once(client, url, headers, body, stream).await {
         Err(ref error) if rejects_temperature_parameter(error) && strip_temperature(body) => {
             tracing::debug!(
                 "{url} takes only the default temperature; resending without the field"
             );
             temperature_unsupported.store(true, Ordering::Relaxed);
-            post_json_once(client, url, headers, body).await
+            post_json_once(client, url, headers, body, stream).await
         }
         other => other,
     }
+}
+
+/// Folds the events of one streamed reply back into the document the
+/// endpoint returns for the same request without streaming.
+pub trait StreamAssembler: Send {
+    /// The event that ends a complete stream, named in the error for a
+    /// stream that ends without it.
+    fn terminal_event(&self) -> &'static str;
+
+    /// Whether a stream that ended without its terminal event still holds
+    /// the whole generation.
+    fn complete_at_eof(&self) -> bool {
+        false
+    }
+
+    /// Takes one event, returning `Flow::Done` once the document is
+    /// complete.  An event that breaks the format is an error.
+    fn on_event(&mut self, event: SseEvent) -> Result<Flow, OpenAiCompatError>;
+
+    /// The rebuilt document.  Called only after `on_event` returned
+    /// `Flow::Done`, or the stream ended and `complete_at_eof` held.
+    fn into_document(self: Box<Self>) -> Value;
+}
+
+/// Makes the assembler for one request.  A function rather than a value,
+/// because the temperature fallback sends a request twice.
+pub type NewAssembler = fn() -> Box<dyn StreamAssembler>;
+
+/// An event that breaks the stream's format.  It fails the way a body that
+/// does not parse fails: the endpoint would send the same again.
+pub fn stream_protocol_error(detail: impl std::fmt::Display) -> OpenAiCompatError {
+    let detail = redact_secret(&detail.to_string());
+    tracing::error!("Malformed OpenAI event stream: {}", detail);
+    OpenAiCompatError::ApiError(reqwest::StatusCode::OK, format!("Stream error: {detail}"))
+}
+
+/// Parses an event's data as the JSON object every OpenAI event carries.
+pub fn event_json(event: &SseEvent) -> Result<Value, OpenAiCompatError> {
+    match serde_json::from_str::<Value>(&event.data) {
+        Ok(value) if value.is_object() => Ok(value),
+        Ok(_) => Err(stream_protocol_error("event data is not a JSON object")),
+        Err(e) => Err(stream_protocol_error(format_args!(
+            "event data is not JSON: {e}"
+        ))),
+    }
+}
+
+/// A failure to read the rest of a reply, which another attempt may not
+/// meet.
+fn body_read_error(detail: &str) -> OpenAiCompatError {
+    tracing::error!("Failed to read OpenAI response body: {}", detail);
+    OpenAiCompatError::TransientError(Duration::from_secs(30), detail.to_string())
+}
+
+/// Reads an event-stream reply and returns the document it rebuilds, as
+/// JSON text for the same decoding a plain reply goes through.
+async fn collect_stream(
+    res: reqwest::Response,
+    new_assembler: NewAssembler,
+) -> Result<String, OpenAiCompatError> {
+    let mut assembler = new_assembler();
+    match read_events(res, |event| assembler.on_event(event)).await {
+        Ok(StreamEnd::Terminal) => {}
+        Ok(StreamEnd::Eof) if assembler.complete_at_eof() => {
+            tracing::debug!(
+                "OpenAI stream ended without {}; every choice had finished",
+                assembler.terminal_event()
+            );
+        }
+        Ok(StreamEnd::Eof) => {
+            return Err(body_read_error(&format!(
+                "stream ended before {}",
+                assembler.terminal_event()
+            )));
+        }
+        Err(ReadError::Transport(e)) => {
+            return Err(body_read_error(&redact_secret(&e.to_string())));
+        }
+        Err(ReadError::Framing(e)) => return Err(stream_protocol_error(e)),
+        Err(ReadError::Handler(e)) => return Err(e),
+    }
+    serde_json::to_string(&assembler.into_document())
+        .map_err(|e| stream_protocol_error(format_args!("rebuilt document: {e}")))
 }
 
 /// The pattern a 429 body states its retry hint in, compiled once for the
@@ -283,6 +373,7 @@ async fn post_json_once<T: DeserializeOwned>(
     url: &str,
     headers: &HeaderMap,
     body: &Value,
+    stream: Option<NewAssembler>,
 ) -> Result<T, OpenAiCompatError> {
     // Request headers replace default headers of the same name, so an extra
     // authorization header overrides the bearer token.
@@ -301,11 +392,15 @@ async fn post_json_once<T: DeserializeOwned>(
 
     if res.status().is_success() {
         let status = res.status();
-        let body_text = res.text().await.map_err(|e| {
-            let err_str = redact_secret(&e.to_string());
-            tracing::error!("Failed to read OpenAI response body: {}", err_str);
-            OpenAiCompatError::TransientError(Duration::from_secs(30), err_str)
-        })?;
+        let body_text = match stream {
+            Some(new_assembler) if is_event_stream(&res) => {
+                collect_stream(res, new_assembler).await?
+            }
+            _ => res
+                .text()
+                .await
+                .map_err(|e| body_read_error(&redact_secret(&e.to_string())))?,
+        };
         return match serde_json::from_str::<T>(&body_text) {
             Ok(response) => Ok(response),
             Err(e) => {
@@ -319,7 +414,6 @@ async fn post_json_once<T: DeserializeOwned>(
     }
 
     let status = res.status();
-    let status_code = status.as_u16();
 
     let retry_after_duration = res
         .headers()
@@ -330,10 +424,20 @@ async fn post_json_once<T: DeserializeOwned>(
 
     let error_text = redact_secret(&res.text().await.unwrap_or_default());
 
-    match status_code {
+    Err(status_error(status, retry_after_duration, error_text))
+}
+
+/// Types an error status by what retrying can do about it.  `error_text`
+/// is the redacted body that came with it.
+pub fn status_error(
+    status: reqwest::StatusCode,
+    retry_after_duration: Option<Duration>,
+    error_text: String,
+) -> OpenAiCompatError {
+    match status.as_u16() {
         429 if is_insufficient_quota(&error_text) => {
             tracing::error!("OpenAI quota exhausted: {}", error_text);
-            Err(OpenAiCompatError::QuotaExhausted(error_text))
+            OpenAiCompatError::QuotaExhausted(error_text)
         }
         429 => {
             let default_retry = retry_after_duration.unwrap_or(Duration::from_secs(60));
@@ -346,17 +450,17 @@ async fn post_json_once<T: DeserializeOwned>(
                 "OpenAI 429 Rate Limit. Retry in {}s",
                 retry_duration.as_secs_f64()
             );
-            Err(OpenAiCompatError::RateLimitExceeded(retry_duration))
+            OpenAiCompatError::RateLimitExceeded(retry_duration)
         }
-        401 | 403 => Err(OpenAiCompatError::AuthenticationError(error_text)),
+        401 | 403 => OpenAiCompatError::AuthenticationError(error_text),
         500..=599 => {
             tracing::warn!("OpenAI Server Error {}: {}", status, error_text);
-            Err(OpenAiCompatError::TransientError(
+            OpenAiCompatError::TransientError(
                 retry_after_duration.unwrap_or(Duration::from_secs(0)),
                 error_text,
-            ))
+            )
         }
-        _ => Err(OpenAiCompatError::ApiError(status, error_text)),
+        _ => OpenAiCompatError::ApiError(status, error_text),
     }
 }
 
@@ -460,13 +564,26 @@ pub(crate) mod tests {
     pub(crate) async fn serve_replies(
         replies: Vec<(u16, String)>,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        serve_typed_replies(
+            replies
+                .into_iter()
+                .map(|(status, body)| (status, "application/json", body))
+                .collect(),
+        )
+        .await
+    }
+
+    /// As serve_replies, with each reply's content type given.
+    pub(crate) async fn serve_typed_replies(
+        replies: Vec<(u16, &'static str, String)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = seen.clone();
         tokio::spawn(async move {
-            for (status, body) in replies {
+            for (status, content_type, body) in replies {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 let mut buf = vec![0u8; 65536];
                 let mut n = 0;
@@ -489,7 +606,7 @@ pub(crate) mod tests {
                     .unwrap()
                     .push(serde_json::from_str(&request).unwrap());
                 let reply = format!(
-                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 sock.write_all(reply.as_bytes()).await.unwrap();

@@ -72,7 +72,6 @@ pub(crate) async fn serve(bytes: Vec<u8>) -> TestServer {
 
 /// Answers one connection per response, in order, and records each request
 /// body it received.
-#[cfg(feature = "bedrock")]
 pub(crate) async fn serve_sequence(
     responses: Vec<Vec<u8>>,
 ) -> (TestServer, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
@@ -164,9 +163,15 @@ async fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     buf.split_off(header_end)
 }
 
-fn response(status: &str, extra_headers: &str, content_length: usize, body: &str) -> Vec<u8> {
+fn response(
+    status: &str,
+    content_type: &str,
+    extra_headers: &str,
+    content_length: usize,
+    body: &str,
+) -> Vec<u8> {
     format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}\
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{extra_headers}\
          Content-Length: {content_length}\r\nConnection: close\r\n\r\n{body}"
     )
     .into_bytes()
@@ -174,11 +179,34 @@ fn response(status: &str, extra_headers: &str, content_length: usize, body: &str
 
 /// A Content-Length larger than the bytes sent simulates a dropped body.
 pub(crate) fn truncated(status: &str, extra_headers: &str, body: &str) -> Vec<u8> {
-    response(status, extra_headers, 4096, body)
+    truncated_with_type(status, "application/json", extra_headers, body)
+}
+
+pub(crate) fn truncated_with_type(
+    status: &str,
+    content_type: &str,
+    extra_headers: &str,
+    body: &str,
+) -> Vec<u8> {
+    response(status, content_type, extra_headers, body.len() + 4096, body)
 }
 
 pub(crate) fn complete(status: &str, extra_headers: &str, body: &str) -> Vec<u8> {
-    response(status, extra_headers, body.len(), body)
+    complete_with_type(status, "application/json", extra_headers, body)
+}
+
+pub(crate) fn complete_with_type(
+    status: &str,
+    content_type: &str,
+    extra_headers: &str,
+    body: &str,
+) -> Vec<u8> {
+    response(status, content_type, extra_headers, body.len(), body)
+}
+
+/// A complete event-stream reply.
+pub(crate) fn sse(body: &str) -> Vec<u8> {
+    complete_with_type("200 OK", "text/event-stream", "", body)
 }
 
 pub(crate) const BODY_READ_FAILURE: &str = "error decoding response body";

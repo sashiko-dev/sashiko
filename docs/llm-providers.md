@@ -77,6 +77,17 @@ base_url = "https://gateway.example.com/v1/messages"
 client_cert = "/path/to/cert-and-key.pem"
 ```
 
+Set `stream = true` to let the endpoint send events during generation.
+This can help when a proxy or gateway closes idle requests, sometimes
+with an HTTP 524. Sashiko assembles the full message before handing it
+to a review stage. If the stream ends before `message_stop`, a retry
+starts the request again.
+
+```toml
+[ai.claude]
+stream = true
+```
+
 ## Claude Code CLI
 
 Uses a local [Claude Code](https://claude.com/claude-code) installation as
@@ -701,6 +712,22 @@ Everything else in `[ai.openai_compat]` applies to both, except
 a chat completion only.
 Setting any of them with `api = "responses"` is refused at startup
 rather than ignored.
+
+If a gateway closes idle requests, set `stream = true` for either
+OpenAI transport so the endpoint can send events during generation.
+Sashiko assembles the full reply before handing it to a review stage.
+
+```toml
+[ai.openai_compat]
+stream = true
+```
+
+An interrupted reply is retried from the start. Chat can treat a reply
+as complete without `[DONE]` if it has at least one choice and each
+choice has reported a finish reason other than `error`. Chat endpoints
+must accept `stream_options.include_usage`, which Sashiko requests for
+token counts. Set `api_timeout_secs` to cover the longest expected
+request, including generation.
 
 `service_tier` picks the processing tier and is sent on both endpoints,
 omitted when unset. `"flex"` halves the per-token price in exchange

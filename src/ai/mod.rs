@@ -934,15 +934,18 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
             let thinking = claude.and_then(|c| c.thinking.clone());
             let effort = claude.and_then(|c| c.effort.clone());
             let client_cert = claude.and_then(|c| c.client_cert.as_deref());
-            Ok(Arc::new(claude::ClaudeClient::new(
-                model,
-                enable_caching,
-                max_tokens,
-                base_url,
-                thinking,
-                effort,
-                client_cert,
-            )?))
+            Ok(Arc::new(
+                claude::ClaudeClient::new(
+                    model,
+                    enable_caching,
+                    max_tokens,
+                    base_url,
+                    thinking,
+                    effort,
+                    client_cert,
+                )?
+                .with_stream(claude.is_some_and(|c| c.stream)),
+            ))
         }
         "stdio-claude" => Ok(Arc::new(claude::StdioClaudeClient::new())),
         #[cfg(feature = "bedrock")]
@@ -1060,7 +1063,8 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                     .with_reasoning_content(compat.is_some_and(|c| c.send_reasoning_content))
                     .with_empty_tool_call_content(
                         compat.is_some_and(|c| c.send_empty_tool_call_content),
-                    );
+                    )
+                    .with_stream(compat.is_some_and(|c| c.stream))?;
                     let provider = match compat {
                         Some(c) => provider
                             .with_extra_headers(&openai::extra_headers_from_env(
@@ -1104,15 +1108,18 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                         .and_then(|c| c.base_url.clone())
                         .unwrap_or_else(openai_responses::OpenAiResponsesClient::default_base_url);
 
-                    Ok(Arc::new(openai_responses::OpenAiResponsesClient::new(
-                        base_url,
-                        ai.model.clone(),
-                        context_window,
-                        max_tokens,
-                        ai.api_timeout_secs,
-                        effort,
-                        service_tier,
-                    )?))
+                    Ok(Arc::new(
+                        openai_responses::OpenAiResponsesClient::new(
+                            base_url,
+                            ai.model.clone(),
+                            context_window,
+                            max_tokens,
+                            ai.api_timeout_secs,
+                            effort,
+                            service_tier,
+                        )?
+                        .with_stream(compat.is_some_and(|c| c.stream)),
+                    ))
                 }
                 other => bail!("Unsupported openai api: {}", other),
             }
@@ -1284,6 +1291,7 @@ pub(crate) mod bedrock_token;
 pub mod cache;
 pub mod claude;
 pub mod claude_cli;
+pub mod claude_stream;
 pub mod cli_common;
 pub mod codex_cli;
 pub mod concurrency_limited_provider;
@@ -1301,6 +1309,7 @@ pub mod openai_responses;
 pub mod proxy;
 pub mod quota;
 pub mod session;
+pub mod sse;
 #[cfg(test)]
 pub(crate) mod test_http;
 pub mod token_budget;
@@ -2015,6 +2024,7 @@ mod tests {
             send_empty_tool_call_content: false,
             api: api.map(str::to_string),
             service_tier: None,
+            stream: false,
             session_affinity_header: None,
         };
 
@@ -2028,6 +2038,59 @@ mod tests {
 
         settings.ai.openai_compat = Some(compat(Some("assistants")));
         assert!(create_provider(&settings).is_err());
+
+        Ok(())
+    }
+
+    /// The Claude stream setting parses, is off when unset, and builds.
+    #[test]
+    fn test_claude_stream_setting_is_opt_in() -> Result<()> {
+        let parsed: crate::settings::ClaudeSettings = toml::from_str("stream = true")?;
+        assert!(parsed.stream);
+        let unset: crate::settings::ClaudeSettings = toml::from_str("")?;
+        assert!(!unset.stream, "streaming is opt-in");
+
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.provider = "claude".to_string();
+        settings.ai.model = "claude-test".to_string();
+        settings.ai.claude = Some(parsed);
+        assert!(create_provider(&settings).is_ok());
+        Ok(())
+    }
+
+    /// The stream setting reaches both transports, and a chat stream
+    /// refuses extra_body fields that would override its own.
+    #[test]
+    fn test_openai_stream_setting_builds_both_transports() -> Result<()> {
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.provider = "openai".to_string();
+        settings.ai.model = "gpt-5.4".to_string();
+
+        let parsed: crate::settings::OpenAiCompatSettings = toml::from_str("stream = true")?;
+        assert!(parsed.stream);
+        let unset: crate::settings::OpenAiCompatSettings = toml::from_str("")?;
+        assert!(!unset.stream, "streaming is opt-in");
+
+        for api in ["chat", "responses"] {
+            let mut compat = parsed.clone();
+            compat.api = Some(api.to_string());
+            settings.ai.openai_compat = Some(compat);
+            assert!(create_provider(&settings).is_ok(), "api = {api}");
+        }
+
+        let mut compat = parsed.clone();
+        compat
+            .extra_body
+            .insert("stream".to_string(), serde_json::Value::Bool(false));
+        settings.ai.openai_compat = Some(compat.clone());
+        let err = create_provider(&settings)
+            .err()
+            .expect("extra_body may not set stream when streaming");
+        assert!(err.to_string().contains("stream"), "{err:#}");
+
+        compat.stream = false;
+        settings.ai.openai_compat = Some(compat);
+        assert!(create_provider(&settings).is_ok());
 
         Ok(())
     }
@@ -2050,6 +2113,7 @@ mod tests {
                 send_empty_tool_call_content: false,
                 api: Some(api.to_string()),
                 service_tier: Some(crate::settings::ServiceTier::Flex),
+                stream: false,
                 session_affinity_header: None,
             });
 
@@ -2089,6 +2153,7 @@ mod tests {
             send_empty_tool_call_content: false,
             api: Some("responses".to_string()),
             service_tier: None,
+            stream: false,
             session_affinity_header: None,
         };
 

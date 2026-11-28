@@ -13,13 +13,16 @@
 // limitations under the License.
 
 use crate::ai::openai_common::{
-    OpenAiCompatError, build_http_client, lenient_option, normalize_base_url, post_json,
+    NewAssembler, OpenAiCompatError, StreamAssembler, build_http_client, event_json,
+    lenient_option, normalize_base_url, post_json, status_error, stream_protocol_error,
 };
+use crate::ai::sse::{Flow, SseEvent};
 use crate::ai::{
     AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage, ProviderCapabilities,
     ToolCall,
 };
 use crate::settings::ServiceTier;
+use crate::utils::redact_secret;
 use anyhow::Result;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -187,8 +190,16 @@ pub struct OpenAiCompatClient {
     send_empty_tool_call_content: bool,
     /// Learned by post_json; see there.
     temperature_unsupported: AtomicBool,
+    /// Ask for an event stream, which keeps bytes flowing while the model
+    /// works; see ChatStream.
+    stream: bool,
     client: Client,
 }
+
+/// Fields a streamed request carries on top of the ones it shares with a
+/// plain one.  `stream_options.include_usage` is what makes a stream
+/// report token counts at all.
+const STREAM_REQUEST_FIELDS: [&str; 2] = ["stream", "stream_options"];
 
 impl OpenAiCompatClient {
     #[allow(clippy::too_many_arguments)]
@@ -220,7 +231,31 @@ impl OpenAiCompatClient {
             extra_body: serde_json::Map::new(),
             temperature_unsupported: AtomicBool::new(false),
             send_empty_tool_call_content: false,
+            stream: false,
         })
+    }
+
+    /// Asks for each reply as an event stream rather than one document.
+    pub fn with_stream(mut self, stream: bool) -> Result<Self> {
+        self.stream = stream;
+        self.check_stream_fields()?;
+        Ok(self)
+    }
+
+    /// A streamed request sets its stream fields itself, and extra_body
+    /// overriding them would change what the reply looks like.  Checked
+    /// only when streaming, so a plain request keeps accepting them.
+    fn check_stream_fields(&self) -> Result<()> {
+        if !self.stream {
+            return Ok(());
+        }
+        if let Some(field) = STREAM_REQUEST_FIELDS
+            .iter()
+            .find(|field| self.extra_body.contains_key(**field))
+        {
+            anyhow::bail!("extra_body may not set {field:?} when stream is enabled");
+        }
+        Ok(())
     }
 
     /// Sends each assistant turn's thought back as `reasoning_content`.
@@ -303,6 +338,7 @@ impl OpenAiCompatClient {
             anyhow::bail!("extra_body may not set {field:?}, which Sashiko sets itself");
         }
         self.extra_body = fields;
+        self.check_stream_fields()?;
         Ok(self)
     }
 
@@ -310,6 +346,13 @@ impl OpenAiCompatClient {
         let mut body = serde_json::to_value(request)?;
         if let Some(object) = body.as_object_mut() {
             object.extend(self.extra_body.clone());
+            if self.stream {
+                object.insert("stream".to_string(), Value::Bool(true));
+                object.insert(
+                    "stream_options".to_string(),
+                    serde_json::json!({"include_usage": true}),
+                );
+            }
         }
         Ok(body)
     }
@@ -374,6 +417,7 @@ impl OpenAiCompatClient {
             headers,
             body,
             &self.temperature_unsupported,
+            self.stream.then_some(ChatStream::boxed as NewAssembler),
         )
         .await?;
         tracing::debug!(
@@ -387,6 +431,357 @@ impl OpenAiCompatClient {
             response.service_tier.as_deref(),
         );
         Ok(response)
+    }
+}
+
+/// Rebuilds a streamed chat completion from its chunks.
+///
+/// Each chunk carries deltas for one or more choices.  Text fields are
+/// concatenated; tool calls are keyed by their `index`, take their id,
+/// type and name from the first delta that has them, and concatenate
+/// their argument fragments.  `finish_reason`, `usage` and `service_tier`
+/// keep the last value sent.  `data: [DONE]` ends the stream; one that
+/// ends without it was cut off.
+///
+/// The rebuilt document is what the endpoint returns without streaming,
+/// so a field that is missing from every chunk is missing from it too and
+/// fails to decode exactly as the plain reply would.
+#[derive(Debug, Default)]
+struct ChatStream {
+    choices: std::collections::BTreeMap<u64, ChoiceDeltas>,
+    usage: Option<Value>,
+    service_tier: Option<Value>,
+}
+
+#[derive(Debug, Default)]
+struct ChoiceDeltas {
+    role: Option<String>,
+    content: String,
+    reasoning_content: String,
+    reasoning: String,
+    tool_calls: ToolCalls,
+    finish_reason: Option<Value>,
+}
+
+/// The tool calls of one choice, in the order their first fragment came.
+#[derive(Debug, Default)]
+struct ToolCalls {
+    calls: Vec<ToolCallDeltas>,
+    /// Which call each wire `index` currently names.
+    by_index: std::collections::BTreeMap<u64, usize>,
+}
+
+impl ToolCalls {
+    /// The call a delta continues, or a new one.  OpenAI tags every delta
+    /// with the call's `index`.  Some compatible servers leave the index
+    /// out and send each call whole, and some give every call index 0, so
+    /// a delta naming an id other than the one its slot already has starts
+    /// a new call, and a delta without an index continues the last call.
+    fn slot(&mut self, index: Option<u64>, id: Option<&str>) -> &mut ToolCallDeltas {
+        let starts_new = |call: &ToolCallDeltas| {
+            id.is_some_and(|id| call.id.as_deref().is_some_and(|known| known != id))
+        };
+        let existing = match index {
+            Some(index) => self.by_index.get(&index).copied(),
+            None => self.calls.len().checked_sub(1),
+        }
+        .filter(|&position| !starts_new(&self.calls[position]));
+        let position = existing.unwrap_or_else(|| {
+            self.calls.push(ToolCallDeltas::default());
+            self.calls.len() - 1
+        });
+        if let Some(index) = index {
+            self.by_index.insert(index, position);
+        }
+        &mut self.calls[position]
+    }
+}
+
+#[derive(Debug, Default)]
+struct ToolCallDeltas {
+    id: Option<String>,
+    call_type: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl ChatStream {
+    fn boxed() -> Box<dyn StreamAssembler> {
+        Box::new(Self::default())
+    }
+
+    fn on_choice(&mut self, choice: &Value) -> Result<(), OpenAiCompatError> {
+        // A server that sends one choice may leave out its index.
+        let index = match choice.get("index") {
+            None | Some(Value::Null) => 0,
+            Some(index) => index
+                .as_u64()
+                .ok_or_else(|| stream_protocol_error("choice index is not a number"))?,
+        };
+        let deltas = self.choices.entry(index).or_default();
+        if let Some(reason) = choice.get("finish_reason").filter(|r| !r.is_null()) {
+            deltas.finish_reason = Some(reason.clone());
+        }
+        let Some(delta) = choice.get("delta").filter(|d| !d.is_null()) else {
+            return Ok(());
+        };
+        set_once(&mut deltas.role, delta.get("role"), "role")?;
+        append(&mut deltas.content, delta.get("content"), "content")?;
+        append(
+            &mut deltas.reasoning_content,
+            delta.get("reasoning_content"),
+            "reasoning_content",
+        )?;
+        append(&mut deltas.reasoning, delta.get("reasoning"), "reasoning")?;
+        match delta.get("tool_calls") {
+            None | Some(Value::Null) => Ok(()),
+            Some(Value::Array(calls)) => calls
+                .iter()
+                .try_for_each(|call| on_tool_call(&mut deltas.tool_calls, call)),
+            Some(_) => Err(stream_protocol_error("tool_calls delta is not an array")),
+        }
+    }
+}
+
+fn on_tool_call(calls: &mut ToolCalls, call: &Value) -> Result<(), OpenAiCompatError> {
+    let index = match call.get("index") {
+        None | Some(Value::Null) => None,
+        Some(index) => Some(
+            index
+                .as_u64()
+                .ok_or_else(|| stream_protocol_error("tool call index is not a number"))?,
+        ),
+    };
+    let id = call
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    let deltas = calls.slot(index, id);
+    set_once(&mut deltas.id, call.get("id"), "tool call id")?;
+    set_once(&mut deltas.call_type, call.get("type"), "tool call type")?;
+    if let Some(function) = call.get("function").filter(|f| !f.is_null()) {
+        set_once(&mut deltas.name, function.get("name"), "tool call name")?;
+        append(
+            &mut deltas.arguments,
+            function.get("arguments"),
+            "tool call arguments",
+        )?;
+    }
+    Ok(())
+}
+
+/// Takes a field the first chunk carrying it sets.  Some servers repeat
+/// it on every chunk, which is accepted; a different value is not, since
+/// neither can be the right one.  An empty string counts as absent: some
+/// servers send `"id": ""` on every fragment after the first.
+fn set_once(
+    slot: &mut Option<String>,
+    value: Option<&Value>,
+    what: &str,
+) -> Result<(), OpenAiCompatError> {
+    match value {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(value)) if value.is_empty() => Ok(()),
+        Some(Value::String(value)) => match slot {
+            Some(existing) if existing != value => Err(stream_protocol_error(format_args!(
+                "{what} changed from {existing:?} to {value:?}"
+            ))),
+            Some(_) => Ok(()),
+            None => {
+                *slot = Some(value.clone());
+                Ok(())
+            }
+        },
+        Some(_) => Err(stream_protocol_error(format_args!(
+            "{what} is not a string"
+        ))),
+    }
+}
+
+fn append(slot: &mut String, value: Option<&Value>, what: &str) -> Result<(), OpenAiCompatError> {
+    match value {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(fragment)) => {
+            slot.push_str(fragment);
+            Ok(())
+        }
+        Some(_) => Err(stream_protocol_error(format_args!(
+            "{what} is not a string"
+        ))),
+    }
+}
+
+/// An error a server reports inside the stream, typed like the HTTP
+/// status it stands for.  Servers name that status as a numeric code, as
+/// a numeric string, or only by kind: OpenAI sends `type: "server_error"`
+/// with a null code for a failure a plain request would get as a 500.
+/// An error none of these place is fatal.
+///
+/// The text keeps the `{"error": ...}` envelope a non-streamed error body
+/// carries, because status_error and rejects_temperature_parameter read
+/// the quota and temperature refusal fields from under that key.
+fn stream_error(error: &Value) -> OpenAiCompatError {
+    let text = redact_secret(&serde_json::json!({ "error": error }).to_string());
+    match stream_error_status(error) {
+        Some(status) => status_error(status, None, text),
+        None => {
+            tracing::error!("OpenAI stream reported an error: {}", text);
+            OpenAiCompatError::ResponseFailed(text)
+        }
+    }
+}
+
+fn stream_error_status(error: &Value) -> Option<reqwest::StatusCode> {
+    use reqwest::StatusCode;
+    let code = error.get("code");
+    let numeric = code
+        .and_then(|code| {
+            code.as_u64()
+                .or_else(|| code.as_str().and_then(|text| text.trim().parse().ok()))
+        })
+        .and_then(|code| u16::try_from(code).ok())
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .filter(|status| status.is_client_error() || status.is_server_error());
+    if numeric.is_some() {
+        return numeric;
+    }
+    [code, error.get("type")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find_map(|kind| match kind {
+            "invalid_request_error" | "unsupported_value" | "unsupported_parameter" => {
+                Some(StatusCode::BAD_REQUEST)
+            }
+            "server_error" | "api_error" | "internal_error" | "internal_server_error" => {
+                Some(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+            "overloaded_error" | "service_unavailable" => Some(StatusCode::SERVICE_UNAVAILABLE),
+            "rate_limit_exceeded" | "rate_limit_error" => Some(StatusCode::TOO_MANY_REQUESTS),
+            _ => None,
+        })
+}
+
+impl StreamAssembler for ChatStream {
+    fn terminal_event(&self) -> &'static str {
+        "[DONE]"
+    }
+
+    /// Some servers close the stream after the last finish_reason without
+    /// sending `[DONE]`.  Every choice having finished means the generation
+    /// did; only a usage chunk can still be missing.  A finish reason of
+    /// "error", which OpenRouter sends for a generation that failed, does
+    /// not count.
+    fn complete_at_eof(&self) -> bool {
+        !self.choices.is_empty()
+            && self.choices.values().all(|choice| {
+                choice
+                    .finish_reason
+                    .as_ref()
+                    .is_some_and(|reason| reason.as_str() != Some("error"))
+            })
+    }
+
+    fn on_event(&mut self, event: SseEvent) -> Result<Flow, OpenAiCompatError> {
+        if event.data == "[DONE]" {
+            return Ok(Flow::Done);
+        }
+        let chunk = event_json(&event)?;
+        if let Some(error) = chunk.get("error").filter(|e| !e.is_null()) {
+            return Err(stream_error(error));
+        }
+        if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
+            self.usage = Some(usage.clone());
+        }
+        if let Some(tier) = chunk.get("service_tier").filter(|t| !t.is_null()) {
+            self.service_tier = Some(tier.clone());
+        }
+        match chunk.get("choices") {
+            None | Some(Value::Null) => Ok(Flow::Continue),
+            Some(Value::Array(choices)) => {
+                for choice in choices {
+                    self.on_choice(choice)?;
+                }
+                Ok(Flow::Continue)
+            }
+            Some(_) => Err(stream_protocol_error("choices is not an array")),
+        }
+    }
+
+    fn into_document(self: Box<Self>) -> Value {
+        let choices: Vec<Value> = self
+            .choices
+            .into_iter()
+            .map(|(index, deltas)| deltas.into_choice(index))
+            .collect();
+        let mut document = serde_json::Map::new();
+        document.insert("choices".to_string(), Value::Array(choices));
+        if let Some(usage) = self.usage {
+            document.insert("usage".to_string(), usage);
+        }
+        if let Some(tier) = self.service_tier {
+            document.insert("service_tier".to_string(), tier);
+        }
+        Value::Object(document)
+    }
+}
+
+impl ChoiceDeltas {
+    /// The choice as a plain reply carries it.  Text that never arrived is
+    /// left out rather than sent empty: a plain reply that only calls
+    /// tools has no content, while the first chunk of its stream carries
+    /// an empty one.
+    fn into_choice(self, index: u64) -> Value {
+        let mut message = serde_json::Map::new();
+        message.insert(
+            "role".to_string(),
+            Value::String(self.role.unwrap_or_else(|| "assistant".to_string())),
+        );
+        for (name, text) in [
+            ("content", self.content),
+            ("reasoning_content", self.reasoning_content),
+            ("reasoning", self.reasoning),
+        ] {
+            if !text.is_empty() {
+                message.insert(name.to_string(), Value::String(text));
+            }
+        }
+        if !self.tool_calls.calls.is_empty() {
+            let calls = self
+                .tool_calls
+                .calls
+                .into_iter()
+                .map(ToolCallDeltas::into_call)
+                .collect();
+            message.insert("tool_calls".to_string(), Value::Array(calls));
+        }
+        let mut choice = serde_json::Map::new();
+        choice.insert("index".to_string(), Value::from(index));
+        choice.insert("message".to_string(), Value::Object(message));
+        if let Some(reason) = self.finish_reason {
+            choice.insert("finish_reason".to_string(), reason);
+        }
+        Value::Object(choice)
+    }
+}
+
+impl ToolCallDeltas {
+    fn into_call(self) -> Value {
+        let mut function = serde_json::Map::new();
+        if let Some(name) = self.name {
+            function.insert("name".to_string(), Value::String(name));
+        }
+        function.insert("arguments".to_string(), Value::String(self.arguments));
+        let mut call = serde_json::Map::new();
+        if let Some(id) = self.id {
+            call.insert("id".to_string(), Value::String(id));
+        }
+        call.insert(
+            "type".to_string(),
+            Value::String(self.call_type.unwrap_or_else(|| "function".to_string())),
+        );
+        call.insert("function".to_string(), Value::Object(function));
+        Value::Object(call)
     }
 }
 
@@ -1934,6 +2329,7 @@ mod tests {
             send_empty_tool_call_content: false,
             api: None,
             service_tier: None,
+            stream: false,
         });
         let provider = crate::ai::create_provider(&settings)?;
 
@@ -2258,5 +2654,419 @@ mod tests {
 
         let json = serde_json::to_value(&translated).unwrap();
         assert!(json.get("reasoning_effort").is_none());
+    }
+
+    const PLAIN_TEXT: &str = r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-5.1","choices":[{"index":0,"message":{"role":"assistant","content":"Hello there","reasoning_content":"Thinking it over","refusal":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":4}},"service_tier":"default"}"#;
+
+    const STREAMED_TEXT: &[&str] = &[
+        r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"","refusal":null},"finish_reason":null}],"usage":null,"service_tier":"default"}"#,
+        r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"Thinking "},"finish_reason":null}]}"#,
+        r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"it over"}}]}"#,
+        r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}"#,
+        r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":" there"}}]}"#,
+        r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        r#"{"id":"chatcmpl-1","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":4}},"service_tier":"default"}"#,
+    ];
+
+    const PLAIN_TOOL_CALLS: &str = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}},{"id":"call_b","type":"function","function":{"name":"git_log","arguments":"{\"n\":3}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":20,"completion_tokens":9,"total_tokens":29}}"#;
+
+    /// Two calls whose argument fragments interleave, the way a server
+    /// streaming parallel tool calls sends them.
+    const STREAMED_TOOL_CALLS: &[&str] = &[
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"git_log","arguments":""}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"arguments":"th\":\"a.rs\"}"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"name":"git_log","arguments":"{\"n\":3}"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        r#"{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":9,"total_tokens":29}}"#,
+    ];
+
+    fn chunk_stream(chunks: &[&str]) -> String {
+        let mut body: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    async fn chat(
+        stream: bool,
+        replies: Vec<(u16, &'static str, String)>,
+    ) -> (Result<AiResponse>, Vec<Value>) {
+        use crate::ai::openai_common::tests::serve_typed_replies;
+        let (base_url, seen) = serve_typed_replies(replies).await;
+        let client = test_client(&base_url, 4096, None)
+            .with_stream(stream)
+            .unwrap();
+        let response = client.generate_content(sample_request()).await;
+        let seen = seen.lock().unwrap().clone();
+        (response, seen)
+    }
+
+    async fn chat_streamed(body: String) -> Result<AiResponse> {
+        chat(true, vec![(200, "text/event-stream", body)]).await.0
+    }
+
+    /// A streamed reply reaches the stage as exactly the response the
+    /// plain reply to the same request does.
+    #[tokio::test]
+    async fn a_streamed_chat_reply_matches_the_plain_one() {
+        for (plain, chunks) in [
+            (PLAIN_TEXT, STREAMED_TEXT),
+            (PLAIN_TOOL_CALLS, STREAMED_TOOL_CALLS),
+        ] {
+            let (plain_response, plain_seen) =
+                chat(false, vec![(200, "application/json", plain.to_string())]).await;
+            let (streamed_response, streamed_seen) =
+                chat(true, vec![(200, "text/event-stream", chunk_stream(chunks))]).await;
+
+            let plain_response = plain_response.unwrap();
+            assert_eq!(
+                serde_json::to_value(streamed_response.unwrap()).unwrap(),
+                serde_json::to_value(&plain_response).unwrap()
+            );
+            assert!(plain_response.usage.unwrap().prompt_tokens > 0);
+
+            assert!(plain_seen[0].get("stream").is_none());
+            assert!(plain_seen[0].get("stream_options").is_none());
+            assert_eq!(streamed_seen[0]["stream"], true);
+            assert_eq!(
+                streamed_seen[0]["stream_options"],
+                json!({"include_usage": true})
+            );
+            let mut unstreamed = streamed_seen[0].clone();
+            let fields = unstreamed.as_object_mut().unwrap();
+            fields.remove("stream");
+            fields.remove("stream_options");
+            assert_eq!(unstreamed, plain_seen[0], "only the stream fields differ");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streamed_tool_call_reply_has_no_content() {
+        let response = chat_streamed(chunk_stream(STREAMED_TOOL_CALLS))
+            .await
+            .unwrap();
+        assert_eq!(response.content, None);
+        let calls = response.tool_calls.unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].arguments, json!({"path": "a.rs"}));
+        assert_eq!(calls[1].function_name, "git_log");
+        assert_eq!(calls[1].arguments, json!({"n": 3}));
+    }
+
+    #[tokio::test]
+    async fn a_plain_reply_to_a_streamed_chat_request_is_accepted() {
+        let (response, seen) = chat(
+            true,
+            vec![(200, "application/json", PLAIN_TEXT.to_string())],
+        )
+        .await;
+        assert_eq!(response.unwrap().content.as_deref(), Some("Hello there"));
+        assert_eq!(seen[0]["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn a_chat_stream_cut_before_it_finished_is_transient() {
+        let body: String = STREAMED_TEXT[..5]
+            .iter()
+            .map(|c| format!("data: {c}\n\n"))
+            .collect();
+        let err = chat_streamed(body).await.expect_err("a cut stream fails");
+        assert!(
+            err.to_string().contains("stream ended before [DONE]"),
+            "{err:#}"
+        );
+        assert!(matches!(
+            crate::ai::classify_ai_error(&err),
+            crate::ai::AiErrorClass::Transient { .. }
+        ));
+    }
+
+    /// A server that closes after the last finish_reason without [DONE]
+    /// has sent the whole generation.
+    #[tokio::test]
+    async fn a_finished_chat_stream_without_done_is_accepted() {
+        let body: String = STREAMED_TEXT
+            .iter()
+            .map(|c| format!("data: {c}\n\n"))
+            .collect();
+        let (plain, _) = chat(
+            false,
+            vec![(200, "application/json", PLAIN_TEXT.to_string())],
+        )
+        .await;
+        assert_eq!(
+            serde_json::to_value(chat_streamed(body).await.unwrap()).unwrap(),
+            serde_json::to_value(plain.unwrap()).unwrap()
+        );
+
+        let without_usage: String = STREAMED_TEXT[..6]
+            .iter()
+            .map(|c| format!("data: {c}\n\n"))
+            .collect();
+        let response = chat_streamed(without_usage).await.unwrap();
+        assert_eq!(response.content.as_deref(), Some("Hello there"));
+    }
+
+    #[tokio::test]
+    async fn an_error_finish_without_done_is_not_complete() {
+        let chunks = [
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"par"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"error"}]}"#,
+        ];
+        let body: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
+        let err = chat_streamed(body).await.expect_err("a failed generation");
+        assert!(matches!(
+            crate::ai::classify_ai_error(&err),
+            crate::ai::AiErrorClass::Transient { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_length_stop_in_a_stream_is_truncated() {
+        let chunks = [
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"cut"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
+        ];
+        assert!(
+            chat_streamed(chunk_stream(&chunks))
+                .await
+                .unwrap()
+                .truncated
+        );
+    }
+
+    /// A choice that never names a finish reason fails to decode, as the
+    /// same plain reply would.
+    #[tokio::test]
+    async fn a_stream_without_a_finish_reason_fails_like_the_plain_reply() {
+        let chunks = [r#"{"choices":[{"index":0,"delta":{"content":"hi"}}]}"#];
+        let err = chat_streamed(chunk_stream(&chunks))
+            .await
+            .expect_err("no finish_reason");
+        assert!(err.to_string().contains("finish_reason"), "{err:#}");
+        assert!(matches!(
+            crate::ai::classify_ai_error(&err),
+            crate::ai::AiErrorClass::Fatal
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_error_chunk_is_classified_like_its_status() {
+        let cases = [
+            (json!({"code": 429}), "rate limit"),
+            (json!({"code": 503}), "transient"),
+            (json!({"code": "502"}), "transient"),
+            (json!({"code": 400}), "fatal"),
+            (json!({"code": null, "type": "server_error"}), "transient"),
+            (json!({"code": "server_error"}), "transient"),
+            (json!({"code": "rate_limit_exceeded"}), "rate limit"),
+            (
+                json!({"code": "insufficient_quota", "type": "insufficient_quota"}),
+                "fatal",
+            ),
+            (json!({"code": 429, "type": "insufficient_quota"}), "fatal"),
+            (json!({"code": "context_length_exceeded"}), "fatal"),
+            (json!({"code": null}), "fatal"),
+        ];
+        for (mut error, expected) in cases {
+            error["message"] = json!("provider said no");
+            let chunk = json!({"error": error}).to_string();
+            let chunks = [STREAMED_TEXT[0], &chunk];
+            let err = chat_streamed(chunk_stream(&chunks))
+                .await
+                .expect_err("an error chunk fails");
+            let class = crate::ai::classify_ai_error(&err);
+            let matches = match expected {
+                "rate limit" => matches!(class, crate::ai::AiErrorClass::RateLimit { .. }),
+                "transient" => matches!(class, crate::ai::AiErrorClass::Transient { .. }),
+                _ => matches!(class, crate::ai::AiErrorClass::Fatal),
+            };
+            assert!(matches, "{error}: {class:?} for {err:#}");
+        }
+    }
+
+    /// A temperature refusal sent inside the stream drops the field and
+    /// resends, exactly like the same refusal sent as an HTTP error body.
+    #[tokio::test]
+    async fn an_in_stream_temperature_refusal_resends_without_it() {
+        use crate::ai::openai_common::tests::serve_typed_replies;
+        let errors = [
+            json!({"code": 400, "type": "invalid_request_error"}),
+            json!({"code": null, "type": "invalid_request_error"}),
+            json!({"code": "unsupported_parameter"}),
+            json!({
+                "code": "unsupported_value",
+                "message": "The requested 'temperature' is not supported with this model.",
+            }),
+        ];
+        for mut error in errors {
+            error["param"] = json!("temperature");
+            let refusal = json!({"error": error}).to_string();
+            let (base_url, seen) = serve_typed_replies(vec![
+                (200, "text/event-stream", chunk_stream(&[&refusal])),
+                (200, "text/event-stream", chunk_stream(STREAMED_TEXT)),
+            ])
+            .await;
+            let client = test_client(&base_url, 4096, None)
+                .with_stream(true)
+                .unwrap();
+            let response = client
+                .generate_content(request_at_zero_temperature())
+                .await
+                .unwrap_or_else(|err| panic!("the retry for {error} failed: {err:#}"));
+            let seen = seen.lock().unwrap();
+            assert_eq!(response.content.as_deref(), Some("Hello there"));
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0]["temperature"], 0.0);
+            assert!(seen[1].get("temperature").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_chat_stream_is_fatal() {
+        let cases = [
+            "not json",
+            r#"{"choices":{}}"#,
+            r#"{"choices":[{"index":"0","delta":{}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":7}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":"0","id":"call_a"}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"role":"user"}}]}"#,
+        ];
+        for bad in cases {
+            let chunks = [STREAMED_TEXT[0], bad];
+            let err = chat_streamed(chunk_stream(&chunks))
+                .await
+                .expect_err("a malformed stream fails");
+            assert!(err.to_string().contains("Stream error"), "{bad}: {err:#}");
+            assert!(
+                matches!(
+                    crate::ai::classify_ai_error(&err),
+                    crate::ai::AiErrorClass::Fatal
+                ),
+                "{bad}: {err:#}"
+            );
+        }
+    }
+
+    async fn streamed_calls(chunks: &[&str]) -> Vec<(String, String, Value)> {
+        chat_streamed(chunk_stream(chunks))
+            .await
+            .unwrap()
+            .tool_calls
+            .unwrap()
+            .into_iter()
+            .map(|call| (call.id, call.function_name, call.arguments))
+            .collect()
+    }
+
+    /// A server that gives every call index 0 is told apart by the ids.
+    #[tokio::test]
+    async fn a_reused_index_with_a_new_id_starts_a_new_call() {
+        let calls = streamed_calls(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"f","arguments":"{\"a\""}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":":1}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b","type":"function","function":{"name":"g","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ])
+        .await;
+        assert_eq!(
+            calls,
+            [
+                ("call_a".to_string(), "f".to_string(), json!({"a": 1})),
+                ("call_b".to_string(), "g".to_string(), json!({})),
+            ]
+        );
+    }
+
+    /// Some servers leave the index out and send each call whole.
+    #[tokio::test]
+    async fn calls_without_an_index_are_kept_apart_by_id() {
+        let calls = streamed_calls(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}},{"id":"call_b","type":"function","function":{"name":"g","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ])
+        .await;
+        assert_eq!(
+            calls,
+            [
+                ("call_a".to_string(), "f".to_string(), json!({"a": 1})),
+                ("call_b".to_string(), "g".to_string(), json!({})),
+            ]
+        );
+    }
+
+    /// Some servers repeat id, type and name as empty strings on every
+    /// fragment after the first, and some send an empty id first.
+    #[tokio::test]
+    async fn empty_identity_fields_in_fragments_are_ignored() {
+        let calls = streamed_calls(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"","type":"","function":{"name":"","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"f","arguments":"{\"a\""}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"","type":"","function":{"name":"","arguments":":1}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ])
+        .await;
+        assert_eq!(
+            calls,
+            [("call_a".to_string(), "f".to_string(), json!({"a": 1}))]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_whose_name_changes_is_fatal() {
+        let chunks = [
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"f","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"g","arguments":"{}"}}]}}]}"#,
+        ];
+        let err = chat_streamed(chunk_stream(&chunks))
+            .await
+            .expect_err("the name changed");
+        assert!(
+            err.to_string().contains("tool call name changed"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn stream_fields_in_extra_body_are_refused_only_when_streaming() -> Result<()> {
+        let fields = |key: &str| {
+            let mut map = serde_json::Map::new();
+            map.insert(key.to_string(), json!(false));
+            map
+        };
+        let client = || test_client("https://api.openai.com/v1", 4096, None);
+        for field in STREAM_REQUEST_FIELDS {
+            assert!(client().with_extra_body(fields(field)).is_ok());
+            assert!(
+                client()
+                    .with_stream(false)?
+                    .with_extra_body(fields(field))
+                    .is_ok()
+            );
+            assert!(
+                client()
+                    .with_stream(true)?
+                    .with_extra_body(fields(field))
+                    .is_err()
+            );
+            assert!(
+                client()
+                    .with_extra_body(fields(field))?
+                    .with_stream(true)
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_stream_flag_stays_out_of_the_cache_identity() -> Result<()> {
+        let plain = test_client("https://api.openai.com/v1", 4096, None);
+        let streamed = test_client("https://api.openai.com/v1", 4096, None).with_stream(true)?;
+        assert_eq!(plain.cache_identity(), streamed.cache_identity());
+        Ok(())
     }
 }
